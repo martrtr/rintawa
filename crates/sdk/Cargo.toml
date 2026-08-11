@@ -1,6 +1,6 @@
 [package]
 name = "taverna-sdk"
-version = "0.1.0"
+version = "0.0.1"
 
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,12 @@ authors.workspace = true
 rust-version.workspace = true
 
 description = "SDK for developing Taverna extensions"
+readme = "README.md"
 
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+toml.workspace = true
