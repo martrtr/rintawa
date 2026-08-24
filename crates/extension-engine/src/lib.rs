@@ -9,9 +9,11 @@
 pub mod context;
 pub mod engine;
 pub mod errors;
+pub mod runtime;
 
 pub use engine::{ExtensionEngine, ExtensionState};
 pub use errors::{EngineError, EngineResult};
+pub use runtime::{WasmComponent, WasmRuntimeEngine};
 
 #[cfg(test)]
 mod tests {

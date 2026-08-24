@@ -14,6 +14,10 @@ pub enum EngineError {
     #[error("extension SDK error: {0}")]
     Sdk(#[from] ExtensionError),
 
+    /// An error occurred during Wasmtime runtime operations.
+    #[error("WASM runtime error: {0}")]
+    WasmRuntime(#[from] wasmtime::Error),
+
     /// The specified extension was not found in the engine.
     #[error("extension `{0}` not found")]
     ExtensionNotFound(String),
