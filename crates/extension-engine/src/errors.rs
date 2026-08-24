@@ -1,0 +1,42 @@
+//! Error types for the Taverna Extension Engine.
+
+use taverna_sdk::errors::ExtensionError;
+use thiserror::Error;
+
+/// Errors that can occur during Extension Engine operations.
+#[derive(Debug, Error)]
+pub enum EngineError {
+    /// An error occurred while parsing an extension manifest.
+    #[error("failed to parse manifest: {0}")]
+    ManifestParse(#[from] toml::de::Error),
+
+    /// An SDK-level lifecycle or registration error.
+    #[error("extension SDK error: {0}")]
+    Sdk(#[from] ExtensionError),
+
+    /// The specified extension was not found in the engine.
+    #[error("extension `{0}` not found")]
+    ExtensionNotFound(String),
+
+    /// The specified extension is already registered in the engine.
+    #[error("extension `{0}` is already registered")]
+    ExtensionAlreadyExists(String),
+
+    /// A component failed during a lifecycle transition.
+    #[error("component `{component_id}` in extension `{extension_id}` failed: {reason}")]
+    LifecycleFailed {
+        /// ID of the extension owning the component.
+        extension_id: String,
+        /// ID of the failed component.
+        component_id: String,
+        /// Failure message detailing the cause.
+        reason: String,
+    },
+
+    /// The extension is in an invalid lifecycle state for the operation.
+    #[error("extension `{0}` is in an invalid state for this operation")]
+    InvalidState(String),
+}
+
+/// A specialized [`Result`] type for Extension Engine operations.
+pub type EngineResult<T = ()> = Result<T, EngineError>;
