@@ -1,14 +1,27 @@
 //! Error types for the Taverna Extension Engine.
 
+use std::io;
 use taverna_sdk::errors::ExtensionError;
 use thiserror::Error;
 
 /// Errors that can occur during Extension Engine operations.
 #[derive(Debug, Error)]
 pub enum EngineError {
+    /// An I/O error occurred during file operations.
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+
+    /// The specified directory for extensions is invalid.
+    #[error("invalid extensions directory: `{0}`")]
+    InvalidDirectory(String),
+
     /// An error occurred while parsing an extension manifest.
     #[error("failed to parse manifest: {0}")]
     ManifestParse(#[from] toml::de::Error),
+
+    /// An error occurred while serializing configuration state.
+    #[error("failed to serialize state: {0}")]
+    StateSerialize(#[from] toml::ser::Error),
 
     /// An SDK-level lifecycle or registration error.
     #[error("extension SDK error: {0}")]
