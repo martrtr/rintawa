@@ -1,0 +1,49 @@
+package taverna:engine@0.0.1;
+
+/// Host operations exported to the WASM guest plugin.
+interface host {
+    /// Severity level for logging messages.
+    enum log-level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    /// Logs a message to the host's tracing system.
+    log: func(level: log-level, message: string);
+
+    /// Publishes an event to the global event bus.
+    publish-event: func(topic: string, payload: list<u8>);
+
+    /// Subscribes the plugin to events under a specific topic.
+    subscribe-event: func(topic: string);
+
+    /// Dynamically registers a runtime capability provided by this plugin.
+    register-capability: func(name: string, schema: string);
+
+    /// Unregisters a previously declared capability.
+    unregister-capability: func(name: string);
+}
+
+/// Guest lifecycle and event handlers implemented by the WASM plugin.
+interface guest {
+    /// Initial plugin registration callback.
+    register: func();
+
+    /// Called when the plugin is activated by the engine.
+    start: func();
+
+    /// Called when the plugin is stopped or unloaded.
+    stop: func();
+
+    /// Dispatches a subscribed event payload to the plugin.
+    on-event: func(topic: string, payload: list<u8>);
+}
+
+/// The plugin world contract combining host imports and guest exports.
+world plugin {
+    import host;
+    export guest;
+}

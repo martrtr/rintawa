@@ -6,11 +6,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
-license = "LGPL-3.0-only"
-repository = "https://github.com/march-taylor/taverna"
-authors = ["march-taylor"]
+license = "GPL-3.0-only"
+repository = "https://github.com/martrtr/taverna"
+authors = ["martrtr"]
 rust-version = "1.88"
 
 [workspace.dependencies]
