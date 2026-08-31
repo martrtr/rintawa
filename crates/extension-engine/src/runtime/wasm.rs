@@ -158,6 +158,7 @@ impl WasmRuntimeEngine {
             engine: self.engine.clone(),
             component,
             linker: Arc::new(linker),
+            instance: None,
         })
     }
 }
@@ -168,24 +169,53 @@ pub struct WasmComponent {
     engine: Engine,
     component: WasmtimeComponent,
     linker: Arc<Linker<WasmHostState>>,
+    instance: Option<WasmInstance>,
+}
+
+/// A live guest instance and its host state for one component lifecycle.
+///
+/// The store owns guest linear memory and globals, so it must live as long as
+/// the guest instance. Re-instantiating per lifecycle callback would reset
+/// guest state and invalidate component-owned runtime resources.
+struct WasmInstance {
+    store: Store<WasmHostState>,
+    plugin: Plugin,
 }
 
 impl WasmComponent {
+    /// Instantiates the guest component once and returns its live instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Wasmtime cannot instantiate the component or when
+    /// it does not satisfy the generated WIT world contract.
+    fn instance_mut(&mut self) -> ExtensionResult<&mut WasmInstance> {
+        if self.instance.is_none() {
+            let host_state = WasmHostState::new(self.id.clone());
+            let mut store = Store::new(&self.engine, host_state);
+            let plugin = Plugin::instantiate(&mut store, &self.component, &self.linker)
+                .map_err(|err| ExtensionError::Message(format!("instantiation error: {err}")))?;
+
+            self.instance = Some(WasmInstance { store, plugin });
+        }
+
+        self.instance.as_mut().ok_or_else(|| {
+            ExtensionError::Message(String::from("WASM component instance was not initialized"))
+        })
+    }
+
     /// Triggers an incoming event dispatch into the WASM guest instance.
     ///
     /// # Errors
     ///
     /// Returns [`ExtensionError::Message`] if WASM instantiation or execution fails.
-    pub fn dispatch_event(&self, topic: &str, payload: &[u8]) -> ExtensionResult<()> {
-        let host_state = WasmHostState::new(self.id.clone());
-        let mut store = Store::new(&self.engine, host_state);
+    pub fn dispatch_event(&mut self, topic: &str, payload: &[u8]) -> ExtensionResult<()> {
+        let instance = self.instance_mut()?;
 
-        let plugin = Plugin::instantiate(&mut store, &self.component, &self.linker)
-            .map_err(|err| ExtensionError::Message(format!("instantiation error: {err}")))?;
-
-        plugin
+        instance
+            .plugin
             .taverna_engine_guest()
-            .call_on_event(&mut store, topic, payload)
+            .call_on_event(&mut instance.store, topic, payload)
             .map_err(|err| ExtensionError::Message(format!("event dispatch error: {err}")))?;
 
         Ok(())
@@ -198,43 +228,35 @@ impl Component for WasmComponent {
     }
 
     fn register(&mut self, _ctx: &mut dyn RegistrationContext) -> ExtensionResult<()> {
-        let host_state = WasmHostState::new(self.id.clone());
-        let mut store = Store::new(&self.engine, host_state);
+        let instance = self.instance_mut()?;
 
-        let plugin = Plugin::instantiate(&mut store, &self.component, &self.linker)
-            .map_err(|err| ExtensionError::Message(format!("instantiation error: {err}")))?;
-
-        plugin
+        instance
+            .plugin
             .taverna_engine_guest()
-            .call_register(&mut store)
+            .call_register(&mut instance.store)
             .map_err(|err| ExtensionError::Message(format!("register failed: {err}")))?;
 
         Ok(())
     }
 
     fn start(&mut self, _ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
-        let host_state = WasmHostState::new(self.id.clone());
-        let mut store = Store::new(&self.engine, host_state);
+        let instance = self.instance_mut()?;
 
-        let plugin = Plugin::instantiate(&mut store, &self.component, &self.linker)
-            .map_err(|err| ExtensionError::Message(format!("instantiation error: {err}")))?;
-
-        plugin
+        instance
+            .plugin
             .taverna_engine_guest()
-            .call_start(&mut store)
+            .call_start(&mut instance.store)
             .map_err(|err| ExtensionError::Message(format!("start failed: {err}")))?;
 
         Ok(())
     }
 
     fn stop(&mut self, _ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
-        let host_state = WasmHostState::new(self.id.clone());
-        let mut store = Store::new(&self.engine, host_state);
-
-        let plugin = Plugin::instantiate(&mut store, &self.component, &self.linker);
-
-        if let Ok(plugin) = plugin {
-            let _ = plugin.taverna_engine_guest().call_stop(&mut store);
+        if let Some(instance) = self.instance.as_mut() {
+            let _ = instance
+                .plugin
+                .taverna_engine_guest()
+                .call_stop(&mut instance.store);
         }
 
         Ok(())
