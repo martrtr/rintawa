@@ -152,10 +152,10 @@ fn test_should_preserve_guest_state_across_component_lifecycle() -> EngineResult
 
     component.register(&mut context)?;
     component.start(&mut context)?;
-    component.dispatch_event("chat.message", b"first")?;
+    component.dispatch_event(&mut context, "chat.message", b"first")?;
     component.stop(&mut context)?;
     component.start(&mut context)?;
-    component.dispatch_event("chat.message", b"second")?;
+    component.dispatch_event(&mut context, "chat.message", b"second")?;
 
     Ok(())
 }

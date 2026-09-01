@@ -70,6 +70,11 @@ fn test_sdk_and_engine_integration_lifecycle() -> EngineResult<()> {
         engine.active_contributions()[0].id.as_str(),
         "chat.send_message"
     );
+    let (extension_id, component_id) = engine
+        .active_contribution_owner(&ContributionId::new("chat.send_message"))
+        .expect("registered contribution should retain its component owner");
+    assert_eq!(extension_id.as_str(), "taverna-chat");
+    assert_eq!(component_id.as_str(), "chat-runtime");
 
     // 3. Start the extension and ensure its state transitions to Active.
     engine.start_extension(&manifest.id)?;

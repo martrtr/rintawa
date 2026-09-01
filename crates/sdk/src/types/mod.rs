@@ -71,6 +71,10 @@ string_id!(
     "An identifier for an extension contribution."
 );
 string_id!(
+    RuntimeEffectId,
+    "An identifier for one reversible runtime effect owned by a component."
+);
+string_id!(
     ComponentTarget,
     "An identifier for the host contract that runs a component."
 );

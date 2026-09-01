@@ -1,6 +1,6 @@
 package taverna:engine@0.0.1;
 
-/// Host operations exported to the WASM guest plugin.
+/// Host operations available throughout a WASM component lifecycle.
 interface host {
     /// Severity level for logging messages.
     enum log-level {
@@ -17,14 +17,45 @@ interface host {
     /// Publishes an event to the global event bus.
     publish-event: func(topic: string, payload: list<u8>);
 
-    /// Subscribes the plugin to events under a specific topic.
-    subscribe-event: func(topic: string);
+}
 
-    /// Dynamically registers a runtime capability provided by this plugin.
-    register-capability: func(name: string, schema: string);
+/// Static contribution declarations available only from guest `register`.
+interface registration {
+    /// An explicit failure while declaring a static contribution.
+    variant error {
+        registration-not-active,
+    }
 
-    /// Unregisters a previously declared capability.
-    unregister-capability: func(name: string);
+    /// Declares a static capability contract during guest `register`.
+    ///
+    /// Runtime service availability is separate from its public contract.
+    register-capability: func(name: string, schema: string) -> result<_, error>;
+
+    /// Removes a capability declaration staged by the current `register` call.
+    unregister-capability: func(name: string) -> result<_, error>;
+}
+
+/// Reversible effects available from guest `start` and `on-event`.
+interface runtime-effects {
+    /// A guest-local handle for one host-owned runtime effect.
+    type handle = string;
+
+    /// An explicit failure while managing a runtime effect.
+    variant error {
+        runtime-not-active,
+        invalid-topic,
+        unknown-effect,
+    }
+
+    /// Adds an owner-scoped subscription while the guest is running.
+    ///
+    /// The handle is later supplied to `unsubscribe-event`. It is valid only
+    /// for the current activation: the host revokes all remaining subscriptions
+    /// on stop or crash, and a later start requires a new subscription.
+    subscribe-event: func(topic: string) -> result<handle, error>;
+
+    /// Removes a subscription previously returned by `subscribe-event`.
+    unsubscribe-event: func(handle: handle) -> result<_, error>;
 }
 
 /// Guest lifecycle and event handlers implemented by the WASM plugin.
@@ -35,7 +66,10 @@ interface guest {
     /// Called when the plugin is activated by the engine.
     start: func();
 
-    /// Called when the plugin is stopped or unloaded.
+    /// Deactivates the plugin while preserving its guest instance for a later restart.
+    ///
+    /// The host revokes runtime effects after this callback. Full guest-state
+    /// disposal happens when the component is unloaded, not on `stop` alone.
     stop: func();
 
     /// Dispatches a subscribed event payload to the plugin.
@@ -45,5 +79,7 @@ interface guest {
 /// The plugin world contract combining host imports and guest exports.
 world plugin {
     import host;
+    import registration;
+    import runtime-effects;
     export guest;
 }

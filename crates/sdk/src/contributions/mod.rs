@@ -67,6 +67,11 @@ impl ContributionKind {
     pub fn event_type() -> Self {
         Self::new("event-type")
     }
+
+    /// Creates a static capability-contract contribution kind.
+    pub fn capability() -> Self {
+        Self::new("capability")
+    }
 }
 
 /// A descriptor for an extension contribution.
@@ -100,6 +105,11 @@ mod tests {
     fn test_contribution_kind_system() {
         let kind = ContributionKind::system();
         assert_eq!(kind.as_str(), "system");
+    }
+
+    #[test]
+    fn test_contribution_kind_capability() {
+        assert_eq!(ContributionKind::capability().as_str(), "capability");
     }
 
     #[test]

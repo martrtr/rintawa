@@ -15,6 +15,8 @@ pub mod loader;
 pub mod runtime;
 pub mod state;
 
+mod runtime_effects;
+
 pub use engine::{ExtensionEngine, ExtensionState};
 pub use errors::{EngineError, EngineResult};
 pub use loader::ExtensionLoader;
@@ -30,6 +32,38 @@ mod tests {
 
     struct DummyRuntime {
         id: ComponentId,
+    }
+
+    struct SubscriptionRuntime {
+        id: ComponentId,
+        should_fail_after_registering: bool,
+    }
+
+    impl SubscriptionRuntime {
+        fn new(id: &str, should_fail_after_registering: bool) -> Self {
+            Self {
+                id: ComponentId::new(id),
+                should_fail_after_registering,
+            }
+        }
+    }
+
+    impl Component for SubscriptionRuntime {
+        fn id(&self) -> &ComponentId {
+            &self.id
+        }
+
+        fn start(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
+            ctx.register_runtime_effect(RuntimeEffect::event_subscription("dialogue.message"))?;
+
+            if self.should_fail_after_registering {
+                return Err(ExtensionError::Message(String::from(
+                    "simulated startup failure",
+                )));
+            }
+
+            Ok(())
+        }
     }
 
     impl DummyRuntime {
@@ -146,6 +180,60 @@ mod tests {
             new_engine.extension_state(&ExtensionId::from("chat-ext")),
             None
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_runtime_effects_are_owner_scoped_and_cleaned_on_stop_and_failed_start()
+    -> EngineResult<()> {
+        let manifest_toml = r#"
+            id = "runtime-effects"
+            name = "Runtime Effects"
+            version = "0.0.1"
+            sdk = "^0.0"
+        "#;
+        let mut engine = ExtensionEngine::new();
+        let manifest = engine.parse_manifest(manifest_toml)?;
+
+        engine.register_extension(
+            manifest.clone(),
+            vec![Box::new(SubscriptionRuntime::new("subscriber", false))],
+        )?;
+        engine.start_extension(&manifest.id)?;
+
+        let effects = engine.active_runtime_effects();
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].1, &manifest.id);
+        assert_eq!(effects[0].2.as_str(), "subscriber");
+        assert_eq!(
+            effects[0].3,
+            &RuntimeEffect::event_subscription("dialogue.message")
+        );
+
+        engine.stop_extension(&manifest.id)?;
+        assert!(engine.active_runtime_effects().is_empty());
+        engine.start_extension(&manifest.id)?;
+        assert_eq!(engine.active_runtime_effects().len(), 1);
+
+        let failed_manifest = engine.parse_manifest(
+            r#"
+                id = "failing-runtime-effects"
+                name = "Failing Runtime Effects"
+                version = "0.0.1"
+                sdk = "^0.0"
+            "#,
+        )?;
+        engine.register_extension(
+            failed_manifest.clone(),
+            vec![Box::new(SubscriptionRuntime::new(
+                "failing-subscriber",
+                true,
+            ))],
+        )?;
+
+        assert!(engine.start_extension(&failed_manifest.id).is_err());
+        assert_eq!(engine.active_runtime_effects().len(), 1);
 
         Ok(())
     }

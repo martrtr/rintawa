@@ -4,13 +4,15 @@ use std::collections::{HashMap, HashSet};
 use taverna_sdk::{
     contributions::ContributionDescriptor,
     manifest::ExtensionManifest,
+    runtime_effects::RuntimeEffect,
     traits::Component,
-    types::{ContributionId, ExtensionId},
+    types::{ComponentId, ContributionId, ExtensionId, RuntimeEffectId},
 };
 
 use crate::{
     context::{EngineComponentContext, EngineRegistrationContext},
     errors::{EngineError, EngineResult},
+    runtime_effects::RuntimeEffectRegistry,
 };
 
 /// Represents the active lifecycle state of an extension in the engine.
@@ -28,7 +30,13 @@ struct ManagedExtension {
     manifest: ExtensionManifest,
     state: ExtensionState,
     components: Vec<Box<dyn Component>>,
-    contributions: Vec<ContributionDescriptor>,
+    contributions: Vec<OwnedContribution>,
+}
+
+/// A contribution registered by a specific component within an extension.
+struct OwnedContribution {
+    component_id: ComponentId,
+    descriptor: ContributionDescriptor,
 }
 
 /// The core engine managing extensions, native components, and contributions.
@@ -36,6 +44,7 @@ struct ManagedExtension {
 pub struct ExtensionEngine {
     extensions: HashMap<ExtensionId, ManagedExtension>,
     active_contributions: HashSet<ContributionId>,
+    runtime_effects: RuntimeEffectRegistry,
 }
 
 impl ExtensionEngine {
@@ -73,13 +82,15 @@ impl ExtensionEngine {
             ));
         }
 
+        let mut registered_descriptors = Vec::new();
         let mut extension_contributions = Vec::new();
 
         for comp in &mut components {
+            let first_contribution = registered_descriptors.len();
             let mut ctx = EngineRegistrationContext::new(
                 manifest.id.clone(),
                 comp.id().clone(),
-                &mut extension_contributions,
+                &mut registered_descriptors,
                 &self.active_contributions,
             );
 
@@ -90,10 +101,21 @@ impl ExtensionEngine {
                     reason: err.to_string(),
                 });
             }
+
+            extension_contributions.extend(
+                registered_descriptors[first_contribution..]
+                    .iter()
+                    .cloned()
+                    .map(|descriptor| OwnedContribution {
+                        component_id: comp.id().clone(),
+                        descriptor,
+                    }),
+            );
         }
 
         for contrib in &extension_contributions {
-            self.active_contributions.insert(contrib.id.clone());
+            self.active_contributions
+                .insert(contrib.descriptor.id.clone());
         }
 
         let managed = ManagedExtension {
@@ -116,8 +138,8 @@ impl ExtensionEngine {
     /// Returns [`EngineError::ExtensionNotFound`] if the extension isn't registered,
     /// or [`EngineError::LifecycleFailed`] if a component fails to start or contributions conflict.
     pub fn start_extension(&mut self, extension_id: &ExtensionId) -> EngineResult<()> {
-        let ext = self
-            .extensions
+        let (extensions, runtime_effects) = (&mut self.extensions, &mut self.runtime_effects);
+        let ext = extensions
             .get_mut(extension_id)
             .ok_or_else(|| EngineError::ExtensionNotFound(extension_id.as_str().to_string()))?;
 
@@ -128,16 +150,20 @@ impl ExtensionEngine {
         // Re-check and re-activate contributions if coming from Stopped state
         if ext.state == ExtensionState::Stopped {
             for contrib in &ext.contributions {
-                if self.active_contributions.contains(&contrib.id) {
+                if self.active_contributions.contains(&contrib.descriptor.id) {
                     return Err(EngineError::LifecycleFailed {
                         extension_id: extension_id.as_str().to_string(),
                         component_id: "engine".to_string(),
-                        reason: format!("contribution conflict on restart: `{}`", contrib.id),
+                        reason: format!(
+                            "contribution conflict on restart: `{}`",
+                            contrib.descriptor.id
+                        ),
                     });
                 }
             }
             for contrib in &ext.contributions {
-                self.active_contributions.insert(contrib.id.clone());
+                self.active_contributions
+                    .insert(contrib.descriptor.id.clone());
             }
         }
 
@@ -146,21 +172,35 @@ impl ExtensionEngine {
         for i in 0..total_components {
             let (started, remaining) = ext.components.split_at_mut(i);
             let comp = &mut remaining[0];
-            let mut ctx = EngineComponentContext::new(ext.manifest.id.clone(), comp.id().clone());
+            let mut ctx = EngineComponentContext::new(
+                ext.manifest.id.clone(),
+                comp.id().clone(),
+                runtime_effects,
+            );
 
             if let Err(err) = comp.start(&mut ctx) {
+                let mut failed_stop_context = EngineComponentContext::new(
+                    ext.manifest.id.clone(),
+                    comp.id().clone(),
+                    runtime_effects,
+                );
+                let _ = comp.stop(&mut failed_stop_context);
+
                 // Rollback previously started components in reverse order
                 for comp_to_stop in started.iter_mut().rev() {
                     let mut stop_ctx = EngineComponentContext::new(
                         ext.manifest.id.clone(),
                         comp_to_stop.id().clone(),
+                        runtime_effects,
                     );
                     let _ = comp_to_stop.stop(&mut stop_ctx);
                 }
 
+                runtime_effects.revoke_extension(extension_id);
+
                 if ext.state == ExtensionState::Stopped {
                     for contrib in &ext.contributions {
-                        self.active_contributions.remove(&contrib.id);
+                        self.active_contributions.remove(&contrib.descriptor.id);
                     }
                 }
 
@@ -182,8 +222,8 @@ impl ExtensionEngine {
     ///
     /// Returns [`EngineError::ExtensionNotFound`] if the extension does not exist.
     pub fn stop_extension(&mut self, extension_id: &ExtensionId) -> EngineResult<()> {
-        let ext = self
-            .extensions
+        let (extensions, runtime_effects) = (&mut self.extensions, &mut self.runtime_effects);
+        let ext = extensions
             .get_mut(extension_id)
             .ok_or_else(|| EngineError::ExtensionNotFound(extension_id.as_str().to_string()))?;
 
@@ -192,7 +232,11 @@ impl ExtensionEngine {
         }
 
         for comp in ext.components.iter_mut().rev() {
-            let mut ctx = EngineComponentContext::new(ext.manifest.id.clone(), comp.id().clone());
+            let mut ctx = EngineComponentContext::new(
+                ext.manifest.id.clone(),
+                comp.id().clone(),
+                runtime_effects,
+            );
             if let Err(err) = comp.stop(&mut ctx) {
                 tracing::warn!(
                     ext = %extension_id,
@@ -203,8 +247,10 @@ impl ExtensionEngine {
         }
 
         for contrib in &ext.contributions {
-            self.active_contributions.remove(&contrib.id);
+            self.active_contributions.remove(&contrib.descriptor.id);
         }
+
+        runtime_effects.revoke_extension(extension_id);
 
         ext.state = ExtensionState::Stopped;
         Ok(())
@@ -235,8 +281,35 @@ impl ExtensionEngine {
         self.extensions
             .values()
             .filter(|ext| ext.state != ExtensionState::Stopped)
-            .flat_map(|ext| ext.contributions.clone())
+            .flat_map(|ext| {
+                ext.contributions
+                    .iter()
+                    .map(|contrib| contrib.descriptor.clone())
+            })
             .collect()
+    }
+
+    /// Returns the owner of an active contribution, if it is registered.
+    pub fn active_contribution_owner(
+        &self,
+        contribution_id: &ContributionId,
+    ) -> Option<(&ExtensionId, &ComponentId)> {
+        self.extensions
+            .iter()
+            .filter(|(_, ext)| ext.state != ExtensionState::Stopped)
+            .find_map(|(extension_id, ext)| {
+                ext.contributions
+                    .iter()
+                    .find(|contrib| contrib.descriptor.id == *contribution_id)
+                    .map(|contrib| (extension_id, &contrib.component_id))
+            })
+    }
+
+    /// Returns all active runtime effects together with their extension and component owner.
+    pub fn active_runtime_effects(
+        &self,
+    ) -> Vec<(&RuntimeEffectId, &ExtensionId, &ComponentId, &RuntimeEffect)> {
+        self.runtime_effects.active_effects()
     }
 
     /// Returns the current lifecycle state of an extension, if registered.

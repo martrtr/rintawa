@@ -6,9 +6,12 @@ use taverna_sdk::{
     context::{ComponentContext, RegistrationContext},
     contributions::ContributionDescriptor,
     errors::{ExtensionError, ExtensionResult},
-    types::{ComponentId, ContributionId, ExtensionId},
+    runtime_effects::RuntimeEffect,
+    types::{ComponentId, ContributionId, ExtensionId, RuntimeEffectId},
 };
 use tracing::{debug, error, info, trace, warn};
+
+use crate::runtime_effects::RuntimeEffectRegistry;
 
 /// Engine logger redirecting SDK logs to the `tracing` ecosystem.
 #[derive(Debug, Clone)]
@@ -103,25 +106,31 @@ impl<'a> RegistrationContext for EngineRegistrationContext<'a> {
 }
 
 /// Context provided to components during start and stop execution phases.
-pub struct EngineComponentContext {
+pub struct EngineComponentContext<'a> {
     extension_id: ExtensionId,
     component_id: ComponentId,
     logger: EngineLogger,
+    runtime_effects: &'a mut RuntimeEffectRegistry,
 }
 
-impl EngineComponentContext {
+impl<'a> EngineComponentContext<'a> {
     /// Creates a new execution context.
-    pub fn new(extension_id: ExtensionId, component_id: ComponentId) -> Self {
+    pub(crate) fn new(
+        extension_id: ExtensionId,
+        component_id: ComponentId,
+        runtime_effects: &'a mut RuntimeEffectRegistry,
+    ) -> Self {
         let logger = EngineLogger::new(extension_id.clone(), component_id.clone());
         Self {
             extension_id,
             component_id,
             logger,
+            runtime_effects,
         }
     }
 }
 
-impl ComponentContext for EngineComponentContext {
+impl ComponentContext for EngineComponentContext<'_> {
     fn extension_id(&self) -> &ExtensionId {
         &self.extension_id
     }
@@ -132,5 +141,24 @@ impl ComponentContext for EngineComponentContext {
 
     fn logger(&self) -> &dyn LoggerApi {
         &self.logger
+    }
+
+    fn register_runtime_effect(
+        &mut self,
+        effect: RuntimeEffect,
+    ) -> ExtensionResult<RuntimeEffectId> {
+        self.runtime_effects
+            .register(self.extension_id.clone(), self.component_id.clone(), effect)
+    }
+
+    fn revoke_runtime_effect(&mut self, effect_id: &RuntimeEffectId) -> ExtensionResult<()> {
+        self.runtime_effects
+            .revoke(effect_id, &self.extension_id, &self.component_id)
+    }
+
+    fn revoke_all_runtime_effects(&mut self) -> ExtensionResult<()> {
+        self.runtime_effects
+            .revoke_component(&self.extension_id, &self.component_id);
+        Ok(())
     }
 }

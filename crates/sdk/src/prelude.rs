@@ -20,6 +20,10 @@ pub use crate::errors::{ExtensionError, ExtensionResult};
 
 pub use crate::manifest::{ComponentDescriptor, ComponentKind, ExtensionManifest};
 
+pub use crate::runtime_effects::RuntimeEffect;
+
 pub use crate::traits::Component;
 
-pub use crate::types::{ComponentId, ComponentTarget, ContributionId, ExtensionId};
+pub use crate::types::{
+    ComponentId, ComponentTarget, ContributionId, ExtensionId, RuntimeEffectId,
+};
