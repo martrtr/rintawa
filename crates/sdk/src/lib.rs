@@ -1,4 +1,4 @@
-//! Taverna SDK — public contracts for developing extensions.
+//! Rintawa SDK — public contracts for developing extensions.
 //!
 //! Version 0.0.1 intentionally provides a small lifecycle and manifest
 //! contract. It does not implement the extension engine, runtime hosts,

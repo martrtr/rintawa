@@ -1,13 +1,13 @@
-use std::fs;
-use taverna_extension_engine::{
+use rintawa_extension_engine::{
     EngineResult, ExtensionEngine, ExtensionLoader, ExtensionState, ExtensionsStateConfig,
     STATE_FILE_NAME,
 };
+use std::fs;
 
 #[test]
 fn test_extension_loader_and_state_persistence() -> EngineResult<()> {
     let temp_dir = tempfile::tempdir().unwrap();
-    let ext_dir = temp_dir.path().join("taverna/extensions/chat-ext");
+    let ext_dir = temp_dir.path().join("rintawa/extensions/chat-ext");
     fs::create_dir_all(&ext_dir)?;
 
     // 1. Create a dummy manifest for a native component
@@ -27,7 +27,7 @@ fn test_extension_loader_and_state_persistence() -> EngineResult<()> {
     // 2. Set extension state as disabled initially in state.toml
     let state_file = temp_dir
         .path()
-        .join("taverna/extensions")
+        .join("rintawa/extensions")
         .join(STATE_FILE_NAME);
     let mut state_config = ExtensionsStateConfig::default();
     state_config.set_enabled("chat-ext", false, "user", "2026-08-25T11:45:00Z");
@@ -39,7 +39,7 @@ fn test_extension_loader_and_state_persistence() -> EngineResult<()> {
     // 3. Load directory — extension should be skipped because it is disabled
     let loaded = loader.load_directory(
         &mut engine,
-        temp_dir.path().join("taverna/extensions").as_path(),
+        temp_dir.path().join("rintawa/extensions").as_path(),
     )?;
     assert_eq!(loaded.len(), 0);
 
@@ -49,7 +49,7 @@ fn test_extension_loader_and_state_persistence() -> EngineResult<()> {
 
     let loaded = loader.load_directory(
         &mut engine,
-        temp_dir.path().join("taverna/extensions").as_path(),
+        temp_dir.path().join("rintawa/extensions").as_path(),
     )?;
     assert_eq!(loaded.len(), 1);
     assert_eq!(

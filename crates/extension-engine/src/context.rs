@@ -1,7 +1,6 @@
 //! Implementation of SDK contexts provided by the Extension Engine.
 
-use std::collections::HashSet;
-use taverna_sdk::{
+use rintawa_sdk::{
     api::{LogLevel, LoggerApi},
     context::{ComponentContext, RegistrationContext},
     contributions::ContributionDescriptor,
@@ -9,6 +8,7 @@ use taverna_sdk::{
     runtime_effects::RuntimeEffect,
     types::{ComponentId, ContributionId, ExtensionId, RuntimeEffectId},
 };
+use std::collections::HashSet;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::runtime_effects::RuntimeEffectRegistry;

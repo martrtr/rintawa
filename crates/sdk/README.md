@@ -1,6 +1,6 @@
-# Taverna SDK
+# Rintawa SDK
 
-`taverna-sdk` defines the public Rust contracts for Taverna extensions.
+`rintawa-sdk` defines the public Rust contracts for Rintawa extensions.
 
 Version 0.0.1 deliberately establishes only the portable foundation:
 
@@ -54,7 +54,7 @@ The Extension Engine owns creation, ordering, rollback, and cleanup. A
 component only registers its capabilities and participates in the lifecycle:
 
 ```rust
-use taverna_sdk::prelude::*;
+use rintawa_sdk::prelude::*;
 
 pub struct ChatRuntime {
     id: ComponentId,
@@ -87,4 +87,4 @@ The first engine milestone is intentionally small: parse this manifest,
 register a component, observe its registered contributions, start it, and
 remove those contributions after `stop` during deactivation.
 
-[`Component`]: https://docs.rs/taverna-sdk/latest/taverna_sdk/traits/trait.Component.html
+[`Component`]: https://docs.rs/rintawa-sdk/latest/rintawa_sdk/traits/trait.Component.html

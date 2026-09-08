@@ -1,8 +1,8 @@
-//! Directory scanner and loader for Taverna extensions.
+//! Directory scanner and loader for Rintawa extensions.
 
 use std::path::{Component as PathComponent, Path};
 
-use taverna_sdk::{manifest::ExtensionManifest, traits::Component, types::ExtensionId};
+use rintawa_sdk::{manifest::ExtensionManifest, traits::Component, types::ExtensionId};
 use tracing::{info, warn};
 
 use crate::{
@@ -24,7 +24,7 @@ impl ExtensionLoader {
         Self { wasm_engine }
     }
 
-    /// Scans a directory (e.g., `taverna/extensions`), parses manifests, and registers enabled extensions.
+    /// Scans a directory (e.g., `rintawa/extensions`), parses manifests, and registers enabled extensions.
     pub fn load_directory(
         &self,
         engine: &mut ExtensionEngine,

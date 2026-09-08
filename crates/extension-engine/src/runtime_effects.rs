@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use taverna_sdk::{
+use rintawa_sdk::{
     errors::{ExtensionError, ExtensionResult},
     runtime_effects::RuntimeEffect,
     types::{ComponentId, ExtensionId, RuntimeEffectId},
@@ -133,7 +133,7 @@ mod tests {
     #[test]
     fn test_should_reject_revocation_by_a_different_component() {
         let mut registry = RuntimeEffectRegistry::default();
-        let extension_id = ExtensionId::new("taverna.chat");
+        let extension_id = ExtensionId::new("rintawa.chat");
         let component_id = ComponentId::new("chat-runtime");
         let effect_id = registry
             .register(
@@ -164,7 +164,7 @@ mod tests {
     #[test]
     fn test_should_revoke_only_the_failed_component_effects() {
         let mut registry = RuntimeEffectRegistry::default();
-        let extension_id = ExtensionId::new("taverna.chat");
+        let extension_id = ExtensionId::new("rintawa.chat");
         let failed_component_id = ComponentId::new("failed-runtime");
         let healthy_component_id = ComponentId::new("healthy-runtime");
 

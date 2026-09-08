@@ -1,6 +1,6 @@
 # Coding Style
 
-This document defines the coding standards for the Taverna project. It applies to all Rust code in the codebase.
+This document defines the coding standards for the Rintawa project. It applies to all Rust code in the codebase.
 
 > **Note**: These rules are enforced by CI. Use `cargo fmt` and `cargo clippy` before committing.
 
@@ -29,7 +29,7 @@ cargo fmt --all
 | Functions, methods, variables | `snake_case` | `register_service()`, `project_path` |
 | Constants | `SCREAMING_SNAKE_CASE` | `MAX_RETRIES`, `DEFAULT_TIMEOUT` |
 | Type parameters | `UpperCamelCase` (single letter or descriptive) | `T`, `Provider` |
-| Modules and crates | `snake_case` | `extension_engine`, `taverna_core` |
+| Modules and crates | `snake_case` | `extension_engine`, `rintawa_core` |
 | Lifetimes | `'lowercase` (single letter preferred) | `'a`, `'ctx` |
 | Enum variants | `UpperCamelCase` | `Loaded`, `Unloaded` |
 | Feature flags | `snake_case` | `wasm_support` |
@@ -200,7 +200,7 @@ Every **public item** must have a doc comment:
 ```rust
 /// Represents a single object in the world.
 ///
-/// Objects are the minimal units of existence in the Taverna world model.
+/// Objects are the minimal units of existence in the Rintawa world model.
 /// They have an ID, a type, and arbitrary properties.
 ///
 /// # Example
@@ -284,7 +284,7 @@ Place integration tests in `tests/` directory at crate root:
 
 ```rust
 // tests/state_integration.rs
-use taverna_core::state::StateEngine;
+use rintawa_core::state::StateEngine;
 
 #[test]
 fn test_state_transaction() {

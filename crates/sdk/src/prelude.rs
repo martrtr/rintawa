@@ -1,13 +1,13 @@
 //! Prelude — a convenience module for common imports.
 //!
 //! This module re-exports the most commonly used types and traits
-//! from the Taverna SDK, making it easy to import everything
+//! from the Rintawa SDK, making it easy to import everything
 //! needed for extension development with a single `use` statement.
 //!
 //! # Example
 //!
 //! ```rust
-//! use taverna_sdk::prelude::*;
+//! use rintawa_sdk::prelude::*;
 //! ```
 
 pub use crate::api::{LogLevel, LoggerApi};

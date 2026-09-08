@@ -1,5 +1,5 @@
-use taverna_extension_engine::{EngineResult, WasmRuntimeEngine};
-use taverna_sdk::{
+use rintawa_extension_engine::{EngineResult, WasmRuntimeEngine};
+use rintawa_sdk::{
     api::{LogLevel, LoggerApi},
     context::{ComponentContext, RegistrationContext},
     contributions::ContributionDescriptor,
@@ -120,7 +120,7 @@ const STATEFUL_WASM_COMPONENT: &str = r#"
             (with "stop" (func $stop-lifted))
             (with "on-event" (func $on-event-lifted))
         ))
-        (export "taverna:engine/guest@0.0.1" (instance $guest-instance))
+        (export "rintawa:engine/guest@0.0.1" (instance $guest-instance))
     )
 "#;
 

@@ -1,11 +1,11 @@
-//! Error types for Taverna extensions.
+//! Error types for Rintawa extensions.
 //!
 //! This module provides the error types used throughout the SDK
 //! for error handling and propagation.
 
 use thiserror::Error;
 
-/// The error type for Taverna extension operations.
+/// The error type for Rintawa extension operations.
 ///
 /// This enum represents the various ways an extension operation can fail,
 /// providing descriptive error messages for each failure case.

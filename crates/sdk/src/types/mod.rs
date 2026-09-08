@@ -1,7 +1,7 @@
-//! Types for Taverna extension development.
+//! Types for Rintawa extension development.
 //!
 //! This module provides identifier types and primitives
-//! used throughout the Taverna extension system.
+//! used throughout the Rintawa extension system.
 
 use std::fmt;
 
@@ -24,7 +24,7 @@ macro_rules! string_id {
         #[doc = $doc]
         ///
         /// This transparent `String` wrapper prevents identifiers from being
-        /// accidentally exchanged across distinct Taverna concepts.
+        /// accidentally exchanged across distinct Rintawa concepts.
         #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
         #[serde(transparent)]
         pub struct $name(String);
@@ -115,11 +115,11 @@ mod tests {
 
     #[test]
     fn test_extension_id_json_round_trip() -> serde_json::Result<()> {
-        let original = ExtensionId::new("taverna.chat");
+        let original = ExtensionId::new("rintawa.chat");
         let encoded = serde_json::to_string(&original)?;
         let decoded: ExtensionId = serde_json::from_str(&encoded)?;
 
-        assert_eq!(encoded, "\"taverna.chat\"");
+        assert_eq!(encoded, "\"rintawa.chat\"");
         assert_eq!(decoded, original);
 
         Ok(())

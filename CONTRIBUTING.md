@@ -1,4 +1,4 @@
-# Contributing to Taverna
+# Contributing to Rintawa
 
 Run the complete local verification suite before opening a pull request:
 

@@ -1,7 +1,7 @@
 //! Types for describing extension contributions.
 //!
 //! This module provides types for representing different kinds of contributions
-//! that extensions can make to the Taverna system.
+//! that extensions can make to the Rintawa system.
 
 use serde::{Deserialize, Serialize};
 
@@ -9,7 +9,7 @@ use crate::types::ContributionId;
 
 /// Represents the kind of contribution an extension can make.
 ///
-/// Contribution kinds define what role an extension plays within the Taverna system.
+/// Contribution kinds define what role an extension plays within the Rintawa system.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ContributionKind(String);
@@ -27,7 +27,7 @@ impl ContributionKind {
 
     /// Creates a system-level contribution kind.
     ///
-    /// System contributions are made by the core Taverna system itself.
+    /// System contributions are made by the core Rintawa system itself.
     pub fn system() -> Self {
         Self::new("system")
     }

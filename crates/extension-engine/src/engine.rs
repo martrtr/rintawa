@@ -1,13 +1,13 @@
 //! Main Extension Engine implementation managing lifecycle and contributions.
 
-use std::collections::{HashMap, HashSet};
-use taverna_sdk::{
+use rintawa_sdk::{
     contributions::ContributionDescriptor,
     manifest::ExtensionManifest,
     runtime_effects::RuntimeEffect,
     traits::Component,
     types::{ComponentId, ContributionId, ExtensionId, RuntimeEffectId},
 };
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     context::{EngineComponentContext, EngineRegistrationContext},

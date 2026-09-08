@@ -1,4 +1,4 @@
-package taverna:engine@0.0.1;
+package rintawa:engine@0.0.1;
 
 /// Host operations available throughout a WASM component lifecycle.
 interface host {

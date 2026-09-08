@@ -1,4 +1,4 @@
-//! Types for Taverna extension manifests.
+//! Types for Rintawa extension manifests.
 //!
 //! This module provides types for describing the structure of extension manifests
 //! and the components that extensions declare.
@@ -56,7 +56,7 @@ pub struct ComponentDescriptor {
     pub required: bool,
 }
 
-/// The minimal manifest for a Taverna extension package.
+/// The minimal manifest for a Rintawa extension package.
 ///
 /// The manifest is the primary way to declare an extension's metadata and
 /// components. It serves as the entry point for Extension Engine parsing and

@@ -13,7 +13,7 @@ use crate::{
 /// The trait that all components must implement.
 ///
 /// This trait defines the lifecycle methods that all components must provide.
-/// Components are the building blocks of Taverna extensions.
+/// Components are the building blocks of Rintawa extensions.
 pub trait Component: Send {
     /// Returns the unique identifier of this component.
     fn id(&self) -> &ComponentId;

@@ -1,11 +1,11 @@
 //! WASM Runtime execution driver built on Wasmtime.
 //!
-//! Provides sandboxed Component Model lifecycle execution for Taverna WASM extensions.
+//! Provides sandboxed Component Model lifecycle execution for Rintawa WASM extensions.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use taverna_sdk::{
+use rintawa_sdk::{
     context::{ComponentContext, RegistrationContext},
     contributions::{ContributionDescriptor, ContributionKind},
     errors::{ExtensionError, ExtensionResult},
@@ -32,7 +32,7 @@ mod bindings {
 }
 
 use bindings::Plugin;
-use bindings::taverna::engine::{
+use bindings::rintawa::engine::{
     host::{Host as HostOperations, LogLevel},
     registration::{Error as RegistrationError, Host as RegistrationHost},
     runtime_effects::{Error as RuntimeEffectError, Host as RuntimeEffectsHost},
@@ -503,7 +503,7 @@ impl WasmComponent {
 
         let dispatch_result = instance
             .plugin
-            .taverna_engine_guest()
+            .rintawa_engine_guest()
             .call_on_event(&mut instance.store, topic, payload)
             .map_err(|err| ExtensionError::Message(format!("event dispatch error: {err}")));
 
@@ -543,7 +543,7 @@ impl Component for WasmComponent {
 
             let registration_result = instance
                 .plugin
-                .taverna_engine_guest()
+                .rintawa_engine_guest()
                 .call_register(&mut instance.store);
 
             if let Err(err) = registration_result {
@@ -570,7 +570,7 @@ impl Component for WasmComponent {
 
         let start_result = instance
             .plugin
-            .taverna_engine_guest()
+            .rintawa_engine_guest()
             .call_start(&mut instance.store)
             .map_err(|err| ExtensionError::Message(format!("start failed: {err}")));
 
@@ -591,7 +591,7 @@ impl Component for WasmComponent {
         if let Some(instance) = self.instance.as_mut() {
             let stop_result = instance
                 .plugin
-                .taverna_engine_guest()
+                .rintawa_engine_guest()
                 .call_stop(&mut instance.store)
                 .map_err(|err| ExtensionError::Message(format!("stop failed: {err}")));
             instance.store.data_mut().discard_pending_runtime_effects();
@@ -606,7 +606,7 @@ impl Component for WasmComponent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use taverna_sdk::{
+    use rintawa_sdk::{
         api::{LogLevel, LoggerApi},
         types::ExtensionId,
     };
@@ -630,7 +630,7 @@ mod tests {
     impl TestRuntimeContext {
         fn new() -> Self {
             Self {
-                extension_id: ExtensionId::new("taverna.chat"),
+                extension_id: ExtensionId::new("rintawa.chat"),
                 component_id: ComponentId::new("chat-runtime"),
                 logger: TestLogger,
                 effects: HashMap::new(),
@@ -687,12 +687,12 @@ mod tests {
     fn test_should_commit_wasm_capability_contributions_only_after_registration_finishes() {
         let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
         state
-            .begin_registration(ExtensionId::new("taverna.chat"))
+            .begin_registration(ExtensionId::new("rintawa.chat"))
             .unwrap();
 
         RegistrationHost::register_capability(
             &mut state,
-            String::from("taverna.ai"),
+            String::from("rintawa.ai"),
             String::from("{}"),
         )
         .unwrap();
@@ -700,7 +700,7 @@ mod tests {
         let contributions = state.finish_registration().unwrap();
 
         assert_eq!(contributions.len(), 1);
-        assert_eq!(contributions[0].id.as_str(), "taverna.ai");
+        assert_eq!(contributions[0].id.as_str(), "rintawa.ai");
         assert_eq!(contributions[0].kind, ContributionKind::capability());
     }
 
@@ -733,7 +733,7 @@ mod tests {
         assert!(matches!(
             RegistrationHost::register_capability(
                 &mut state,
-                String::from("taverna.ai"),
+                String::from("rintawa.ai"),
                 String::from("{}"),
             ),
             Err(RegistrationError::RegistrationNotActive)

@@ -1,4 +1,4 @@
-//! API available to Taverna extensions.
+//! API available to Rintawa extensions.
 //!
 //! This module provides APIs that are exposed to extensions at runtime,
 //! such as logging and other system services.

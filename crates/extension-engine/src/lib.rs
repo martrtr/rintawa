@@ -1,4 +1,4 @@
-//! Taverna Extension Engine — lifecycle management, directory scanning, and runtime host.
+//! Rintawa Extension Engine — lifecycle management, directory scanning, and runtime host.
 //!
 //! Provides core abstractions for:
 //! - Parsing manifests and managing component lifecycles (`register`, `start`, `stop`).
@@ -26,8 +26,8 @@ pub use state::{ExtensionStateRecord, ExtensionsStateConfig, STATE_FILE_NAME};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rintawa_sdk::prelude::*;
     use std::fs;
-    use taverna_sdk::prelude::*;
     use tempfile::tempdir;
 
     struct DummyRuntime {

@@ -1,7 +1,7 @@
-//! Error types for the Taverna Extension Engine.
+//! Error types for the Rintawa Extension Engine.
 
+use rintawa_sdk::errors::ExtensionError;
 use std::io;
-use taverna_sdk::errors::ExtensionError;
 use thiserror::Error;
 
 /// Errors that can occur during Extension Engine operations.

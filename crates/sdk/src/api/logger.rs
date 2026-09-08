@@ -1,6 +1,6 @@
 //! Logging API exposed to extension components.
 
-/// Logging levels supported by the Taverna logging API.
+/// Logging levels supported by the Rintawa logging API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LogLevel {
     /// A trace-level log message.

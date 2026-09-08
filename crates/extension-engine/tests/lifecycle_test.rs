@@ -1,5 +1,5 @@
-use taverna_extension_engine::{EngineResult, ExtensionEngine, ExtensionState};
-use taverna_sdk::prelude::*;
+use rintawa_extension_engine::{EngineResult, ExtensionEngine, ExtensionState};
+use rintawa_sdk::prelude::*;
 
 /// Mock runtime component used exclusively for integration lifecycle tests.
 struct MockChatComponent {
@@ -45,8 +45,8 @@ fn test_sdk_and_engine_integration_lifecycle() -> EngineResult<()> {
 
     // 1. Parse a valid extension manifest containing a native component declaration.
     let raw_manifest = r#"
-        id = "taverna-chat"
-        name = "Taverna Chat"
+        id = "rintawa-chat"
+        name = "Rintawa Chat"
         version = "0.1.0"
         sdk = "^0.0"
 
@@ -73,7 +73,7 @@ fn test_sdk_and_engine_integration_lifecycle() -> EngineResult<()> {
     let (extension_id, component_id) = engine
         .active_contribution_owner(&ContributionId::new("chat.send_message"))
         .expect("registered contribution should retain its component owner");
-    assert_eq!(extension_id.as_str(), "taverna-chat");
+    assert_eq!(extension_id.as_str(), "rintawa-chat");
     assert_eq!(component_id.as_str(), "chat-runtime");
 
     // 3. Start the extension and ensure its state transitions to Active.

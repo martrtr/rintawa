@@ -1,5 +1,5 @@
 [package]
-name = "taverna-sdk"
+name = "rintawa-sdk"
 version = "0.0.1"
 
 edition.workspace = true
@@ -8,7 +8,7 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
-description = "SDK for developing Taverna extensions"
+description = "SDK for developing Rintawa extensions"
 readme = "README.md"
 
 [dependencies]
