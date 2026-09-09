@@ -12,6 +12,7 @@ description = "Extension engine for Rintawa"
 
 [dependencies]
 anyhow.workspace = true
+keyring = "4.2.0"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

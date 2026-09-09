@@ -10,6 +10,7 @@ use rintawa_sdk::{
     contributions::{ContributionDescriptor, ContributionKind},
     errors::{ExtensionError, ExtensionResult},
     runtime_effects::RuntimeEffect,
+    secrets::{SecretAccessError, SecretPath},
     traits::Component,
     types::{ComponentId, ExtensionId, RuntimeEffectId},
 };
@@ -20,7 +21,7 @@ use wasmtime::{
     component::{Component as WasmtimeComponent, Linker},
 };
 
-use crate::errors::EngineResult;
+use crate::{errors::EngineResult, secrets::SecretManager};
 
 #[allow(missing_docs)]
 mod bindings {
@@ -36,6 +37,7 @@ use bindings::rintawa::engine::{
     host::{Host as HostOperations, LogLevel},
     registration::{Error as RegistrationError, Host as RegistrationHost},
     runtime_effects::{Error as RuntimeEffectError, Host as RuntimeEffectsHost},
+    secrets::{Error as SecretError, Host as SecretsHost},
 };
 
 /// Internal host state stored inside the Wasmtime Store context.
@@ -48,6 +50,8 @@ pub struct WasmHostState {
     effect_handles: HashMap<String, ActiveWasmRuntimeEffect>,
     pending_effects: Vec<WasmRuntimeEffectOperation>,
     pending_revocations: HashSet<String>,
+    secrets: SecretManager,
+    secret_access_active: bool,
 }
 
 /// Registrations produced by one guest `register` invocation before the host
@@ -79,6 +83,11 @@ struct ActiveWasmRuntimeEffect {
 impl WasmHostState {
     /// Creates a new host state instance.
     pub fn new(component_id: ComponentId) -> Self {
+        Self::with_secret_manager(component_id, SecretManager::system())
+    }
+
+    /// Creates host state with the Rintawa secret manager shared by the runtime.
+    pub fn with_secret_manager(component_id: ComponentId, secrets: SecretManager) -> Self {
         Self {
             component_id,
             extension_id: None,
@@ -88,6 +97,8 @@ impl WasmHostState {
             effect_handles: HashMap::new(),
             pending_effects: Vec::new(),
             pending_revocations: HashSet::new(),
+            secrets,
+            secret_access_active: false,
         }
     }
 
@@ -146,11 +157,12 @@ impl WasmHostState {
         Ok(())
     }
 
-    fn discard_pending_runtime_effects(&mut self) {
+    fn discard_guest_execution(&mut self) {
         self.registration_scope = None;
         self.runtime_effects_active = false;
         self.pending_effects.clear();
         self.pending_revocations.clear();
+        self.secret_access_active = false;
     }
 
     fn queue_capability(&mut self, name: String) -> Result<(), RegistrationError> {
@@ -244,13 +256,22 @@ impl WasmHostState {
         Ok(())
     }
 
-    fn begin_runtime_effects(&mut self) {
+    /// Opens the only guest execution scope that can create effects or read secrets.
+    fn begin_guest_execution(&mut self) {
         self.runtime_effects_active = true;
+        self.secret_access_active = true;
     }
 
-    fn finish_runtime_effects(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
+    /// Closes guest access before committing its queued runtime effects.
+    fn finish_guest_execution(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
         self.runtime_effects_active = false;
+        self.secret_access_active = false;
 
+        self.commit_runtime_effects(ctx)
+    }
+
+    /// Commits reversible effects requested by the just-completed guest callback.
+    fn commit_runtime_effects(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
         let mut registered_handles = Vec::new();
         let mut revoked_effects = Vec::new();
         for operation in std::mem::take(&mut self.pending_effects) {
@@ -331,6 +352,28 @@ impl WasmHostState {
             Err(ExtensionError::Message(rollback_errors.join("; ")))
         }
     }
+
+    fn read_secret(&self, path: String) -> Result<String, SecretError> {
+        if !self.secret_access_active {
+            return Err(SecretError::AccessNotActive);
+        }
+
+        let extension_id = self
+            .extension_id
+            .as_ref()
+            .ok_or(SecretError::AccessNotActive)?;
+        let path = SecretPath::parse(path).map_err(|_| SecretError::InvalidPath)?;
+
+        self.secrets
+            .read_for_component(extension_id, &self.component_id, &path)
+            .map(|value| value.expose_secret().to_string())
+            .map_err(|error| match error {
+                SecretAccessError::InvalidPath => SecretError::InvalidPath,
+                SecretAccessError::AccessDenied => SecretError::AccessDenied,
+                SecretAccessError::NotFound => SecretError::NotFound,
+                SecretAccessError::Unavailable => SecretError::Unavailable,
+            })
+    }
 }
 
 impl HostOperations for WasmHostState {
@@ -369,6 +412,12 @@ impl RuntimeEffectsHost for WasmHostState {
     }
 }
 
+impl SecretsHost for WasmHostState {
+    fn read(&mut self, path: String) -> Result<String, SecretError> {
+        self.read_secret(path)
+    }
+}
+
 impl RegistrationHost for WasmHostState {
     fn register_capability(
         &mut self,
@@ -397,6 +446,7 @@ impl RegistrationHost for WasmHostState {
 #[derive(Clone)]
 pub struct WasmRuntimeEngine {
     engine: Engine,
+    secrets: SecretManager,
 }
 
 impl Default for WasmRuntimeEngine {
@@ -407,7 +457,10 @@ impl Default for WasmRuntimeEngine {
 
         let engine = Engine::new(&config).unwrap_or_else(|_| Engine::default());
 
-        Self { engine }
+        Self {
+            engine,
+            secrets: SecretManager::system(),
+        }
     }
 }
 
@@ -415,6 +468,12 @@ impl WasmRuntimeEngine {
     /// Creates a new [`WasmRuntimeEngine`].
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a WASM runtime that shares the supplied Rintawa secret policy.
+    pub fn with_secret_manager(secrets: SecretManager) -> Self {
+        let engine = Self::default().engine;
+        Self { engine, secrets }
     }
 
     /// Loads and compiles a WASM component from binary bytes.
@@ -438,6 +497,7 @@ impl WasmRuntimeEngine {
             engine: self.engine.clone(),
             component,
             linker: Arc::new(linker),
+            secrets: self.secrets.clone(),
             instance: None,
         })
     }
@@ -449,6 +509,7 @@ pub struct WasmComponent {
     engine: Engine,
     component: WasmtimeComponent,
     linker: Arc<Linker<WasmHostState>>,
+    secrets: SecretManager,
     instance: Option<WasmInstance>,
 }
 
@@ -471,7 +532,8 @@ impl WasmComponent {
     /// it does not satisfy the generated WIT world contract.
     fn instance_mut(&mut self) -> ExtensionResult<&mut WasmInstance> {
         if self.instance.is_none() {
-            let host_state = WasmHostState::new(self.id.clone());
+            let host_state =
+                WasmHostState::with_secret_manager(self.id.clone(), self.secrets.clone());
             let mut store = Store::new(&self.engine, host_state);
             let plugin = Plugin::instantiate(&mut store, &self.component, &self.linker)
                 .map_err(|err| ExtensionError::Message(format!("instantiation error: {err}")))?;
@@ -499,7 +561,7 @@ impl WasmComponent {
 
         instance.store.data().validate_execution_owner(ctx)?;
 
-        instance.store.data_mut().begin_runtime_effects();
+        instance.store.data_mut().begin_guest_execution();
 
         let dispatch_result = instance
             .plugin
@@ -508,7 +570,7 @@ impl WasmComponent {
             .map_err(|err| ExtensionError::Message(format!("event dispatch error: {err}")));
 
         if let Err(error) = dispatch_result {
-            instance.store.data_mut().discard_pending_runtime_effects();
+            instance.store.data_mut().discard_guest_execution();
             instance.store.data_mut().effect_handles.clear();
             if let Err(cleanup_error) = ctx.revoke_all_runtime_effects() {
                 return Err(ExtensionError::RuntimeEffectCleanupFailed {
@@ -519,8 +581,8 @@ impl WasmComponent {
             return Err(error);
         }
 
-        if let Err(error) = instance.store.data_mut().finish_runtime_effects(ctx) {
-            instance.store.data_mut().discard_pending_runtime_effects();
+        if let Err(error) = instance.store.data_mut().finish_guest_execution(ctx) {
+            instance.store.data_mut().discard_guest_execution();
             return Err(error);
         }
 
@@ -566,7 +628,7 @@ impl Component for WasmComponent {
 
         instance.store.data().validate_execution_owner(ctx)?;
 
-        instance.store.data_mut().begin_runtime_effects();
+        instance.store.data_mut().begin_guest_execution();
 
         let start_result = instance
             .plugin
@@ -575,12 +637,12 @@ impl Component for WasmComponent {
             .map_err(|err| ExtensionError::Message(format!("start failed: {err}")));
 
         if let Err(error) = start_result {
-            instance.store.data_mut().discard_pending_runtime_effects();
+            instance.store.data_mut().discard_guest_execution();
             return Err(error);
         }
 
-        if let Err(error) = instance.store.data_mut().finish_runtime_effects(ctx) {
-            instance.store.data_mut().discard_pending_runtime_effects();
+        if let Err(error) = instance.store.data_mut().finish_guest_execution(ctx) {
+            instance.store.data_mut().discard_guest_execution();
             return Err(error);
         }
 
@@ -594,7 +656,7 @@ impl Component for WasmComponent {
                 .rintawa_engine_guest()
                 .call_stop(&mut instance.store)
                 .map_err(|err| ExtensionError::Message(format!("stop failed: {err}")));
-            instance.store.data_mut().discard_pending_runtime_effects();
+            instance.store.data_mut().discard_guest_execution();
             instance.store.data_mut().effect_handles.clear();
             stop_result?;
         }
@@ -606,10 +668,13 @@ impl Component for WasmComponent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::InMemorySecretVault;
     use rintawa_sdk::{
         api::{LogLevel, LoggerApi},
+        secrets::{SecretPath, SecretPathPattern, SecretValue},
         types::ExtensionId,
     };
+    use std::sync::Arc;
 
     struct TestLogger;
 
@@ -709,16 +774,16 @@ mod tests {
         let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
         let mut context = TestRuntimeContext::new();
 
-        state.begin_runtime_effects();
+        state.begin_guest_execution();
         let handle =
             RuntimeEffectsHost::subscribe_event(&mut state, String::from("dialogue.message"))
                 .unwrap();
-        state.finish_runtime_effects(&mut context).unwrap();
+        state.finish_guest_execution(&mut context).unwrap();
         assert_eq!(context.effects.len(), 1);
 
-        state.begin_runtime_effects();
+        state.begin_guest_execution();
         RuntimeEffectsHost::unsubscribe_event(&mut state, handle).unwrap();
-        state.finish_runtime_effects(&mut context).unwrap();
+        state.finish_guest_execution(&mut context).unwrap();
         assert!(context.effects.is_empty());
     }
 
@@ -741,12 +806,57 @@ mod tests {
     }
 
     #[test]
+    fn test_should_read_only_host_granted_wasm_secret_during_and_after_execution() {
+        let manager = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
+        let extension_id = ExtensionId::new("official_ai");
+        let component_id = ComponentId::new("provider");
+        let allowed_path = SecretPath::parse("ai.api_keys.openai").unwrap();
+
+        manager
+            .store(&allowed_path, &SecretValue::new("test-key"))
+            .unwrap();
+        manager
+            .grant_read(
+                extension_id.clone(),
+                component_id.clone(),
+                SecretPathPattern::parse("ai.api_keys.*").unwrap(),
+            )
+            .unwrap();
+
+        let mut state = WasmHostState::with_secret_manager(component_id, manager);
+        state.begin_registration(extension_id).unwrap();
+        state.finish_registration().unwrap();
+
+        assert!(matches!(
+            SecretsHost::read(&mut state, String::from("ai.api_keys.openai")),
+            Err(SecretError::AccessNotActive)
+        ));
+
+        state.begin_guest_execution();
+        assert!(matches!(
+            SecretsHost::read(&mut state, String::from("ai.api_keys.openai")),
+            Ok(value) if value == "test-key"
+        ));
+        assert!(matches!(
+            SecretsHost::read(&mut state, String::from("ai.api_keys_backup.openai")),
+            Err(SecretError::AccessDenied)
+        ));
+
+        let mut context = TestRuntimeContext::new();
+        state.finish_guest_execution(&mut context).unwrap();
+        assert!(matches!(
+            SecretsHost::read(&mut state, String::from("ai.api_keys.openai")),
+            Err(SecretError::AccessNotActive)
+        ));
+    }
+
+    #[test]
     fn test_should_roll_back_effects_when_a_callback_batch_fails() {
         let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
         let mut context = TestRuntimeContext::new();
         context.fail_registration_on(2);
 
-        state.begin_runtime_effects();
+        state.begin_guest_execution();
         state
             .subscribe_event(String::from("dialogue.first"))
             .unwrap();
@@ -754,7 +864,7 @@ mod tests {
             .subscribe_event(String::from("dialogue.second"))
             .unwrap();
 
-        assert!(state.finish_runtime_effects(&mut context).is_err());
+        assert!(state.finish_guest_execution(&mut context).is_err());
         assert!(context.effects.is_empty());
     }
 
@@ -763,25 +873,25 @@ mod tests {
         let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
         let mut context = TestRuntimeContext::new();
 
-        state.begin_runtime_effects();
+        state.begin_guest_execution();
         let active_handle = state
             .subscribe_event(String::from("dialogue.active"))
             .unwrap();
-        state.finish_runtime_effects(&mut context).unwrap();
+        state.finish_guest_execution(&mut context).unwrap();
 
         context.fail_registration_on(2);
         context.fail_registration_on(3);
-        state.begin_runtime_effects();
+        state.begin_guest_execution();
         state.unsubscribe_event(active_handle.clone()).unwrap();
         state.subscribe_event(String::from("dialogue.new")).unwrap();
 
         assert!(matches!(
-            state.finish_runtime_effects(&mut context),
+            state.finish_guest_execution(&mut context),
             Err(ExtensionError::RuntimeEffectRollbackFailed { .. })
         ));
         assert!(context.effects.is_empty());
 
-        state.begin_runtime_effects();
+        state.begin_guest_execution();
         assert!(matches!(
             state.unsubscribe_event(active_handle),
             Err(RuntimeEffectError::UnknownEffect)

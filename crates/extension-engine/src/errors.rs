@@ -1,6 +1,7 @@
 //! Error types for the Rintawa Extension Engine.
 
 use rintawa_sdk::errors::ExtensionError;
+use rintawa_sdk::secrets::SecretAccessError;
 use std::io;
 use thiserror::Error;
 
@@ -22,6 +23,32 @@ pub enum EngineError {
     /// An error occurred while serializing configuration state.
     #[error("failed to serialize state: {0}")]
     StateSerialize(#[from] toml::ser::Error),
+
+    /// A host secret configuration or policy operation failed.
+    #[error("secret operation failed: {0}")]
+    SecretAccess(#[from] SecretAccessError),
+
+    /// A requested secret grant does not correspond to the extension manifest.
+    #[error(
+        "secret grant `{pattern}` was not requested by component `{component_id}` in extension `{extension_id}`"
+    )]
+    SecretPermissionNotRequested {
+        /// ID of the extension requesting secret access.
+        extension_id: String,
+        /// ID of the component requesting secret access.
+        component_id: String,
+        /// Requested grant pattern that policy attempted to approve.
+        pattern: String,
+    },
+
+    /// A host attempted to grant access to an undeclared component.
+    #[error("component `{component_id}` was not found in extension `{extension_id}`")]
+    SecretComponentNotFound {
+        /// ID of the extension containing the component.
+        extension_id: String,
+        /// ID of the missing component.
+        component_id: String,
+    },
 
     /// An SDK-level lifecycle or registration error.
     #[error("extension SDK error: {0}")]

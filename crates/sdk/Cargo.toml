@@ -12,6 +12,7 @@ description = "SDK for developing Rintawa extensions"
 readme = "README.md"
 
 [dependencies]
+secrecy = "0.10"
 serde.workspace = true
 thiserror.workspace = true
 

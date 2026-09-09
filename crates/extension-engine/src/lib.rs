@@ -13,6 +13,7 @@ pub mod engine;
 pub mod errors;
 pub mod loader;
 pub mod runtime;
+pub mod secrets;
 pub mod state;
 
 mod runtime_effects;
@@ -21,13 +22,16 @@ pub use engine::{ExtensionEngine, ExtensionState};
 pub use errors::{EngineError, EngineResult};
 pub use loader::ExtensionLoader;
 pub use runtime::{WasmComponent, WasmRuntimeEngine};
+pub use secrets::SecretManager;
 pub use state::{ExtensionStateRecord, ExtensionsStateConfig, STATE_FILE_NAME};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::InMemorySecretVault;
     use rintawa_sdk::prelude::*;
     use std::fs;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
     struct DummyRuntime {
@@ -37,6 +41,29 @@ mod tests {
     struct SubscriptionRuntime {
         id: ComponentId,
         should_fail_after_registering: bool,
+    }
+
+    struct SecretReaderRuntime {
+        id: ComponentId,
+        path: SecretPath,
+        observed_value: Arc<Mutex<Option<String>>>,
+        stop_read_denied: Arc<Mutex<bool>>,
+    }
+
+    impl SecretReaderRuntime {
+        fn new(
+            id: &str,
+            path: SecretPath,
+            observed_value: Arc<Mutex<Option<String>>>,
+            stop_read_denied: Arc<Mutex<bool>>,
+        ) -> Self {
+            Self {
+                id: ComponentId::new(id),
+                path,
+                observed_value,
+                stop_read_denied,
+            }
+        }
     }
 
     impl SubscriptionRuntime {
@@ -62,6 +89,23 @@ mod tests {
                 )));
             }
 
+            Ok(())
+        }
+    }
+
+    impl Component for SecretReaderRuntime {
+        fn id(&self) -> &ComponentId {
+            &self.id
+        }
+
+        fn start(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
+            let value = ctx.read_secret(&self.path)?;
+            *self.observed_value.lock().unwrap() = Some(value.expose_secret().to_string());
+            Ok(())
+        }
+
+        fn stop(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
+            *self.stop_read_denied.lock().unwrap() = ctx.read_secret(&self.path).is_err();
             Ok(())
         }
     }
@@ -234,6 +278,152 @@ mod tests {
 
         assert!(engine.start_extension(&failed_manifest.id).is_err());
         assert_eq!(engine.active_runtime_effects().len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_grant_requested_secret_domain_only_to_active_component() -> EngineResult<()> {
+        let secret_manager = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
+        let secret_path = SecretPath::parse("ai.api_keys.openai").unwrap();
+        secret_manager.store(&secret_path, &SecretValue::new("test-key"))?;
+
+        let observed_value = Arc::new(Mutex::new(None));
+        let stop_read_denied = Arc::new(Mutex::new(false));
+        let component = Box::new(SecretReaderRuntime::new(
+            "provider",
+            secret_path.clone(),
+            observed_value.clone(),
+            stop_read_denied.clone(),
+        ));
+        let mut engine = ExtensionEngine::with_secret_manager(secret_manager);
+        let manifest = engine.parse_manifest(
+            r#"
+                id = "official_ai"
+                name = "Official AI"
+                version = "0.0.1"
+                sdk = "^0.0"
+
+                [[components]]
+                id = "provider"
+                kind = "runtime"
+                target = "native"
+
+                [components.permissions]
+                secret-read = ["ai.api_keys.*"]
+            "#,
+        )?;
+        let extension_id = manifest.id.clone();
+        engine.register_extension(manifest, vec![component])?;
+
+        assert!(engine.start_extension(&extension_id).is_err());
+        assert!(observed_value.lock().unwrap().is_none());
+
+        engine.grant_requested_secret_read(
+            &extension_id,
+            &ComponentId::new("provider"),
+            SecretPathPattern::parse("ai.api_keys.openai").unwrap(),
+        )?;
+        engine.start_extension(&extension_id)?;
+        assert_eq!(observed_value.lock().unwrap().as_deref(), Some("test-key"));
+
+        engine.stop_extension(&extension_id)?;
+        assert!(*stop_read_denied.lock().unwrap());
+
+        assert!(matches!(
+            engine.grant_requested_secret_read(
+                &extension_id,
+                &ComponentId::new("provider"),
+                SecretPathPattern::parse("ai.*").unwrap(),
+            ),
+            Err(EngineError::SecretPermissionNotRequested { .. })
+        ));
+
+        engine.unregister_extension(&extension_id)?;
+        assert!(matches!(
+            engine.grant_requested_secret_read(
+                &extension_id,
+                &ComponentId::new("provider"),
+                SecretPathPattern::parse("ai.api_keys.openai").unwrap(),
+            ),
+            Err(EngineError::ExtensionNotFound(_))
+        ));
+
+        let replacement_observed_value = Arc::new(Mutex::new(None));
+        let replacement_stop_read_denied = Arc::new(Mutex::new(false));
+        let replacement_manifest = engine.parse_manifest(
+            r#"
+                id = "official_ai"
+                name = "Official AI"
+                version = "0.0.1"
+                sdk = "^0.0"
+
+                [[components]]
+                id = "provider"
+                kind = "runtime"
+                target = "native"
+
+                [components.permissions]
+                secret-read = ["ai.api_keys.*"]
+            "#,
+        )?;
+        engine.register_extension(
+            replacement_manifest,
+            vec![Box::new(SecretReaderRuntime::new(
+                "provider",
+                secret_path,
+                replacement_observed_value.clone(),
+                replacement_stop_read_denied,
+            ))],
+        )?;
+
+        assert!(engine.start_extension(&extension_id).is_err());
+        assert!(replacement_observed_value.lock().unwrap().is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_revoke_secret_grants_for_manifest_only_components() -> EngineResult<()> {
+        let secret_manager = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
+        let secret_path = SecretPath::parse("ai.api_keys.openai").unwrap();
+        secret_manager.store(&secret_path, &SecretValue::new("test-key"))?;
+
+        let mut engine = ExtensionEngine::with_secret_manager(secret_manager);
+        let manifest = engine.parse_manifest(
+            r#"
+                id = "optional_components"
+                name = "Optional Components"
+                version = "0.0.1"
+                sdk = "^0.0"
+
+                [[components]]
+                id = "optional_provider"
+                kind = "runtime"
+                target = "wasm"
+                required = false
+
+                [components.permissions]
+                secret-read = ["ai.api_keys.*"]
+            "#,
+        )?;
+        let extension_id = manifest.id.clone();
+        let component_id = ComponentId::new("optional_provider");
+        engine.register_extension(manifest, Vec::new())?;
+        engine.grant_requested_secret_read(
+            &extension_id,
+            &component_id,
+            SecretPathPattern::parse("ai.api_keys.openai").unwrap(),
+        )?;
+
+        engine.unregister_extension(&extension_id)?;
+
+        assert!(matches!(
+            engine
+                .secret_manager()
+                .read_for_component(&extension_id, &component_id, &secret_path),
+            Err(SecretAccessError::AccessDenied)
+        ));
 
         Ok(())
     }

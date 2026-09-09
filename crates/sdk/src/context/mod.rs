@@ -8,6 +8,7 @@ use crate::{
     contributions::ContributionDescriptor,
     errors::ExtensionResult,
     runtime_effects::RuntimeEffect,
+    secrets::{SecretPath, SecretValue},
     types::{ComponentId, ExtensionId, RuntimeEffectId},
 };
 
@@ -52,6 +53,22 @@ pub trait ComponentContext {
     /// revokes one known effect with [`Self::revoke_runtime_effect`] instead.
     fn revoke_all_runtime_effects(&mut self) -> ExtensionResult<()> {
         Err(crate::errors::ExtensionError::RuntimeEffectsUnavailable)
+    }
+
+    /// Reads a secret through this component's active host-granted capability.
+    ///
+    /// The caller identity comes from the host context, not from extension
+    /// input. Contexts supplied during `stop` and registration do not permit
+    /// secret reads. Extensions cannot enumerate, store, or delete secrets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::errors::ExtensionError::SecretAccess`] when the path is
+    /// not granted, absent, or unavailable from the host credential store.
+    fn read_secret(&self, _path: &SecretPath) -> ExtensionResult<SecretValue> {
+        Err(crate::errors::ExtensionError::SecretAccess(
+            crate::secrets::SecretAccessError::AccessDenied,
+        ))
     }
 }
 

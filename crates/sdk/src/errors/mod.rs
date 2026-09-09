@@ -3,6 +3,8 @@
 //! This module provides the error types used throughout the SDK
 //! for error handling and propagation.
 
+use crate::secrets::SecretAccessError;
+
 use thiserror::Error;
 
 /// The error type for Rintawa extension operations.
@@ -44,6 +46,10 @@ pub enum ExtensionError {
         /// The error that prevented owner-effect cleanup.
         cleanup: String,
     },
+
+    /// A secret read failed because the active component lacks access or the host cannot serve it.
+    #[error("secret access failed: {0}")]
+    SecretAccess(#[from] SecretAccessError),
 
     /// A generic error with a message.
     #[error("{0}")]

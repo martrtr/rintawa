@@ -58,6 +58,25 @@ interface runtime-effects {
     unsubscribe-event: func(handle: handle) -> result<_, error>;
 }
 
+/// Read-only secrets capability available only while guest code is executing.
+interface secrets {
+    /// A secret-read failure that does not disclose values or host internals.
+    variant error {
+        access-not-active,
+        invalid-path,
+        access-denied,
+        not-found,
+        unavailable,
+    }
+
+    /// Reads one host-granted secret path.
+    ///
+    /// The host derives extension and component identity from the instance; the
+    /// guest cannot supply another owner. This interface intentionally has no
+    /// list, store, or delete operation.
+    read: func(path: string) -> result<string, error>;
+}
+
 /// Guest lifecycle and event handlers implemented by the WASM plugin.
 interface guest {
     /// Initial plugin registration callback.
@@ -81,5 +100,6 @@ world plugin {
     import host;
     import registration;
     import runtime-effects;
+    import secrets;
     export guest;
 }

@@ -5,7 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{ComponentId, ComponentTarget, ExtensionId};
+use crate::{
+    secrets::SecretPathPattern,
+    types::{ComponentId, ComponentTarget, ExtensionId},
+};
 
 /// Represents the role of a component in an extension.
 ///
@@ -23,6 +26,17 @@ pub enum ComponentKind {
 
 fn required_by_default() -> bool {
     true
+}
+
+/// Permissions a component may request from a Rintawa host.
+///
+/// A request is only metadata. It does not grant access: Rintawa must approve
+/// an exact requested pattern for a specific component before activation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentPermissions {
+    /// Secret domains the extension may ask the host to grant for reading.
+    #[serde(default, rename = "secret-read")]
+    pub secret_read: Vec<SecretPathPattern>,
 }
 
 /// Describes a single component declared by an extension.
@@ -54,6 +68,10 @@ pub struct ComponentDescriptor {
     /// Whether activation requires a compatible host for this component.
     #[serde(default = "required_by_default")]
     pub required: bool,
+
+    /// Permissions requested by this component.
+    #[serde(default)]
+    pub permissions: ComponentPermissions,
 }
 
 /// The minimal manifest for a Rintawa extension package.
@@ -61,7 +79,9 @@ pub struct ComponentDescriptor {
 /// The manifest is the primary way to declare an extension's metadata and
 /// components. It serves as the entry point for Extension Engine parsing and
 /// validation. SDK 0.0.1 does not yet define validation or runtime semantics
-/// for permissions, inter-extension dependencies, or declarative contributions.
+/// for inter-extension dependencies or declarative contributions. Component
+/// permission requests are parsed, but their grants remain an explicit host
+/// policy decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtensionManifest {
     /// The unique identifier of the extension.
@@ -107,6 +127,7 @@ mod tests {
         assert_eq!(component.target.as_str(), "native");
         assert_eq!(component.entry, None);
         assert!(component.required);
+        assert!(component.permissions.secret_read.is_empty());
 
         Ok(())
     }
@@ -150,6 +171,9 @@ mod tests {
                 target: ComponentTarget::new("wasm"),
                 entry: Some(String::from("runtime.wasm")),
                 required: true,
+                permissions: ComponentPermissions {
+                    secret_read: vec![SecretPathPattern::parse("ai.api_keys.*")?],
+                },
             }],
         };
 
@@ -157,6 +181,33 @@ mod tests {
         let decoded: ExtensionManifest = toml::from_str(&encoded)?;
 
         assert_eq!(decoded, original);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_parse_requested_secret_domain() -> Result<(), toml::de::Error> {
+        let manifest: ExtensionManifest = toml::from_str(
+            r#"
+                id = "official_ai"
+                name = "Official AI"
+                version = "0.0.1"
+                sdk = "^0.0"
+
+                [[components]]
+                id = "provider"
+                kind = "runtime"
+                target = "native"
+
+                [components.permissions]
+                secret-read = ["ai.api_keys.*"]
+            "#,
+        )?;
+
+        assert_eq!(
+            manifest.components[0].permissions.secret_read,
+            vec![SecretPathPattern::parse("ai.api_keys.*").unwrap()]
+        );
 
         Ok(())
     }

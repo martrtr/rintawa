@@ -1,8 +1,9 @@
 //! Rintawa SDK — public contracts for developing extensions.
 //!
 //! Version 0.0.1 intentionally provides a small lifecycle and manifest
-//! contract. It does not implement the extension engine, runtime hosts,
-//! permissions, state, storage, AI, or UI rendering.
+//! contract. It does not implement the extension engine, runtime hosts, state,
+//! storage, AI, or UI rendering. It defines declarative secret-read requests;
+//! the Rintawa host alone evaluates and grants them.
 //!
 //! A runtime component uses `kind = "runtime"` in its manifest. Its execution
 //! model is selected by its target: `"native"` for the initial host and
@@ -19,6 +20,7 @@
 //! - [`context`] — execution context
 //! - [`api`] — APIs available to extensions
 //! - [`errors`] — error types
+//! - [`secrets`] — validated secret paths and redacted secret values
 //! - [`prelude`] — commonly used imports
 
 #![forbid(unsafe_code)]
@@ -30,6 +32,7 @@ pub mod contributions;
 pub mod errors;
 pub mod manifest;
 pub mod runtime_effects;
+pub mod secrets;
 pub mod traits;
 pub mod types;
 

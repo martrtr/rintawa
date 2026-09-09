@@ -6,12 +6,14 @@ use rintawa_sdk::{
     contributions::ContributionDescriptor,
     errors::{ExtensionError, ExtensionResult},
     runtime_effects::RuntimeEffect,
+    secrets::{SecretPath, SecretValue},
     types::{ComponentId, ContributionId, ExtensionId, RuntimeEffectId},
 };
 use std::collections::HashSet;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::runtime_effects::RuntimeEffectRegistry;
+use crate::secrets::SecretManager;
 
 /// Engine logger redirecting SDK logs to the `tracing` ecosystem.
 #[derive(Debug, Clone)]
@@ -111,6 +113,8 @@ pub struct EngineComponentContext<'a> {
     component_id: ComponentId,
     logger: EngineLogger,
     runtime_effects: &'a mut RuntimeEffectRegistry,
+    secrets: &'a SecretManager,
+    secret_access_active: bool,
 }
 
 impl<'a> EngineComponentContext<'a> {
@@ -119,6 +123,8 @@ impl<'a> EngineComponentContext<'a> {
         extension_id: ExtensionId,
         component_id: ComponentId,
         runtime_effects: &'a mut RuntimeEffectRegistry,
+        secrets: &'a SecretManager,
+        secret_access_active: bool,
     ) -> Self {
         let logger = EngineLogger::new(extension_id.clone(), component_id.clone());
         Self {
@@ -126,6 +132,8 @@ impl<'a> EngineComponentContext<'a> {
             component_id,
             logger,
             runtime_effects,
+            secrets,
+            secret_access_active,
         }
     }
 }
@@ -160,5 +168,17 @@ impl ComponentContext for EngineComponentContext<'_> {
         self.runtime_effects
             .revoke_component(&self.extension_id, &self.component_id);
         Ok(())
+    }
+
+    fn read_secret(&self, path: &SecretPath) -> ExtensionResult<SecretValue> {
+        if !self.secret_access_active {
+            return Err(ExtensionError::SecretAccess(
+                rintawa_sdk::secrets::SecretAccessError::AccessDenied,
+            ));
+        }
+
+        self.secrets
+            .read_for_component(&self.extension_id, &self.component_id, path)
+            .map_err(ExtensionError::from)
     }
 }

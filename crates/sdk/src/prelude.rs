@@ -18,9 +18,13 @@ pub use crate::contributions::{ContributionDescriptor, ContributionKind};
 
 pub use crate::errors::{ExtensionError, ExtensionResult};
 
-pub use crate::manifest::{ComponentDescriptor, ComponentKind, ExtensionManifest};
+pub use crate::manifest::{
+    ComponentDescriptor, ComponentKind, ComponentPermissions, ExtensionManifest,
+};
 
 pub use crate::runtime_effects::RuntimeEffect;
+
+pub use crate::secrets::{SecretAccessError, SecretPath, SecretPathPattern, SecretValue};
 
 pub use crate::traits::Component;
 

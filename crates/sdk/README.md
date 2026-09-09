@@ -10,7 +10,9 @@ Version 0.0.1 deliberately establishes only the portable foundation:
 - a logging API and common error type.
 
 The SDK does not contain an Extension Engine, Wasmtime, React, state/storage/AI
-APIs, permission enforcement, dependency resolution, or a System scheduler.
+APIs, general permission enforcement, dependency resolution, or a System
+scheduler. Secret-read requests are an exception: the SDK can declare them,
+but only the Rintawa host can grant and serve them.
 Those are host or engine responsibilities and will be introduced only when a
 real end-to-end pipeline needs them.
 
