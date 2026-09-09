@@ -50,6 +50,19 @@ pub enum EngineError {
         component_id: String,
     },
 
+    /// A WASM component artifact exceeded the host-owned byte limit.
+    #[error(
+        "WASM component `{component_id}` is at least {observed_bytes} bytes, exceeding the {maximum_bytes}-byte limit"
+    )]
+    WasmArtifactTooLarge {
+        /// ID of the component whose artifact was rejected.
+        component_id: String,
+        /// Number of bytes observed before loading stopped.
+        observed_bytes: usize,
+        /// Maximum artifact size accepted by the host in bytes.
+        maximum_bytes: usize,
+    },
+
     /// An SDK-level lifecycle or registration error.
     #[error("extension SDK error: {0}")]
     Sdk(#[from] ExtensionError),

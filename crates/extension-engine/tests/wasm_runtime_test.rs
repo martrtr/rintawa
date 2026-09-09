@@ -1,12 +1,13 @@
-use rintawa_extension_engine::{EngineResult, WasmRuntimeEngine};
+use rintawa_extension_engine::{EngineResult, WasmExecutionBudget, WasmRuntimeEngine};
 use rintawa_sdk::{
     api::{LogLevel, LoggerApi},
     context::{ComponentContext, RegistrationContext},
     contributions::ContributionDescriptor,
-    errors::ExtensionResult,
+    errors::{ExtensionError, ExtensionResult},
     traits::Component,
     types::{ComponentId, ExtensionId},
 };
+use std::fs;
 
 struct TestLogger;
 
@@ -126,7 +127,7 @@ const STATEFUL_WASM_COMPONENT: &str = r#"
 
 #[test]
 fn test_wasm_runtime_engine_initialization() -> EngineResult<()> {
-    let runtime = WasmRuntimeEngine::new();
+    let runtime = WasmRuntimeEngine::new()?;
     let id = ComponentId::new("test-wasm-component");
 
     // Minimal valid WebAssembly Component binary representation (empty component header)
@@ -143,7 +144,7 @@ fn test_wasm_runtime_engine_initialization() -> EngineResult<()> {
 
 #[test]
 fn test_should_preserve_guest_state_across_component_lifecycle() -> EngineResult<()> {
-    let runtime = WasmRuntimeEngine::new();
+    let runtime = WasmRuntimeEngine::new()?;
     let mut component = runtime.load_component_from_bytes(
         ComponentId::new("stateful-component"),
         STATEFUL_WASM_COMPONENT.as_bytes(),
@@ -156,6 +157,197 @@ fn test_should_preserve_guest_state_across_component_lifecycle() -> EngineResult
     component.stop(&mut context)?;
     component.start(&mut context)?;
     component.dispatch_event(&mut context, "chat.message", b"second")?;
+
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_component_artifacts_above_the_host_budget() {
+    let budget = WasmExecutionBudget {
+        max_component_bytes: 8,
+        ..WasmExecutionBudget::default()
+    };
+    let runtime = WasmRuntimeEngine::with_execution_budget(budget).unwrap();
+
+    let error = match runtime.load_component_from_bytes(ComponentId::new("oversized"), &[0; 9]) {
+        Ok(_) => panic!("oversized component should be rejected"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        rintawa_extension_engine::EngineError::WasmArtifactTooLarge {
+            observed_bytes: 9,
+            maximum_bytes: 8,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn test_should_bound_file_reads_before_compiling_an_oversized_artifact() -> EngineResult<()> {
+    let budget = WasmExecutionBudget {
+        max_component_bytes: 8,
+        ..WasmExecutionBudget::default()
+    };
+    let runtime = WasmRuntimeEngine::with_execution_budget(budget)?;
+    let directory = tempfile::tempdir()?;
+    let artifact_path = directory.path().join("oversized.wasm");
+    fs::write(&artifact_path, [0; 9])?;
+
+    let error =
+        match runtime.load_component_from_file(ComponentId::new("oversized"), &artifact_path) {
+            Ok(_) => panic!("oversized component should be rejected"),
+            Err(error) => error,
+        };
+
+    assert!(matches!(
+        error,
+        rintawa_extension_engine::EngineError::WasmArtifactTooLarge {
+            observed_bytes: 9,
+            maximum_bytes: 8,
+            ..
+        }
+    ));
+
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_messages_above_the_host_budget() -> EngineResult<()> {
+    let budget = WasmExecutionBudget {
+        max_host_message_bytes: 3,
+        ..WasmExecutionBudget::default()
+    };
+    let runtime = WasmRuntimeEngine::with_execution_budget(budget)?;
+    let mut component = runtime.load_component_from_bytes(
+        ComponentId::new("stateful-component"),
+        STATEFUL_WASM_COMPONENT.as_bytes(),
+    )?;
+    let mut context = TestComponentContext::new();
+
+    component.register(&mut context)?;
+    component.start(&mut context)?;
+
+    assert!(matches!(
+        component.dispatch_event(&mut context, "chat", b"ok"),
+        Err(ExtensionError::HostMessageTooLarge {
+            operation: "event topic",
+            actual_bytes: 4,
+            maximum_bytes: 3,
+        })
+    ));
+
+    Ok(())
+}
+
+#[test]
+fn test_should_stop_an_infinite_guest_callback_when_its_fuel_is_exhausted() -> EngineResult<()> {
+    let budget = WasmExecutionBudget {
+        fuel_per_callback: 10_000,
+        ..WasmExecutionBudget::default()
+    };
+    let runtime = WasmRuntimeEngine::with_execution_budget(budget)?;
+    let fuel_exhausting_component = STATEFUL_WASM_COMPONENT.replace(
+        r#"(func (export "start")
+                (global.set $event-count
+                    (i32.add (global.get $event-count) (i32.const 1))))"#,
+        r#"(func (export "start") (loop br 0))"#,
+    );
+    let mut component = runtime.load_component_from_bytes(
+        ComponentId::new("stateful-component"),
+        fuel_exhausting_component.as_bytes(),
+    )?;
+    let mut context = TestComponentContext::new();
+
+    component.register(&mut context)?;
+
+    assert!(matches!(
+        component.start(&mut context),
+        Err(ExtensionError::ExecutionBudgetExceeded {
+            resource: "fuel",
+            operation: "start",
+        })
+    ));
+
+    let mut healthy_component = runtime.load_component_from_bytes(
+        ComponentId::new("stateful-component"),
+        STATEFUL_WASM_COMPONENT.as_bytes(),
+    )?;
+    let mut healthy_context = TestComponentContext::new();
+    healthy_component.register(&mut healthy_context)?;
+    healthy_component.start(&mut healthy_context)?;
+
+    Ok(())
+}
+
+#[test]
+fn test_should_reset_fuel_for_each_callback_on_the_same_guest_instance() -> EngineResult<()> {
+    let budget = WasmExecutionBudget {
+        fuel_per_callback: 100_000,
+        ..WasmExecutionBudget::default()
+    };
+    let runtime = WasmRuntimeEngine::with_execution_budget(budget)?;
+    let fuel_consuming_component = STATEFUL_WASM_COMPONENT
+        .replace(
+            r#"(func (export "start")
+                (global.set $event-count
+                    (i32.add (global.get $event-count) (i32.const 1))))"#,
+            r#"(func (export "start")
+                (local $remaining i32)
+                (loop $work
+                    (local.set $remaining
+                        (i32.add (local.get $remaining) (i32.const 1)))
+                    (br_if $work
+                        (i32.lt_u (local.get $remaining) (i32.const 8000)))))"#,
+        )
+        .replace(
+            r#"(func (export "on-event") (param i32 i32 i32 i32)
+                (if (i32.eqz
+                    (i32.or
+                        (i32.eq (global.get $event-count) (i32.const 2))
+                        (i32.eq (global.get $event-count) (i32.const 3))))
+                    (then unreachable)))"#,
+            r#"(func (export "on-event") (param i32 i32 i32 i32)
+                (local $remaining i32)
+                (loop $work
+                    (local.set $remaining
+                        (i32.add (local.get $remaining) (i32.const 1)))
+                    (br_if $work
+                        (i32.lt_u (local.get $remaining) (i32.const 8000)))))"#,
+        );
+    let mut component = runtime.load_component_from_bytes(
+        ComponentId::new("stateful-component"),
+        fuel_consuming_component.as_bytes(),
+    )?;
+    let mut context = TestComponentContext::new();
+
+    component.register(&mut context)?;
+    component.start(&mut context)?;
+    component.dispatch_event(&mut context, "chat.message", b"message")?;
+
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_a_component_that_exceeds_the_memory_budget() -> EngineResult<()> {
+    let budget = WasmExecutionBudget {
+        max_memory_bytes: 64 * 1024,
+        ..WasmExecutionBudget::default()
+    };
+    let runtime = WasmRuntimeEngine::with_execution_budget(budget)?;
+    let oversized_memory_component = STATEFUL_WASM_COMPONENT.replace(
+        r#"(memory (export "memory") 1)"#,
+        r#"(memory (export "memory") 2)"#,
+    );
+    let mut component = runtime.load_component_from_bytes(
+        ComponentId::new("stateful-component"),
+        oversized_memory_component.as_bytes(),
+    )?;
+    let mut context = TestComponentContext::new();
+
+    let error = component.register(&mut context).unwrap_err();
+    assert!(error.to_string().contains("memory"));
 
     Ok(())
 }

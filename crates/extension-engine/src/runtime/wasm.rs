@@ -2,8 +2,13 @@
 //!
 //! Provides sandboxed Component Model lifecycle execution for Rintawa WASM extensions.
 
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    fs::File,
+    io::Read,
+    path::Path,
+};
 
 use rintawa_sdk::{
     context::{ComponentContext, RegistrationContext},
@@ -17,11 +22,68 @@ use rintawa_sdk::{
 
 use tracing::{debug, error, info, trace, warn};
 use wasmtime::{
-    Engine, Store,
+    Engine, Store, StoreLimits, StoreLimitsBuilder, Trap,
     component::{Component as WasmtimeComponent, Linker},
 };
 
-use crate::{errors::EngineResult, secrets::SecretManager};
+use crate::{
+    errors::{EngineError, EngineResult},
+    secrets::SecretManager,
+};
+
+/// Host-owned resource limits for one WASM component instance.
+///
+/// Each lifecycle callback receives a fresh `fuel_per_callback` allowance;
+/// unused fuel is discarded before the next callback. Memory and table limits
+/// are enforced by Wasmtime for the lifetime of the component store. The
+/// defaults are a deliberately conservative local-host baseline, not a public
+/// package ABI: a production supervisor may choose a stricter policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WasmExecutionBudget {
+    /// Largest accepted compiled component artifact in bytes.
+    pub max_component_bytes: usize,
+    /// Maximum size of each guest linear memory in bytes.
+    pub max_memory_bytes: usize,
+    /// Maximum number of elements in each guest table.
+    pub max_table_elements: usize,
+    /// Maximum core instances allocated by one component store.
+    pub max_instances: usize,
+    /// Maximum tables allocated by one component store.
+    pub max_tables: usize,
+    /// Maximum linear memories allocated by one component store.
+    pub max_memories: usize,
+    /// Fuel made available before each guest callback and instantiation.
+    pub fuel_per_callback: u64,
+    /// Maximum byte length of an inbound event topic or payload.
+    pub max_host_message_bytes: usize,
+}
+
+impl Default for WasmExecutionBudget {
+    fn default() -> Self {
+        Self {
+            max_component_bytes: 32 * 1024 * 1024,
+            max_memory_bytes: 64 * 1024 * 1024,
+            max_table_elements: 100_000,
+            max_instances: 32,
+            max_tables: 16,
+            max_memories: 8,
+            fuel_per_callback: 10_000_000,
+            max_host_message_bytes: 1024 * 1024,
+        }
+    }
+}
+
+impl WasmExecutionBudget {
+    fn store_limits(&self) -> StoreLimits {
+        StoreLimitsBuilder::new()
+            .memory_size(self.max_memory_bytes)
+            .table_elements(self.max_table_elements)
+            .instances(self.max_instances)
+            .tables(self.max_tables)
+            .memories(self.max_memories)
+            .build()
+    }
+}
 
 #[allow(missing_docs)]
 mod bindings {
@@ -52,6 +114,7 @@ pub struct WasmHostState {
     pending_revocations: HashSet<String>,
     secrets: SecretManager,
     secret_access_active: bool,
+    resource_limits: StoreLimits,
 }
 
 /// Registrations produced by one guest `register` invocation before the host
@@ -88,6 +151,14 @@ impl WasmHostState {
 
     /// Creates host state with the Rintawa secret manager shared by the runtime.
     pub fn with_secret_manager(component_id: ComponentId, secrets: SecretManager) -> Self {
+        Self::with_secret_manager_and_budget(component_id, secrets, &WasmExecutionBudget::default())
+    }
+
+    fn with_secret_manager_and_budget(
+        component_id: ComponentId,
+        secrets: SecretManager,
+        budget: &WasmExecutionBudget,
+    ) -> Self {
         Self {
             component_id,
             extension_id: None,
@@ -99,6 +170,7 @@ impl WasmHostState {
             pending_revocations: HashSet::new(),
             secrets,
             secret_access_active: false,
+            resource_limits: budget.store_limits(),
         }
     }
 
@@ -447,46 +519,80 @@ impl RegistrationHost for WasmHostState {
 pub struct WasmRuntimeEngine {
     engine: Engine,
     secrets: SecretManager,
-}
-
-impl Default for WasmRuntimeEngine {
-    fn default() -> Self {
-        let mut config = wasmtime::Config::new();
-        config.wasm_component_model(true);
-        config.async_support(false);
-
-        let engine = Engine::new(&config).unwrap_or_else(|_| Engine::default());
-
-        Self {
-            engine,
-            secrets: SecretManager::system(),
-        }
-    }
+    budget: WasmExecutionBudget,
 }
 
 impl WasmRuntimeEngine {
-    /// Creates a new [`WasmRuntimeEngine`].
-    pub fn new() -> Self {
-        Self::default()
+    /// Creates a runtime using the system secret manager and default resource budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::WasmRuntime`] when Wasmtime cannot create the
+    /// configured Component Model engine.
+    pub fn new() -> EngineResult<Self> {
+        Self::with_secret_manager_and_budget(
+            SecretManager::system(),
+            WasmExecutionBudget::default(),
+        )
     }
 
-    /// Creates a WASM runtime that shares the supplied Rintawa secret policy.
-    pub fn with_secret_manager(secrets: SecretManager) -> Self {
-        let engine = Self::default().engine;
-        Self { engine, secrets }
+    /// Creates a runtime that shares the supplied Rintawa secret policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::WasmRuntime`] when Wasmtime cannot create the
+    /// configured Component Model engine.
+    pub fn with_secret_manager(secrets: SecretManager) -> EngineResult<Self> {
+        Self::with_secret_manager_and_budget(secrets, WasmExecutionBudget::default())
+    }
+
+    /// Creates a runtime using the system secret manager and the supplied budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::WasmRuntime`] when Wasmtime cannot create the
+    /// configured Component Model engine.
+    pub fn with_execution_budget(budget: WasmExecutionBudget) -> EngineResult<Self> {
+        Self::with_secret_manager_and_budget(SecretManager::system(), budget)
+    }
+
+    /// Creates a runtime with host-owned secret and resource policies.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::WasmRuntime`] when Wasmtime cannot create the
+    /// configured Component Model engine.
+    pub fn with_secret_manager_and_budget(
+        secrets: SecretManager,
+        budget: WasmExecutionBudget,
+    ) -> EngineResult<Self> {
+        let mut config = wasmtime::Config::new();
+        config.wasm_component_model(true);
+        config.async_support(false);
+        config.consume_fuel(true);
+
+        let engine = Engine::new(&config)?;
+
+        Ok(Self {
+            engine,
+            secrets,
+            budget,
+        })
     }
 
     /// Loads and compiles a WASM component from binary bytes.
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::WasmRuntime`](crate::errors::EngineError::WasmRuntime)
-    /// if compilation or linker binding fails.
+    /// Returns [`EngineError::WasmArtifactTooLarge`] when `bytes` exceed the
+    /// configured artifact budget, or [`EngineError::WasmRuntime`] if
+    /// compilation or linker binding fails.
     pub fn load_component_from_bytes(
         &self,
         id: ComponentId,
         bytes: &[u8],
     ) -> EngineResult<WasmComponent> {
+        self.ensure_component_size(&id, bytes.len())?;
         let component = WasmtimeComponent::new(&self.engine, bytes)?;
         let mut linker = Linker::new(&self.engine);
 
@@ -498,8 +604,45 @@ impl WasmRuntimeEngine {
             component,
             linker: Arc::new(linker),
             secrets: self.secrets.clone(),
+            budget: self.budget.clone(),
             instance: None,
         })
+    }
+
+    /// Reads, bounds, and compiles a WASM component artifact from disk.
+    ///
+    /// The method intentionally reads no more than one byte above the configured
+    /// limit, so a package artifact cannot make the loader allocate its full
+    /// untrusted file size before the limit is checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::WasmArtifactTooLarge`] when the artifact exceeds
+    /// the configured byte limit, [`EngineError::Io`] when it cannot be read,
+    /// or [`EngineError::WasmRuntime`] when Wasmtime cannot compile it.
+    pub fn load_component_from_file(
+        &self,
+        id: ComponentId,
+        path: &Path,
+    ) -> EngineResult<WasmComponent> {
+        let read_limit = u64::try_from(self.budget.max_component_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let mut bytes = Vec::new();
+        File::open(path)?.take(read_limit).read_to_end(&mut bytes)?;
+        self.load_component_from_bytes(id, &bytes)
+    }
+
+    fn ensure_component_size(&self, id: &ComponentId, observed_bytes: usize) -> EngineResult<()> {
+        if observed_bytes > self.budget.max_component_bytes {
+            return Err(EngineError::WasmArtifactTooLarge {
+                component_id: id.as_str().to_string(),
+                observed_bytes,
+                maximum_bytes: self.budget.max_component_bytes,
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -510,6 +653,7 @@ pub struct WasmComponent {
     component: WasmtimeComponent,
     linker: Arc<Linker<WasmHostState>>,
     secrets: SecretManager,
+    budget: WasmExecutionBudget,
     instance: Option<WasmInstance>,
 }
 
@@ -532,11 +676,16 @@ impl WasmComponent {
     /// it does not satisfy the generated WIT world contract.
     fn instance_mut(&mut self) -> ExtensionResult<&mut WasmInstance> {
         if self.instance.is_none() {
-            let host_state =
-                WasmHostState::with_secret_manager(self.id.clone(), self.secrets.clone());
+            let host_state = WasmHostState::with_secret_manager_and_budget(
+                self.id.clone(),
+                self.secrets.clone(),
+                &self.budget,
+            );
             let mut store = Store::new(&self.engine, host_state);
+            store.limiter(|state| &mut state.resource_limits);
+            Self::set_callback_fuel(&mut store, &self.budget, "instantiate")?;
             let plugin = Plugin::instantiate(&mut store, &self.component, &self.linker)
-                .map_err(|err| ExtensionError::Message(format!("instantiation error: {err}")))?;
+                .map_err(|err| Self::execution_error("instantiate", err))?;
 
             self.instance = Some(WasmInstance { store, plugin });
         }
@@ -544,6 +693,43 @@ impl WasmComponent {
         self.instance.as_mut().ok_or_else(|| {
             ExtensionError::Message(String::from("WASM component instance was not initialized"))
         })
+    }
+
+    fn set_callback_fuel(
+        store: &mut Store<WasmHostState>,
+        budget: &WasmExecutionBudget,
+        operation: &'static str,
+    ) -> ExtensionResult<()> {
+        store.set_fuel(budget.fuel_per_callback).map_err(|error| {
+            ExtensionError::Message(format!("could not set WASM fuel for {operation}: {error}"))
+        })
+    }
+
+    fn execution_error(operation: &'static str, error: wasmtime::Error) -> ExtensionError {
+        if error.downcast_ref::<Trap>() == Some(&Trap::OutOfFuel) {
+            return ExtensionError::ExecutionBudgetExceeded {
+                resource: "fuel",
+                operation,
+            };
+        }
+
+        ExtensionError::Message(format!("{operation} failed: {error}"))
+    }
+
+    fn validate_inbound_message(
+        &self,
+        operation: &'static str,
+        message_bytes: usize,
+    ) -> ExtensionResult<()> {
+        if message_bytes > self.budget.max_host_message_bytes {
+            return Err(ExtensionError::HostMessageTooLarge {
+                operation,
+                actual_bytes: message_bytes,
+                maximum_bytes: self.budget.max_host_message_bytes,
+            });
+        }
+
+        Ok(())
     }
 
     /// Triggers an incoming event dispatch into the WASM guest instance.
@@ -557,9 +743,13 @@ impl WasmComponent {
         topic: &str,
         payload: &[u8],
     ) -> ExtensionResult<()> {
+        self.validate_inbound_message("event topic", topic.len())?;
+        self.validate_inbound_message("event payload", payload.len())?;
+        let budget = self.budget.clone();
         let instance = self.instance_mut()?;
 
         instance.store.data().validate_execution_owner(ctx)?;
+        Self::set_callback_fuel(&mut instance.store, &budget, "event dispatch")?;
 
         instance.store.data_mut().begin_guest_execution();
 
@@ -567,7 +757,7 @@ impl WasmComponent {
             .plugin
             .rintawa_engine_guest()
             .call_on_event(&mut instance.store, topic, payload)
-            .map_err(|err| ExtensionError::Message(format!("event dispatch error: {err}")));
+            .map_err(|err| Self::execution_error("event dispatch", err));
 
         if let Err(error) = dispatch_result {
             instance.store.data_mut().discard_guest_execution();
@@ -596,8 +786,10 @@ impl Component for WasmComponent {
     }
 
     fn register(&mut self, ctx: &mut dyn RegistrationContext) -> ExtensionResult<()> {
+        let budget = self.budget.clone();
         let contributions = {
             let instance = self.instance_mut()?;
+            Self::set_callback_fuel(&mut instance.store, &budget, "register")?;
             instance
                 .store
                 .data_mut()
@@ -610,7 +802,7 @@ impl Component for WasmComponent {
 
             if let Err(err) = registration_result {
                 instance.store.data_mut().cancel_registration();
-                return Err(ExtensionError::Message(format!("register failed: {err}")));
+                return Err(Self::execution_error("register", err));
             }
 
             instance.store.data_mut().finish_registration()?
@@ -624,9 +816,11 @@ impl Component for WasmComponent {
     }
 
     fn start(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
+        let budget = self.budget.clone();
         let instance = self.instance_mut()?;
 
         instance.store.data().validate_execution_owner(ctx)?;
+        Self::set_callback_fuel(&mut instance.store, &budget, "start")?;
 
         instance.store.data_mut().begin_guest_execution();
 
@@ -634,7 +828,7 @@ impl Component for WasmComponent {
             .plugin
             .rintawa_engine_guest()
             .call_start(&mut instance.store)
-            .map_err(|err| ExtensionError::Message(format!("start failed: {err}")));
+            .map_err(|err| Self::execution_error("start", err));
 
         if let Err(error) = start_result {
             instance.store.data_mut().discard_guest_execution();
@@ -650,12 +844,14 @@ impl Component for WasmComponent {
     }
 
     fn stop(&mut self, _ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
+        let budget = self.budget.clone();
         if let Some(instance) = self.instance.as_mut() {
+            Self::set_callback_fuel(&mut instance.store, &budget, "stop")?;
             let stop_result = instance
                 .plugin
                 .rintawa_engine_guest()
                 .call_stop(&mut instance.store)
-                .map_err(|err| ExtensionError::Message(format!("stop failed: {err}")));
+                .map_err(|err| Self::execution_error("stop", err));
             instance.store.data_mut().discard_guest_execution();
             instance.store.data_mut().effect_handles.clear();
             stop_result?;

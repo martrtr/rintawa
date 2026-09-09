@@ -4,4 +4,4 @@
 
 pub mod wasm;
 
-pub use wasm::{WasmComponent, WasmRuntimeEngine};
+pub use wasm::{WasmComponent, WasmExecutionBudget, WasmRuntimeEngine};

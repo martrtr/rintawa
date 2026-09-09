@@ -13,7 +13,6 @@ use crate::{
 };
 
 /// Service responsible for discovering and loading extensions from disk.
-#[derive(Default)]
 pub struct ExtensionLoader {
     wasm_engine: WasmRuntimeEngine,
 }
@@ -109,10 +108,9 @@ impl ExtensionLoader {
                 }
 
                 let wasm_path = ext_dir.join(wasm_rel_path);
-                let wasm_bytes = std::fs::read(&wasm_path)?;
                 let wasm_component = self
                     .wasm_engine
-                    .load_component_from_bytes(comp_desc.id.clone(), &wasm_bytes)?;
+                    .load_component_from_file(comp_desc.id.clone(), &wasm_path)?;
 
                 components.push(Box::new(wasm_component));
             }

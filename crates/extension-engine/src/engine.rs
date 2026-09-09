@@ -81,7 +81,12 @@ impl ExtensionEngine {
     /// Use this factory for components that may request `secret-read`. Creating
     /// an independent [`WasmRuntimeEngine`] also creates an independent policy
     /// and therefore cannot observe grants configured on this engine.
-    pub fn wasm_runtime_engine(&self) -> WasmRuntimeEngine {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::WasmRuntime`] when Wasmtime cannot create the
+    /// configured Component Model engine.
+    pub fn wasm_runtime_engine(&self) -> EngineResult<WasmRuntimeEngine> {
         WasmRuntimeEngine::with_secret_manager(self.secrets.clone())
     }
 

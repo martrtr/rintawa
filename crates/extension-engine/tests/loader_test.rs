@@ -34,7 +34,7 @@ fn test_extension_loader_and_state_persistence() -> EngineResult<()> {
     state_config.save_to_file(&state_file)?;
 
     let mut engine = ExtensionEngine::new();
-    let loader = ExtensionLoader::default();
+    let loader = ExtensionLoader::new(engine.wasm_runtime_engine()?);
 
     // 3. Load directory — extension should be skipped because it is disabled
     let loaded = loader.load_directory(

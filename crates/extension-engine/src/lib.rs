@@ -21,7 +21,7 @@ mod runtime_effects;
 pub use engine::{ExtensionEngine, ExtensionState};
 pub use errors::{EngineError, EngineResult};
 pub use loader::ExtensionLoader;
-pub use runtime::{WasmComponent, WasmRuntimeEngine};
+pub use runtime::{WasmComponent, WasmExecutionBudget, WasmRuntimeEngine};
 pub use secrets::SecretManager;
 pub use state::{ExtensionStateRecord, ExtensionsStateConfig, STATE_FILE_NAME};
 
@@ -203,7 +203,7 @@ mod tests {
         fs::write(ext_dir.join("manifest.toml"), manifest_toml).map_err(EngineError::Io)?;
 
         let mut engine = ExtensionEngine::new();
-        let loader = ExtensionLoader::default();
+        let loader = ExtensionLoader::new(engine.wasm_runtime_engine()?);
         let mut state_config = ExtensionsStateConfig::default();
 
         // 1. Extension is enabled by default

@@ -47,6 +47,28 @@ pub enum ExtensionError {
         cleanup: String,
     },
 
+    /// An execution budget enforced by the host was exhausted.
+    #[error("execution budget for `{resource}` was exhausted during `{operation}`")]
+    ExecutionBudgetExceeded {
+        /// The bounded resource, for example `fuel`.
+        resource: &'static str,
+        /// The lifecycle operation that exceeded its budget.
+        operation: &'static str,
+    },
+
+    /// A host-to-component message exceeds the host's configured size limit.
+    #[error(
+        "host message for `{operation}` is {actual_bytes} bytes, exceeding the {maximum_bytes}-byte limit"
+    )]
+    HostMessageTooLarge {
+        /// The lifecycle operation receiving the message.
+        operation: &'static str,
+        /// Size of the supplied message in bytes.
+        actual_bytes: usize,
+        /// Maximum message size accepted by the host in bytes.
+        maximum_bytes: usize,
+    },
+
     /// A secret read failed because the active component lacks access or the host cannot serve it.
     #[error("secret access failed: {0}")]
     SecretAccess(#[from] SecretAccessError),
