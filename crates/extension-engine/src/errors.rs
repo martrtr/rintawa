@@ -6,6 +6,15 @@ use rintawa_sdk::{
 use std::io;
 use thiserror::Error;
 
+/// One component failure observed while stopping or rolling back an extension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentStopFailure {
+    /// ID of the component whose `stop` callback failed.
+    pub component_id: String,
+    /// Failure message returned by the component.
+    pub reason: String,
+}
+
 /// Errors that can occur during Extension Engine operations.
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -93,6 +102,30 @@ pub enum EngineError {
         component_id: String,
         /// Failure message detailing the cause.
         reason: String,
+    },
+
+    /// One or more component `stop` callbacks failed after host cleanup completed.
+    #[error("one or more components in extension `{extension_id}` failed to stop: {failures:?}")]
+    StopFailed {
+        /// ID of the extension being stopped.
+        extension_id: String,
+        /// Component failures collected while stopping in reverse lifecycle order.
+        failures: Vec<ComponentStopFailure>,
+    },
+
+    /// Startup failed and one or more rollback `stop` callbacks failed as well.
+    #[error(
+        "component `{component_id}` in extension `{extension_id}` failed to start: {start_reason}; startup rollback failures: {rollback_failures:?}"
+    )]
+    StartupRollbackFailed {
+        /// ID of the extension whose startup failed.
+        extension_id: String,
+        /// ID of the component whose `start` callback failed.
+        component_id: String,
+        /// Failure returned by the component's `start` callback.
+        start_reason: String,
+        /// Stop failures collected while rolling back the failed startup.
+        rollback_failures: Vec<ComponentStopFailure>,
     },
 
     /// The extension is in an invalid lifecycle state for the operation.

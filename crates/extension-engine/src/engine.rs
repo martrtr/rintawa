@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     context::{EngineComponentContext, EngineRegistrationContext},
-    errors::{EngineError, EngineResult},
+    errors::{ComponentStopFailure, EngineError, EngineResult},
     runtime::WasmRuntimeEngine,
     runtime_effects::RuntimeEffectRegistry,
     secrets::SecretManager,
@@ -25,7 +25,10 @@ pub enum ExtensionState {
     Registered,
     /// Extension components are active.
     Active,
-    /// Extension has been stopped and contributions deactivated.
+    /// Host-owned contributions and runtime effects are deactivated.
+    ///
+    /// A transition can still return [`EngineError::StopFailed`] when one or
+    /// more component callbacks could not clean up their own external state.
     Stopped,
 }
 
@@ -232,7 +235,10 @@ impl ExtensionEngine {
     /// # Errors
     ///
     /// Returns [`EngineError::ExtensionNotFound`] if the extension isn't registered,
-    /// or [`EngineError::LifecycleFailed`] if a component fails to start or contributions conflict.
+    /// [`EngineError::LifecycleFailed`] if a component fails to start or contributions conflict,
+    /// or [`EngineError::StartupRollbackFailed`] if startup fails and one or more rollback
+    /// `stop` callbacks fail as well. Host-owned runtime effects are revoked before either
+    /// startup error is returned.
     pub fn start_extension(&mut self, extension_id: &ExtensionId) -> EngineResult<()> {
         let (extensions, runtime_effects) = (&mut self.extensions, &mut self.runtime_effects);
         let ext = extensions
@@ -277,6 +283,10 @@ impl ExtensionEngine {
             );
 
             if let Err(err) = comp.start(&mut ctx) {
+                let failed_component_id = comp.id().as_str().to_string();
+                let start_reason = err.to_string();
+                let mut rollback_failures = Vec::new();
+
                 let mut failed_stop_context = EngineComponentContext::new(
                     ext.manifest.id.clone(),
                     comp.id().clone(),
@@ -284,10 +294,16 @@ impl ExtensionEngine {
                     &self.secrets,
                     false,
                 );
-                let _ = comp.stop(&mut failed_stop_context);
+                if let Err(stop_error) = comp.stop(&mut failed_stop_context) {
+                    rollback_failures.push(ComponentStopFailure {
+                        component_id: failed_component_id.clone(),
+                        reason: stop_error.to_string(),
+                    });
+                }
 
-                // Rollback previously started components in reverse order
+                // Rollback previously started components in reverse order.
                 for comp_to_stop in started.iter_mut().rev() {
+                    let component_id = comp_to_stop.id().as_str().to_string();
                     let mut stop_ctx = EngineComponentContext::new(
                         ext.manifest.id.clone(),
                         comp_to_stop.id().clone(),
@@ -295,9 +311,15 @@ impl ExtensionEngine {
                         &self.secrets,
                         false,
                     );
-                    let _ = comp_to_stop.stop(&mut stop_ctx);
+                    if let Err(stop_error) = comp_to_stop.stop(&mut stop_ctx) {
+                        rollback_failures.push(ComponentStopFailure {
+                            component_id,
+                            reason: stop_error.to_string(),
+                        });
+                    }
                 }
 
+                // Host-owned effects are revoked even when component rollback fails.
                 runtime_effects.revoke_extension(extension_id);
 
                 if ext.state == ExtensionState::Stopped {
@@ -306,10 +328,19 @@ impl ExtensionEngine {
                     }
                 }
 
-                return Err(EngineError::LifecycleFailed {
+                if rollback_failures.is_empty() {
+                    return Err(EngineError::LifecycleFailed {
+                        extension_id: extension_id.as_str().to_string(),
+                        component_id: failed_component_id,
+                        reason: start_reason,
+                    });
+                }
+
+                return Err(EngineError::StartupRollbackFailed {
                     extension_id: extension_id.as_str().to_string(),
-                    component_id: comp.id().as_str().to_string(),
-                    reason: err.to_string(),
+                    component_id: failed_component_id,
+                    start_reason,
+                    rollback_failures,
                 });
             }
         }
@@ -322,7 +353,10 @@ impl ExtensionEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::ExtensionNotFound`] if the extension does not exist.
+    /// Returns [`EngineError::ExtensionNotFound`] if the extension does not exist,
+    /// or [`EngineError::StopFailed`] if one or more component callbacks fail.
+    /// Host-owned contributions and runtime effects are revoked before that
+    /// error is returned, and the extension transitions to `Stopped`.
     pub fn stop_extension(&mut self, extension_id: &ExtensionId) -> EngineResult<()> {
         let (extensions, runtime_effects) = (&mut self.extensions, &mut self.runtime_effects);
         let ext = extensions
@@ -333,7 +367,9 @@ impl ExtensionEngine {
             return Ok(());
         }
 
+        let mut stop_failures = Vec::new();
         for comp in ext.components.iter_mut().rev() {
+            let component_id = comp.id().as_str().to_string();
             let mut ctx = EngineComponentContext::new(
                 ext.manifest.id.clone(),
                 comp.id().clone(),
@@ -342,11 +378,10 @@ impl ExtensionEngine {
                 false,
             );
             if let Err(err) = comp.stop(&mut ctx) {
-                tracing::warn!(
-                    ext = %extension_id,
-                    comp = %comp.id(),
-                    "Error during component stop: {err}"
-                );
+                stop_failures.push(ComponentStopFailure {
+                    component_id,
+                    reason: err.to_string(),
+                });
             }
         }
 
@@ -355,16 +390,26 @@ impl ExtensionEngine {
         }
 
         runtime_effects.revoke_extension(extension_id);
-
         ext.state = ExtensionState::Stopped;
-        Ok(())
+
+        if stop_failures.is_empty() {
+            Ok(())
+        } else {
+            Err(EngineError::StopFailed {
+                extension_id: extension_id.as_str().to_string(),
+                failures: stop_failures,
+            })
+        }
     }
 
     /// Completely unregisters and unloads an extension from the engine.
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::ExtensionNotFound`] if the extension does not exist.
+    /// Returns [`EngineError::ExtensionNotFound`] if the extension does not exist, or propagates
+    /// [`EngineError::StopFailed`] if an active extension cannot stop cleanly. Host-owned cleanup
+    /// still completes inside [`Self::stop_extension`] before that error is returned; unloading is
+    /// aborted and the extension remains registered in `Stopped` state.
     pub fn unregister_extension(&mut self, extension_id: &ExtensionId) -> EngineResult<()> {
         if let Some(ext) = self.extensions.get(extension_id) {
             if ext.state == ExtensionState::Active {

@@ -269,6 +269,11 @@ fn test_should_stop_an_infinite_guest_callback_when_its_fuel_is_exhausted() -> E
             operation: "start",
         })
     ));
+    assert!(matches!(
+        component.start(&mut context),
+        Err(ExtensionError::Message(message))
+            if message.contains("discarded after failed `start` callback")
+    ));
 
     let mut healthy_component = runtime.load_component_from_bytes(
         ComponentId::new("stateful-component"),
@@ -277,6 +282,31 @@ fn test_should_stop_an_infinite_guest_callback_when_its_fuel_is_exhausted() -> E
     let mut healthy_context = TestComponentContext::new();
     healthy_component.register(&mut healthy_context)?;
     healthy_component.start(&mut healthy_context)?;
+
+    Ok(())
+}
+
+#[test]
+fn test_should_discard_wasm_instance_after_failed_stop() -> EngineResult<()> {
+    let runtime = WasmRuntimeEngine::new()?;
+    let stop_failing_component = STATEFUL_WASM_COMPONENT.replace(
+        r#"(func (export "stop"))"#,
+        r#"(func (export "stop") unreachable)"#,
+    );
+    let mut component = runtime.load_component_from_bytes(
+        ComponentId::new("stateful-component"),
+        stop_failing_component.as_bytes(),
+    )?;
+    let mut context = TestComponentContext::new();
+
+    component.register(&mut context)?;
+    component.start(&mut context)?;
+    assert!(component.stop(&mut context).is_err());
+    assert!(matches!(
+        component.start(&mut context),
+        Err(ExtensionError::Message(message))
+            if message.contains("discarded after failed `stop` callback")
+    ));
 
     Ok(())
 }

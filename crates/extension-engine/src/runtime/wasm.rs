@@ -602,6 +602,7 @@ impl WasmRuntimeEngine {
             secrets: self.secrets.clone(),
             budget: self.budget.clone(),
             instance: None,
+            failed_lifecycle_callback: None,
         })
     }
 
@@ -643,6 +644,10 @@ impl WasmRuntimeEngine {
 }
 
 /// A WASM component implementing the public SDK [`Component`] trait.
+///
+/// A successful `stop` keeps the guest instance warm for restart. If guest
+/// `start` or `stop` execution fails, the instance is discarded and the
+/// component must be reloaded before it can execute again.
 pub struct WasmComponent {
     id: ComponentId,
     engine: Engine,
@@ -651,6 +656,7 @@ pub struct WasmComponent {
     secrets: SecretManager,
     budget: WasmExecutionBudget,
     instance: Option<WasmInstance>,
+    failed_lifecycle_callback: Option<&'static str>,
 }
 
 /// A live guest instance and its host state for one component lifecycle.
@@ -671,6 +677,12 @@ impl WasmComponent {
     /// Returns an error when Wasmtime cannot instantiate the component or when
     /// it does not satisfy the generated WIT world contract.
     fn instance_mut(&mut self) -> ExtensionResult<&mut WasmInstance> {
+        if let Some(operation) = self.failed_lifecycle_callback {
+            return Err(ExtensionError::Message(format!(
+                "WASM component instance was discarded after failed `{operation}` callback; reload required"
+            )));
+        }
+
         if self.instance.is_none() {
             let host_state = WasmHostState::with_secret_manager_and_budget(
                 self.id.clone(),
@@ -813,44 +825,63 @@ impl Component for WasmComponent {
 
     fn start(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
         let budget = self.budget.clone();
-        let instance = self.instance_mut()?;
+        let mut guest_failed = false;
+        let result = {
+            let instance = self.instance_mut()?;
 
-        instance.store.data().validate_execution_owner(ctx)?;
-        Self::set_callback_fuel(&mut instance.store, &budget, "start")?;
+            instance.store.data().validate_execution_owner(ctx)?;
+            Self::set_callback_fuel(&mut instance.store, &budget, "start")?;
 
-        instance.store.data_mut().begin_guest_execution();
+            instance.store.data_mut().begin_guest_execution();
 
-        let start_result = instance
-            .plugin
-            .rintawa_engine_guest()
-            .call_start(&mut instance.store)
-            .map_err(|err| Self::execution_error("start", err));
+            let start_result = instance
+                .plugin
+                .rintawa_engine_guest()
+                .call_start(&mut instance.store)
+                .map_err(|err| Self::execution_error("start", err));
 
-        if let Err(error) = start_result {
-            instance.store.data_mut().discard_guest_execution();
-            return Err(error);
+            if let Err(error) = start_result {
+                instance.store.data_mut().discard_guest_execution();
+                guest_failed = true;
+                Err(error)
+            } else if let Err(error) = instance.store.data_mut().finish_guest_execution(ctx) {
+                instance.store.data_mut().discard_guest_execution();
+                Err(error)
+            } else {
+                Ok(())
+            }
+        };
+
+        if guest_failed {
+            self.instance = None;
+            self.failed_lifecycle_callback = Some("start");
         }
 
-        if let Err(error) = instance.store.data_mut().finish_guest_execution(ctx) {
-            instance.store.data_mut().discard_guest_execution();
-            return Err(error);
-        }
-
-        Ok(())
+        result
     }
 
     fn stop(&mut self, _ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
         let budget = self.budget.clone();
-        if let Some(instance) = self.instance.as_mut() {
-            Self::set_callback_fuel(&mut instance.store, &budget, "stop")?;
-            let stop_result = instance
-                .plugin
-                .rintawa_engine_guest()
-                .call_stop(&mut instance.store)
-                .map_err(|err| Self::execution_error("stop", err));
+        let stop_result = if let Some(instance) = self.instance.as_mut() {
+            let result =
+                Self::set_callback_fuel(&mut instance.store, &budget, "stop").and_then(|()| {
+                    instance
+                        .plugin
+                        .rintawa_engine_guest()
+                        .call_stop(&mut instance.store)
+                        .map_err(|err| Self::execution_error("stop", err))
+                });
             instance.store.data_mut().discard_guest_execution();
             instance.store.data_mut().effect_handles.clear();
-            stop_result?;
+            result
+        } else {
+            return Ok(());
+        };
+
+        if let Err(error) = stop_result {
+            self.instance = None;
+            self.failed_lifecycle_callback = Some("stop");
+            return Err(error);
         }
 
         Ok(())

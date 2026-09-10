@@ -19,7 +19,7 @@ pub mod state;
 mod runtime_effects;
 
 pub use engine::{ExtensionEngine, ExtensionState};
-pub use errors::{EngineError, EngineResult};
+pub use errors::{ComponentStopFailure, EngineError, EngineResult};
 pub use loader::ExtensionLoader;
 pub use runtime::{WasmComponent, WasmExecutionBudget, WasmRuntimeEngine};
 pub use secrets::SecretManager;
@@ -50,6 +50,29 @@ mod tests {
         stop_read_denied: Arc<Mutex<bool>>,
     }
 
+    struct LifecycleFailureRuntime {
+        id: ComponentId,
+        contribution_id: Option<&'static str>,
+        fail_start: bool,
+        fail_stop: bool,
+    }
+
+    impl LifecycleFailureRuntime {
+        fn new(
+            id: &str,
+            contribution_id: Option<&'static str>,
+            fail_start: bool,
+            fail_stop: bool,
+        ) -> Self {
+            Self {
+                id: ComponentId::new(id),
+                contribution_id,
+                fail_start,
+                fail_stop,
+            }
+        }
+    }
+
     impl SecretReaderRuntime {
         fn new(
             id: &str,
@@ -72,6 +95,48 @@ mod tests {
                 id: ComponentId::new(id),
                 should_fail_after_registering,
             }
+        }
+    }
+
+    impl Component for LifecycleFailureRuntime {
+        fn id(&self) -> &ComponentId {
+            &self.id
+        }
+
+        fn register(&mut self, ctx: &mut dyn RegistrationContext) -> ExtensionResult<()> {
+            if let Some(contribution_id) = self.contribution_id {
+                ctx.register(ContributionDescriptor::new(
+                    contribution_id,
+                    ContributionKind::capability(),
+                ))?;
+            }
+            Ok(())
+        }
+
+        fn start(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
+            ctx.register_runtime_effect(RuntimeEffect::event_subscription(format!(
+                "test.{}",
+                self.id
+            )))?;
+            if self.fail_start {
+                return Err(ExtensionError::Message(String::from(
+                    "simulated start failure",
+                )));
+            }
+            Ok(())
+        }
+
+        fn stop(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
+            if self.fail_stop {
+                ctx.register_runtime_effect(RuntimeEffect::event_subscription(format!(
+                    "stop.{}",
+                    self.id
+                )))?;
+                return Err(ExtensionError::Message(String::from(
+                    "simulated stop failure",
+                )));
+            }
+            Ok(())
         }
     }
 
@@ -278,6 +343,170 @@ mod tests {
 
         assert!(engine.start_extension(&failed_manifest.id).is_err());
         assert_eq!(engine.active_runtime_effects().len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_stop_failures_are_returned_after_host_cleanup() -> EngineResult<()> {
+        let mut engine = ExtensionEngine::new();
+        let manifest = engine.parse_manifest(
+            r#"
+                id = "stop-failures"
+                name = "Stop Failures"
+                version = "0.0.1"
+                sdk = "^0.0"
+            "#,
+        )?;
+
+        engine.register_extension(
+            manifest.clone(),
+            vec![
+                Box::new(LifecycleFailureRuntime::new(
+                    "first",
+                    Some("stop.first"),
+                    false,
+                    true,
+                )),
+                Box::new(LifecycleFailureRuntime::new(
+                    "second",
+                    Some("stop.second"),
+                    false,
+                    true,
+                )),
+            ],
+        )?;
+        engine.start_extension(&manifest.id)?;
+        assert_eq!(engine.active_contributions().len(), 2);
+        assert_eq!(engine.active_runtime_effects().len(), 2);
+
+        let error = engine.stop_extension(&manifest.id).unwrap_err();
+        match error {
+            EngineError::StopFailed {
+                extension_id,
+                failures,
+            } => {
+                assert_eq!(extension_id, "stop-failures");
+                assert_eq!(
+                    failures,
+                    vec![
+                        ComponentStopFailure {
+                            component_id: String::from("second"),
+                            reason: String::from("simulated stop failure"),
+                        },
+                        ComponentStopFailure {
+                            component_id: String::from("first"),
+                            reason: String::from("simulated stop failure"),
+                        },
+                    ]
+                );
+            }
+            other => panic!("expected StopFailed, got {other:?}"),
+        }
+
+        assert_eq!(
+            engine.extension_state(&manifest.id),
+            Some(ExtensionState::Stopped)
+        );
+        assert!(engine.active_contributions().is_empty());
+        assert!(engine.active_runtime_effects().is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_unregister_propagates_stop_failure_after_host_cleanup() -> EngineResult<()> {
+        let mut engine = ExtensionEngine::new();
+        let manifest = engine.parse_manifest(
+            r#"
+                id = "unregister-stop-failure"
+                name = "Unregister Stop Failure"
+                version = "0.0.1"
+                sdk = "^0.0"
+            "#,
+        )?;
+
+        engine.register_extension(
+            manifest.clone(),
+            vec![Box::new(LifecycleFailureRuntime::new(
+                "runtime",
+                Some("unregister.runtime"),
+                false,
+                true,
+            ))],
+        )?;
+        engine.start_extension(&manifest.id)?;
+
+        assert!(matches!(
+            engine.unregister_extension(&manifest.id),
+            Err(EngineError::StopFailed { .. })
+        ));
+        assert_eq!(
+            engine.extension_state(&manifest.id),
+            Some(ExtensionState::Stopped)
+        );
+        assert!(engine.active_contributions().is_empty());
+        assert!(engine.active_runtime_effects().is_empty());
+
+        engine.unregister_extension(&manifest.id)?;
+        assert_eq!(engine.extension_state(&manifest.id), None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_startup_rollback_failures_are_aggregated_and_effects_revoked() -> EngineResult<()> {
+        let mut engine = ExtensionEngine::new();
+        let manifest = engine.parse_manifest(
+            r#"
+                id = "rollback-failures"
+                name = "Rollback Failures"
+                version = "0.0.1"
+                sdk = "^0.0"
+            "#,
+        )?;
+
+        engine.register_extension(
+            manifest.clone(),
+            vec![
+                Box::new(LifecycleFailureRuntime::new("first", None, false, true)),
+                Box::new(LifecycleFailureRuntime::new("second", None, true, true)),
+            ],
+        )?;
+
+        let error = engine.start_extension(&manifest.id).unwrap_err();
+        match error {
+            EngineError::StartupRollbackFailed {
+                extension_id,
+                component_id,
+                start_reason,
+                rollback_failures,
+            } => {
+                assert_eq!(extension_id, "rollback-failures");
+                assert_eq!(component_id, "second");
+                assert_eq!(start_reason, "simulated start failure");
+                assert_eq!(
+                    rollback_failures,
+                    vec![
+                        ComponentStopFailure {
+                            component_id: String::from("second"),
+                            reason: String::from("simulated stop failure"),
+                        },
+                        ComponentStopFailure {
+                            component_id: String::from("first"),
+                            reason: String::from("simulated stop failure"),
+                        },
+                    ]
+                );
+            }
+            other => panic!("expected StartupRollbackFailed, got {other:?}"),
+        }
+
+        assert_eq!(
+            engine.extension_state(&manifest.id),
+            Some(ExtensionState::Registered)
+        );
+        assert!(engine.active_runtime_effects().is_empty());
 
         Ok(())
     }
