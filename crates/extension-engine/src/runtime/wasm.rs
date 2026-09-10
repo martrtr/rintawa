@@ -96,7 +96,7 @@ mod bindings {
 
 use bindings::Plugin;
 use bindings::rintawa::engine::{
-    host::{Host as HostOperations, LogLevel},
+    host::{Host as HostOperations, LogLevel, PublishError},
     registration::{Error as RegistrationError, Host as RegistrationHost},
     runtime_effects::{Error as RuntimeEffectError, Host as RuntimeEffectsHost},
     secrets::{Error as SecretError, Host as SecretsHost},
@@ -460,12 +460,8 @@ impl HostOperations for WasmHostState {
         }
     }
 
-    fn publish_event(&mut self, topic: String, _payload: Vec<u8>) {
-        debug!(
-            plugin = %self.component_id,
-            topic = %topic,
-            "WASM plugin published event"
-        );
+    fn publish_event(&mut self, _topic: String, _payload: Vec<u8>) -> Result<(), PublishError> {
+        Err(PublishError::Unavailable)
     }
 }
 
@@ -942,6 +938,20 @@ mod tests {
             self.effects.remove(effect_id);
             Ok(())
         }
+    }
+
+    #[test]
+    fn test_should_report_event_publication_as_unavailable() {
+        let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
+
+        assert!(matches!(
+            HostOperations::publish_event(
+                &mut state,
+                String::from("dialogue.message"),
+                b"payload".to_vec(),
+            ),
+            Err(PublishError::Unavailable)
+        ));
     }
 
     #[test]

@@ -14,8 +14,17 @@ interface host {
     /// Logs a message to the host's tracing system.
     log: func(level: log-level, message: string);
 
-    /// Publishes an event to the global event bus.
-    publish-event: func(topic: string, payload: list<u8>);
+    /// An explicit event-publication failure.
+    variant publish-error {
+        /// Event publication is unavailable until the Event Runtime exists.
+        unavailable,
+    }
+
+    /// Requests host event publication.
+    ///
+    /// MVP 0.0.1 has no Event Runtime, so the host returns `unavailable`
+    /// instead of accepting and silently discarding the event.
+    publish-event: func(topic: string, payload: list<u8>) -> result<_, publish-error>;
 
 }
 
