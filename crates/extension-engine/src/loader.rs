@@ -2,7 +2,7 @@
 
 use std::path::{Component as PathComponent, Path};
 
-use rintawa_sdk::{manifest::ExtensionManifest, traits::Component, types::ExtensionId};
+use rintawa_sdk::{traits::Component, types::ExtensionId};
 use tracing::{info, warn};
 
 use crate::{
@@ -80,7 +80,7 @@ impl ExtensionLoader {
     ) -> EngineResult<Option<ExtensionId>> {
         let manifest_path = ext_dir.join("manifest.toml");
         let raw_manifest = std::fs::read_to_string(&manifest_path)?;
-        let manifest: ExtensionManifest = toml::from_str(&raw_manifest)?;
+        let manifest = engine.parse_manifest(&raw_manifest)?;
 
         let ext_id_str = manifest.id.as_str();
 

@@ -427,4 +427,42 @@ mod tests {
 
         Ok(())
     }
+    #[test]
+    fn test_should_reject_programmatic_manifest_with_duplicate_component_principals() {
+        let mut engine = ExtensionEngine::new();
+        let manifest = ExtensionManifest {
+            id: ExtensionId::new("duplicate-principals"),
+            name: String::from("Duplicate Principals"),
+            version: String::from("0.0.1"),
+            sdk: String::from("^0.0"),
+            components: vec![
+                ComponentDescriptor {
+                    id: ComponentId::new("provider"),
+                    kind: ComponentKind::Runtime,
+                    target: ComponentTarget::new("native"),
+                    entry: None,
+                    required: true,
+                    permissions: ComponentPermissions {
+                        secret_read: vec![SecretPathPattern::parse("ai.api_keys.*").unwrap()],
+                    },
+                },
+                ComponentDescriptor {
+                    id: ComponentId::new("provider"),
+                    kind: ComponentKind::Runtime,
+                    target: ComponentTarget::new("native"),
+                    entry: None,
+                    required: true,
+                    permissions: ComponentPermissions::default(),
+                },
+            ],
+        };
+        let error = engine.register_extension(manifest, Vec::new()).unwrap_err();
+        assert!(matches!(error, EngineError::ManifestValidation(
+            ManifestValidationError::DuplicateComponentId { extension_id, component_id }
+        ) if extension_id.as_str() == "duplicate-principals" && component_id.as_str() == "provider"));
+        assert_eq!(
+            engine.extension_state(&ExtensionId::new("duplicate-principals")),
+            None
+        );
+    }
 }

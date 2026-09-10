@@ -3,7 +3,10 @@
 //! This module provides types for describing the structure of extension manifests
 //! and the components that extensions declare.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::{
     secrets::SecretPathPattern,
@@ -74,12 +77,28 @@ pub struct ComponentDescriptor {
     pub permissions: ComponentPermissions,
 }
 
+/// Semantic validation errors for an extension manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ManifestValidationError {
+    /// Two or more components use the same component identifier.
+    #[error("duplicate component ID `{component_id}` in extension `{extension_id}`")]
+    DuplicateComponentId {
+        /// Extension containing the duplicate component declaration.
+        extension_id: ExtensionId,
+        /// Component identifier declared more than once.
+        component_id: ComponentId,
+    },
+}
+
 /// The minimal manifest for a Rintawa extension package.
 ///
 /// The manifest is the primary way to declare an extension's metadata and
-/// components. It serves as the entry point for Extension Engine parsing and
-/// validation. SDK 0.0.1 does not yet define validation or runtime semantics
-/// for inter-extension dependencies or declarative contributions. Component
+/// components. Structural validity is enforced during deserialization, while
+/// [`ExtensionManifest::validate`] enforces semantic package invariants such as
+/// unique component IDs.
+///
+/// SDK 0.0.1 does not yet define validation or runtime semantics for
+/// inter-extension dependencies or declarative contributions. Component
 /// permission requests are parsed, but their grants remain an explicit host
 /// policy decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +118,27 @@ pub struct ExtensionManifest {
     /// Components defined by the extension.
     #[serde(default)]
     pub components: Vec<ComponentDescriptor>,
+}
+
+impl ExtensionManifest {
+    /// Validates semantic invariants that cannot be enforced by TOML parsing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManifestValidationError::DuplicateComponentId`] when multiple
+    /// component descriptors declare the same component ID.
+    pub fn validate(&self) -> Result<(), ManifestValidationError> {
+        let mut component_ids = HashSet::with_capacity(self.components.len());
+        for component in &self.components {
+            if !component_ids.insert(component.id.as_str()) {
+                return Err(ManifestValidationError::DuplicateComponentId {
+                    extension_id: self.id.clone(),
+                    component_id: component.id.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -209,6 +249,55 @@ mod tests {
             vec![SecretPathPattern::parse("ai.api_keys.*").unwrap()]
         );
 
+        Ok(())
+    }
+    #[test]
+    fn test_should_reject_duplicate_component_ids() -> Result<(), toml::de::Error> {
+        let manifest: ExtensionManifest = toml::from_str(
+            r#"
+            id = "duplicate-components"
+            name = "Duplicate Components"
+            version = "0.0.1"
+            sdk = "^0.0"
+            [[components]]
+            id = "runtime"
+            kind = "runtime"
+            target = "wasm"
+            [[components]]
+            id = "runtime"
+            kind = "runtime"
+            target = "native"
+        "#,
+        )?;
+        assert_eq!(
+            manifest.validate(),
+            Err(ManifestValidationError::DuplicateComponentId {
+                extension_id: ExtensionId::new("duplicate-components"),
+                component_id: ComponentId::new("runtime"),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_accept_unique_component_ids() -> Result<(), toml::de::Error> {
+        let manifest: ExtensionManifest = toml::from_str(
+            r#"
+            id = "unique-components"
+            name = "Unique Components"
+            version = "0.0.1"
+            sdk = "^0.0"
+            [[components]]
+            id = "runtime"
+            kind = "runtime"
+            target = "wasm"
+            [[components]]
+            id = "settings-ui"
+            kind = "ui"
+            target = "web"
+        "#,
+        )?;
+        assert_eq!(manifest.validate(), Ok(()));
         Ok(())
     }
 }

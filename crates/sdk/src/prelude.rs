@@ -20,6 +20,7 @@ pub use crate::errors::{ExtensionError, ExtensionResult};
 
 pub use crate::manifest::{
     ComponentDescriptor, ComponentKind, ComponentPermissions, ExtensionManifest,
+    ManifestValidationError,
 };
 
 pub use crate::runtime_effects::RuntimeEffect;

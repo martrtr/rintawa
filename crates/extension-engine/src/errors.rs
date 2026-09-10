@@ -1,7 +1,8 @@
 //! Error types for the Rintawa Extension Engine.
 
-use rintawa_sdk::errors::ExtensionError;
-use rintawa_sdk::secrets::SecretAccessError;
+use rintawa_sdk::{
+    errors::ExtensionError, manifest::ManifestValidationError, secrets::SecretAccessError,
+};
 use std::io;
 use thiserror::Error;
 
@@ -19,6 +20,10 @@ pub enum EngineError {
     /// An error occurred while parsing an extension manifest.
     #[error("failed to parse manifest: {0}")]
     ManifestParse(#[from] toml::de::Error),
+
+    /// An extension manifest is structurally valid but violates a semantic invariant.
+    #[error("invalid extension manifest: {0}")]
+    ManifestValidation(#[from] ManifestValidationError),
 
     /// An error occurred while serializing configuration state.
     #[error("failed to serialize state: {0}")]

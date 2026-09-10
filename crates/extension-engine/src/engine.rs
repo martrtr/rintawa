@@ -90,13 +90,15 @@ impl ExtensionEngine {
         WasmRuntimeEngine::with_secret_manager(self.secrets.clone())
     }
 
-    /// Parses an extension manifest from a TOML string.
+    /// Parses and validates an extension manifest from a TOML string.
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::ManifestParse`] if the manifest structure is invalid TOML.
+    /// Returns [`EngineError::ManifestParse`] if the manifest structure is invalid
+    /// TOML, or [`EngineError::ManifestValidation`] if it violates a semantic invariant.
     pub fn parse_manifest(&self, raw_toml: &str) -> EngineResult<ExtensionManifest> {
         let manifest: ExtensionManifest = toml::from_str(raw_toml)?;
+        manifest.validate()?;
         Ok(manifest)
     }
 
@@ -106,13 +108,17 @@ impl ExtensionEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::ExtensionAlreadyExists`] if the ID is taken,
-    /// or [`EngineError::LifecycleFailed`] if duplicate contributions or component errors occur.
+    /// Returns [`EngineError::ManifestValidation`] if the manifest violates a
+    /// semantic invariant, [`EngineError::ExtensionAlreadyExists`] if the extension
+    /// ID is taken, or [`EngineError::LifecycleFailed`] if duplicate contributions
+    /// or component errors occur.
     pub fn register_extension(
         &mut self,
         manifest: ExtensionManifest,
         mut components: Vec<Box<dyn Component>>,
     ) -> EngineResult<()> {
+        manifest.validate()?;
+
         if self.extensions.contains_key(&manifest.id) {
             return Err(EngineError::ExtensionAlreadyExists(
                 manifest.id.as_str().to_string(),
