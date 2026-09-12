@@ -73,6 +73,22 @@ pub enum ExtensionError {
     #[error("secret access failed: {0}")]
     SecretAccess(#[from] SecretAccessError),
 
+    /// The component defined the same contract more than once.
+    #[error("duplicate contract definition `{0}`")]
+    DuplicateContractDefinition(String),
+
+    /// The component registered the same contract provider more than once.
+    #[error("duplicate contract provider `{0}`")]
+    DuplicateContractProvider(String),
+
+    /// The component registered the same contract consumer more than once.
+    #[error("duplicate contract consumer `{0}`")]
+    DuplicateContractConsumer(String),
+
+    /// The host cannot register contract metadata in the current context.
+    #[error("contract registration is unavailable in this component context")]
+    ContractRegistrationUnavailable,
+
     /// A generic error with a message.
     #[error("{0}")]
     Message(String),

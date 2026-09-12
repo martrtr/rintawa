@@ -3,6 +3,7 @@
 use rintawa_sdk::{
     api::{LogLevel, LoggerApi},
     context::{ComponentContext, RegistrationContext},
+    contracts::{ContractConsumer, ContractDefinition, ContractProvider},
     contributions::ContributionDescriptor,
     errors::{ExtensionError, ExtensionResult},
     runtime_effects::RuntimeEffect,
@@ -12,8 +13,11 @@ use rintawa_sdk::{
 use std::collections::HashSet;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::runtime_effects::RuntimeEffectRegistry;
-use crate::secrets::SecretManager;
+use crate::{
+    composition::{OwnedContractConsumer, OwnedContractDefinition, OwnedContractProvider},
+    runtime_effects::RuntimeEffectRegistry,
+    secrets::SecretManager,
+};
 
 /// Engine logger redirecting SDK logs to the `tracing` ecosystem.
 #[derive(Debug, Clone)]
@@ -53,15 +57,21 @@ pub struct EngineRegistrationContext<'a> {
     component_id: ComponentId,
     logger: EngineLogger,
     registered_contributions: &'a mut Vec<ContributionDescriptor>,
+    contract_definitions: &'a mut Vec<OwnedContractDefinition>,
+    contract_providers: &'a mut Vec<OwnedContractProvider>,
+    contract_consumers: &'a mut Vec<OwnedContractConsumer>,
     active_contribution_ids: &'a HashSet<ContributionId>,
 }
 
 impl<'a> EngineRegistrationContext<'a> {
     /// Creates a new registration context instance.
-    pub fn new(
+    pub(crate) fn new(
         extension_id: ExtensionId,
         component_id: ComponentId,
         registered_contributions: &'a mut Vec<ContributionDescriptor>,
+        contract_definitions: &'a mut Vec<OwnedContractDefinition>,
+        contract_providers: &'a mut Vec<OwnedContractProvider>,
+        contract_consumers: &'a mut Vec<OwnedContractConsumer>,
         active_contribution_ids: &'a HashSet<ContributionId>,
     ) -> Self {
         let logger = EngineLogger::new(extension_id.clone(), component_id.clone());
@@ -70,6 +80,9 @@ impl<'a> EngineRegistrationContext<'a> {
             component_id,
             logger,
             registered_contributions,
+            contract_definitions,
+            contract_providers,
+            contract_consumers,
             active_contribution_ids,
         }
     }
@@ -103,6 +116,57 @@ impl<'a> RegistrationContext for EngineRegistrationContext<'a> {
         }
 
         self.registered_contributions.push(contribution);
+        Ok(())
+    }
+
+    fn define_contract(&mut self, definition: ContractDefinition) -> ExtensionResult<()> {
+        let owner = rintawa_sdk::contracts::ComponentRef::new(
+            self.extension_id.clone(),
+            self.component_id.clone(),
+        );
+        if self.contract_definitions.iter().any(|registered| {
+            registered.owner == owner && registered.definition.contract == definition.contract
+        }) {
+            return Err(ExtensionError::DuplicateContractDefinition(
+                definition.contract.to_string(),
+            ));
+        }
+        self.contract_definitions
+            .push(OwnedContractDefinition { owner, definition });
+        Ok(())
+    }
+
+    fn provide_contract(&mut self, provider: ContractProvider) -> ExtensionResult<()> {
+        let owner = rintawa_sdk::contracts::ComponentRef::new(
+            self.extension_id.clone(),
+            self.component_id.clone(),
+        );
+        if self.contract_providers.iter().any(|registered| {
+            registered.owner == owner && registered.provider.contract == provider.contract
+        }) {
+            return Err(ExtensionError::DuplicateContractProvider(
+                provider.contract.to_string(),
+            ));
+        }
+        self.contract_providers
+            .push(OwnedContractProvider { owner, provider });
+        Ok(())
+    }
+
+    fn consume_contract(&mut self, consumer: ContractConsumer) -> ExtensionResult<()> {
+        let owner = rintawa_sdk::contracts::ComponentRef::new(
+            self.extension_id.clone(),
+            self.component_id.clone(),
+        );
+        if self.contract_consumers.iter().any(|registered| {
+            registered.owner == owner && registered.consumer.contract == consumer.contract
+        }) {
+            return Err(ExtensionError::DuplicateContractConsumer(
+                consumer.contract.to_string(),
+            ));
+        }
+        self.contract_consumers
+            .push(OwnedContractConsumer { owner, consumer });
         Ok(())
     }
 }

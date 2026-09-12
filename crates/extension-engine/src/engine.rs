@@ -1,6 +1,7 @@
 //! Main Extension Engine implementation managing lifecycle and contributions.
 
 use rintawa_sdk::{
+    contracts::{ComponentRef, ContractKey},
     contributions::ContributionDescriptor,
     manifest::ExtensionManifest,
     runtime_effects::RuntimeEffect,
@@ -11,6 +12,10 @@ use rintawa_sdk::{
 use std::collections::{HashMap, HashSet};
 
 use crate::{
+    composition::{
+        CompositionSnapshot, OwnedContractConsumer, OwnedContractDefinition, OwnedContractProvider,
+        resolve_contracts,
+    },
     context::{EngineComponentContext, EngineRegistrationContext},
     errors::{ComponentStopFailure, EngineError, EngineResult},
     runtime::WasmRuntimeEngine,
@@ -37,6 +42,9 @@ struct ManagedExtension {
     state: ExtensionState,
     components: Vec<Box<dyn Component>>,
     contributions: Vec<OwnedContribution>,
+    contract_definitions: Vec<OwnedContractDefinition>,
+    contract_providers: Vec<OwnedContractProvider>,
+    contract_consumers: Vec<OwnedContractConsumer>,
 }
 
 /// A contribution registered by a specific component within an extension.
@@ -52,6 +60,7 @@ pub struct ExtensionEngine {
     active_contributions: HashSet<ContributionId>,
     runtime_effects: RuntimeEffectRegistry,
     secrets: SecretManager,
+    preferred_contract_providers: HashMap<ContractKey, ComponentRef>,
 }
 
 impl ExtensionEngine {
@@ -105,6 +114,37 @@ impl ExtensionEngine {
         Ok(manifest)
     }
 
+    fn validate_contract_definitions(
+        &self,
+        incoming: &[OwnedContractDefinition],
+    ) -> EngineResult<()> {
+        let mut definitions = HashMap::new();
+        for extension in self.extensions.values() {
+            for owned in &extension.contract_definitions {
+                definitions.insert(
+                    owned.definition.contract.clone(),
+                    owned.definition.resolution,
+                );
+            }
+        }
+
+        for owned in incoming {
+            let definition = &owned.definition;
+            if let Some(existing) = definitions.get(&definition.contract) {
+                if *existing != definition.resolution {
+                    return Err(EngineError::ContractDefinitionConflict {
+                        contract: definition.contract.to_string(),
+                        existing: existing.to_string(),
+                        incoming: definition.resolution.to_string(),
+                    });
+                }
+            } else {
+                definitions.insert(definition.contract.clone(), definition.resolution);
+            }
+        }
+        Ok(())
+    }
+
     /// Registers an extension and its native components into the engine.
     ///
     /// Runs the `register` phase on all supplied components and tracks contributions.
@@ -130,6 +170,9 @@ impl ExtensionEngine {
 
         let mut registered_descriptors = Vec::new();
         let mut extension_contributions = Vec::new();
+        let mut contract_definitions = Vec::new();
+        let mut contract_providers = Vec::new();
+        let mut contract_consumers = Vec::new();
 
         for comp in &mut components {
             let first_contribution = registered_descriptors.len();
@@ -137,6 +180,9 @@ impl ExtensionEngine {
                 manifest.id.clone(),
                 comp.id().clone(),
                 &mut registered_descriptors,
+                &mut contract_definitions,
+                &mut contract_providers,
+                &mut contract_consumers,
                 &self.active_contributions,
             );
 
@@ -159,6 +205,8 @@ impl ExtensionEngine {
             );
         }
 
+        self.validate_contract_definitions(&contract_definitions)?;
+
         for contrib in &extension_contributions {
             self.active_contributions
                 .insert(contrib.descriptor.id.clone());
@@ -169,6 +217,9 @@ impl ExtensionEngine {
             state: ExtensionState::Registered,
             components,
             contributions: extension_contributions,
+            contract_definitions,
+            contract_providers,
+            contract_consumers,
         };
 
         self.extensions.insert(manifest.id, managed);
@@ -431,6 +482,45 @@ impl ExtensionEngine {
             }
         }
         Ok(())
+    }
+
+    /// Selects the preferred provider for a single-provider contract.
+    pub fn set_preferred_contract_provider(
+        &mut self,
+        contract: ContractKey,
+        provider: ComponentRef,
+    ) {
+        self.preferred_contract_providers.insert(contract, provider);
+    }
+
+    /// Removes an explicit preferred-provider selection.
+    pub fn clear_preferred_contract_provider(&mut self, contract: &ContractKey) {
+        self.preferred_contract_providers.remove(contract);
+    }
+
+    /// Resolves the current active contract composition.
+    pub fn composition_snapshot(&self) -> CompositionSnapshot {
+        let mut definitions = Vec::new();
+        let mut providers = Vec::new();
+        let mut consumers = Vec::new();
+
+        for extension in self
+            .extensions
+            .values()
+            .filter(|extension| extension.state == ExtensionState::Active)
+        {
+            definitions.extend(extension.contract_definitions.iter().cloned());
+            providers.extend(extension.contract_providers.iter().cloned());
+            consumers.extend(extension.contract_consumers.iter().cloned());
+        }
+
+        resolve_contracts(
+            &definitions,
+            &providers,
+            &consumers,
+            &self.preferred_contract_providers,
+            &self.secrets,
+        )
     }
 
     /// Returns a list of all currently active contribution descriptors across registered extensions.

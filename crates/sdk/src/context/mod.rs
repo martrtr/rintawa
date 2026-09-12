@@ -5,6 +5,7 @@
 
 use crate::{
     api::LoggerApi,
+    contracts::{ContractConsumer, ContractDefinition, ContractProvider},
     contributions::ContributionDescriptor,
     errors::ExtensionResult,
     runtime_effects::RuntimeEffect,
@@ -84,4 +85,34 @@ pub trait RegistrationContext: ComponentContext {
     /// Returns [`crate::errors::ExtensionError::DuplicateContribution`] if another active
     /// registration already owns the contribution identifier.
     fn register(&mut self, contribution: ContributionDescriptor) -> ExtensionResult<()>;
+
+    /// Defines one versioned contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this context cannot register contract metadata or
+    /// the component already defined the same contract.
+    fn define_contract(&mut self, _definition: ContractDefinition) -> ExtensionResult<()> {
+        Err(crate::errors::ExtensionError::ContractRegistrationUnavailable)
+    }
+
+    /// Registers this component as a provider of one contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this context cannot register contract metadata or
+    /// the component already provides the same contract.
+    fn provide_contract(&mut self, _provider: ContractProvider) -> ExtensionResult<()> {
+        Err(crate::errors::ExtensionError::ContractRegistrationUnavailable)
+    }
+
+    /// Registers this component as a consumer of one contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this context cannot register contract metadata or
+    /// the component already consumes the same contract.
+    fn consume_contract(&mut self, _consumer: ContractConsumer) -> ExtensionResult<()> {
+        Err(crate::errors::ExtensionError::ContractRegistrationUnavailable)
+    }
 }

@@ -14,6 +14,10 @@ pub use crate::api::{LogLevel, LoggerApi};
 
 pub use crate::context::{ComponentContext, RegistrationContext};
 
+pub use crate::contracts::{
+    ComponentRef, ContractConsumer, ContractDefinition, ContractGrantRequirement, ContractKey,
+    ContractProvider, ContractResolutionPolicy, ContractVersion,
+};
 pub use crate::contributions::{ContributionDescriptor, ContributionKind};
 
 pub use crate::errors::{ExtensionError, ExtensionResult};
@@ -30,5 +34,5 @@ pub use crate::secrets::{SecretAccessError, SecretPath, SecretPathPattern, Secre
 pub use crate::traits::Component;
 
 pub use crate::types::{
-    ComponentId, ComponentTarget, ContributionId, ExtensionId, RuntimeEffectId,
+    ComponentId, ComponentTarget, ContractId, ContributionId, ExtensionId, RuntimeEffectId,
 };

@@ -197,6 +197,27 @@ impl SecretManager {
         Ok(())
     }
 
+    /// Returns whether one component currently holds a grant covering `pattern`.
+    pub(crate) fn has_read_grant(
+        &self,
+        extension_id: &ExtensionId,
+        component_id: &ComponentId,
+        pattern: &SecretPathPattern,
+    ) -> bool {
+        let principal = SecretPrincipal::new(extension_id.clone(), component_id.clone());
+        self.read_grants
+            .read()
+            .ok()
+            .and_then(|grants| {
+                grants.get(&principal).map(|patterns| {
+                    patterns
+                        .iter()
+                        .any(|granted| granted.allows_pattern(pattern))
+                })
+            })
+            .unwrap_or(false)
+    }
+
     /// Revokes every secret grant held by one component.
     pub fn revoke_component(&self, extension_id: &ExtensionId, component_id: &ComponentId) {
         if let Ok(mut grants) = self.read_grants.write() {

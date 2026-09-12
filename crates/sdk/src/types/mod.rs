@@ -66,6 +66,7 @@ string_id!(
     ComponentId,
     "An identifier for a component in an extension."
 );
+string_id!(ContractId, "An identifier for a versioned public contract.");
 string_id!(
     ContributionId,
     "An identifier for an extension contribution."

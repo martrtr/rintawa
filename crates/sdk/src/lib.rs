@@ -28,6 +28,7 @@
 
 pub mod api;
 pub mod context;
+pub mod contracts;
 pub mod contributions;
 pub mod errors;
 pub mod manifest;

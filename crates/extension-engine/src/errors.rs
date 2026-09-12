@@ -85,6 +85,17 @@ pub enum EngineError {
     #[error("WASM runtime error: {0}")]
     WasmRuntime(#[from] wasmtime::Error),
 
+    /// Active contract definitions disagree about one contract's resolution policy.
+    #[error("conflicting definitions for contract `{contract}`: `{existing}` versus `{incoming}`")]
+    ContractDefinitionConflict {
+        /// Contract whose definitions disagree.
+        contract: String,
+        /// Previously registered resolution policy.
+        existing: String,
+        /// Incoming resolution policy.
+        incoming: String,
+    },
+
     /// The specified extension was not found in the engine.
     #[error("extension `{0}` not found")]
     ExtensionNotFound(String),

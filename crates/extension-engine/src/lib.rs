@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs, rustdoc::broken_intra_doc_links)]
 
+pub mod composition;
 pub mod context;
 pub mod engine;
 pub mod errors;
@@ -18,6 +19,9 @@ pub mod state;
 
 mod runtime_effects;
 
+pub use composition::{
+    CompositionSnapshot, ContractBinding, UnresolvedContract, UnresolvedContractReason,
+};
 pub use engine::{ExtensionEngine, ExtensionState};
 pub use errors::{ComponentStopFailure, EngineError, EngineResult};
 pub use loader::ExtensionLoader;
