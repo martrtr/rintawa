@@ -95,6 +95,26 @@ impl fmt::Display for ContractResolutionPolicy {
     }
 }
 
+/// Declares how a resolved contract is used by the host.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContractProtocol {
+    /// The contract only participates in provider/consumer composition.
+    #[default]
+    Binding,
+    /// The contract exposes host-routed service operations.
+    Service,
+}
+
+impl fmt::Display for ContractProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Binding => f.write_str("binding"),
+            Self::Service => f.write_str("service"),
+        }
+    }
+}
+
 /// Defines a contract and its provider resolution policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContractDefinition {
@@ -102,14 +122,27 @@ pub struct ContractDefinition {
     pub contract: ContractKey,
     /// Provider composition policy.
     pub resolution: ContractResolutionPolicy,
+    /// Host interaction protocol for this contract.
+    #[serde(default)]
+    pub protocol: ContractProtocol,
 }
 
 impl ContractDefinition {
-    /// Creates a contract definition.
+    /// Creates a composition-only contract definition.
     pub fn new(contract: ContractKey, resolution: ContractResolutionPolicy) -> Self {
         Self {
             contract,
             resolution,
+            protocol: ContractProtocol::Binding,
+        }
+    }
+
+    /// Creates a host-routed service contract definition.
+    pub fn service(contract: ContractKey, resolution: ContractResolutionPolicy) -> Self {
+        Self {
+            contract,
+            resolution,
+            protocol: ContractProtocol::Service,
         }
     }
 }

@@ -117,6 +117,12 @@ const PUBLISH_EVENT_UNAVAILABLE_WASM_COMPONENT: &str = r#"
                 (then unreachable)))
         (func (export "stop"))
         (func (export "on-event") (param i32 i32 i32 i32))
+        (func (export "handle-service")
+            (param i32 i32 i32 i32 i32)
+            (result i32)
+            (i32.store (i32.const 112) (i32.const 0))
+            (i32.store offset=4 (i32.const 112) (i32.const 0))
+            (i32.const 112))
     )
     (core instance $instance (instantiate $module
         (with "memory" (instance $memory-core))
@@ -127,10 +133,17 @@ const PUBLISH_EVENT_UNAVAILABLE_WASM_COMPONENT: &str = r#"
     (alias core export $instance "start" (core func $start))
     (alias core export $instance "stop" (core func $stop))
     (alias core export $instance "on-event" (core func $on-event))
+    (alias core export $instance "handle-service" (core func $handle-service))
 
     (type $lifecycle (func))
     (type $on-event-type
         (func (param "topic" string) (param "payload" (list u8))))
+    (type $handle-service-type
+        (func
+            (param "contract" string)
+            (param "version" u32)
+            (param "payload" (list u8))
+            (result (list u8))))
     (func $register-lifted (type $lifecycle)
         (canon lift (core func $register)))
     (func $start-lifted (type $lifecycle)
@@ -143,30 +156,46 @@ const PUBLISH_EVENT_UNAVAILABLE_WASM_COMPONENT: &str = r#"
             (memory $memory)
             (realloc $realloc)
             string-encoding=utf8))
+    (func $handle-service-lifted (type $handle-service-type)
+        (canon lift
+            (core func $handle-service)
+            (memory $memory)
+            (realloc $realloc)
+            string-encoding=utf8))
     (type $guest (instance
         (export "register" (func (type $lifecycle)))
         (export "start" (func (type $lifecycle)))
         (export "stop" (func (type $lifecycle)))
         (export "on-event" (func (type $on-event-type)))
+        (export "handle-service" (func (type $handle-service-type)))
     ))
     (component $guest-shim
         (type $lifecycle (func))
         (type $on-event-type
             (func (param "topic" string) (param "payload" (list u8))))
+        (type $handle-service-type
+            (func
+                (param "contract" string)
+                (param "version" u32)
+                (param "payload" (list u8))
+                (result (list u8))))
         (import "register" (func $register (type $lifecycle)))
         (import "start" (func $start (type $lifecycle)))
         (import "stop" (func $stop (type $lifecycle)))
         (import "on-event" (func $on-event (type $on-event-type)))
+        (import "handle-service" (func $handle-service (type $handle-service-type)))
         (export "register" (func $register))
         (export "start" (func $start))
         (export "stop" (func $stop))
         (export "on-event" (func $on-event))
+        (export "handle-service" (func $handle-service))
     )
     (instance $guest-instance (instantiate $guest-shim
         (with "register" (func $register-lifted))
         (with "start" (func $start-lifted))
         (with "stop" (func $stop-lifted))
         (with "on-event" (func $on-event-lifted))
+        (with "handle-service" (func $handle-service-lifted))
     ))
     (export "rintawa:engine/guest@0.0.1" (instance $guest-instance))
 )

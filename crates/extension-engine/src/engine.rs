@@ -9,7 +9,10 @@ use rintawa_sdk::{
     traits::Component,
     types::{ComponentId, ContributionId, ExtensionId, RuntimeEffectId},
 };
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+};
 
 use crate::{
     composition::{
@@ -21,6 +24,7 @@ use crate::{
     runtime::WasmRuntimeEngine,
     runtime_effects::RuntimeEffectRegistry,
     secrets::SecretManager,
+    services::{ComponentHandle, ServiceRuntime},
 };
 
 /// Represents the active lifecycle state of an extension in the engine.
@@ -40,11 +44,46 @@ pub enum ExtensionState {
 struct ManagedExtension {
     manifest: ExtensionManifest,
     state: ExtensionState,
-    components: Vec<Box<dyn Component>>,
+    components: Vec<ManagedComponent>,
     contributions: Vec<OwnedContribution>,
     contract_definitions: Vec<OwnedContractDefinition>,
     contract_providers: Vec<OwnedContractProvider>,
     contract_consumers: Vec<OwnedContractConsumer>,
+}
+
+struct ManagedComponent {
+    id: ComponentId,
+    handle: ComponentHandle,
+}
+
+impl ManagedComponent {
+    fn id(&self) -> &ComponentId {
+        &self.id
+    }
+
+    fn start(
+        &self,
+        context: &mut dyn rintawa_sdk::context::ComponentContext,
+    ) -> rintawa_sdk::errors::ExtensionResult<()> {
+        let mut component = self.handle.lock().map_err(|_| {
+            rintawa_sdk::errors::ExtensionError::Message(String::from(
+                "component lock was poisoned",
+            ))
+        })?;
+        component.start(context)
+    }
+
+    fn stop(
+        &self,
+        context: &mut dyn rintawa_sdk::context::ComponentContext,
+    ) -> rintawa_sdk::errors::ExtensionResult<()> {
+        let mut component = self.handle.lock().map_err(|_| {
+            rintawa_sdk::errors::ExtensionError::Message(String::from(
+                "component lock was poisoned",
+            ))
+        })?;
+        component.stop(context)
+    }
 }
 
 /// A contribution registered by a specific component within an extension.
@@ -54,13 +93,28 @@ struct OwnedContribution {
 }
 
 /// The core engine managing extensions, native components, and contributions.
-#[derive(Default)]
 pub struct ExtensionEngine {
     extensions: HashMap<ExtensionId, ManagedExtension>,
     active_contributions: HashSet<ContributionId>,
     runtime_effects: RuntimeEffectRegistry,
     secrets: SecretManager,
+    services: ServiceRuntime,
     preferred_contract_providers: HashMap<ContractKey, ComponentRef>,
+}
+
+impl Default for ExtensionEngine {
+    fn default() -> Self {
+        let secrets = SecretManager::default();
+        let services = ServiceRuntime::new(secrets.clone());
+        Self {
+            extensions: HashMap::new(),
+            active_contributions: HashSet::new(),
+            runtime_effects: RuntimeEffectRegistry::default(),
+            secrets,
+            services,
+            preferred_contract_providers: HashMap::new(),
+        }
+    }
 }
 
 impl ExtensionEngine {
@@ -74,9 +128,14 @@ impl ExtensionEngine {
     /// Rintawa should supply its production credential-store manager here.
     /// The engine's internal tests use an in-memory vault separately.
     pub fn with_secret_manager(secrets: SecretManager) -> Self {
+        let services = ServiceRuntime::new(secrets.clone());
         Self {
+            extensions: HashMap::new(),
+            active_contributions: HashSet::new(),
+            runtime_effects: RuntimeEffectRegistry::default(),
             secrets,
-            ..Self::default()
+            services,
+            preferred_contract_providers: HashMap::new(),
         }
     }
 
@@ -99,7 +158,7 @@ impl ExtensionEngine {
     /// Returns [`EngineError::WasmRuntime`] when Wasmtime cannot create the
     /// configured Component Model engine.
     pub fn wasm_runtime_engine(&self) -> EngineResult<WasmRuntimeEngine> {
-        WasmRuntimeEngine::with_secret_manager(self.secrets.clone())
+        WasmRuntimeEngine::with_host_services(self.secrets.clone(), self.services.clone())
     }
 
     /// Parses and validates an extension manifest from a TOML string.
@@ -123,7 +182,7 @@ impl ExtensionEngine {
             for owned in &extension.contract_definitions {
                 definitions.insert(
                     owned.definition.contract.clone(),
-                    owned.definition.resolution,
+                    (owned.definition.resolution, owned.definition.protocol),
                 );
             }
         }
@@ -131,15 +190,19 @@ impl ExtensionEngine {
         for owned in incoming {
             let definition = &owned.definition;
             if let Some(existing) = definitions.get(&definition.contract) {
-                if *existing != definition.resolution {
+                let incoming = (definition.resolution, definition.protocol);
+                if *existing != incoming {
                     return Err(EngineError::ContractDefinitionConflict {
                         contract: definition.contract.to_string(),
-                        existing: existing.to_string(),
-                        incoming: definition.resolution.to_string(),
+                        existing: format!("{}/{}", existing.1, existing.0),
+                        incoming: format!("{}/{}", incoming.1, incoming.0),
                     });
                 }
             } else {
-                definitions.insert(definition.contract.clone(), definition.resolution);
+                definitions.insert(
+                    definition.contract.clone(),
+                    (definition.resolution, definition.protocol),
+                );
             }
         }
         Ok(())
@@ -206,6 +269,29 @@ impl ExtensionEngine {
         }
 
         self.validate_contract_definitions(&contract_definitions)?;
+
+        let components: Vec<_> = components
+            .into_iter()
+            .map(|component| {
+                let id = component.id().clone();
+                ManagedComponent {
+                    id,
+                    handle: Arc::new(Mutex::new(component)),
+                }
+            })
+            .collect();
+
+        self.services
+            .register_extension(
+                manifest.id.clone(),
+                contract_definitions.clone(),
+                contract_providers.clone(),
+                contract_consumers.clone(),
+                components
+                    .iter()
+                    .map(|component| (component.id.clone(), component.handle.clone())),
+            )
+            .map_err(|()| EngineError::ServiceRuntimeUnavailable)?;
 
         for contrib in &extension_contributions {
             self.active_contributions
@@ -330,6 +416,7 @@ impl ExtensionEngine {
                 comp.id().clone(),
                 runtime_effects,
                 &self.secrets,
+                &self.services,
                 true,
             );
 
@@ -343,6 +430,7 @@ impl ExtensionEngine {
                     comp.id().clone(),
                     runtime_effects,
                     &self.secrets,
+                    &self.services,
                     false,
                 );
                 if let Err(stop_error) = comp.stop(&mut failed_stop_context) {
@@ -360,6 +448,7 @@ impl ExtensionEngine {
                         comp_to_stop.id().clone(),
                         runtime_effects,
                         &self.secrets,
+                        &self.services,
                         false,
                     );
                     if let Err(stop_error) = comp_to_stop.stop(&mut stop_ctx) {
@@ -397,6 +486,7 @@ impl ExtensionEngine {
         }
 
         ext.state = ExtensionState::Active;
+        self.services.set_active(extension_id, true);
         Ok(())
     }
 
@@ -418,6 +508,8 @@ impl ExtensionEngine {
             return Ok(());
         }
 
+        self.services.set_active(extension_id, false);
+
         let mut stop_failures = Vec::new();
         for comp in ext.components.iter_mut().rev() {
             let component_id = comp.id().as_str().to_string();
@@ -426,6 +518,7 @@ impl ExtensionEngine {
                 comp.id().clone(),
                 runtime_effects,
                 &self.secrets,
+                &self.services,
                 false,
             );
             if let Err(err) = comp.stop(&mut ctx) {
@@ -478,8 +571,9 @@ impl ExtensionEngine {
                 self.secrets.revoke_component(extension_id, &component.id);
             }
             for component in extension.components {
-                self.secrets.revoke_component(extension_id, component.id());
+                self.secrets.revoke_component(extension_id, &component.id);
             }
+            self.services.unregister_extension(extension_id);
         }
         Ok(())
     }
@@ -490,12 +584,30 @@ impl ExtensionEngine {
         contract: ContractKey,
         provider: ComponentRef,
     ) {
-        self.preferred_contract_providers.insert(contract, provider);
+        self.preferred_contract_providers
+            .insert(contract.clone(), provider.clone());
+        self.services.set_preferred_provider(contract, provider);
     }
 
     /// Removes an explicit preferred-provider selection.
     pub fn clear_preferred_contract_provider(&mut self, contract: &ContractKey) {
         self.preferred_contract_providers.remove(contract);
+        self.services.clear_preferred_provider(contract);
+    }
+
+    /// Calls a unary service on behalf of an active consumer component.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport-level service error when the consumer has no usable
+    /// single-provider binding or provider execution fails.
+    pub fn call_service(
+        &self,
+        consumer: &ComponentRef,
+        contract: &ContractKey,
+        request: &[u8],
+    ) -> rintawa_sdk::services::ServiceCallResult<Vec<u8>> {
+        self.services.call(consumer, contract, request)
     }
 
     /// Resolves the current active contract composition.

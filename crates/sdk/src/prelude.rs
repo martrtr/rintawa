@@ -16,7 +16,7 @@ pub use crate::context::{ComponentContext, RegistrationContext};
 
 pub use crate::contracts::{
     ComponentRef, ContractConsumer, ContractDefinition, ContractGrantRequirement, ContractKey,
-    ContractProvider, ContractResolutionPolicy, ContractVersion,
+    ContractProtocol, ContractProvider, ContractResolutionPolicy, ContractVersion,
 };
 pub use crate::contributions::{ContributionDescriptor, ContributionKind};
 
@@ -30,6 +30,8 @@ pub use crate::manifest::{
 pub use crate::runtime_effects::RuntimeEffect;
 
 pub use crate::secrets::{SecretAccessError, SecretPath, SecretPathPattern, SecretValue};
+
+pub use crate::services::{ServiceCallError, ServiceCallResult};
 
 pub use crate::traits::Component;
 

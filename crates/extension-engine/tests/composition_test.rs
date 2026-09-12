@@ -362,3 +362,31 @@ fn test_unresolved_consumer_preserves_required_flag() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn test_conflicting_contract_protocols_are_rejected() -> anyhow::Result<()> {
+    let contract = contract("example.protocol-conflict");
+    let mut engine = ExtensionEngine::new();
+
+    engine.register_extension(
+        manifest("binding-definition"),
+        vec![Box::new(ContractComponent::new("runtime").defining(
+            ContractDefinition::new(contract.clone(), ContractResolutionPolicy::Single),
+        ))],
+    )?;
+
+    let error = engine
+        .register_extension(
+            manifest("service-definition"),
+            vec![Box::new(ContractComponent::new("runtime").defining(
+                ContractDefinition::service(contract, ContractResolutionPolicy::Single),
+            ))],
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        EngineError::ContractDefinitionConflict { .. }
+    ));
+    Ok(())
+}

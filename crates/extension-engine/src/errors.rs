@@ -85,6 +85,10 @@ pub enum EngineError {
     #[error("WASM runtime error: {0}")]
     WasmRuntime(#[from] wasmtime::Error),
 
+    /// The internal service-routing state is unavailable.
+    #[error("service runtime is unavailable")]
+    ServiceRuntimeUnavailable,
+
     /// Active contract definitions disagree about one contract's resolution policy.
     #[error("conflicting definitions for contract `{contract}`: `{existing}` versus `{incoming}`")]
     ContractDefinitionConflict {

@@ -7,7 +7,10 @@
 use std::{
     collections::HashMap,
     fmt::Display,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use keyring::Entry;
@@ -140,6 +143,7 @@ impl SecretPrincipal {
 pub struct SecretManager {
     vault: Arc<dyn SecretVault>,
     read_grants: Arc<RwLock<HashMap<SecretPrincipal, Vec<SecretPathPattern>>>>,
+    policy_revision: Arc<AtomicU64>,
 }
 
 impl Default for SecretManager {
@@ -159,6 +163,7 @@ impl SecretManager {
         Self {
             vault,
             read_grants: Arc::new(RwLock::new(HashMap::new())),
+            policy_revision: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -193,8 +198,13 @@ impl SecretManager {
         let principal_grants = grants.entry(principal).or_default();
         if !principal_grants.contains(&pattern) {
             principal_grants.push(pattern);
+            self.policy_revision.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    pub(crate) fn policy_revision(&self) -> u64 {
+        self.policy_revision.load(Ordering::Relaxed)
     }
 
     /// Returns whether one component currently holds a grant covering `pattern`.
@@ -220,11 +230,15 @@ impl SecretManager {
 
     /// Revokes every secret grant held by one component.
     pub fn revoke_component(&self, extension_id: &ExtensionId, component_id: &ComponentId) {
-        if let Ok(mut grants) = self.read_grants.write() {
-            grants.remove(&SecretPrincipal::new(
-                extension_id.clone(),
-                component_id.clone(),
-            ));
+        if let Ok(mut grants) = self.read_grants.write()
+            && grants
+                .remove(&SecretPrincipal::new(
+                    extension_id.clone(),
+                    component_id.clone(),
+                ))
+                .is_some()
+        {
+            self.policy_revision.fetch_add(1, Ordering::Relaxed);
         }
     }
 

@@ -89,6 +89,10 @@ pub enum ExtensionError {
     #[error("contract registration is unavailable in this component context")]
     ContractRegistrationUnavailable,
 
+    /// The component does not implement a handler for the requested service contract.
+    #[error("service handler is unavailable for contract `{0}`")]
+    ServiceHandlerUnavailable(String),
+
     /// A generic error with a message.
     #[error("{0}")]
     Message(String),

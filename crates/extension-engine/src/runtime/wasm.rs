@@ -12,10 +12,15 @@ use std::{
 
 use rintawa_sdk::{
     context::{ComponentContext, RegistrationContext},
+    contracts::{
+        ContractConsumer, ContractDefinition, ContractGrantRequirement, ContractKey,
+        ContractProtocol, ContractProvider, ContractResolutionPolicy, ContractVersion,
+    },
     contributions::{ContributionDescriptor, ContributionKind},
     errors::{ExtensionError, ExtensionResult},
     runtime_effects::RuntimeEffect,
-    secrets::{SecretAccessError, SecretPath},
+    secrets::{SecretAccessError, SecretPath, SecretPathPattern},
+    services::ServiceCallError,
     traits::Component,
     types::{ComponentId, ExtensionId, RuntimeEffectId},
 };
@@ -29,6 +34,7 @@ use wasmtime::{
 use crate::{
     errors::{EngineError, EngineResult},
     secrets::SecretManager,
+    services::ServiceRuntime,
 };
 
 /// Host-owned resource limits for one WASM component instance.
@@ -97,9 +103,13 @@ mod bindings {
 use bindings::Plugin;
 use bindings::rintawa::engine::{
     host::{Host as HostOperations, LogLevel, PublishError},
-    registration::{Error as RegistrationError, Host as RegistrationHost},
+    registration::{
+        ContractProtocol as WitContractProtocol, Error as RegistrationError,
+        Host as RegistrationHost, ResolutionPolicy as WitResolutionPolicy,
+    },
     runtime_effects::{Error as RuntimeEffectError, Host as RuntimeEffectsHost},
     secrets::{Error as SecretError, Host as SecretsHost},
+    services::{Error as ServiceTransportError, Host as ServicesHost},
 };
 
 /// Internal host state stored inside the Wasmtime Store context.
@@ -113,7 +123,9 @@ pub struct WasmHostState {
     pending_effects: Vec<WasmRuntimeEffectOperation>,
     pending_revocations: HashSet<String>,
     secrets: SecretManager,
+    services: ServiceRuntime,
     secret_access_active: bool,
+    service_access_active: bool,
     resource_limits: StoreLimits,
 }
 
@@ -122,6 +134,19 @@ pub struct WasmHostState {
 struct WasmRegistrationScope {
     contributions: Vec<ContributionDescriptor>,
     capabilities: HashSet<String>,
+    definitions: Vec<ContractDefinition>,
+    definition_keys: HashSet<ContractKey>,
+    providers: Vec<ContractProvider>,
+    provider_keys: HashSet<ContractKey>,
+    consumers: Vec<ContractConsumer>,
+    consumer_keys: HashSet<ContractKey>,
+}
+
+struct WasmRegistrations {
+    contributions: Vec<ContributionDescriptor>,
+    definitions: Vec<ContractDefinition>,
+    providers: Vec<ContractProvider>,
+    consumers: Vec<ContractConsumer>,
 }
 
 /// A guest request that is committed through the Engine-owned effect registry.
@@ -146,17 +171,31 @@ struct ActiveWasmRuntimeEffect {
 impl WasmHostState {
     /// Creates a new host state instance.
     pub fn new(component_id: ComponentId) -> Self {
-        Self::with_secret_manager(component_id, SecretManager::system())
+        let secrets = SecretManager::system();
+        let services = ServiceRuntime::new(secrets.clone());
+        Self::with_host_services_and_budget(
+            component_id,
+            secrets,
+            services,
+            &WasmExecutionBudget::default(),
+        )
     }
 
     /// Creates host state with the Rintawa secret manager shared by the runtime.
     pub fn with_secret_manager(component_id: ComponentId, secrets: SecretManager) -> Self {
-        Self::with_secret_manager_and_budget(component_id, secrets, &WasmExecutionBudget::default())
+        let services = ServiceRuntime::new(secrets.clone());
+        Self::with_host_services_and_budget(
+            component_id,
+            secrets,
+            services,
+            &WasmExecutionBudget::default(),
+        )
     }
 
-    fn with_secret_manager_and_budget(
+    fn with_host_services_and_budget(
         component_id: ComponentId,
         secrets: SecretManager,
+        services: ServiceRuntime,
         budget: &WasmExecutionBudget,
     ) -> Self {
         Self {
@@ -169,7 +208,9 @@ impl WasmHostState {
             pending_effects: Vec::new(),
             pending_revocations: HashSet::new(),
             secrets,
+            services,
             secret_access_active: false,
+            service_access_active: false,
             resource_limits: budget.store_limits(),
         }
     }
@@ -195,17 +236,28 @@ impl WasmHostState {
         self.registration_scope = Some(WasmRegistrationScope {
             contributions: Vec::new(),
             capabilities: HashSet::new(),
+            definitions: Vec::new(),
+            definition_keys: HashSet::new(),
+            providers: Vec::new(),
+            provider_keys: HashSet::new(),
+            consumers: Vec::new(),
+            consumer_keys: HashSet::new(),
         });
         self.extension_id = Some(extension_id);
         Ok(())
     }
 
-    fn finish_registration(&mut self) -> ExtensionResult<Vec<ContributionDescriptor>> {
+    fn finish_registration(&mut self) -> ExtensionResult<WasmRegistrations> {
         let scope = self.registration_scope.take().ok_or_else(|| {
             ExtensionError::Message(String::from("WASM component registration is not active"))
         })?;
 
-        Ok(scope.contributions)
+        Ok(WasmRegistrations {
+            contributions: scope.contributions,
+            definitions: scope.definitions,
+            providers: scope.providers,
+            consumers: scope.consumers,
+        })
     }
 
     fn cancel_registration(&mut self) {
@@ -235,6 +287,7 @@ impl WasmHostState {
         self.pending_effects.clear();
         self.pending_revocations.clear();
         self.secret_access_active = false;
+        self.service_access_active = false;
     }
 
     fn queue_capability(&mut self, name: String) -> Result<(), RegistrationError> {
@@ -280,6 +333,76 @@ impl WasmHostState {
             });
         }
         Ok(())
+    }
+
+    fn queue_contract_definition(
+        &mut self,
+        contract: ContractKey,
+        resolution: ContractResolutionPolicy,
+        protocol: ContractProtocol,
+    ) -> Result<(), RegistrationError> {
+        let Some(scope) = self.registration_scope.as_mut() else {
+            return Err(RegistrationError::RegistrationNotActive);
+        };
+        if !scope.definition_keys.insert(contract.clone()) {
+            return Err(RegistrationError::DuplicateContract);
+        }
+        scope.definitions.push(ContractDefinition {
+            contract,
+            resolution,
+            protocol,
+        });
+        Ok(())
+    }
+
+    fn queue_contract_provider(
+        &mut self,
+        contract: ContractKey,
+        required_secret_read: Vec<String>,
+    ) -> Result<(), RegistrationError> {
+        let requirements = Self::secret_requirements(required_secret_read)?;
+        let Some(scope) = self.registration_scope.as_mut() else {
+            return Err(RegistrationError::RegistrationNotActive);
+        };
+        if !scope.provider_keys.insert(contract.clone()) {
+            return Err(RegistrationError::DuplicateContract);
+        }
+        let mut provider = ContractProvider::new(contract);
+        provider.required_grants = requirements;
+        scope.providers.push(provider);
+        Ok(())
+    }
+
+    fn queue_contract_consumer(
+        &mut self,
+        contract: ContractKey,
+        required: bool,
+        required_secret_read: Vec<String>,
+    ) -> Result<(), RegistrationError> {
+        let requirements = Self::secret_requirements(required_secret_read)?;
+        let Some(scope) = self.registration_scope.as_mut() else {
+            return Err(RegistrationError::RegistrationNotActive);
+        };
+        if !scope.consumer_keys.insert(contract.clone()) {
+            return Err(RegistrationError::DuplicateContract);
+        }
+        let mut consumer = ContractConsumer::new(contract, required);
+        consumer.required_grants = requirements;
+        scope.consumers.push(consumer);
+        Ok(())
+    }
+
+    fn secret_requirements(
+        patterns: Vec<String>,
+    ) -> Result<Vec<ContractGrantRequirement>, RegistrationError> {
+        patterns
+            .into_iter()
+            .map(|pattern| {
+                SecretPathPattern::parse(pattern)
+                    .map(|pattern| ContractGrantRequirement::SecretRead { pattern })
+                    .map_err(|_| RegistrationError::InvalidSecretPattern)
+            })
+            .collect()
     }
 
     fn subscribe_event(&mut self, topic: String) -> Result<String, RuntimeEffectError> {
@@ -332,12 +455,25 @@ impl WasmHostState {
     fn begin_guest_execution(&mut self) {
         self.runtime_effects_active = true;
         self.secret_access_active = true;
+        self.service_access_active = true;
+    }
+
+    fn begin_service_execution(&mut self) {
+        self.runtime_effects_active = false;
+        self.secret_access_active = true;
+        self.service_access_active = true;
+    }
+
+    fn finish_service_execution(&mut self) {
+        self.secret_access_active = false;
+        self.service_access_active = false;
     }
 
     /// Closes guest access before committing its queued runtime effects.
     fn finish_guest_execution(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
         self.runtime_effects_active = false;
         self.secret_access_active = false;
+        self.service_access_active = false;
 
         self.commit_runtime_effects(ctx)
     }
@@ -487,6 +623,54 @@ impl SecretsHost for WasmHostState {
 }
 
 impl RegistrationHost for WasmHostState {
+    fn define_contract(
+        &mut self,
+        name: String,
+        version: u32,
+        resolution: WitResolutionPolicy,
+        protocol: WitContractProtocol,
+    ) -> Result<(), RegistrationError> {
+        let resolution = match resolution {
+            WitResolutionPolicy::Single => ContractResolutionPolicy::Single,
+            WitResolutionPolicy::Multiple => ContractResolutionPolicy::Multiple,
+        };
+        let protocol = match protocol {
+            WitContractProtocol::Binding => ContractProtocol::Binding,
+            WitContractProtocol::Service => ContractProtocol::Service,
+        };
+        self.queue_contract_definition(
+            ContractKey::new(name, ContractVersion::new(version)),
+            resolution,
+            protocol,
+        )
+    }
+
+    fn provide_contract(
+        &mut self,
+        name: String,
+        version: u32,
+        required_secret_read: Vec<String>,
+    ) -> Result<(), RegistrationError> {
+        self.queue_contract_provider(
+            ContractKey::new(name, ContractVersion::new(version)),
+            required_secret_read,
+        )
+    }
+
+    fn consume_contract(
+        &mut self,
+        name: String,
+        version: u32,
+        required: bool,
+        required_secret_read: Vec<String>,
+    ) -> Result<(), RegistrationError> {
+        self.queue_contract_consumer(
+            ContractKey::new(name, ContractVersion::new(version)),
+            required,
+            required_secret_read,
+        )
+    }
+
     fn register_capability(
         &mut self,
         name: String,
@@ -510,11 +694,49 @@ impl RegistrationHost for WasmHostState {
     }
 }
 
+impl ServicesHost for WasmHostState {
+    fn call(
+        &mut self,
+        contract: String,
+        version: u32,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, ServiceTransportError> {
+        if !self.service_access_active {
+            return Err(ServiceTransportError::Unavailable);
+        }
+        let extension_id = self
+            .extension_id
+            .as_ref()
+            .ok_or(ServiceTransportError::Unavailable)?;
+        let caller = rintawa_sdk::contracts::ComponentRef::new(
+            extension_id.clone(),
+            self.component_id.clone(),
+        );
+        let contract = ContractKey::new(contract, ContractVersion::new(version));
+        self.services
+            .call_from_execution(&caller, &contract, &payload)
+            .map_err(|error| match error {
+                ServiceCallError::Unavailable => ServiceTransportError::Unavailable,
+                ServiceCallError::NotConsumer => ServiceTransportError::NotConsumer,
+                ServiceCallError::NotServiceContract => ServiceTransportError::NotServiceContract,
+                ServiceCallError::UnsupportedResolution => {
+                    ServiceTransportError::UnsupportedResolution
+                }
+                ServiceCallError::CyclicCall => ServiceTransportError::CyclicCall,
+                ServiceCallError::ProviderBusy => ServiceTransportError::ProviderBusy,
+                ServiceCallError::ProviderFailed => ServiceTransportError::ProviderFailed,
+                ServiceCallError::RequestTooLarge => ServiceTransportError::RequestTooLarge,
+                ServiceCallError::ResponseTooLarge => ServiceTransportError::ResponseTooLarge,
+            })
+    }
+}
+
 /// The engine manager for compiled WebAssembly components.
 #[derive(Clone)]
 pub struct WasmRuntimeEngine {
     engine: Engine,
     secrets: SecretManager,
+    services: ServiceRuntime,
     budget: WasmExecutionBudget,
 }
 
@@ -562,6 +784,22 @@ impl WasmRuntimeEngine {
         secrets: SecretManager,
         budget: WasmExecutionBudget,
     ) -> EngineResult<Self> {
+        let services = ServiceRuntime::new(secrets.clone());
+        Self::with_host_services_and_budget(secrets, services, budget)
+    }
+
+    pub(crate) fn with_host_services(
+        secrets: SecretManager,
+        services: ServiceRuntime,
+    ) -> EngineResult<Self> {
+        Self::with_host_services_and_budget(secrets, services, WasmExecutionBudget::default())
+    }
+
+    fn with_host_services_and_budget(
+        secrets: SecretManager,
+        services: ServiceRuntime,
+        budget: WasmExecutionBudget,
+    ) -> EngineResult<Self> {
         let mut config = wasmtime::Config::new();
         config.wasm_component_model(true);
         config.async_support(false);
@@ -572,6 +810,7 @@ impl WasmRuntimeEngine {
         Ok(Self {
             engine,
             secrets,
+            services,
             budget,
         })
     }
@@ -600,6 +839,7 @@ impl WasmRuntimeEngine {
             component,
             linker: Arc::new(linker),
             secrets: self.secrets.clone(),
+            services: self.services.clone(),
             budget: self.budget.clone(),
             instance: None,
             failed_lifecycle_callback: None,
@@ -654,6 +894,7 @@ pub struct WasmComponent {
     component: WasmtimeComponent,
     linker: Arc<Linker<WasmHostState>>,
     secrets: SecretManager,
+    services: ServiceRuntime,
     budget: WasmExecutionBudget,
     instance: Option<WasmInstance>,
     failed_lifecycle_callback: Option<&'static str>,
@@ -684,9 +925,10 @@ impl WasmComponent {
         }
 
         if self.instance.is_none() {
-            let host_state = WasmHostState::with_secret_manager_and_budget(
+            let host_state = WasmHostState::with_host_services_and_budget(
                 self.id.clone(),
                 self.secrets.clone(),
+                self.services.clone(),
                 &self.budget,
             );
             let mut store = Store::new(&self.engine, host_state);
@@ -793,9 +1035,13 @@ impl Component for WasmComponent {
         &self.id
     }
 
+    fn service_message_limit(&self) -> Option<usize> {
+        Some(self.budget.max_host_message_bytes)
+    }
+
     fn register(&mut self, ctx: &mut dyn RegistrationContext) -> ExtensionResult<()> {
         let budget = self.budget.clone();
-        let contributions = {
+        let registrations = {
             let instance = self.instance_mut()?;
             Self::set_callback_fuel(&mut instance.store, &budget, "register")?;
             instance
@@ -816,8 +1062,17 @@ impl Component for WasmComponent {
             instance.store.data_mut().finish_registration()?
         };
 
-        for contribution in contributions {
+        for contribution in registrations.contributions {
             ctx.register(contribution)?;
+        }
+        for definition in registrations.definitions {
+            ctx.define_contract(definition)?;
+        }
+        for provider in registrations.providers {
+            ctx.provide_contract(provider)?;
+        }
+        for consumer in registrations.consumers {
+            ctx.consume_contract(consumer)?;
         }
 
         Ok(())
@@ -885,6 +1140,36 @@ impl Component for WasmComponent {
         }
 
         Ok(())
+    }
+
+    fn handle_service(
+        &mut self,
+        ctx: &mut dyn ComponentContext,
+        contract: &ContractKey,
+        request: &[u8],
+    ) -> ExtensionResult<Vec<u8>> {
+        self.validate_inbound_message("service contract", contract.id.as_str().len())?;
+        self.validate_inbound_message("service request", request.len())?;
+        let budget = self.budget.clone();
+        let instance = self.instance_mut()?;
+
+        instance.store.data().validate_execution_owner(ctx)?;
+        Self::set_callback_fuel(&mut instance.store, &budget, "service request")?;
+        instance.store.data_mut().begin_service_execution();
+
+        let response = instance
+            .plugin
+            .rintawa_engine_guest()
+            .call_handle_service(
+                &mut instance.store,
+                contract.id.as_str(),
+                contract.version.major(),
+                request,
+            )
+            .map_err(|error| Self::execution_error("service request", error));
+
+        instance.store.data_mut().finish_service_execution();
+        response
     }
 }
 
@@ -999,11 +1284,80 @@ mod tests {
         )
         .unwrap();
 
-        let contributions = state.finish_registration().unwrap();
+        let registrations = state.finish_registration().unwrap();
 
-        assert_eq!(contributions.len(), 1);
-        assert_eq!(contributions[0].id.as_str(), "rintawa.ai");
-        assert_eq!(contributions[0].kind, ContributionKind::capability());
+        assert_eq!(registrations.contributions.len(), 1);
+        assert_eq!(registrations.contributions[0].id.as_str(), "rintawa.ai");
+        assert_eq!(
+            registrations.contributions[0].kind,
+            ContributionKind::capability()
+        );
+    }
+
+    #[test]
+    fn test_should_stage_wasm_contract_registrations() {
+        let mut state = WasmHostState::new(ComponentId::new("runtime"));
+        state
+            .begin_registration(ExtensionId::new("example.extension"))
+            .unwrap();
+
+        RegistrationHost::define_contract(
+            &mut state,
+            String::from("example.service"),
+            1,
+            WitResolutionPolicy::Single,
+            WitContractProtocol::Service,
+        )
+        .unwrap();
+        RegistrationHost::provide_contract(
+            &mut state,
+            String::from("example.service"),
+            1,
+            vec![String::from("ai.api_keys.*")],
+        )
+        .unwrap();
+        RegistrationHost::consume_contract(
+            &mut state,
+            String::from("example.dependency"),
+            1,
+            true,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let registrations = state.finish_registration().unwrap();
+        assert_eq!(registrations.definitions.len(), 1);
+        assert_eq!(registrations.providers.len(), 1);
+        assert_eq!(registrations.consumers.len(), 1);
+        assert_eq!(
+            registrations.definitions[0].contract.to_string(),
+            "example.service@1"
+        );
+        assert_eq!(
+            registrations.definitions[0].resolution,
+            ContractResolutionPolicy::Single
+        );
+        assert_eq!(registrations.providers[0].required_grants.len(), 1);
+        assert!(registrations.consumers[0].required);
+    }
+
+    #[test]
+    fn test_should_reject_wasm_service_calls_outside_execution_scope() {
+        let mut state = WasmHostState::new(ComponentId::new("runtime"));
+        state
+            .begin_registration(ExtensionId::new("example.extension"))
+            .unwrap();
+        state.finish_registration().unwrap();
+
+        assert!(matches!(
+            ServicesHost::call(
+                &mut state,
+                String::from("example.service"),
+                1,
+                b"payload".to_vec(),
+            ),
+            Err(ServiceTransportError::Unavailable)
+        ));
     }
 
     #[test]

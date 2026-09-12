@@ -6,7 +6,8 @@
 
 use crate::{
     context::{ComponentContext, RegistrationContext},
-    errors::ExtensionResult,
+    contracts::ContractKey,
+    errors::{ExtensionError, ExtensionResult},
     types::ComponentId,
 };
 
@@ -53,5 +54,31 @@ pub trait Component: Send {
     /// Returns an error when the component cannot stop cleanly.
     fn stop(&mut self, _ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
         Ok(())
+    }
+
+    /// Returns a provider-specific service message limit, if one is stricter than the host limit.
+    fn service_message_limit(&self) -> Option<usize> {
+        None
+    }
+
+    /// Handles one generic service request routed to this component.
+    ///
+    /// Service-specific success and domain failure payloads belong to the
+    /// versioned contract. This method only returns an SDK error when the
+    /// provider itself cannot execute the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtensionError::ServiceHandlerUnavailable`] by default or a
+    /// component-specific execution failure from an implementation.
+    fn handle_service(
+        &mut self,
+        _ctx: &mut dyn ComponentContext,
+        contract: &ContractKey,
+        _request: &[u8],
+    ) -> ExtensionResult<Vec<u8>> {
+        Err(ExtensionError::ServiceHandlerUnavailable(
+            contract.to_string(),
+        ))
     }
 }

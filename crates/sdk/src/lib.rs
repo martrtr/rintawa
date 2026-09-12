@@ -34,6 +34,7 @@ pub mod errors;
 pub mod manifest;
 pub mod runtime_effects;
 pub mod secrets;
+pub mod services;
 pub mod traits;
 pub mod types;
 

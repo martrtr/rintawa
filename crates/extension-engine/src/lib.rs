@@ -17,6 +17,8 @@ pub mod runtime;
 pub mod secrets;
 pub mod state;
 
+mod services;
+
 mod runtime_effects;
 
 pub use composition::{

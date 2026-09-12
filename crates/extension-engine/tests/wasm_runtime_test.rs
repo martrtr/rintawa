@@ -2,6 +2,7 @@ use rintawa_extension_engine::{EngineResult, WasmExecutionBudget, WasmRuntimeEng
 use rintawa_sdk::{
     api::{LogLevel, LoggerApi},
     context::{ComponentContext, RegistrationContext},
+    contracts::{ContractKey, ContractVersion},
     contributions::ContributionDescriptor,
     errors::{ExtensionError, ExtensionResult},
     traits::Component,
@@ -78,6 +79,15 @@ const STATEFUL_WASM_COMPONENT: &str = r#"
                         (i32.eq (global.get $event-count) (i32.const 2))
                         (i32.eq (global.get $event-count) (i32.const 3))))
                     (then unreachable)))
+
+            (func (export "handle-service")
+                (param i32 i32 i32 i32 i32)
+                (result i32)
+                (if (i32.eq (local.get 2) (i32.const 99))
+                    (then unreachable))
+                (i32.store (i32.const 64) (i32.const 0))
+                (i32.store offset=4 (i32.const 64) (i32.const 0))
+                (i32.const 64))
         )
 
         (core instance $instance (instantiate $module))
@@ -87,39 +97,62 @@ const STATEFUL_WASM_COMPONENT: &str = r#"
         (alias core export $instance "start" (core func $start))
         (alias core export $instance "stop" (core func $stop))
         (alias core export $instance "on-event" (core func $on-event))
+        (alias core export $instance "handle-service" (core func $handle-service))
 
         (type $lifecycle (func))
         (type $on-event-type (func (param "topic" string) (param "payload" (list u8))))
+        (type $handle-service-type
+            (func
+                (param "contract" string)
+                (param "version" u32)
+                (param "payload" (list u8))
+                (result (list u8))))
 
         (func $register-lifted (type $lifecycle) (canon lift (core func $register)))
         (func $start-lifted (type $lifecycle) (canon lift (core func $start)))
         (func $stop-lifted (type $lifecycle) (canon lift (core func $stop)))
         (func $on-event-lifted (type $on-event-type)
             (canon lift (core func $on-event) (memory $memory) (realloc $realloc) string-encoding=utf8))
+        (func $handle-service-lifted (type $handle-service-type)
+            (canon lift
+                (core func $handle-service)
+                (memory $memory)
+                (realloc $realloc)
+                string-encoding=utf8))
 
         (type $guest (instance
             (export "register" (func (type $lifecycle)))
             (export "start" (func (type $lifecycle)))
             (export "stop" (func (type $lifecycle)))
             (export "on-event" (func (type $on-event-type)))
+            (export "handle-service" (func (type $handle-service-type)))
         ))
         (component $guest-shim
             (type $lifecycle (func))
             (type $on-event-type (func (param "topic" string) (param "payload" (list u8))))
+            (type $handle-service-type
+                (func
+                    (param "contract" string)
+                    (param "version" u32)
+                    (param "payload" (list u8))
+                    (result (list u8))))
             (import "register" (func $register (type $lifecycle)))
             (import "start" (func $start (type $lifecycle)))
             (import "stop" (func $stop (type $lifecycle)))
             (import "on-event" (func $on-event (type $on-event-type)))
+            (import "handle-service" (func $handle-service (type $handle-service-type)))
             (export "register" (func $register))
             (export "start" (func $start))
             (export "stop" (func $stop))
             (export "on-event" (func $on-event))
+            (export "handle-service" (func $handle-service))
         )
         (instance $guest-instance (instantiate $guest-shim
             (with "register" (func $register-lifted))
             (with "start" (func $start-lifted))
             (with "stop" (func $stop-lifted))
             (with "on-event" (func $on-event-lifted))
+            (with "handle-service" (func $handle-service-lifted))
         ))
         (export "rintawa:engine/guest@0.0.1" (instance $guest-instance))
     )
@@ -139,6 +172,87 @@ fn test_wasm_runtime_engine_initialization() -> EngineResult<()> {
     let result = runtime.load_component_from_bytes(id, &minimal_wasm_component_bytes);
     assert!(result.is_ok());
 
+    Ok(())
+}
+
+#[test]
+fn test_should_dispatch_service_request_to_wasm_guest() -> EngineResult<()> {
+    let runtime = WasmRuntimeEngine::new()?;
+    let mut component = runtime.load_component_from_bytes(
+        ComponentId::new("stateful-component"),
+        STATEFUL_WASM_COMPONENT.as_bytes(),
+    )?;
+    let mut context = TestComponentContext::new();
+
+    component.register(&mut context)?;
+    component.start(&mut context)?;
+    let response = component.handle_service(
+        &mut context,
+        &ContractKey::new("example.service", ContractVersion::new(1)),
+        b"payload",
+    )?;
+
+    assert!(response.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_oversized_wasm_service_request() -> EngineResult<()> {
+    let budget = WasmExecutionBudget {
+        max_host_message_bytes: 32,
+        ..WasmExecutionBudget::default()
+    };
+    let runtime = WasmRuntimeEngine::with_execution_budget(budget)?;
+    let mut component = runtime.load_component_from_bytes(
+        ComponentId::new("stateful-component"),
+        STATEFUL_WASM_COMPONENT.as_bytes(),
+    )?;
+    let mut context = TestComponentContext::new();
+
+    component.register(&mut context)?;
+    component.start(&mut context)?;
+    let error = component
+        .handle_service(
+            &mut context,
+            &ContractKey::new("x", ContractVersion::new(1)),
+            &[0; 33],
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ExtensionError::HostMessageTooLarge {
+            operation: "service request",
+            actual_bytes: 33,
+            maximum_bytes: 32,
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_should_report_wasm_trap_from_service_handler() -> EngineResult<()> {
+    let runtime = WasmRuntimeEngine::new()?;
+    let mut component = runtime.load_component_from_bytes(
+        ComponentId::new("stateful-component"),
+        STATEFUL_WASM_COMPONENT.as_bytes(),
+    )?;
+    let mut context = TestComponentContext::new();
+
+    component.register(&mut context)?;
+    component.start(&mut context)?;
+    let error = component
+        .handle_service(
+            &mut context,
+            &ContractKey::new("example.service", ContractVersion::new(99)),
+            b"payload",
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ExtensionError::Message(message) if message.contains("service request failed")
+    ));
     Ok(())
 }
 

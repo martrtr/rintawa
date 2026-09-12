@@ -8,6 +8,7 @@ use rintawa_sdk::{
     errors::{ExtensionError, ExtensionResult},
     runtime_effects::RuntimeEffect,
     secrets::{SecretPath, SecretValue},
+    services::{ServiceCallError, ServiceCallResult},
     types::{ComponentId, ContributionId, ExtensionId, RuntimeEffectId},
 };
 use std::collections::HashSet;
@@ -17,6 +18,7 @@ use crate::{
     composition::{OwnedContractConsumer, OwnedContractDefinition, OwnedContractProvider},
     runtime_effects::RuntimeEffectRegistry,
     secrets::SecretManager,
+    services::ServiceRuntime,
 };
 
 /// Engine logger redirecting SDK logs to the `tracing` ecosystem.
@@ -178,7 +180,8 @@ pub struct EngineComponentContext<'a> {
     logger: EngineLogger,
     runtime_effects: &'a mut RuntimeEffectRegistry,
     secrets: &'a SecretManager,
-    secret_access_active: bool,
+    services: &'a ServiceRuntime,
+    execution_active: bool,
 }
 
 impl<'a> EngineComponentContext<'a> {
@@ -188,7 +191,8 @@ impl<'a> EngineComponentContext<'a> {
         component_id: ComponentId,
         runtime_effects: &'a mut RuntimeEffectRegistry,
         secrets: &'a SecretManager,
-        secret_access_active: bool,
+        services: &'a ServiceRuntime,
+        execution_active: bool,
     ) -> Self {
         let logger = EngineLogger::new(extension_id.clone(), component_id.clone());
         Self {
@@ -197,7 +201,8 @@ impl<'a> EngineComponentContext<'a> {
             logger,
             runtime_effects,
             secrets,
-            secret_access_active,
+            services,
+            execution_active,
         }
     }
 }
@@ -235,7 +240,7 @@ impl ComponentContext for EngineComponentContext<'_> {
     }
 
     fn read_secret(&self, path: &SecretPath) -> ExtensionResult<SecretValue> {
-        if !self.secret_access_active {
+        if !self.execution_active {
             return Err(ExtensionError::SecretAccess(
                 rintawa_sdk::secrets::SecretAccessError::AccessDenied,
             ));
@@ -244,5 +249,23 @@ impl ComponentContext for EngineComponentContext<'_> {
         self.secrets
             .read_for_component(&self.extension_id, &self.component_id, path)
             .map_err(ExtensionError::from)
+    }
+
+    fn call_service(
+        &mut self,
+        contract: &rintawa_sdk::contracts::ContractKey,
+        request: &[u8],
+    ) -> ServiceCallResult<Vec<u8>> {
+        if !self.execution_active {
+            return Err(ServiceCallError::Unavailable);
+        }
+        self.services.call_from_execution(
+            &rintawa_sdk::contracts::ComponentRef::new(
+                self.extension_id.clone(),
+                self.component_id.clone(),
+            ),
+            contract,
+            request,
+        )
     }
 }

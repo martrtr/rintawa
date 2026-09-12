@@ -10,6 +10,7 @@ use crate::{
     errors::ExtensionResult,
     runtime_effects::RuntimeEffect,
     secrets::{SecretPath, SecretValue},
+    services::{ServiceCallError, ServiceCallResult},
     types::{ComponentId, ExtensionId, RuntimeEffectId},
 };
 
@@ -70,6 +71,20 @@ pub trait ComponentContext {
         Err(crate::errors::ExtensionError::SecretAccess(
             crate::secrets::SecretAccessError::AccessDenied,
         ))
+    }
+
+    /// Calls one provider selected for a versioned contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport-level [`ServiceCallError`] when no usable provider
+    /// exists, the caller is not a declared consumer, or provider execution fails.
+    fn call_service(
+        &mut self,
+        _contract: &crate::contracts::ContractKey,
+        _request: &[u8],
+    ) -> ServiceCallResult<Vec<u8>> {
+        Err(ServiceCallError::Unavailable)
     }
 }
 

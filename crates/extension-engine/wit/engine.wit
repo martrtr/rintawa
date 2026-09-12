@@ -30,10 +30,47 @@ interface host {
 
 /// Static contribution declarations available only from guest `register`.
 interface registration {
-    /// An explicit failure while declaring a static contribution.
+    /// Contract provider composition supported by the current resolver.
+    enum resolution-policy {
+        single,
+        multiple,
+    }
+
+    /// Host interaction protocol exposed by a contract.
+    enum contract-protocol {
+        binding,
+        service,
+    }
+
+    /// An explicit failure while declaring static metadata.
     variant error {
         registration-not-active,
+        duplicate-contract,
+        invalid-secret-pattern,
     }
+
+    /// Declares one versioned contract and its resolution policy.
+    define-contract: func(
+        name: string,
+        version: u32,
+        resolution: resolution-policy,
+        protocol: contract-protocol,
+    ) -> result<_, error>;
+
+    /// Declares this component as a provider of one versioned contract.
+    provide-contract: func(
+        name: string,
+        version: u32,
+        required-secret-read: list<string>,
+    ) -> result<_, error>;
+
+    /// Declares this component as a consumer of one versioned contract.
+    consume-contract: func(
+        name: string,
+        version: u32,
+        required: bool,
+        required-secret-read: list<string>,
+    ) -> result<_, error>;
 
     /// Declares a static capability contract during guest `register`.
     ///
@@ -86,6 +123,30 @@ interface secrets {
     read: func(path: string) -> result<string, error>;
 }
 
+
+/// Generic unary service transport available while guest code is executing.
+interface services {
+    /// Transport-level routing failure.
+    variant error {
+        unavailable,
+        not-consumer,
+        not-service-contract,
+        unsupported-resolution,
+        cyclic-call,
+        provider-busy,
+        provider-failed,
+        request-too-large,
+        response-too-large,
+    }
+
+    /// Calls the provider selected for a versioned contract.
+    call: func(
+        contract: string,
+        version: u32,
+        payload: list<u8>,
+    ) -> result<list<u8>, error>;
+}
+
 /// Guest lifecycle and event handlers implemented by the WASM plugin.
 interface guest {
     /// Initial plugin registration callback.
@@ -102,6 +163,16 @@ interface guest {
 
     /// Dispatches a subscribed event payload to the plugin.
     on-event: func(topic: string, payload: list<u8>);
+
+    /// Handles one unary request for a contract provided by this component.
+    ///
+    /// Domain-level errors are encoded by the versioned contract itself. A
+    /// trap or host execution failure is reported to the caller as provider-failed.
+    handle-service: func(
+        contract: string,
+        version: u32,
+        payload: list<u8>,
+    ) -> list<u8>;
 }
 
 /// The plugin world contract combining host imports and guest exports.
@@ -110,5 +181,6 @@ world plugin {
     import registration;
     import runtime-effects;
     import secrets;
+    import services;
     export guest;
 }
