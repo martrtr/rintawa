@@ -8,7 +8,10 @@ use rintawa_sdk::{
     secrets::SecretPathPattern,
     traits::Component,
     types::{ComponentId, ContributionId, ExtensionId, RuntimeEffectId},
+    ui::{UiActionEvent, UiLayerDescriptor},
 };
+use rintawa_ui_runtime::{UiPresentationSurface, UiRuntime};
+
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -19,7 +22,7 @@ use crate::{
         CompositionSnapshot, OwnedContractConsumer, OwnedContractDefinition, OwnedContractProvider,
         resolve_contracts,
     },
-    context::{EngineComponentContext, EngineRegistrationContext},
+    context::{EngineComponentContext, EngineRegistrationContext, RegistrationBuffers},
     errors::{ComponentStopFailure, EngineError, EngineResult},
     runtime::WasmRuntimeEngine,
     runtime_effects::RuntimeEffectRegistry,
@@ -84,6 +87,19 @@ impl ManagedComponent {
         })?;
         component.stop(context)
     }
+
+    fn handle_ui_action(
+        &self,
+        context: &mut dyn rintawa_sdk::context::ComponentContext,
+        event: &UiActionEvent,
+    ) -> rintawa_sdk::errors::ExtensionResult<()> {
+        let mut component = self.handle.lock().map_err(|_| {
+            rintawa_sdk::errors::ExtensionError::Message(String::from(
+                "component lock was poisoned",
+            ))
+        })?;
+        component.handle_ui_action(context, event)
+    }
 }
 
 /// A contribution registered by a specific component within an extension.
@@ -99,6 +115,7 @@ pub struct ExtensionEngine {
     runtime_effects: RuntimeEffectRegistry,
     secrets: SecretManager,
     services: ServiceRuntime,
+    ui: UiRuntime,
     preferred_contract_providers: HashMap<ContractKey, ComponentRef>,
 }
 
@@ -112,6 +129,7 @@ impl Default for ExtensionEngine {
             runtime_effects: RuntimeEffectRegistry::default(),
             secrets,
             services,
+            ui: UiRuntime::new(),
             preferred_contract_providers: HashMap::new(),
         }
     }
@@ -135,6 +153,7 @@ impl ExtensionEngine {
             runtime_effects: RuntimeEffectRegistry::default(),
             secrets,
             services,
+            ui: UiRuntime::new(),
             preferred_contract_providers: HashMap::new(),
         }
     }
@@ -158,7 +177,11 @@ impl ExtensionEngine {
     /// Returns [`EngineError::WasmRuntime`] when Wasmtime cannot create the
     /// configured Component Model engine.
     pub fn wasm_runtime_engine(&self) -> EngineResult<WasmRuntimeEngine> {
-        WasmRuntimeEngine::with_host_services(self.secrets.clone(), self.services.clone())
+        WasmRuntimeEngine::with_host_services(
+            self.secrets.clone(),
+            self.services.clone(),
+            self.ui.clone(),
+        )
     }
 
     /// Parses and validates an extension manifest from a TOML string.
@@ -236,16 +259,21 @@ impl ExtensionEngine {
         let mut contract_definitions = Vec::new();
         let mut contract_providers = Vec::new();
         let mut contract_consumers = Vec::new();
+        let mut ui_surfaces = Vec::new();
 
         for comp in &mut components {
             let first_contribution = registered_descriptors.len();
+            let buffers = RegistrationBuffers {
+                contributions: &mut registered_descriptors,
+                contract_definitions: &mut contract_definitions,
+                contract_providers: &mut contract_providers,
+                contract_consumers: &mut contract_consumers,
+                ui_surfaces: &mut ui_surfaces,
+            };
             let mut ctx = EngineRegistrationContext::new(
                 manifest.id.clone(),
                 comp.id().clone(),
-                &mut registered_descriptors,
-                &mut contract_definitions,
-                &mut contract_providers,
-                &mut contract_consumers,
+                buffers,
                 &self.active_contributions,
             );
 
@@ -292,6 +320,14 @@ impl ExtensionEngine {
                     .map(|component| (component.id.clone(), component.handle.clone())),
             )
             .map_err(|()| EngineError::ServiceRuntimeUnavailable)?;
+
+        if let Err(error) = self
+            .ui
+            .register_extension(manifest.id.clone(), ui_surfaces.clone())
+        {
+            self.services.unregister_extension(&manifest.id);
+            return Err(error.into());
+        }
 
         for contrib in &extension_contributions {
             self.active_contributions
@@ -417,6 +453,7 @@ impl ExtensionEngine {
                 runtime_effects,
                 &self.secrets,
                 &self.services,
+                &self.ui,
                 true,
             );
 
@@ -431,6 +468,7 @@ impl ExtensionEngine {
                     runtime_effects,
                     &self.secrets,
                     &self.services,
+                    &self.ui,
                     false,
                 );
                 if let Err(stop_error) = comp.stop(&mut failed_stop_context) {
@@ -449,6 +487,7 @@ impl ExtensionEngine {
                         runtime_effects,
                         &self.secrets,
                         &self.services,
+                        &self.ui,
                         false,
                     );
                     if let Err(stop_error) = comp_to_stop.stop(&mut stop_ctx) {
@@ -461,6 +500,7 @@ impl ExtensionEngine {
 
                 // Host-owned effects are revoked even when component rollback fails.
                 runtime_effects.revoke_extension(extension_id);
+                self.ui.set_extension_active(extension_id, false)?;
 
                 if ext.state == ExtensionState::Stopped {
                     for contrib in &ext.contributions {
@@ -485,6 +525,7 @@ impl ExtensionEngine {
             }
         }
 
+        self.ui.set_extension_active(extension_id, true)?;
         ext.state = ExtensionState::Active;
         self.services.set_active(extension_id, true);
         Ok(())
@@ -508,6 +549,7 @@ impl ExtensionEngine {
             return Ok(());
         }
 
+        self.ui.set_extension_active(extension_id, false)?;
         self.services.set_active(extension_id, false);
 
         let mut stop_failures = Vec::new();
@@ -519,6 +561,7 @@ impl ExtensionEngine {
                 runtime_effects,
                 &self.secrets,
                 &self.services,
+                &self.ui,
                 false,
             );
             if let Err(err) = comp.stop(&mut ctx) {
@@ -574,6 +617,7 @@ impl ExtensionEngine {
                 self.secrets.revoke_component(extension_id, &component.id);
             }
             self.services.unregister_extension(extension_id);
+            self.ui.unregister_extension(extension_id);
         }
         Ok(())
     }
@@ -593,6 +637,100 @@ impl ExtensionEngine {
     pub fn clear_preferred_contract_provider(&mut self, contract: &ContractKey) {
         self.preferred_contract_providers.remove(contract);
         self.services.clear_preferred_provider(contract);
+    }
+
+    /// Attaches the selected portable UI Layer for an active extension component.
+    ///
+    /// # Errors
+    ///
+    /// Returns a portable UI error when the owner is inactive, another layer is
+    /// attached, the protocol is incompatible, or mounted surfaces require unsupported capabilities.
+    pub fn attach_ui_layer(
+        &self,
+        owner: ComponentRef,
+        descriptor: UiLayerDescriptor,
+    ) -> EngineResult<()> {
+        self.ui.attach_layer(owner, descriptor)?;
+        Ok(())
+    }
+
+    /// Detaches the selected portable UI Layer without deleting feature snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Ui`] when another component owns the active layer.
+    pub fn detach_ui_layer(&self, owner: &ComponentRef) -> EngineResult<()> {
+        self.ui.detach_layer(owner)?;
+        Ok(())
+    }
+
+    /// Returns portable surfaces currently visible to a UI Layer.
+    pub fn portable_ui_surfaces(&self) -> Vec<UiPresentationSurface> {
+        self.ui.presentation_surfaces()
+    }
+
+    /// Validates and dispatches one semantic input event from the active UI Layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a portable UI validation error for spoofed or stale input,
+    /// [`EngineError::ExtensionNotFound`] if its owner disappeared, or
+    /// [`EngineError::UiActionFailed`] when the owner component rejects the action.
+    pub fn dispatch_ui_action(
+        &mut self,
+        layer_owner: &ComponentRef,
+        event: UiActionEvent,
+    ) -> EngineResult<()> {
+        let dispatch = self.ui.route_action(layer_owner, event)?;
+        let extension = self
+            .extensions
+            .get(&dispatch.owner.extension_id)
+            .ok_or_else(|| {
+                EngineError::ExtensionNotFound(dispatch.owner.extension_id.to_string())
+            })?;
+        if extension.state != ExtensionState::Active {
+            return Err(EngineError::UiActionFailed {
+                extension_id: dispatch.owner.extension_id.to_string(),
+                component_id: dispatch.owner.component_id.to_string(),
+                action_id: dispatch.event.action_id.to_string(),
+                reason: String::from("surface owner extension is not active"),
+            });
+        }
+        let component = extension
+            .components
+            .iter()
+            .find(|component| component.id() == &dispatch.owner.component_id)
+            .ok_or_else(|| EngineError::UiActionFailed {
+                extension_id: dispatch.owner.extension_id.to_string(),
+                component_id: dispatch.owner.component_id.to_string(),
+                action_id: dispatch.event.action_id.to_string(),
+                reason: String::from("surface owner component is not loaded"),
+            })?;
+        let component_handle = component.handle.clone();
+        let owner = dispatch.owner.clone();
+        let action_id = dispatch.event.action_id.to_string();
+
+        let mut context = EngineComponentContext::new(
+            owner.extension_id.clone(),
+            owner.component_id.clone(),
+            &mut self.runtime_effects,
+            &self.secrets,
+            &self.services,
+            &self.ui,
+            true,
+        );
+        let managed = ManagedComponent {
+            id: owner.component_id.clone(),
+            handle: component_handle,
+        };
+        managed
+            .handle_ui_action(&mut context, &dispatch.event)
+            .map_err(|error| EngineError::UiActionFailed {
+                extension_id: owner.extension_id.to_string(),
+                component_id: owner.component_id.to_string(),
+                action_id,
+                reason: error.to_string(),
+            })
     }
 
     /// Calls a unary service on behalf of an active consumer component.

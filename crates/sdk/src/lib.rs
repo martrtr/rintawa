@@ -37,5 +37,6 @@ pub mod secrets;
 pub mod services;
 pub mod traits;
 pub mod types;
+pub mod ui;
 
 pub mod prelude;

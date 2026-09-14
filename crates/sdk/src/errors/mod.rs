@@ -89,6 +89,18 @@ pub enum ExtensionError {
     #[error("contract registration is unavailable in this component context")]
     ContractRegistrationUnavailable,
 
+    /// The component registered the same portable UI surface more than once.
+    #[error("duplicate UI surface `{0}`")]
+    DuplicateUiSurface(String),
+
+    /// The host cannot register portable UI metadata in the current context.
+    #[error("UI registration is unavailable in this component context")]
+    UiRegistrationUnavailable,
+
+    /// The component does not implement a handler for a routed UI action.
+    #[error("UI action handler is unavailable for action `{0}`")]
+    UiActionHandlerUnavailable(String),
+
     /// The component does not implement a handler for the requested service contract.
     #[error("service handler is unavailable for contract `{0}`")]
     ServiceHandlerUnavailable(String),

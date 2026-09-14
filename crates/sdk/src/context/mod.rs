@@ -12,6 +12,7 @@ use crate::{
     secrets::{SecretPath, SecretValue},
     services::{ServiceCallError, ServiceCallResult},
     types::{ComponentId, ExtensionId, RuntimeEffectId},
+    ui::{UiPatchBatch, UiResult, UiSurfaceContribution, UiSurfaceId, UiSurfaceSnapshot},
 };
 
 /// The context available to a component during execution.
@@ -86,6 +87,33 @@ pub trait ComponentContext {
     ) -> ServiceCallResult<Vec<u8>> {
         Err(ServiceCallError::Unavailable)
     }
+
+    /// Mounts the initial presentation snapshot for one statically registered surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`crate::ui::UiError`] when the surface cannot be mounted.
+    fn mount_ui_surface(&mut self, _snapshot: UiSurfaceSnapshot) -> UiResult<()> {
+        Err(crate::ui::UiError::RuntimeUnavailable)
+    }
+
+    /// Applies one incremental patch batch to an owned mounted surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`crate::ui::UiError`] when the patch batch is invalid or cannot be applied.
+    fn patch_ui_surface(&mut self, _batch: UiPatchBatch) -> UiResult<()> {
+        Err(crate::ui::UiError::RuntimeUnavailable)
+    }
+
+    /// Removes the current presentation snapshot for an owned surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`crate::ui::UiError`] when the surface is unavailable or not owned by the caller.
+    fn unmount_ui_surface(&mut self, _surface_id: &UiSurfaceId) -> UiResult<()> {
+        Err(crate::ui::UiError::RuntimeUnavailable)
+    }
 }
 
 /// The context available during component registration.
@@ -129,5 +157,14 @@ pub trait RegistrationContext: ComponentContext {
     /// the component already consumes the same contract.
     fn consume_contract(&mut self, _consumer: ContractConsumer) -> ExtensionResult<()> {
         Err(crate::errors::ExtensionError::ContractRegistrationUnavailable)
+    }
+
+    /// Registers one static portable UI surface owned by this component.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current host context cannot register UI metadata.
+    fn register_ui_surface(&mut self, _surface: UiSurfaceContribution) -> ExtensionResult<()> {
+        Err(crate::errors::ExtensionError::UiRegistrationUnavailable)
     }
 }

@@ -1,0 +1,17 @@
+[package]
+name = "rintawa-ui-runtime"
+
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+description = "Renderer-neutral portable UI runtime for Rintawa"
+
+[dependencies]
+rintawa-sdk = { path = "../sdk" }
+
+[dev-dependencies]
+anyhow.workspace = true

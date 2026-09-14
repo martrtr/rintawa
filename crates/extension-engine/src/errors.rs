@@ -2,6 +2,7 @@
 
 use rintawa_sdk::{
     errors::ExtensionError, manifest::ManifestValidationError, secrets::SecretAccessError,
+    ui::UiError,
 };
 use std::io;
 use thiserror::Error;
@@ -85,6 +86,10 @@ pub enum EngineError {
     #[error("WASM runtime error: {0}")]
     WasmRuntime(#[from] wasmtime::Error),
 
+    /// Portable UI registration, lifecycle, patching, or action validation failed.
+    #[error("portable UI error: {0}")]
+    Ui(#[from] UiError),
+
     /// The internal service-routing state is unavailable.
     #[error("service runtime is unavailable")]
     ServiceRuntimeUnavailable,
@@ -107,6 +112,21 @@ pub enum EngineError {
     /// The specified extension is already registered in the engine.
     #[error("extension `{0}` is already registered")]
     ExtensionAlreadyExists(String),
+
+    /// A component failed while handling a validated portable UI action.
+    #[error(
+        "component `{component_id}` in extension `{extension_id}` failed UI action `{action_id}`: {reason}"
+    )]
+    UiActionFailed {
+        /// ID of the extension owning the component.
+        extension_id: String,
+        /// ID of the component handling the action.
+        component_id: String,
+        /// Semantic action identifier.
+        action_id: String,
+        /// Failure returned by the component.
+        reason: String,
+    },
 
     /// A component failed during a lifecycle transition.
     #[error("component `{component_id}` in extension `{extension_id}` failed: {reason}")]

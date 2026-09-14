@@ -38,3 +38,10 @@ pub use crate::traits::Component;
 pub use crate::types::{
     ComponentId, ComponentTarget, ContractId, ContributionId, ExtensionId, RuntimeEffectId,
 };
+
+pub use crate::ui::{
+    PORTABLE_UI_PROTOCOL_MAJOR, UiActionEvent, UiActionId, UiActionPayload, UiButtonNode,
+    UiCapabilityId, UiContainerNode, UiError, UiLayerDescriptor, UiMarkdownNode, UiNode, UiNodeId,
+    UiNodeKind, UiPatch, UiPatchBatch, UiPlacementHint, UiResult, UiSurfaceContribution,
+    UiSurfaceId, UiSurfaceSnapshot, UiTextAreaNode, UiTextInputNode, UiTextNode,
+};

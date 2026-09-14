@@ -1466,6 +1466,7 @@ dependencies = [
  "anyhow",
  "keyring",
  "rintawa-sdk",
+ "rintawa-ui-runtime",
  "serde",
  "serde_json",
  "tempfile",
@@ -1484,6 +1485,14 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
+name = "rintawa-ui-runtime"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "rintawa-sdk",
 ]
 
 [[package]]

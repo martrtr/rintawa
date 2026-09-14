@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    io::Read,
+    io::{Read, Write},
     path::Path,
 };
 
@@ -23,6 +23,10 @@ use rintawa_sdk::{
     services::ServiceCallError,
     traits::Component,
     types::{ComponentId, ExtensionId, RuntimeEffectId},
+    ui::{
+        UiActionEvent, UiCapabilityId, UiError, UiPatchBatch, UiPlacementHint,
+        UiSurfaceContribution, UiSurfaceId, UiSurfaceSnapshot,
+    },
 };
 
 use tracing::{debug, error, info, trace, warn};
@@ -36,6 +40,23 @@ use crate::{
     secrets::SecretManager,
     services::ServiceRuntime,
 };
+use rintawa_ui_runtime::UiRuntime;
+
+#[derive(Default)]
+struct JsonSizeCounter {
+    bytes: usize,
+}
+
+impl Write for JsonSizeCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buffer.len());
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Host-owned resource limits for one WASM component instance.
 ///
@@ -103,6 +124,9 @@ mod bindings {
 use bindings::Plugin;
 use bindings::rintawa::engine::{
     host::{Host as HostOperations, LogLevel, PublishError},
+    portable_ui::{
+        Error as PortableUiError, Host as PortableUiHost, PlacementHint as WitPlacementHint,
+    },
     registration::{
         ContractProtocol as WitContractProtocol, Error as RegistrationError,
         Host as RegistrationHost, ResolutionPolicy as WitResolutionPolicy,
@@ -124,8 +148,11 @@ pub struct WasmHostState {
     pending_revocations: HashSet<String>,
     secrets: SecretManager,
     services: ServiceRuntime,
+    ui: UiRuntime,
     secret_access_active: bool,
     service_access_active: bool,
+    ui_access_active: bool,
+    max_host_message_bytes: usize,
     resource_limits: StoreLimits,
 }
 
@@ -140,6 +167,8 @@ struct WasmRegistrationScope {
     provider_keys: HashSet<ContractKey>,
     consumers: Vec<ContractConsumer>,
     consumer_keys: HashSet<ContractKey>,
+    ui_surfaces: Vec<UiSurfaceContribution>,
+    ui_surface_ids: HashSet<UiSurfaceId>,
 }
 
 struct WasmRegistrations {
@@ -147,6 +176,7 @@ struct WasmRegistrations {
     definitions: Vec<ContractDefinition>,
     providers: Vec<ContractProvider>,
     consumers: Vec<ContractConsumer>,
+    ui_surfaces: Vec<UiSurfaceContribution>,
 }
 
 /// A guest request that is committed through the Engine-owned effect registry.
@@ -177,6 +207,7 @@ impl WasmHostState {
             component_id,
             secrets,
             services,
+            UiRuntime::new(),
             &WasmExecutionBudget::default(),
         )
     }
@@ -188,6 +219,7 @@ impl WasmHostState {
             component_id,
             secrets,
             services,
+            UiRuntime::new(),
             &WasmExecutionBudget::default(),
         )
     }
@@ -196,6 +228,7 @@ impl WasmHostState {
         component_id: ComponentId,
         secrets: SecretManager,
         services: ServiceRuntime,
+        ui: UiRuntime,
         budget: &WasmExecutionBudget,
     ) -> Self {
         Self {
@@ -209,8 +242,11 @@ impl WasmHostState {
             pending_revocations: HashSet::new(),
             secrets,
             services,
+            ui,
             secret_access_active: false,
             service_access_active: false,
+            ui_access_active: false,
+            max_host_message_bytes: budget.max_host_message_bytes,
             resource_limits: budget.store_limits(),
         }
     }
@@ -242,6 +278,8 @@ impl WasmHostState {
             provider_keys: HashSet::new(),
             consumers: Vec::new(),
             consumer_keys: HashSet::new(),
+            ui_surfaces: Vec::new(),
+            ui_surface_ids: HashSet::new(),
         });
         self.extension_id = Some(extension_id);
         Ok(())
@@ -257,6 +295,7 @@ impl WasmHostState {
             definitions: scope.definitions,
             providers: scope.providers,
             consumers: scope.consumers,
+            ui_surfaces: scope.ui_surfaces,
         })
     }
 
@@ -288,6 +327,7 @@ impl WasmHostState {
         self.pending_revocations.clear();
         self.secret_access_active = false;
         self.service_access_active = false;
+        self.ui_access_active = false;
     }
 
     fn queue_capability(&mut self, name: String) -> Result<(), RegistrationError> {
@@ -456,17 +496,20 @@ impl WasmHostState {
         self.runtime_effects_active = true;
         self.secret_access_active = true;
         self.service_access_active = true;
+        self.ui_access_active = true;
     }
 
     fn begin_service_execution(&mut self) {
         self.runtime_effects_active = false;
         self.secret_access_active = true;
         self.service_access_active = true;
+        self.ui_access_active = true;
     }
 
     fn finish_service_execution(&mut self) {
         self.secret_access_active = false;
         self.service_access_active = false;
+        self.ui_access_active = false;
     }
 
     /// Closes guest access before committing its queued runtime effects.
@@ -474,6 +517,7 @@ impl WasmHostState {
         self.runtime_effects_active = false;
         self.secret_access_active = false;
         self.service_access_active = false;
+        self.ui_access_active = false;
 
         self.commit_runtime_effects(ctx)
     }
@@ -561,6 +605,125 @@ impl WasmHostState {
         }
     }
 
+    fn abort_guest_execution(
+        &mut self,
+        ctx: &mut dyn ComponentContext,
+        operation_error: ExtensionError,
+    ) -> ExtensionError {
+        self.discard_guest_execution();
+        self.effect_handles.clear();
+        if let Err(cleanup_error) = ctx.revoke_all_runtime_effects() {
+            return ExtensionError::RuntimeEffectCleanupFailed {
+                operation: operation_error.to_string(),
+                cleanup: cleanup_error.to_string(),
+            };
+        }
+        operation_error
+    }
+
+    fn queue_ui_surface(
+        &mut self,
+        id: String,
+        placement: WitPlacementHint,
+        semantic_contract: Option<String>,
+        semantic_version: Option<u32>,
+        required_capabilities: Vec<String>,
+    ) -> Result<(), PortableUiError> {
+        let semantic = match (semantic_contract, semantic_version) {
+            (Some(contract), Some(version)) => {
+                Some(ContractKey::new(contract, ContractVersion::new(version)))
+            }
+            (None, None) => None,
+            _ => return Err(PortableUiError::InvalidPayload),
+        };
+        let Some(scope) = self.registration_scope.as_mut() else {
+            return Err(PortableUiError::RegistrationNotActive);
+        };
+        let id = UiSurfaceId::new(id);
+        if !scope.ui_surface_ids.insert(id.clone()) {
+            return Err(PortableUiError::DuplicateSurface);
+        }
+        let placement = match placement {
+            WitPlacementHint::Primary => UiPlacementHint::Primary,
+            WitPlacementHint::Secondary => UiPlacementHint::Secondary,
+            WitPlacementHint::Sidebar => UiPlacementHint::Sidebar,
+            WitPlacementHint::Settings => UiPlacementHint::Settings,
+            WitPlacementHint::Dialog => UiPlacementHint::Dialog,
+            WitPlacementHint::Status => UiPlacementHint::Status,
+            WitPlacementHint::Overlay => UiPlacementHint::Overlay,
+        };
+        scope.ui_surfaces.push(UiSurfaceContribution {
+            id,
+            placement,
+            semantic,
+            required_capabilities: required_capabilities
+                .into_iter()
+                .map(UiCapabilityId::new)
+                .collect(),
+        });
+        Ok(())
+    }
+
+    fn ui_owner(&self) -> Result<rintawa_sdk::contracts::ComponentRef, PortableUiError> {
+        let extension_id = self
+            .extension_id
+            .as_ref()
+            .ok_or(PortableUiError::Unavailable)?;
+        Ok(rintawa_sdk::contracts::ComponentRef::new(
+            extension_id.clone(),
+            self.component_id.clone(),
+        ))
+    }
+
+    fn validate_ui_message_size(&self, message_bytes: usize) -> Result<(), PortableUiError> {
+        if message_bytes > self.max_host_message_bytes {
+            return Err(PortableUiError::MessageTooLarge);
+        }
+        Ok(())
+    }
+
+    fn validate_ui_registration_size(
+        &self,
+        id: &str,
+        placement: WitPlacementHint,
+        semantic_contract: Option<&str>,
+        semantic_version: Option<u32>,
+        required_capabilities: &[String],
+    ) -> Result<(), PortableUiError> {
+        let placement = match placement {
+            WitPlacementHint::Primary => "primary",
+            WitPlacementHint::Secondary => "secondary",
+            WitPlacementHint::Sidebar => "sidebar",
+            WitPlacementHint::Settings => "settings",
+            WitPlacementHint::Dialog => "dialog",
+            WitPlacementHint::Status => "status",
+            WitPlacementHint::Overlay => "overlay",
+        };
+        let mut counter = JsonSizeCounter::default();
+        serde_json::to_writer(
+            &mut counter,
+            &(
+                id,
+                placement,
+                semantic_contract,
+                semantic_version,
+                required_capabilities,
+            ),
+        )
+        .map_err(|_| PortableUiError::InvalidPayload)?;
+        self.validate_ui_message_size(counter.bytes)
+    }
+
+    fn map_ui_error(error: UiError) -> PortableUiError {
+        match error {
+            UiError::UnsupportedCapability(capability) => {
+                PortableUiError::UnsupportedCapability(capability)
+            }
+            UiError::RuntimeUnavailable => PortableUiError::Unavailable,
+            _ => PortableUiError::Rejected,
+        }
+    }
+
     fn read_secret(&self, path: String) -> Result<String, SecretError> {
         if !self.secret_access_active {
             return Err(SecretError::AccessNotActive);
@@ -581,6 +744,82 @@ impl WasmHostState {
                 SecretAccessError::NotFound => SecretError::NotFound,
                 SecretAccessError::Unavailable => SecretError::Unavailable,
             })
+    }
+}
+
+impl PortableUiHost for WasmHostState {
+    fn register_surface(
+        &mut self,
+        id: String,
+        placement: WitPlacementHint,
+        semantic_contract: Option<String>,
+        semantic_version: Option<u32>,
+        required_capabilities: Vec<String>,
+    ) -> Result<(), PortableUiError> {
+        self.validate_ui_registration_size(
+            &id,
+            placement,
+            semantic_contract.as_deref(),
+            semantic_version,
+            &required_capabilities,
+        )?;
+        self.queue_ui_surface(
+            id,
+            placement,
+            semantic_contract,
+            semantic_version,
+            required_capabilities,
+        )
+    }
+
+    fn mount_surface(&mut self, snapshot_json: Vec<u8>) -> Result<(), PortableUiError> {
+        if !self.ui_access_active {
+            return Err(PortableUiError::Unavailable);
+        }
+        self.validate_ui_message_size(snapshot_json.len())?;
+        let snapshot: UiSurfaceSnapshot =
+            serde_json::from_slice(&snapshot_json).map_err(|error| {
+                warn!(
+                    plugin = %self.component_id,
+                    error = %error,
+                    "Rejecting invalid portable UI snapshot JSON"
+                );
+                PortableUiError::InvalidPayload
+            })?;
+        let owner = self.ui_owner()?;
+        self.ui
+            .mount_surface(&owner, snapshot)
+            .map_err(Self::map_ui_error)
+    }
+
+    fn patch_surface(&mut self, batch_json: Vec<u8>) -> Result<(), PortableUiError> {
+        if !self.ui_access_active {
+            return Err(PortableUiError::Unavailable);
+        }
+        self.validate_ui_message_size(batch_json.len())?;
+        let batch: UiPatchBatch = serde_json::from_slice(&batch_json).map_err(|error| {
+            warn!(
+                plugin = %self.component_id,
+                error = %error,
+                "Rejecting invalid portable UI patch JSON"
+            );
+            PortableUiError::InvalidPayload
+        })?;
+        let owner = self.ui_owner()?;
+        self.ui
+            .apply_patches(&owner, batch)
+            .map_err(Self::map_ui_error)
+    }
+
+    fn unmount_surface(&mut self, surface_id: String) -> Result<(), PortableUiError> {
+        if !self.ui_access_active {
+            return Err(PortableUiError::Unavailable);
+        }
+        self.validate_ui_message_size(surface_id.len())?;
+        let owner = self.ui_owner()?;
+        self.ui
+            .unmount_surface(&owner, &UiSurfaceId::new(surface_id))
+            .map_err(Self::map_ui_error)
     }
 }
 
@@ -737,6 +976,7 @@ pub struct WasmRuntimeEngine {
     engine: Engine,
     secrets: SecretManager,
     services: ServiceRuntime,
+    ui: UiRuntime,
     budget: WasmExecutionBudget,
 }
 
@@ -785,19 +1025,21 @@ impl WasmRuntimeEngine {
         budget: WasmExecutionBudget,
     ) -> EngineResult<Self> {
         let services = ServiceRuntime::new(secrets.clone());
-        Self::with_host_services_and_budget(secrets, services, budget)
+        Self::with_host_services_and_budget(secrets, services, UiRuntime::new(), budget)
     }
 
     pub(crate) fn with_host_services(
         secrets: SecretManager,
         services: ServiceRuntime,
+        ui: UiRuntime,
     ) -> EngineResult<Self> {
-        Self::with_host_services_and_budget(secrets, services, WasmExecutionBudget::default())
+        Self::with_host_services_and_budget(secrets, services, ui, WasmExecutionBudget::default())
     }
 
     fn with_host_services_and_budget(
         secrets: SecretManager,
         services: ServiceRuntime,
+        ui: UiRuntime,
         budget: WasmExecutionBudget,
     ) -> EngineResult<Self> {
         let mut config = wasmtime::Config::new();
@@ -811,6 +1053,7 @@ impl WasmRuntimeEngine {
             engine,
             secrets,
             services,
+            ui,
             budget,
         })
     }
@@ -840,6 +1083,7 @@ impl WasmRuntimeEngine {
             linker: Arc::new(linker),
             secrets: self.secrets.clone(),
             services: self.services.clone(),
+            ui: self.ui.clone(),
             budget: self.budget.clone(),
             instance: None,
             failed_lifecycle_callback: None,
@@ -895,6 +1139,7 @@ pub struct WasmComponent {
     linker: Arc<Linker<WasmHostState>>,
     secrets: SecretManager,
     services: ServiceRuntime,
+    ui: UiRuntime,
     budget: WasmExecutionBudget,
     instance: Option<WasmInstance>,
     failed_lifecycle_callback: Option<&'static str>,
@@ -929,6 +1174,7 @@ impl WasmComponent {
                 self.id.clone(),
                 self.secrets.clone(),
                 self.services.clone(),
+                self.ui.clone(),
                 &self.budget,
             );
             let mut store = Store::new(&self.engine, host_state);
@@ -1010,20 +1256,11 @@ impl WasmComponent {
             .map_err(|err| Self::execution_error("event dispatch", err));
 
         if let Err(error) = dispatch_result {
-            instance.store.data_mut().discard_guest_execution();
-            instance.store.data_mut().effect_handles.clear();
-            if let Err(cleanup_error) = ctx.revoke_all_runtime_effects() {
-                return Err(ExtensionError::RuntimeEffectCleanupFailed {
-                    operation: error.to_string(),
-                    cleanup: cleanup_error.to_string(),
-                });
-            }
-            return Err(error);
+            return Err(instance.store.data_mut().abort_guest_execution(ctx, error));
         }
 
         if let Err(error) = instance.store.data_mut().finish_guest_execution(ctx) {
-            instance.store.data_mut().discard_guest_execution();
-            return Err(error);
+            return Err(instance.store.data_mut().abort_guest_execution(ctx, error));
         }
 
         Ok(())
@@ -1073,6 +1310,9 @@ impl Component for WasmComponent {
         }
         for consumer in registrations.consumers {
             ctx.consume_contract(consumer)?;
+        }
+        for surface in registrations.ui_surfaces {
+            ctx.register_ui_surface(surface)?;
         }
 
         Ok(())
@@ -1140,6 +1380,47 @@ impl Component for WasmComponent {
         }
 
         Ok(())
+    }
+
+    fn handle_ui_action(
+        &mut self,
+        ctx: &mut dyn ComponentContext,
+        event: &UiActionEvent,
+    ) -> ExtensionResult<()> {
+        let payload = serde_json::to_vec(event).map_err(|error| {
+            ExtensionError::Message(format!("could not encode UI action: {error}"))
+        })?;
+        self.validate_inbound_message("UI action", payload.len())?;
+        let budget = self.budget.clone();
+        let mut guest_failed = false;
+        let result = {
+            let instance = self.instance_mut()?;
+            instance.store.data().validate_execution_owner(ctx)?;
+            Self::set_callback_fuel(&mut instance.store, &budget, "UI action")?;
+            instance.store.data_mut().begin_guest_execution();
+
+            let action_result = instance
+                .plugin
+                .rintawa_engine_guest()
+                .call_handle_ui_action(&mut instance.store, &payload)
+                .map_err(|error| Self::execution_error("UI action", error));
+
+            if let Err(error) = action_result {
+                guest_failed = true;
+                Err(instance.store.data_mut().abort_guest_execution(ctx, error))
+            } else if let Err(error) = instance.store.data_mut().finish_guest_execution(ctx) {
+                guest_failed = true;
+                Err(instance.store.data_mut().abort_guest_execution(ctx, error))
+            } else {
+                Ok(())
+            }
+        };
+
+        if guest_failed {
+            self.instance = None;
+            self.failed_lifecycle_callback = Some("UI action");
+        }
+        result
     }
 
     fn handle_service(
@@ -1254,6 +1535,109 @@ mod tests {
             self.effects.remove(effect_id);
             Ok(())
         }
+
+        fn revoke_all_runtime_effects(&mut self) -> ExtensionResult<()> {
+            self.effects.clear();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_should_abort_failed_guest_execution_and_revoke_effects() {
+        let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
+        let mut context = TestRuntimeContext::new();
+        let effect_id = RuntimeEffectId::new("effect-active");
+        let effect = RuntimeEffect::event_subscription("dialogue.message");
+        context.effects.insert(effect_id.clone(), effect.clone());
+        state.effect_handles.insert(
+            String::from("guest-handle"),
+            ActiveWasmRuntimeEffect { effect_id, effect },
+        );
+        state.begin_guest_execution();
+
+        let error = state.abort_guest_execution(
+            &mut context,
+            ExtensionError::Message(String::from("simulated callback failure")),
+        );
+
+        assert_eq!(error.to_string(), "simulated callback failure");
+        assert!(context.effects.is_empty());
+        assert!(state.effect_handles.is_empty());
+        assert!(!state.runtime_effects_active);
+        assert!(!state.secret_access_active);
+        assert!(!state.service_access_active);
+        assert!(!state.ui_access_active);
+    }
+
+    #[test]
+    fn test_should_enforce_wasm_ui_message_limit_for_registration_and_string_ids() {
+        let budget = WasmExecutionBudget {
+            max_host_message_bytes: 4,
+            ..WasmExecutionBudget::default()
+        };
+        let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
+        let services = ServiceRuntime::new(secrets.clone());
+        let mut state = WasmHostState::with_host_services_and_budget(
+            ComponentId::new("runtime"),
+            secrets,
+            services,
+            UiRuntime::new(),
+            &budget,
+        );
+        state
+            .begin_registration(ExtensionId::new("example.extension"))
+            .unwrap();
+
+        assert!(matches!(
+            PortableUiHost::register_surface(
+                &mut state,
+                String::from("12345"),
+                WitPlacementHint::Primary,
+                None,
+                None,
+                Vec::new(),
+            ),
+            Err(PortableUiError::MessageTooLarge)
+        ));
+
+        state.finish_registration().unwrap();
+        state.begin_guest_execution();
+        assert!(matches!(
+            PortableUiHost::unmount_surface(&mut state, String::from("12345")),
+            Err(PortableUiError::MessageTooLarge)
+        ));
+    }
+
+    #[test]
+    fn test_should_count_ui_registration_structure_overhead() {
+        let budget = WasmExecutionBudget {
+            max_host_message_bytes: 64,
+            ..WasmExecutionBudget::default()
+        };
+        let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
+        let services = ServiceRuntime::new(secrets.clone());
+        let mut state = WasmHostState::with_host_services_and_budget(
+            ComponentId::new("runtime"),
+            secrets,
+            services,
+            UiRuntime::new(),
+            &budget,
+        );
+        state
+            .begin_registration(ExtensionId::new("example.extension"))
+            .unwrap();
+
+        assert!(matches!(
+            PortableUiHost::register_surface(
+                &mut state,
+                String::from("x"),
+                WitPlacementHint::Primary,
+                None,
+                None,
+                vec![String::new(); 32],
+            ),
+            Err(PortableUiError::MessageTooLarge)
+        ));
     }
 
     #[test]
@@ -1339,6 +1723,79 @@ mod tests {
         );
         assert_eq!(registrations.providers[0].required_grants.len(), 1);
         assert!(registrations.consumers[0].required);
+    }
+
+    #[test]
+    fn test_should_stage_and_apply_wasm_portable_ui_operations() {
+        let mut state = WasmHostState::new(ComponentId::new("runtime"));
+        let extension_id = ExtensionId::new("example.extension");
+        state.begin_registration(extension_id.clone()).unwrap();
+
+        PortableUiHost::register_surface(
+            &mut state,
+            String::from("example.main"),
+            WitPlacementHint::Primary,
+            None,
+            None,
+            vec![String::from(rintawa_sdk::ui::UI_CAPABILITY_TEXT)],
+        )
+        .unwrap();
+        let registrations = state.finish_registration().unwrap();
+        assert_eq!(registrations.ui_surfaces.len(), 1);
+        assert_eq!(registrations.ui_surfaces[0].id.as_str(), "example.main");
+
+        let owner = rintawa_sdk::contracts::ComponentRef::new(
+            extension_id.clone(),
+            ComponentId::new("runtime"),
+        );
+        state
+            .ui
+            .register_extension(
+                extension_id.clone(),
+                vec![rintawa_ui_runtime::OwnedUiSurfaceContribution {
+                    owner: owner.clone(),
+                    contribution: registrations.ui_surfaces[0].clone(),
+                }],
+            )
+            .unwrap();
+
+        let snapshot = UiSurfaceSnapshot {
+            surface_id: UiSurfaceId::new("example.main"),
+            revision: 1,
+            root: rintawa_sdk::ui::UiNodeId::new("root"),
+            nodes: vec![rintawa_sdk::ui::UiNode::new(
+                "root",
+                rintawa_sdk::ui::UiNodeKind::Text(rintawa_sdk::ui::UiTextNode {
+                    text: String::from("hello"),
+                }),
+            )],
+        };
+        state.begin_guest_execution();
+        PortableUiHost::mount_surface(&mut state, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        state.finish_service_execution();
+        assert_eq!(state.ui.presentation_surfaces().len(), 0);
+
+        state.ui.set_extension_active(&extension_id, true).unwrap();
+        assert_eq!(state.ui.presentation_surfaces().len(), 1);
+
+        let patch = UiPatchBatch {
+            surface_id: UiSurfaceId::new("example.main"),
+            base_revision: 1,
+            next_revision: 2,
+            patches: vec![rintawa_sdk::ui::UiPatch::UpsertNode {
+                node: rintawa_sdk::ui::UiNode::new(
+                    "root",
+                    rintawa_sdk::ui::UiNodeKind::Text(rintawa_sdk::ui::UiTextNode {
+                        text: String::from("updated"),
+                    }),
+                ),
+            }],
+        };
+        state.begin_guest_execution();
+        PortableUiHost::patch_surface(&mut state, serde_json::to_vec(&patch).unwrap()).unwrap();
+        PortableUiHost::unmount_surface(&mut state, String::from("example.main")).unwrap();
+        state.finish_service_execution();
+        assert!(state.ui.presentation_surfaces().is_empty());
     }
 
     #[test]

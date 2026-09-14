@@ -21,6 +21,7 @@ toml.workspace = true
 wasmtime.workspace = true
 
 rintawa-sdk = { path = "../sdk" }
+rintawa-ui-runtime = { path = "../ui-runtime" }
 
 [dev-dependencies]
 tempfile = "3.27.0"

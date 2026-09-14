@@ -10,9 +10,12 @@ use rintawa_sdk::{
     secrets::{SecretPath, SecretValue},
     services::{ServiceCallError, ServiceCallResult},
     types::{ComponentId, ContributionId, ExtensionId, RuntimeEffectId},
+    ui::{UiPatchBatch, UiResult, UiSurfaceContribution, UiSurfaceId, UiSurfaceSnapshot},
 };
 use std::collections::HashSet;
 use tracing::{debug, error, info, trace, warn};
+
+use rintawa_ui_runtime::{OwnedUiSurfaceContribution, UiRuntime};
 
 use crate::{
     composition::{OwnedContractConsumer, OwnedContractDefinition, OwnedContractProvider},
@@ -53,15 +56,21 @@ impl LoggerApi for EngineLogger {
     }
 }
 
+/// Mutable registration buffers populated by one component register callback.
+pub(crate) struct RegistrationBuffers<'a> {
+    pub(crate) contributions: &'a mut Vec<ContributionDescriptor>,
+    pub(crate) contract_definitions: &'a mut Vec<OwnedContractDefinition>,
+    pub(crate) contract_providers: &'a mut Vec<OwnedContractProvider>,
+    pub(crate) contract_consumers: &'a mut Vec<OwnedContractConsumer>,
+    pub(crate) ui_surfaces: &'a mut Vec<OwnedUiSurfaceContribution>,
+}
+
 /// Registration context provided to components during initialization.
 pub struct EngineRegistrationContext<'a> {
     extension_id: ExtensionId,
     component_id: ComponentId,
     logger: EngineLogger,
-    registered_contributions: &'a mut Vec<ContributionDescriptor>,
-    contract_definitions: &'a mut Vec<OwnedContractDefinition>,
-    contract_providers: &'a mut Vec<OwnedContractProvider>,
-    contract_consumers: &'a mut Vec<OwnedContractConsumer>,
+    buffers: RegistrationBuffers<'a>,
     active_contribution_ids: &'a HashSet<ContributionId>,
 }
 
@@ -70,10 +79,7 @@ impl<'a> EngineRegistrationContext<'a> {
     pub(crate) fn new(
         extension_id: ExtensionId,
         component_id: ComponentId,
-        registered_contributions: &'a mut Vec<ContributionDescriptor>,
-        contract_definitions: &'a mut Vec<OwnedContractDefinition>,
-        contract_providers: &'a mut Vec<OwnedContractProvider>,
-        contract_consumers: &'a mut Vec<OwnedContractConsumer>,
+        buffers: RegistrationBuffers<'a>,
         active_contribution_ids: &'a HashSet<ContributionId>,
     ) -> Self {
         let logger = EngineLogger::new(extension_id.clone(), component_id.clone());
@@ -81,10 +87,7 @@ impl<'a> EngineRegistrationContext<'a> {
             extension_id,
             component_id,
             logger,
-            registered_contributions,
-            contract_definitions,
-            contract_providers,
-            contract_consumers,
+            buffers,
             active_contribution_ids,
         }
     }
@@ -108,7 +111,8 @@ impl<'a> RegistrationContext for EngineRegistrationContext<'a> {
     fn register(&mut self, contribution: ContributionDescriptor) -> ExtensionResult<()> {
         if self.active_contribution_ids.contains(&contribution.id)
             || self
-                .registered_contributions
+                .buffers
+                .contributions
                 .iter()
                 .any(|c| c.id == contribution.id)
         {
@@ -117,7 +121,7 @@ impl<'a> RegistrationContext for EngineRegistrationContext<'a> {
             ));
         }
 
-        self.registered_contributions.push(contribution);
+        self.buffers.contributions.push(contribution);
         Ok(())
     }
 
@@ -126,14 +130,15 @@ impl<'a> RegistrationContext for EngineRegistrationContext<'a> {
             self.extension_id.clone(),
             self.component_id.clone(),
         );
-        if self.contract_definitions.iter().any(|registered| {
+        if self.buffers.contract_definitions.iter().any(|registered| {
             registered.owner == owner && registered.definition.contract == definition.contract
         }) {
             return Err(ExtensionError::DuplicateContractDefinition(
                 definition.contract.to_string(),
             ));
         }
-        self.contract_definitions
+        self.buffers
+            .contract_definitions
             .push(OwnedContractDefinition { owner, definition });
         Ok(())
     }
@@ -143,14 +148,15 @@ impl<'a> RegistrationContext for EngineRegistrationContext<'a> {
             self.extension_id.clone(),
             self.component_id.clone(),
         );
-        if self.contract_providers.iter().any(|registered| {
+        if self.buffers.contract_providers.iter().any(|registered| {
             registered.owner == owner && registered.provider.contract == provider.contract
         }) {
             return Err(ExtensionError::DuplicateContractProvider(
                 provider.contract.to_string(),
             ));
         }
-        self.contract_providers
+        self.buffers
+            .contract_providers
             .push(OwnedContractProvider { owner, provider });
         Ok(())
     }
@@ -160,15 +166,36 @@ impl<'a> RegistrationContext for EngineRegistrationContext<'a> {
             self.extension_id.clone(),
             self.component_id.clone(),
         );
-        if self.contract_consumers.iter().any(|registered| {
+        if self.buffers.contract_consumers.iter().any(|registered| {
             registered.owner == owner && registered.consumer.contract == consumer.contract
         }) {
             return Err(ExtensionError::DuplicateContractConsumer(
                 consumer.contract.to_string(),
             ));
         }
-        self.contract_consumers
+        self.buffers
+            .contract_consumers
             .push(OwnedContractConsumer { owner, consumer });
+        Ok(())
+    }
+
+    fn register_ui_surface(&mut self, surface: UiSurfaceContribution) -> ExtensionResult<()> {
+        let owner = rintawa_sdk::contracts::ComponentRef::new(
+            self.extension_id.clone(),
+            self.component_id.clone(),
+        );
+        if self
+            .buffers
+            .ui_surfaces
+            .iter()
+            .any(|registered| registered.contribution.id == surface.id)
+        {
+            return Err(ExtensionError::DuplicateUiSurface(surface.id.to_string()));
+        }
+        self.buffers.ui_surfaces.push(OwnedUiSurfaceContribution {
+            owner,
+            contribution: surface,
+        });
         Ok(())
     }
 }
@@ -181,6 +208,7 @@ pub struct EngineComponentContext<'a> {
     runtime_effects: &'a mut RuntimeEffectRegistry,
     secrets: &'a SecretManager,
     services: &'a ServiceRuntime,
+    ui: &'a UiRuntime,
     execution_active: bool,
 }
 
@@ -192,6 +220,7 @@ impl<'a> EngineComponentContext<'a> {
         runtime_effects: &'a mut RuntimeEffectRegistry,
         secrets: &'a SecretManager,
         services: &'a ServiceRuntime,
+        ui: &'a UiRuntime,
         execution_active: bool,
     ) -> Self {
         let logger = EngineLogger::new(extension_id.clone(), component_id.clone());
@@ -202,6 +231,7 @@ impl<'a> EngineComponentContext<'a> {
             runtime_effects,
             secrets,
             services,
+            ui,
             execution_active,
         }
     }
@@ -266,6 +296,45 @@ impl ComponentContext for EngineComponentContext<'_> {
             ),
             contract,
             request,
+        )
+    }
+
+    fn mount_ui_surface(&mut self, snapshot: UiSurfaceSnapshot) -> UiResult<()> {
+        if !self.execution_active {
+            return Err(rintawa_sdk::ui::UiError::OwnerInactive);
+        }
+        self.ui.mount_surface(
+            &rintawa_sdk::contracts::ComponentRef::new(
+                self.extension_id.clone(),
+                self.component_id.clone(),
+            ),
+            snapshot,
+        )
+    }
+
+    fn patch_ui_surface(&mut self, batch: UiPatchBatch) -> UiResult<()> {
+        if !self.execution_active {
+            return Err(rintawa_sdk::ui::UiError::OwnerInactive);
+        }
+        self.ui.apply_patches(
+            &rintawa_sdk::contracts::ComponentRef::new(
+                self.extension_id.clone(),
+                self.component_id.clone(),
+            ),
+            batch,
+        )
+    }
+
+    fn unmount_ui_surface(&mut self, surface_id: &UiSurfaceId) -> UiResult<()> {
+        if !self.execution_active {
+            return Err(rintawa_sdk::ui::UiError::OwnerInactive);
+        }
+        self.ui.unmount_surface(
+            &rintawa_sdk::contracts::ComponentRef::new(
+                self.extension_id.clone(),
+                self.component_id.clone(),
+            ),
+            surface_id,
         )
     }
 }

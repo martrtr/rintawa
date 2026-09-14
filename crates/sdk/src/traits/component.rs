@@ -9,6 +9,7 @@ use crate::{
     contracts::ContractKey,
     errors::{ExtensionError, ExtensionResult},
     types::ComponentId,
+    ui::UiActionEvent,
 };
 
 /// The trait that all components must implement.
@@ -54,6 +55,22 @@ pub trait Component: Send {
     /// Returns an error when the component cannot stop cleanly.
     fn stop(&mut self, _ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
         Ok(())
+    }
+
+    /// Handles one validated semantic action from the active UI Layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtensionError::UiActionHandlerUnavailable`] by default or a
+    /// component-specific execution failure from an implementation.
+    fn handle_ui_action(
+        &mut self,
+        _ctx: &mut dyn ComponentContext,
+        event: &UiActionEvent,
+    ) -> ExtensionResult<()> {
+        Err(ExtensionError::UiActionHandlerUnavailable(
+            event.action_id.to_string(),
+        ))
     }
 
     /// Returns a provider-specific service message limit, if one is stricter than the host limit.

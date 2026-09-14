@@ -147,6 +147,49 @@ interface services {
     ) -> result<list<u8>, error>;
 }
 
+/// Portable UI operations available to a component during registration or execution.
+interface portable-ui {
+    /// Renderer-neutral placement hint for a surface.
+    enum placement-hint {
+        primary,
+        secondary,
+        sidebar,
+        settings,
+        dialog,
+        status,
+        overlay,
+    }
+
+    /// Portable UI boundary failure.
+    variant error {
+        unavailable,
+        registration-not-active,
+        duplicate-surface,
+        invalid-payload,
+        message-too-large,
+        unsupported-capability(string),
+        rejected,
+    }
+
+    /// Registers one static portable UI surface during guest `register`.
+    register-surface: func(
+        id: string,
+        placement: placement-hint,
+        semantic-contract: option<string>,
+        semantic-version: option<u32>,
+        required-capabilities: list<string>,
+    ) -> result<_, error>;
+
+    /// Mounts a serialized `UiSurfaceSnapshot` during active guest execution.
+    mount-surface: func(snapshot-json: list<u8>) -> result<_, error>;
+
+    /// Applies a serialized `UiPatchBatch` during active guest execution.
+    patch-surface: func(batch-json: list<u8>) -> result<_, error>;
+
+    /// Unmounts one owned surface during active guest execution.
+    unmount-surface: func(surface-id: string) -> result<_, error>;
+}
+
 /// Guest lifecycle and event handlers implemented by the WASM plugin.
 interface guest {
     /// Initial plugin registration callback.
@@ -163,6 +206,9 @@ interface guest {
 
     /// Dispatches a subscribed event payload to the plugin.
     on-event: func(topic: string, payload: list<u8>);
+
+    /// Handles one validated semantic action for a surface owned by this component.
+    handle-ui-action: func(action-json: list<u8>);
 
     /// Handles one unary request for a contract provided by this component.
     ///
@@ -182,5 +228,6 @@ world plugin {
     import runtime-effects;
     import secrets;
     import services;
+    import portable-ui;
     export guest;
 }
