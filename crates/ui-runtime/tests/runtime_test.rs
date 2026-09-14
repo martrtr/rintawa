@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rintawa_sdk::{
     contracts::ComponentRef,
-    types::ExtensionId,
+    types::{ExtensionInstanceId, RuntimeScopeId},
     ui::{
         UI_CAPABILITY_BUTTON, UI_CAPABILITY_COLUMN, UI_CAPABILITY_TEXT, UI_CAPABILITY_TEXT_INPUT,
         UiActionEvent, UiActionId, UiActionPayload, UiButtonNode, UiCapabilityId, UiContainerNode,
@@ -12,8 +12,16 @@ use rintawa_sdk::{
 };
 use rintawa_ui_runtime::{OwnedUiSurfaceContribution, UiRuntime};
 
-fn owner(extension: &str) -> ComponentRef {
-    ComponentRef::new(extension, "runtime")
+fn instance(id: &str) -> ExtensionInstanceId {
+    ExtensionInstanceId::new(id)
+}
+
+fn scope() -> RuntimeScopeId {
+    RuntimeScopeId::new("default")
+}
+
+fn owner(instance_id: &str) -> ComponentRef {
+    ComponentRef::new(instance_id, "runtime")
 }
 
 fn surface() -> UiSurfaceContribution {
@@ -70,8 +78,9 @@ fn compatible_layer() -> UiLayerDescriptor {
 }
 
 fn register_feature(runtime: &UiRuntime, contribution: UiSurfaceContribution) -> Result<()> {
-    runtime.register_extension(
-        ExtensionId::new("feature"),
+    runtime.register_instance(
+        instance("feature"),
+        scope(),
         vec![OwnedUiSurfaceContribution {
             owner: owner("feature"),
             contribution,
@@ -81,8 +90,8 @@ fn register_feature(runtime: &UiRuntime, contribution: UiSurfaceContribution) ->
 }
 
 fn attach_layer(runtime: &UiRuntime, descriptor: UiLayerDescriptor) -> Result<()> {
-    runtime.register_extension(ExtensionId::new("layer"), Vec::new())?;
-    runtime.set_extension_active(&ExtensionId::new("layer"), true)?;
+    runtime.register_instance(instance("layer"), scope(), Vec::new())?;
+    runtime.set_instance_active(&instance("layer"), true)?;
     runtime.attach_layer(owner("layer"), descriptor)?;
     Ok(())
 }
@@ -92,13 +101,15 @@ fn test_should_mount_headless_and_attach_compatible_layer_later() -> Result<()> 
     let runtime = UiRuntime::new();
     register_feature(&runtime, surface())?;
     runtime.mount_surface(&owner("feature"), base_snapshot())?;
-    assert!(runtime.active_layer().is_none());
+    assert!(runtime.active_layer(&scope()).is_none());
     assert!(runtime.presentation_surfaces().is_empty());
 
-    runtime.set_extension_active(&ExtensionId::new("feature"), true)?;
+    runtime.set_instance_active(&instance("feature"), true)?;
     attach_layer(&runtime, compatible_layer())?;
 
-    let layer = runtime.active_layer().expect("layer should be attached");
+    let layer = runtime
+        .active_layer(&scope())
+        .expect("layer should be attached");
     assert_eq!(layer.0, owner("layer"));
     assert_eq!(runtime.presentation_surfaces()[0].snapshot.revision, 1);
     Ok(())
@@ -112,9 +123,9 @@ fn test_should_reject_layer_missing_required_capability() -> Result<()> {
         surface().requiring_capability(UiCapabilityId::new("example.canvas@1")),
     )?;
     runtime.mount_surface(&owner("feature"), base_snapshot())?;
-    runtime.set_extension_active(&ExtensionId::new("feature"), true)?;
-    runtime.register_extension(ExtensionId::new("layer"), Vec::new())?;
-    runtime.set_extension_active(&ExtensionId::new("layer"), true)?;
+    runtime.set_instance_active(&instance("feature"), true)?;
+    runtime.register_instance(instance("layer"), scope(), Vec::new())?;
+    runtime.set_instance_active(&instance("layer"), true)?;
 
     assert_eq!(
         runtime.attach_layer(owner("layer"), compatible_layer()),
@@ -122,7 +133,7 @@ fn test_should_reject_layer_missing_required_capability() -> Result<()> {
             "example.canvas@1"
         )))
     );
-    assert!(runtime.active_layer().is_none());
+    assert!(runtime.active_layer(&scope()).is_none());
     Ok(())
 }
 
@@ -130,7 +141,7 @@ fn test_should_reject_layer_missing_required_capability() -> Result<()> {
 fn test_should_apply_patch_batch_atomically_and_advance_revision() -> Result<()> {
     let runtime = UiRuntime::new();
     register_feature(&runtime, surface())?;
-    runtime.set_extension_active(&ExtensionId::new("feature"), true)?;
+    runtime.set_instance_active(&instance("feature"), true)?;
     runtime.mount_surface(&owner("feature"), base_snapshot())?;
 
     runtime.apply_patches(
@@ -168,7 +179,7 @@ fn test_should_apply_patch_batch_atomically_and_advance_revision() -> Result<()>
 fn test_should_keep_previous_snapshot_when_patch_batch_is_invalid() -> Result<()> {
     let runtime = UiRuntime::new();
     register_feature(&runtime, surface())?;
-    runtime.set_extension_active(&ExtensionId::new("feature"), true)?;
+    runtime.set_instance_active(&instance("feature"), true)?;
     runtime.mount_surface(&owner("feature"), base_snapshot())?;
 
     let error = runtime.apply_patches(
@@ -215,10 +226,11 @@ fn test_should_route_only_owned_bound_actions_from_active_layer() -> Result<()> 
     let runtime = UiRuntime::new();
     register_feature(&runtime, surface())?;
     runtime.mount_surface(&owner("feature"), base_snapshot())?;
-    runtime.set_extension_active(&ExtensionId::new("feature"), true)?;
+    runtime.set_instance_active(&instance("feature"), true)?;
     attach_layer(&runtime, compatible_layer())?;
 
     let valid = UiActionEvent {
+        owner_instance_id: instance("feature"),
         surface_id: UiSurfaceId::new("example.main"),
         node_id: "send".into(),
         action_id: UiActionId::new("example.send"),
@@ -265,15 +277,15 @@ fn test_should_remove_surfaces_and_layer_on_extension_deactivation() -> Result<(
     let runtime = UiRuntime::new();
     register_feature(&runtime, surface())?;
     runtime.mount_surface(&owner("feature"), base_snapshot())?;
-    runtime.set_extension_active(&ExtensionId::new("feature"), true)?;
+    runtime.set_instance_active(&instance("feature"), true)?;
     attach_layer(&runtime, compatible_layer())?;
 
-    runtime.set_extension_active(&ExtensionId::new("feature"), false)?;
+    runtime.set_instance_active(&instance("feature"), false)?;
     assert!(runtime.presentation_surfaces().is_empty());
-    assert!(runtime.active_layer().is_some());
+    assert!(runtime.active_layer(&scope()).is_some());
 
-    runtime.set_extension_active(&ExtensionId::new("layer"), false)?;
-    assert!(runtime.active_layer().is_none());
+    runtime.set_instance_active(&instance("layer"), false)?;
+    assert!(runtime.active_layer(&scope()).is_none());
     Ok(())
 }
 
@@ -312,7 +324,7 @@ fn test_should_reject_invalid_surface_tree() -> Result<()> {
 fn test_should_move_child_using_post_removal_index() -> Result<()> {
     let runtime = UiRuntime::new();
     register_feature(&runtime, surface())?;
-    runtime.set_extension_active(&ExtensionId::new("feature"), true)?;
+    runtime.set_instance_active(&instance("feature"), true)?;
     runtime.mount_surface(&owner("feature"), base_snapshot())?;
 
     runtime.apply_patches(

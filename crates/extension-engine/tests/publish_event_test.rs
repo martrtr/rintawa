@@ -5,7 +5,7 @@ use rintawa_sdk::{
     contributions::ContributionDescriptor,
     errors::ExtensionResult,
     traits::Component,
-    types::{ComponentId, ExtensionId},
+    types::{ComponentId, ExtensionId, ExtensionInstanceId, RuntimeScopeId},
 };
 
 struct TestLogger;
@@ -16,6 +16,8 @@ impl LoggerApi for TestLogger {
 
 struct TestContext {
     extension_id: ExtensionId,
+    instance_id: ExtensionInstanceId,
+    scope_id: RuntimeScopeId,
     component_id: ComponentId,
     logger: TestLogger,
 }
@@ -24,6 +26,8 @@ impl TestContext {
     fn new() -> Self {
         Self {
             extension_id: ExtensionId::new("test-extension"),
+            instance_id: ExtensionInstanceId::new("test-extension"),
+            scope_id: RuntimeScopeId::new("default"),
             component_id: ComponentId::new("publish-test"),
             logger: TestLogger,
         }
@@ -32,6 +36,14 @@ impl TestContext {
 impl ComponentContext for TestContext {
     fn extension_id(&self) -> &ExtensionId {
         &self.extension_id
+    }
+
+    fn extension_instance_id(&self) -> &ExtensionInstanceId {
+        &self.instance_id
+    }
+
+    fn runtime_scope_id(&self) -> &RuntimeScopeId {
+        &self.scope_id
     }
 
     fn component_id(&self) -> &ComponentId {

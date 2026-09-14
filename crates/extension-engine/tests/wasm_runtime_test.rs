@@ -6,7 +6,7 @@ use rintawa_sdk::{
     contributions::ContributionDescriptor,
     errors::{ExtensionError, ExtensionResult},
     traits::Component,
-    types::{ComponentId, ExtensionId},
+    types::{ComponentId, ExtensionId, ExtensionInstanceId, RuntimeScopeId},
     ui::{UiActionEvent, UiActionId, UiActionPayload, UiNodeId, UiSurfaceId},
 };
 use std::fs;
@@ -19,6 +19,8 @@ impl LoggerApi for TestLogger {
 
 struct TestComponentContext {
     extension_id: ExtensionId,
+    instance_id: ExtensionInstanceId,
+    scope_id: RuntimeScopeId,
     component_id: ComponentId,
     logger: TestLogger,
 }
@@ -27,6 +29,8 @@ impl TestComponentContext {
     fn new() -> Self {
         Self {
             extension_id: ExtensionId::new("test-extension"),
+            instance_id: ExtensionInstanceId::new("test-extension"),
+            scope_id: RuntimeScopeId::new("default"),
             component_id: ComponentId::new("stateful-component"),
             logger: TestLogger,
         }
@@ -36,6 +40,14 @@ impl TestComponentContext {
 impl ComponentContext for TestComponentContext {
     fn extension_id(&self) -> &ExtensionId {
         &self.extension_id
+    }
+
+    fn extension_instance_id(&self) -> &ExtensionInstanceId {
+        &self.instance_id
+    }
+
+    fn runtime_scope_id(&self) -> &RuntimeScopeId {
+        &self.scope_id
     }
 
     fn component_id(&self) -> &ComponentId {
@@ -285,6 +297,7 @@ fn test_should_dispatch_validated_ui_action_to_wasm_guest() -> EngineResult<()> 
     component.handle_ui_action(
         &mut context,
         &UiActionEvent {
+            owner_instance_id: ExtensionInstanceId::new("test-extension"),
             surface_id: UiSurfaceId::new("example.main"),
             node_id: UiNodeId::new("send"),
             action_id: UiActionId::new("example.send"),

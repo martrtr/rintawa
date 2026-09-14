@@ -5,7 +5,7 @@ use std::{
 
 use rintawa_sdk::{
     contracts::ComponentRef,
-    types::ExtensionId,
+    types::{ExtensionInstanceId, RuntimeScopeId},
     ui::{
         PORTABLE_UI_PROTOCOL_MAJOR, UiActionEvent, UiError, UiLayerDescriptor, UiPatch,
         UiPatchBatch, UiResult, UiSurfaceContribution, UiSurfaceId, UiSurfaceSnapshot,
@@ -25,7 +25,7 @@ pub struct OwnedUiSurfaceContribution {
     pub contribution: UiSurfaceContribution,
 }
 
-/// Mounted presentation exposed to the active UI Layer.
+/// Mounted presentation exposed to an eligible UI Layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiPresentationSurface {
     /// Component that owns and updates the surface.
@@ -45,8 +45,24 @@ pub struct UiActionDispatch {
     pub event: UiActionEvent,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct UiSurfaceKey {
+    instance_id: ExtensionInstanceId,
+    surface_id: UiSurfaceId,
+}
+
+impl UiSurfaceKey {
+    fn new(instance_id: ExtensionInstanceId, surface_id: UiSurfaceId) -> Self {
+        Self {
+            instance_id,
+            surface_id,
+        }
+    }
+}
+
 #[derive(Clone)]
-struct UiExtension {
+struct UiExtensionInstance {
+    scope_id: RuntimeScopeId,
     is_active: bool,
     surfaces: HashSet<UiSurfaceId>,
 }
@@ -60,13 +76,17 @@ struct ActiveUiLayer {
 
 #[derive(Default)]
 struct UiRuntimeState {
-    extensions: HashMap<ExtensionId, UiExtension>,
-    registered_surfaces: HashMap<UiSurfaceId, OwnedUiSurfaceContribution>,
-    mounted_surfaces: HashMap<UiSurfaceId, UiSurfaceSnapshot>,
-    layer: Option<ActiveUiLayer>,
+    instances: HashMap<ExtensionInstanceId, UiExtensionInstance>,
+    registered_surfaces: HashMap<UiSurfaceKey, OwnedUiSurfaceContribution>,
+    mounted_surfaces: HashMap<UiSurfaceKey, UiSurfaceSnapshot>,
+    layers: HashMap<RuntimeScopeId, ActiveUiLayer>,
 }
 
 /// Shared renderer-neutral runtime for portable surfaces and semantic actions.
+///
+/// The runtime isolates registrations and mounted surfaces by extension instance.
+/// UI layers currently see only instances in their exact runtime scope. A future
+/// scope-visibility policy can widen that relation without changing surface ownership.
 #[derive(Clone, Default)]
 pub struct UiRuntime {
     state: Arc<RwLock<UiRuntimeState>>,
@@ -78,36 +98,35 @@ impl UiRuntime {
         Self::default()
     }
 
-    /// Registers static surface declarations for one extension.
+    /// Registers static surface declarations for one extension runtime instance.
+    ///
+    /// Surface identifiers are local to an extension instance, so two instances
+    /// of the same logical extension may register the same surface IDs safely.
     ///
     /// # Errors
     ///
-    /// Returns an error for duplicate extension or globally conflicting surface identifiers.
-    pub fn register_extension(
+    /// Returns an error for a duplicate instance, mismatched owner, or duplicate
+    /// surface identifier within the same instance.
+    pub fn register_instance(
         &self,
-        extension_id: ExtensionId,
+        instance_id: ExtensionInstanceId,
+        scope_id: RuntimeScopeId,
         surfaces: Vec<OwnedUiSurfaceContribution>,
     ) -> UiResult<()> {
         let mut state = self
             .state
             .write()
             .map_err(|_| UiError::RuntimeUnavailable)?;
-        if state.extensions.contains_key(&extension_id) {
-            return Err(UiError::ExtensionAlreadyRegistered(
-                extension_id.to_string(),
-            ));
+        if state.instances.contains_key(&instance_id) {
+            return Err(UiError::InstanceAlreadyRegistered(instance_id.to_string()));
         }
 
         let mut surface_ids = HashSet::new();
         for owned in &surfaces {
-            if owned.owner.extension_id != extension_id {
+            if owned.owner.instance_id != instance_id {
                 return Err(UiError::SurfaceNotOwned(owned.contribution.id.to_string()));
             }
-            if !surface_ids.insert(owned.contribution.id.clone())
-                || state
-                    .registered_surfaces
-                    .contains_key(&owned.contribution.id)
-            {
+            if !surface_ids.insert(owned.contribution.id.clone()) {
                 return Err(UiError::SurfaceAlreadyRegistered(
                     owned.contribution.id.to_string(),
                 ));
@@ -115,13 +134,13 @@ impl UiRuntime {
         }
 
         for owned in surfaces {
-            state
-                .registered_surfaces
-                .insert(owned.contribution.id.clone(), owned);
+            let key = UiSurfaceKey::new(instance_id.clone(), owned.contribution.id.clone());
+            state.registered_surfaces.insert(key, owned);
         }
-        state.extensions.insert(
-            extension_id,
-            UiExtension {
+        state.instances.insert(
+            instance_id,
+            UiExtensionInstance {
+                scope_id,
                 is_active: false,
                 surfaces: surface_ids,
             },
@@ -129,83 +148,89 @@ impl UiRuntime {
         Ok(())
     }
 
-    /// Removes one extension and all of its UI state.
-    pub fn unregister_extension(&self, extension_id: &ExtensionId) {
+    /// Removes one extension instance and all of its UI state.
+    pub fn unregister_instance(&self, instance_id: &ExtensionInstanceId) {
         if let Ok(mut state) = self.state.write()
-            && let Some(extension) = state.extensions.remove(extension_id)
+            && let Some(instance) = state.instances.remove(instance_id)
         {
-            for surface_id in extension.surfaces {
-                state.registered_surfaces.remove(&surface_id);
-                state.mounted_surfaces.remove(&surface_id);
+            for surface_id in instance.surfaces {
+                let key = UiSurfaceKey::new(instance_id.clone(), surface_id);
+                state.registered_surfaces.remove(&key);
+                state.mounted_surfaces.remove(&key);
             }
             if state
-                .layer
-                .as_ref()
-                .is_some_and(|layer| &layer.owner.extension_id == extension_id)
+                .layers
+                .get(&instance.scope_id)
+                .is_some_and(|layer| &layer.owner.instance_id == instance_id)
             {
-                state.layer = None;
+                state.layers.remove(&instance.scope_id);
             }
         }
     }
 
-    /// Updates extension activation and revokes mounted presentation on deactivation.
+    /// Updates instance activation and revokes mounted presentation on deactivation.
     ///
     /// # Errors
     ///
-    /// Returns [`UiError::ExtensionNotRegistered`] for an unknown extension.
-    pub fn set_extension_active(
+    /// Returns [`UiError::InstanceNotRegistered`] for an unknown instance.
+    pub fn set_instance_active(
         &self,
-        extension_id: &ExtensionId,
+        instance_id: &ExtensionInstanceId,
         is_active: bool,
     ) -> UiResult<()> {
         let mut state = self
             .state
             .write()
             .map_err(|_| UiError::RuntimeUnavailable)?;
-        let surface_ids = {
-            let extension = state
-                .extensions
-                .get_mut(extension_id)
-                .ok_or_else(|| UiError::ExtensionNotRegistered(extension_id.to_string()))?;
-            extension.is_active = is_active;
-            extension.surfaces.clone()
+        let (scope_id, surface_ids) = {
+            let instance = state
+                .instances
+                .get_mut(instance_id)
+                .ok_or_else(|| UiError::InstanceNotRegistered(instance_id.to_string()))?;
+            instance.is_active = is_active;
+            (instance.scope_id.clone(), instance.surfaces.clone())
         };
 
         if !is_active {
             for surface_id in surface_ids {
-                state.mounted_surfaces.remove(&surface_id);
+                state
+                    .mounted_surfaces
+                    .remove(&UiSurfaceKey::new(instance_id.clone(), surface_id));
             }
             if state
-                .layer
-                .as_ref()
-                .is_some_and(|layer| &layer.owner.extension_id == extension_id)
+                .layers
+                .get(&scope_id)
+                .is_some_and(|layer| &layer.owner.instance_id == instance_id)
             {
-                state.layer = None;
+                state.layers.remove(&scope_id);
             }
         }
         Ok(())
     }
 
-    /// Attaches or refreshes the selected UI Layer.
+    /// Attaches or refreshes the selected UI Layer for its runtime scope.
     ///
-    /// Existing mounted surfaces are validated before the layer becomes active.
+    /// Existing mounted surfaces in the same scope are validated before the layer
+    /// becomes active. Different scopes may host different UI layers concurrently.
     ///
     /// # Errors
     ///
     /// Returns an error for an inactive owner, incompatible protocol version,
-    /// unsupported mounted capability, or a different already attached layer.
+    /// unsupported mounted capability, or a different layer already attached in
+    /// the same scope.
     pub fn attach_layer(&self, owner: ComponentRef, descriptor: UiLayerDescriptor) -> UiResult<()> {
         let mut state = self
             .state
             .write()
             .map_err(|_| UiError::RuntimeUnavailable)?;
-        let extension = state
-            .extensions
-            .get(&owner.extension_id)
-            .ok_or_else(|| UiError::ExtensionNotRegistered(owner.extension_id.to_string()))?;
-        if !extension.is_active {
+        let instance = state
+            .instances
+            .get(&owner.instance_id)
+            .ok_or_else(|| UiError::InstanceNotRegistered(owner.instance_id.to_string()))?;
+        if !instance.is_active {
             return Err(UiError::OwnerInactive);
         }
+        let scope_id = instance.scope_id.clone();
         if descriptor.protocol_major != PORTABLE_UI_PROTOCOL_MAJOR {
             return Err(UiError::UnsupportedProtocol {
                 expected: PORTABLE_UI_PROTOCOL_MAJOR,
@@ -213,63 +238,82 @@ impl UiRuntime {
             });
         }
         if state
-            .layer
-            .as_ref()
+            .layers
+            .get(&scope_id)
             .is_some_and(|layer| layer.owner != owner)
         {
             return Err(UiError::LayerAlreadyAttached);
         }
 
         let capabilities: HashSet<_> = descriptor.capabilities.iter().cloned().collect();
-        for (surface_id, snapshot) in &state.mounted_surfaces {
+        for (key, snapshot) in &state.mounted_surfaces {
+            let Some(surface_instance) = state.instances.get(&key.instance_id) else {
+                continue;
+            };
+            if surface_instance.scope_id != scope_id || !surface_instance.is_active {
+                continue;
+            }
             let registered = state
                 .registered_surfaces
-                .get(surface_id)
-                .ok_or_else(|| UiError::SurfaceNotRegistered(surface_id.to_string()))?;
+                .get(key)
+                .ok_or_else(|| UiError::SurfaceNotRegistered(key.surface_id.to_string()))?;
             ensure_surface_supported(&capabilities, &registered.contribution, snapshot)?;
         }
 
-        state.layer = Some(ActiveUiLayer {
-            owner,
-            descriptor,
-            capabilities,
-        });
+        state.layers.insert(
+            scope_id,
+            ActiveUiLayer {
+                owner,
+                descriptor,
+                capabilities,
+            },
+        );
         Ok(())
     }
 
-    /// Detaches the current UI Layer without deleting feature presentation snapshots.
+    /// Detaches the current UI Layer in the owner's scope without deleting surfaces.
     ///
     /// # Errors
     ///
-    /// Returns [`UiError::LayerNotOwner`] if another component owns the active layer.
+    /// Returns an error for an unknown instance or if another component owns the
+    /// active layer in that scope.
     pub fn detach_layer(&self, owner: &ComponentRef) -> UiResult<()> {
         let mut state = self
             .state
             .write()
             .map_err(|_| UiError::RuntimeUnavailable)?;
-        if let Some(layer) = &state.layer {
+        let scope_id = state
+            .instances
+            .get(&owner.instance_id)
+            .ok_or_else(|| UiError::InstanceNotRegistered(owner.instance_id.to_string()))?
+            .scope_id
+            .clone();
+        if let Some(layer) = state.layers.get(&scope_id) {
             if &layer.owner != owner {
                 return Err(UiError::LayerNotOwner);
             }
-            state.layer = None;
+            state.layers.remove(&scope_id);
         }
         Ok(())
     }
 
-    /// Returns the descriptor of the current UI Layer, if attached.
-    pub fn active_layer(&self) -> Option<(ComponentRef, UiLayerDescriptor)> {
+    /// Returns the active UI Layer in one runtime scope, if attached.
+    pub fn active_layer(
+        &self,
+        scope_id: &RuntimeScopeId,
+    ) -> Option<(ComponentRef, UiLayerDescriptor)> {
         self.state.read().ok().and_then(|state| {
             state
-                .layer
-                .as_ref()
+                .layers
+                .get(scope_id)
                 .map(|layer| (layer.owner.clone(), layer.descriptor.clone()))
         })
     }
 
     /// Mounts an initial snapshot for a statically registered surface.
     ///
-    /// A surface can be mounted while no layer is attached. If a layer exists,
-    /// its capabilities are validated immediately.
+    /// A surface can be mounted while no layer is attached. If a layer exists in
+    /// the same scope, its capabilities are validated immediately.
     ///
     /// # Errors
     ///
@@ -281,24 +325,29 @@ impl UiRuntime {
             .state
             .write()
             .map_err(|_| UiError::RuntimeUnavailable)?;
+        let key = UiSurfaceKey::new(owner.instance_id.clone(), snapshot.surface_id.clone());
         let registered = state
             .registered_surfaces
-            .get(&snapshot.surface_id)
+            .get(&key)
             .ok_or_else(|| UiError::SurfaceNotRegistered(snapshot.surface_id.to_string()))?;
         if &registered.owner != owner {
             return Err(UiError::SurfaceNotOwned(snapshot.surface_id.to_string()));
         }
-        if state.mounted_surfaces.contains_key(&snapshot.surface_id) {
+        if state.mounted_surfaces.contains_key(&key) {
             return Err(UiError::SurfaceAlreadyMounted(
                 snapshot.surface_id.to_string(),
             ));
         }
-        if let Some(layer) = &state.layer {
+        let scope_id = state
+            .instances
+            .get(&owner.instance_id)
+            .ok_or_else(|| UiError::InstanceNotRegistered(owner.instance_id.to_string()))?
+            .scope_id
+            .clone();
+        if let Some(layer) = state.layers.get(&scope_id) {
             ensure_surface_supported(&layer.capabilities, &registered.contribution, &snapshot)?;
         }
-        state
-            .mounted_surfaces
-            .insert(snapshot.surface_id.clone(), snapshot);
+        state.mounted_surfaces.insert(key, snapshot);
         Ok(())
     }
 
@@ -320,16 +369,17 @@ impl UiRuntime {
             .state
             .write()
             .map_err(|_| UiError::RuntimeUnavailable)?;
+        let key = UiSurfaceKey::new(owner.instance_id.clone(), batch.surface_id.clone());
         let registered = state
             .registered_surfaces
-            .get(&batch.surface_id)
+            .get(&key)
             .ok_or_else(|| UiError::SurfaceNotRegistered(batch.surface_id.to_string()))?;
         if &registered.owner != owner {
             return Err(UiError::SurfaceNotOwned(batch.surface_id.to_string()));
         }
         let current = state
             .mounted_surfaces
-            .get(&batch.surface_id)
+            .get(&key)
             .ok_or_else(|| UiError::SurfaceNotMounted(batch.surface_id.to_string()))?;
         if current.revision != batch.base_revision {
             return Err(UiError::RevisionMismatch {
@@ -348,10 +398,16 @@ impl UiRuntime {
         apply_patch_operations(&mut next, &batch.patches)?;
         next.revision = batch.next_revision;
         validate_snapshot(&next)?;
-        if let Some(layer) = &state.layer {
+        let scope_id = state
+            .instances
+            .get(&owner.instance_id)
+            .ok_or_else(|| UiError::InstanceNotRegistered(owner.instance_id.to_string()))?
+            .scope_id
+            .clone();
+        if let Some(layer) = state.layers.get(&scope_id) {
             ensure_surface_supported(&layer.capabilities, &registered.contribution, &next)?;
         }
-        state.mounted_surfaces.insert(batch.surface_id, next);
+        state.mounted_surfaces.insert(key, next);
         Ok(())
     }
 
@@ -366,78 +422,89 @@ impl UiRuntime {
             .state
             .write()
             .map_err(|_| UiError::RuntimeUnavailable)?;
+        let key = UiSurfaceKey::new(owner.instance_id.clone(), surface_id.clone());
         let registered = state
             .registered_surfaces
-            .get(surface_id)
+            .get(&key)
             .ok_or_else(|| UiError::SurfaceNotRegistered(surface_id.to_string()))?;
         if &registered.owner != owner {
             return Err(UiError::SurfaceNotOwned(surface_id.to_string()));
         }
-        if state.mounted_surfaces.remove(surface_id).is_none() {
+        if state.mounted_surfaces.remove(&key).is_none() {
             return Err(UiError::SurfaceNotMounted(surface_id.to_string()));
         }
         Ok(())
     }
 
-    /// Returns a stable snapshot of all currently mounted portable surfaces.
+    /// Returns a stable host snapshot of all active mounted portable surfaces.
     pub fn presentation_surfaces(&self) -> Vec<UiPresentationSurface> {
         let Ok(state) = self.state.read() else {
             return Vec::new();
         };
-        let mut surfaces: Vec<_> = state
-            .mounted_surfaces
-            .iter()
-            .filter_map(|(surface_id, snapshot)| {
-                let registered = state.registered_surfaces.get(surface_id)?;
-                let extension = state.extensions.get(&registered.owner.extension_id)?;
-                extension.is_active.then(|| UiPresentationSurface {
-                    owner: registered.owner.clone(),
-                    contribution: registered.contribution.clone(),
-                    snapshot: snapshot.clone(),
-                })
-            })
-            .collect();
-        surfaces.sort_by(|left, right| {
-            left.contribution
-                .id
-                .as_str()
-                .cmp(right.contribution.id.as_str())
-        });
-        surfaces
+        collect_presentations(&state, None)
     }
 
-    /// Validates an input event from the active UI Layer and resolves its owner.
+    /// Returns surfaces visible to the active UI Layer in its exact runtime scope.
     ///
     /// # Errors
     ///
-    /// Returns an error for layer spoofing, stale revisions, inactive owners,
-    /// missing nodes, unbound actions, disabled controls, or invalid payloads.
+    /// Returns an error when the layer instance is unknown or is not the active
+    /// layer for its scope.
+    pub fn presentation_surfaces_for_layer(
+        &self,
+        layer_owner: &ComponentRef,
+    ) -> UiResult<Vec<UiPresentationSurface>> {
+        let state = self.state.read().map_err(|_| UiError::RuntimeUnavailable)?;
+        let scope_id = state
+            .layers
+            .iter()
+            .find_map(|(scope_id, layer)| (&layer.owner == layer_owner).then_some(scope_id.clone()))
+            .ok_or(UiError::LayerNotOwner)?;
+        Ok(collect_presentations(&state, Some(&scope_id)))
+    }
+
+    /// Validates an input event from an active UI Layer and resolves its owner.
+    ///
+    /// Current scope policy is intentionally conservative: a layer may route input
+    /// only to surfaces in its exact runtime scope. Future scope imports can widen
+    /// visibility without weakening instance ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for layer spoofing, cross-scope input, stale revisions,
+    /// inactive owners, missing nodes, unbound actions, disabled controls, or
+    /// invalid payloads.
     pub fn route_action(
         &self,
         layer_owner: &ComponentRef,
         event: UiActionEvent,
     ) -> UiResult<UiActionDispatch> {
         let state = self.state.read().map_err(|_| UiError::RuntimeUnavailable)?;
-        let layer = state.layer.as_ref().ok_or(UiError::LayerUnavailable)?;
-        if &layer.owner != layer_owner {
-            return Err(UiError::LayerNotOwner);
+        let layer_scope = state
+            .layers
+            .iter()
+            .find_map(|(scope_id, layer)| (&layer.owner == layer_owner).then_some(scope_id.clone()))
+            .ok_or(UiError::LayerNotOwner)?;
+
+        let target_instance = state
+            .instances
+            .get(&event.owner_instance_id)
+            .ok_or_else(|| UiError::InstanceNotRegistered(event.owner_instance_id.to_string()))?;
+        if target_instance.scope_id != layer_scope {
+            return Err(UiError::ScopeNotVisible);
         }
-        let registered = state
-            .registered_surfaces
-            .get(&event.surface_id)
-            .ok_or_else(|| UiError::SurfaceNotRegistered(event.surface_id.to_string()))?;
-        let extension = state
-            .extensions
-            .get(&registered.owner.extension_id)
-            .ok_or_else(|| {
-                UiError::ExtensionNotRegistered(registered.owner.extension_id.to_string())
-            })?;
-        if !extension.is_active {
+        if !target_instance.is_active {
             return Err(UiError::OwnerInactive);
         }
+
+        let key = UiSurfaceKey::new(event.owner_instance_id.clone(), event.surface_id.clone());
+        let registered = state
+            .registered_surfaces
+            .get(&key)
+            .ok_or_else(|| UiError::SurfaceNotRegistered(event.surface_id.to_string()))?;
         let snapshot = state
             .mounted_surfaces
-            .get(&event.surface_id)
+            .get(&key)
             .ok_or_else(|| UiError::SurfaceNotMounted(event.surface_id.to_string()))?;
         if snapshot.revision != event.surface_revision {
             return Err(UiError::RevisionMismatch {
@@ -478,6 +545,42 @@ impl UiRuntime {
             event,
         })
     }
+}
+
+fn collect_presentations(
+    state: &UiRuntimeState,
+    scope_filter: Option<&RuntimeScopeId>,
+) -> Vec<UiPresentationSurface> {
+    let mut surfaces: Vec<_> = state
+        .mounted_surfaces
+        .iter()
+        .filter_map(|(key, snapshot)| {
+            let registered = state.registered_surfaces.get(key)?;
+            let instance = state.instances.get(&key.instance_id)?;
+            if !instance.is_active || scope_filter.is_some_and(|scope| scope != &instance.scope_id)
+            {
+                return None;
+            }
+            Some(UiPresentationSurface {
+                owner: registered.owner.clone(),
+                contribution: registered.contribution.clone(),
+                snapshot: snapshot.clone(),
+            })
+        })
+        .collect();
+    surfaces.sort_by(|left, right| {
+        left.owner
+            .instance_id
+            .as_str()
+            .cmp(right.owner.instance_id.as_str())
+            .then_with(|| {
+                left.contribution
+                    .id
+                    .as_str()
+                    .cmp(right.contribution.id.as_str())
+            })
+    });
+    surfaces
 }
 
 fn ensure_surface_supported(

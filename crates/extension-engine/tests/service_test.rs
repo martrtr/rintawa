@@ -300,10 +300,9 @@ fn test_secret_policy_revision_invalidates_cached_route() -> Result<()> {
         engine.call_service(&consumer, &contract, b"ping")?,
         b"secret-ready"
     );
-    engine.secret_manager().revoke_component(
-        &ExtensionId::new("secured-provider"),
-        &ComponentId::new("runtime"),
-    );
+    engine
+        .secret_manager()
+        .revoke_component(&ComponentRef::new("secured-provider", "runtime"));
     assert_eq!(
         engine.call_service(&consumer, &contract, b"ping"),
         Err(ServiceCallError::Unavailable)
@@ -536,5 +535,102 @@ fn test_nested_service_cycle_is_detected_before_provider_locking() -> Result<()>
         engine.call_service(&caller, &a, b"ping")?,
         b"cycle-detected"
     );
+    Ok(())
+}
+
+#[test]
+fn test_service_routes_are_isolated_by_runtime_scope() -> Result<()> {
+    let contract = contract("example.scoped-service");
+    let definition =
+        ContractDefinition::service(contract.clone(), ContractResolutionPolicy::Single);
+    let mut engine = ExtensionEngine::new();
+
+    let provider_a = ExtensionInstanceId::new("provider@world-a");
+    let provider_b = ExtensionInstanceId::new("provider@world-b");
+    let consumer_a = ExtensionInstanceId::new("consumer@world-a");
+    let consumer_b = ExtensionInstanceId::new("consumer@world-b");
+    let scope_a = RuntimeScopeId::new("world-a");
+    let scope_b = RuntimeScopeId::new("world-b");
+
+    engine.register_extension_instance(
+        provider_a.clone(),
+        scope_a.clone(),
+        manifest("provider"),
+        vec![Box::new(
+            ServiceComponent::new("runtime")
+                .defining(definition.clone())
+                .providing(ContractProvider::new(contract.clone()))
+                .responding(b"world-a".to_vec()),
+        )],
+    )?;
+    engine.register_extension_instance(
+        provider_b.clone(),
+        scope_b.clone(),
+        manifest("provider"),
+        vec![Box::new(
+            ServiceComponent::new("runtime")
+                .defining(definition)
+                .providing(ContractProvider::new(contract.clone()))
+                .responding(b"world-b".to_vec()),
+        )],
+    )?;
+    engine.register_extension_instance(
+        consumer_a.clone(),
+        scope_a,
+        manifest("consumer"),
+        vec![Box::new(
+            ServiceComponent::new("runtime")
+                .consuming(ContractConsumer::new(contract.clone(), true)),
+        )],
+    )?;
+    engine.register_extension_instance(
+        consumer_b.clone(),
+        scope_b,
+        manifest("consumer"),
+        vec![Box::new(
+            ServiceComponent::new("runtime")
+                .consuming(ContractConsumer::new(contract.clone(), true)),
+        )],
+    )?;
+
+    for instance in [&provider_a, &provider_b, &consumer_a, &consumer_b] {
+        engine.start_extension_instance(instance)?;
+    }
+
+    assert_eq!(
+        engine.call_service(
+            &ComponentRef::new(consumer_a.clone(), "runtime"),
+            &contract,
+            b"ping",
+        )?,
+        b"world-a"
+    );
+    assert_eq!(
+        engine.call_service(
+            &ComponentRef::new(consumer_b.clone(), "runtime"),
+            &contract,
+            b"ping",
+        )?,
+        b"world-b"
+    );
+
+    engine.stop_extension_instance(&provider_a)?;
+    assert_eq!(
+        engine.call_service(
+            &ComponentRef::new(consumer_a, "runtime"),
+            &contract,
+            b"ping",
+        ),
+        Err(ServiceCallError::Unavailable)
+    );
+    assert_eq!(
+        engine.call_service(
+            &ComponentRef::new(consumer_b, "runtime"),
+            &contract,
+            b"ping",
+        )?,
+        b"world-b"
+    );
+
     Ok(())
 }

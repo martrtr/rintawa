@@ -7,7 +7,10 @@ use rintawa_sdk::{
     runtime_effects::RuntimeEffect,
     secrets::SecretPathPattern,
     traits::Component,
-    types::{ComponentId, ContributionId, ExtensionId, RuntimeEffectId},
+    types::{
+        ComponentId, ContributionId, ExtensionId, ExtensionInstanceId, RuntimeEffectId,
+        RuntimeScopeId,
+    },
     ui::{UiActionEvent, UiLayerDescriptor},
 };
 use rintawa_ui_runtime::{UiPresentationSurface, UiRuntime};
@@ -22,12 +25,14 @@ use crate::{
         CompositionSnapshot, OwnedContractConsumer, OwnedContractDefinition, OwnedContractProvider,
         resolve_contracts,
     },
-    context::{EngineComponentContext, EngineRegistrationContext, RegistrationBuffers},
+    context::{
+        ComponentIdentity, EngineComponentContext, EngineRegistrationContext, RegistrationBuffers,
+    },
     errors::{ComponentStopFailure, EngineError, EngineResult},
     runtime::WasmRuntimeEngine,
     runtime_effects::RuntimeEffectRegistry,
     secrets::SecretManager,
-    services::{ComponentHandle, ServiceRuntime},
+    services::{ComponentHandle, ServiceInstanceRegistration, ServiceRuntime},
 };
 
 /// Represents the active lifecycle state of an extension in the engine.
@@ -45,6 +50,8 @@ pub enum ExtensionState {
 }
 
 struct ManagedExtension {
+    instance_id: ExtensionInstanceId,
+    scope_id: RuntimeScopeId,
     manifest: ExtensionManifest,
     state: ExtensionState,
     components: Vec<ManagedComponent>,
@@ -110,13 +117,24 @@ struct OwnedContribution {
 
 /// The core engine managing extensions, native components, and contributions.
 pub struct ExtensionEngine {
-    extensions: HashMap<ExtensionId, ManagedExtension>,
-    active_contributions: HashSet<ContributionId>,
+    extensions: HashMap<ExtensionInstanceId, ManagedExtension>,
+    active_contributions: HashSet<(RuntimeScopeId, ContributionId)>,
     runtime_effects: RuntimeEffectRegistry,
     secrets: SecretManager,
     services: ServiceRuntime,
     ui: UiRuntime,
-    preferred_contract_providers: HashMap<ContractKey, ComponentRef>,
+    preferred_contract_providers: HashMap<RuntimeScopeId, HashMap<ContractKey, ComponentRef>>,
+}
+
+/// Runtime scope used by legacy convenience APIs that do not specify one.
+pub const DEFAULT_RUNTIME_SCOPE: &str = "default";
+
+fn default_scope_id() -> RuntimeScopeId {
+    RuntimeScopeId::new(DEFAULT_RUNTIME_SCOPE)
+}
+
+fn default_instance_id(extension_id: &ExtensionId) -> ExtensionInstanceId {
+    ExtensionInstanceId::new(extension_id.as_str())
 }
 
 impl Default for ExtensionEngine {
@@ -198,10 +216,15 @@ impl ExtensionEngine {
 
     fn validate_contract_definitions(
         &self,
+        scope_id: &RuntimeScopeId,
         incoming: &[OwnedContractDefinition],
     ) -> EngineResult<()> {
         let mut definitions = HashMap::new();
-        for extension in self.extensions.values() {
+        for extension in self
+            .extensions
+            .values()
+            .filter(|extension| &extension.scope_id == scope_id)
+        {
             for owned in &extension.contract_definitions {
                 definitions.insert(
                     owned.definition.contract.clone(),
@@ -231,26 +254,51 @@ impl ExtensionEngine {
         Ok(())
     }
 
-    /// Registers an extension and its native components into the engine.
+    /// Registers an extension in the default runtime scope.
     ///
-    /// Runs the `register` phase on all supplied components and tracks contributions.
+    /// This convenience API preserves the early single-instance workflow. New
+    /// supervisors and package managers should call [`Self::register_extension_instance`]
+    /// with an explicit opaque instance ID and scope.
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::ManifestValidation`] if the manifest violates a
-    /// semantic invariant, [`EngineError::ExtensionAlreadyExists`] if the extension
-    /// ID is taken, or [`EngineError::LifecycleFailed`] if duplicate contributions
-    /// or component errors occur.
+    /// Returns the same errors as [`Self::register_extension_instance`].
     pub fn register_extension(
         &mut self,
+        manifest: ExtensionManifest,
+        components: Vec<Box<dyn Component>>,
+    ) -> EngineResult<()> {
+        let instance_id = default_instance_id(&manifest.id);
+        if self.extensions.contains_key(&instance_id) {
+            return Err(EngineError::ExtensionAlreadyExists(manifest.id.to_string()));
+        }
+        self.register_extension_instance(instance_id, default_scope_id(), manifest, components)
+    }
+
+    /// Registers one concrete extension runtime instance.
+    ///
+    /// The logical [`ExtensionId`] comes from the manifest, while `instance_id`
+    /// identifies this exact activation and `scope_id` defines its current
+    /// composition boundary. Multiple instances of the same logical extension
+    /// may coexist when they use distinct instance IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid manifest, duplicate runtime instance,
+    /// conflicting registrations inside the same scope, or a component register
+    /// callback failure.
+    pub fn register_extension_instance(
+        &mut self,
+        instance_id: ExtensionInstanceId,
+        scope_id: RuntimeScopeId,
         manifest: ExtensionManifest,
         mut components: Vec<Box<dyn Component>>,
     ) -> EngineResult<()> {
         manifest.validate()?;
 
-        if self.extensions.contains_key(&manifest.id) {
-            return Err(EngineError::ExtensionAlreadyExists(
-                manifest.id.as_str().to_string(),
+        if self.extensions.contains_key(&instance_id) {
+            return Err(EngineError::ExtensionInstanceAlreadyExists(
+                instance_id.to_string(),
             ));
         }
 
@@ -270,12 +318,14 @@ impl ExtensionEngine {
                 contract_consumers: &mut contract_consumers,
                 ui_surfaces: &mut ui_surfaces,
             };
-            let mut ctx = EngineRegistrationContext::new(
+            let identity = ComponentIdentity::new(
                 manifest.id.clone(),
+                instance_id.clone(),
+                scope_id.clone(),
                 comp.id().clone(),
-                buffers,
-                &self.active_contributions,
             );
+            let mut ctx =
+                EngineRegistrationContext::new(identity, buffers, &self.active_contributions);
 
             if let Err(err) = comp.register(&mut ctx) {
                 return Err(EngineError::LifecycleFailed {
@@ -296,7 +346,7 @@ impl ExtensionEngine {
             );
         }
 
-        self.validate_contract_definitions(&contract_definitions)?;
+        self.validate_contract_definitions(&scope_id, &contract_definitions)?;
 
         let components: Vec<_> = components
             .into_iter()
@@ -310,32 +360,37 @@ impl ExtensionEngine {
             .collect();
 
         self.services
-            .register_extension(
-                manifest.id.clone(),
-                contract_definitions.clone(),
-                contract_providers.clone(),
-                contract_consumers.clone(),
-                components
+            .register_instance(ServiceInstanceRegistration {
+                instance_id: instance_id.clone(),
+                extension_id: manifest.id.clone(),
+                scope_id: scope_id.clone(),
+                definitions: contract_definitions.clone(),
+                providers: contract_providers.clone(),
+                consumers: contract_consumers.clone(),
+                components: components
                     .iter()
-                    .map(|component| (component.id.clone(), component.handle.clone())),
-            )
+                    .map(|component| (component.id.clone(), component.handle.clone()))
+                    .collect(),
+            })
             .map_err(|()| EngineError::ServiceRuntimeUnavailable)?;
 
-        if let Err(error) = self
-            .ui
-            .register_extension(manifest.id.clone(), ui_surfaces.clone())
+        if let Err(error) =
+            self.ui
+                .register_instance(instance_id.clone(), scope_id.clone(), ui_surfaces.clone())
         {
-            self.services.unregister_extension(&manifest.id);
+            self.services.unregister_instance(&instance_id);
             return Err(error.into());
         }
 
         for contrib in &extension_contributions {
             self.active_contributions
-                .insert(contrib.descriptor.id.clone());
+                .insert((scope_id.clone(), contrib.descriptor.id.clone()));
         }
 
         let managed = ManagedExtension {
-            manifest: manifest.clone(),
+            instance_id: instance_id.clone(),
+            scope_id,
+            manifest,
             state: ExtensionState::Registered,
             components,
             contributions: extension_contributions,
@@ -344,32 +399,46 @@ impl ExtensionEngine {
             contract_consumers,
         };
 
-        self.extensions.insert(manifest.id, managed);
+        self.extensions.insert(instance_id, managed);
         Ok(())
     }
 
-    /// Approves a manifest-requested read grant for one component.
-    ///
-    /// The granted pattern must be equal to, or narrower than, a pattern in
-    /// the extension's manifest. The grant takes effect only while an active
-    /// execution context exposes the secret-read capability.
+    /// Approves a manifest-requested secret grant for the default instance.
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::ExtensionNotFound`] for an unknown extension,
-    /// [`EngineError::SecretComponentNotFound`] for an undeclared component, or
-    /// [`EngineError::SecretPermissionNotRequested`] if policy tries to expand
-    /// beyond the manifest request.
+    /// Returns the same errors as [`Self::grant_requested_secret_read_for_instance`].
     pub fn grant_requested_secret_read(
         &self,
         extension_id: &ExtensionId,
         component_id: &ComponentId,
         pattern: SecretPathPattern,
     ) -> EngineResult<()> {
+        let instance_id = default_instance_id(extension_id);
+        if !self.extensions.contains_key(&instance_id) {
+            return Err(EngineError::ExtensionNotFound(extension_id.to_string()));
+        }
+        self.grant_requested_secret_read_for_instance(&instance_id, component_id, pattern)
+    }
+
+    /// Approves a manifest-requested read grant for one concrete component principal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::ExtensionInstanceNotFound`] for an unknown instance,
+    /// [`EngineError::SecretComponentNotFound`] for an undeclared component, or
+    /// [`EngineError::SecretPermissionNotRequested`] if policy tries to expand
+    /// beyond the manifest request.
+    pub fn grant_requested_secret_read_for_instance(
+        &self,
+        instance_id: &ExtensionInstanceId,
+        component_id: &ComponentId,
+        pattern: SecretPathPattern,
+    ) -> EngineResult<()> {
         let extension = self
             .extensions
-            .get(extension_id)
-            .ok_or_else(|| EngineError::ExtensionNotFound(extension_id.as_str().to_string()))?;
+            .get(instance_id)
+            .ok_or_else(|| EngineError::ExtensionInstanceNotFound(instance_id.to_string()))?;
 
         let Some(component) = extension
             .manifest
@@ -378,7 +447,7 @@ impl ExtensionEngine {
             .find(|component| &component.id == component_id)
         else {
             return Err(EngineError::SecretComponentNotFound {
-                extension_id: extension_id.as_str().to_string(),
+                extension_id: extension.manifest.id.to_string(),
                 component_id: component_id.as_str().to_string(),
             });
         };
@@ -390,66 +459,91 @@ impl ExtensionEngine {
             .any(|requested| requested.allows_pattern(&pattern))
         {
             return Err(EngineError::SecretPermissionNotRequested {
-                extension_id: extension_id.as_str().to_string(),
+                extension_id: extension.manifest.id.to_string(),
                 component_id: component_id.as_str().to_string(),
                 pattern: pattern.to_string(),
             });
         }
 
-        self.secrets
-            .grant_read(extension_id.clone(), component_id.clone(), pattern)?;
+        self.secrets.grant_read(
+            ComponentRef::new(instance_id.clone(), component_id.clone()),
+            pattern,
+        )?;
         Ok(())
     }
 
-    /// Activates an extension by executing `start` on all its components.
-    ///
-    /// Re-activates registered contributions if resuming from `Stopped` state.
+    /// Activates the default runtime instance of one logical extension.
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::ExtensionNotFound`] if the extension isn't registered,
-    /// [`EngineError::LifecycleFailed`] if a component fails to start or contributions conflict,
-    /// or [`EngineError::StartupRollbackFailed`] if startup fails and one or more rollback
-    /// `stop` callbacks fail as well. Host-owned runtime effects are revoked before either
-    /// startup error is returned.
+    /// Returns the same errors as [`Self::start_extension_instance`].
     pub fn start_extension(&mut self, extension_id: &ExtensionId) -> EngineResult<()> {
+        let instance_id = default_instance_id(extension_id);
+        if !self.extensions.contains_key(&instance_id) {
+            return Err(EngineError::ExtensionNotFound(extension_id.to_string()));
+        }
+        self.start_extension_instance(&instance_id)
+    }
+
+    /// Activates one concrete extension runtime instance.
+    ///
+    /// Re-activates scope-local contributions if resuming from `Stopped` state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::ExtensionInstanceNotFound`] if the instance is not
+    /// registered, [`EngineError::LifecycleFailed`] if a component fails to start
+    /// or a contribution conflicts inside the same runtime scope, or
+    /// [`EngineError::StartupRollbackFailed`] when rollback callbacks fail.
+    pub fn start_extension_instance(
+        &mut self,
+        instance_id: &ExtensionInstanceId,
+    ) -> EngineResult<()> {
         let (extensions, runtime_effects) = (&mut self.extensions, &mut self.runtime_effects);
         let ext = extensions
-            .get_mut(extension_id)
-            .ok_or_else(|| EngineError::ExtensionNotFound(extension_id.as_str().to_string()))?;
+            .get_mut(instance_id)
+            .ok_or_else(|| EngineError::ExtensionInstanceNotFound(instance_id.to_string()))?;
 
         if ext.state == ExtensionState::Active {
             return Ok(());
         }
 
-        // Re-check and re-activate contributions if coming from Stopped state
         if ext.state == ExtensionState::Stopped {
             for contrib in &ext.contributions {
-                if self.active_contributions.contains(&contrib.descriptor.id) {
+                let key = (ext.scope_id.clone(), contrib.descriptor.id.clone());
+                if self.active_contributions.contains(&key) {
                     return Err(EngineError::LifecycleFailed {
-                        extension_id: extension_id.as_str().to_string(),
-                        component_id: "engine".to_string(),
+                        extension_id: ext.manifest.id.to_string(),
+                        component_id: String::from("engine"),
                         reason: format!(
-                            "contribution conflict on restart: `{}`",
-                            contrib.descriptor.id
+                            "contribution conflict on restart in scope `{}`: `{}`",
+                            ext.scope_id, contrib.descriptor.id
                         ),
                     });
                 }
             }
             for contrib in &ext.contributions {
                 self.active_contributions
-                    .insert(contrib.descriptor.id.clone());
+                    .insert((ext.scope_id.clone(), contrib.descriptor.id.clone()));
             }
         }
 
+        let logical_id = ext.manifest.id.clone();
+        let scope_id = ext.scope_id.clone();
+        let concrete_instance_id = ext.instance_id.clone();
         let total_components = ext.components.len();
 
-        for i in 0..total_components {
-            let (started, remaining) = ext.components.split_at_mut(i);
+        for index in 0..total_components {
+            let (started, remaining) = ext.components.split_at_mut(index);
             let comp = &mut remaining[0];
-            let mut ctx = EngineComponentContext::new(
-                ext.manifest.id.clone(),
+            let identity = ComponentIdentity::new(
+                logical_id.clone(),
+                concrete_instance_id.clone(),
+                scope_id.clone(),
                 comp.id().clone(),
+            );
+            let mut ctx = EngineComponentContext::new(
+                identity,
                 runtime_effects,
                 &self.secrets,
                 &self.services,
@@ -462,9 +556,14 @@ impl ExtensionEngine {
                 let start_reason = err.to_string();
                 let mut rollback_failures = Vec::new();
 
-                let mut failed_stop_context = EngineComponentContext::new(
-                    ext.manifest.id.clone(),
+                let identity = ComponentIdentity::new(
+                    logical_id.clone(),
+                    concrete_instance_id.clone(),
+                    scope_id.clone(),
                     comp.id().clone(),
+                );
+                let mut failed_stop_context = EngineComponentContext::new(
+                    identity,
                     runtime_effects,
                     &self.secrets,
                     &self.services,
@@ -478,12 +577,16 @@ impl ExtensionEngine {
                     });
                 }
 
-                // Rollback previously started components in reverse order.
                 for comp_to_stop in started.iter_mut().rev() {
                     let component_id = comp_to_stop.id().as_str().to_string();
-                    let mut stop_ctx = EngineComponentContext::new(
-                        ext.manifest.id.clone(),
+                    let identity = ComponentIdentity::new(
+                        logical_id.clone(),
+                        concrete_instance_id.clone(),
+                        scope_id.clone(),
                         comp_to_stop.id().clone(),
+                    );
+                    let mut stop_ctx = EngineComponentContext::new(
+                        identity,
                         runtime_effects,
                         &self.secrets,
                         &self.services,
@@ -498,26 +601,27 @@ impl ExtensionEngine {
                     }
                 }
 
-                // Host-owned effects are revoked even when component rollback fails.
-                runtime_effects.revoke_extension(extension_id);
-                self.ui.set_extension_active(extension_id, false)?;
+                runtime_effects.revoke_instance(&concrete_instance_id);
+                self.ui.set_instance_active(&concrete_instance_id, false)?;
+                self.services.set_active(&concrete_instance_id, false);
 
                 if ext.state == ExtensionState::Stopped {
                     for contrib in &ext.contributions {
-                        self.active_contributions.remove(&contrib.descriptor.id);
+                        self.active_contributions
+                            .remove(&(scope_id.clone(), contrib.descriptor.id.clone()));
                     }
                 }
 
                 if rollback_failures.is_empty() {
                     return Err(EngineError::LifecycleFailed {
-                        extension_id: extension_id.as_str().to_string(),
+                        extension_id: logical_id.to_string(),
                         component_id: failed_component_id,
                         reason: start_reason,
                     });
                 }
 
                 return Err(EngineError::StartupRollbackFailed {
-                    extension_id: extension_id.as_str().to_string(),
+                    extension_id: logical_id.to_string(),
                     component_id: failed_component_id,
                     start_reason,
                     rollback_failures,
@@ -525,39 +629,66 @@ impl ExtensionEngine {
             }
         }
 
-        self.ui.set_extension_active(extension_id, true)?;
+        self.ui.set_instance_active(&concrete_instance_id, true)?;
         ext.state = ExtensionState::Active;
-        self.services.set_active(extension_id, true);
+        self.services.set_active(&concrete_instance_id, true);
         Ok(())
     }
 
-    /// Stops an extension and deactivates its registered contributions.
+    /// Stops the default runtime instance of one logical extension.
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::ExtensionNotFound`] if the extension does not exist,
-    /// or [`EngineError::StopFailed`] if one or more component callbacks fail.
-    /// Host-owned contributions and runtime effects are revoked before that
-    /// error is returned, and the extension transitions to `Stopped`.
+    /// Returns the same errors as [`Self::stop_extension_instance`].
     pub fn stop_extension(&mut self, extension_id: &ExtensionId) -> EngineResult<()> {
+        let instance_id = default_instance_id(extension_id);
+        if !self.extensions.contains_key(&instance_id) {
+            return Err(EngineError::ExtensionNotFound(extension_id.to_string()));
+        }
+        self.stop_extension_instance(&instance_id)
+    }
+
+    /// Stops one concrete extension runtime instance.
+    ///
+    /// Host-owned services, UI presentation, contributions, and runtime effects
+    /// are revoked for this instance without affecting another instance of the
+    /// same logical extension.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::ExtensionInstanceNotFound`] for an unknown instance,
+    /// or [`EngineError::StopFailed`] after cleanup if one or more callbacks fail.
+    pub fn stop_extension_instance(
+        &mut self,
+        instance_id: &ExtensionInstanceId,
+    ) -> EngineResult<()> {
         let (extensions, runtime_effects) = (&mut self.extensions, &mut self.runtime_effects);
         let ext = extensions
-            .get_mut(extension_id)
-            .ok_or_else(|| EngineError::ExtensionNotFound(extension_id.as_str().to_string()))?;
+            .get_mut(instance_id)
+            .ok_or_else(|| EngineError::ExtensionInstanceNotFound(instance_id.to_string()))?;
 
         if ext.state == ExtensionState::Stopped {
             return Ok(());
         }
 
-        self.ui.set_extension_active(extension_id, false)?;
-        self.services.set_active(extension_id, false);
+        let logical_id = ext.manifest.id.clone();
+        let scope_id = ext.scope_id.clone();
+        let concrete_instance_id = ext.instance_id.clone();
+
+        self.ui.set_instance_active(&concrete_instance_id, false)?;
+        self.services.set_active(&concrete_instance_id, false);
 
         let mut stop_failures = Vec::new();
         for comp in ext.components.iter_mut().rev() {
             let component_id = comp.id().as_str().to_string();
-            let mut ctx = EngineComponentContext::new(
-                ext.manifest.id.clone(),
+            let identity = ComponentIdentity::new(
+                logical_id.clone(),
+                concrete_instance_id.clone(),
+                scope_id.clone(),
                 comp.id().clone(),
+            );
+            let mut ctx = EngineComponentContext::new(
+                identity,
                 runtime_effects,
                 &self.secrets,
                 &self.services,
@@ -573,70 +704,152 @@ impl ExtensionEngine {
         }
 
         for contrib in &ext.contributions {
-            self.active_contributions.remove(&contrib.descriptor.id);
+            self.active_contributions
+                .remove(&(scope_id.clone(), contrib.descriptor.id.clone()));
         }
 
-        runtime_effects.revoke_extension(extension_id);
+        runtime_effects.revoke_instance(&concrete_instance_id);
         ext.state = ExtensionState::Stopped;
 
         if stop_failures.is_empty() {
             Ok(())
         } else {
             Err(EngineError::StopFailed {
-                extension_id: extension_id.as_str().to_string(),
+                extension_id: logical_id.to_string(),
                 failures: stop_failures,
             })
         }
     }
 
-    /// Completely unregisters and unloads an extension from the engine.
+    /// Unregisters the default runtime instance of one logical extension.
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::ExtensionNotFound`] if the extension does not exist, or propagates
-    /// [`EngineError::StopFailed`] if an active extension cannot stop cleanly. Host-owned cleanup
-    /// still completes inside [`Self::stop_extension`] before that error is returned; unloading is
-    /// aborted and the extension remains registered in `Stopped` state.
+    /// Returns the same errors as [`Self::unregister_extension_instance`].
     pub fn unregister_extension(&mut self, extension_id: &ExtensionId) -> EngineResult<()> {
-        if let Some(ext) = self.extensions.get(extension_id) {
+        let instance_id = default_instance_id(extension_id);
+        if !self.extensions.contains_key(&instance_id) {
+            return Err(EngineError::ExtensionNotFound(extension_id.to_string()));
+        }
+        self.unregister_extension_instance(&instance_id)
+    }
+
+    /// Completely unregisters and unloads one concrete extension runtime instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::ExtensionInstanceNotFound`] for an unknown instance
+    /// or propagates [`EngineError::StopFailed`] after host cleanup.
+    pub fn unregister_extension_instance(
+        &mut self,
+        instance_id: &ExtensionInstanceId,
+    ) -> EngineResult<()> {
+        if let Some(ext) = self.extensions.get(instance_id) {
             if ext.state == ExtensionState::Active {
-                self.stop_extension(extension_id)?;
+                self.stop_extension_instance(instance_id)?;
             }
         } else {
-            return Err(EngineError::ExtensionNotFound(
-                extension_id.as_str().to_string(),
+            return Err(EngineError::ExtensionInstanceNotFound(
+                instance_id.to_string(),
             ));
         }
 
-        let removed = self.extensions.remove(extension_id);
+        let removed = self.extensions.remove(instance_id);
         if let Some(extension) = removed {
+            for contribution in &extension.contributions {
+                self.active_contributions.remove(&(
+                    extension.scope_id.clone(),
+                    contribution.descriptor.id.clone(),
+                ));
+            }
             for component in &extension.manifest.components {
-                self.secrets.revoke_component(extension_id, &component.id);
+                self.secrets.revoke_component(&ComponentRef::new(
+                    instance_id.clone(),
+                    component.id.clone(),
+                ));
             }
-            for component in extension.components {
-                self.secrets.revoke_component(extension_id, &component.id);
+            for component in &extension.components {
+                self.secrets.revoke_component(&ComponentRef::new(
+                    instance_id.clone(),
+                    component.id.clone(),
+                ));
             }
-            self.services.unregister_extension(extension_id);
-            self.ui.unregister_extension(extension_id);
+            self.services.unregister_instance(instance_id);
+            self.ui.unregister_instance(instance_id);
+
+            for providers in self.preferred_contract_providers.values_mut() {
+                providers.retain(|_, provider| &provider.instance_id != instance_id);
+            }
+            self.preferred_contract_providers
+                .retain(|_, providers| !providers.is_empty());
         }
         Ok(())
     }
 
-    /// Selects the preferred provider for a single-provider contract.
+    /// Selects the preferred provider for a single-provider contract in the default scope.
     pub fn set_preferred_contract_provider(
         &mut self,
         contract: ContractKey,
         provider: ComponentRef,
     ) {
+        let scope_id = default_scope_id();
         self.preferred_contract_providers
+            .entry(scope_id.clone())
+            .or_default()
             .insert(contract.clone(), provider.clone());
-        self.services.set_preferred_provider(contract, provider);
+        self.services
+            .set_preferred_provider(scope_id, contract, provider);
     }
 
-    /// Removes an explicit preferred-provider selection.
+    /// Selects a preferred provider inside one exact runtime scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::ExtensionInstanceNotFound`] when the provider
+    /// instance is unknown, or [`EngineError::InvalidState`] when it belongs to
+    /// a different runtime scope.
+    pub fn set_preferred_contract_provider_in_scope(
+        &mut self,
+        scope_id: &RuntimeScopeId,
+        contract: ContractKey,
+        provider: ComponentRef,
+    ) -> EngineResult<()> {
+        let extension = self.extensions.get(&provider.instance_id).ok_or_else(|| {
+            EngineError::ExtensionInstanceNotFound(provider.instance_id.to_string())
+        })?;
+        if &extension.scope_id != scope_id {
+            return Err(EngineError::InvalidState(format!(
+                "provider instance `{}` does not belong to runtime scope `{scope_id}`",
+                provider.instance_id
+            )));
+        }
+        self.preferred_contract_providers
+            .entry(scope_id.clone())
+            .or_default()
+            .insert(contract.clone(), provider.clone());
+        self.services
+            .set_preferred_provider(scope_id.clone(), contract, provider);
+        Ok(())
+    }
+
+    /// Removes a preferred-provider selection in the default runtime scope.
     pub fn clear_preferred_contract_provider(&mut self, contract: &ContractKey) {
-        self.preferred_contract_providers.remove(contract);
-        self.services.clear_preferred_provider(contract);
+        self.clear_preferred_contract_provider_in_scope(&default_scope_id(), contract);
+    }
+
+    /// Removes a preferred-provider selection in one exact runtime scope.
+    pub fn clear_preferred_contract_provider_in_scope(
+        &mut self,
+        scope_id: &RuntimeScopeId,
+        contract: &ContractKey,
+    ) {
+        if let Some(providers) = self.preferred_contract_providers.get_mut(scope_id) {
+            providers.remove(contract);
+            if providers.is_empty() {
+                self.preferred_contract_providers.remove(scope_id);
+            }
+        }
+        self.services.clear_preferred_provider(scope_id, contract);
     }
 
     /// Attaches the selected portable UI Layer for an active extension component.
@@ -664,55 +877,80 @@ impl ExtensionEngine {
         Ok(())
     }
 
-    /// Returns portable surfaces currently visible to a UI Layer.
+    /// Returns a host snapshot of every active portable UI surface across scopes.
     pub fn portable_ui_surfaces(&self) -> Vec<UiPresentationSurface> {
         self.ui.presentation_surfaces()
+    }
+
+    /// Returns portable surfaces visible to one active UI Layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Ui`] when the caller is not the active layer in
+    /// its runtime scope.
+    pub fn portable_ui_surfaces_for_layer(
+        &self,
+        layer_owner: &ComponentRef,
+    ) -> EngineResult<Vec<UiPresentationSurface>> {
+        Ok(self.ui.presentation_surfaces_for_layer(layer_owner)?)
     }
 
     /// Validates and dispatches one semantic input event from the active UI Layer.
     ///
     /// # Errors
     ///
-    /// Returns a portable UI validation error for spoofed or stale input,
-    /// [`EngineError::ExtensionNotFound`] if its owner disappeared, or
-    /// [`EngineError::UiActionFailed`] when the owner component rejects the action.
+    /// Returns a portable UI validation error for spoofed, cross-scope, or stale
+    /// input, [`EngineError::ExtensionInstanceNotFound`] if its runtime owner
+    /// disappeared, or [`EngineError::UiActionFailed`] when the owner component
+    /// rejects the action.
     pub fn dispatch_ui_action(
         &mut self,
         layer_owner: &ComponentRef,
         event: UiActionEvent,
     ) -> EngineResult<()> {
         let dispatch = self.ui.route_action(layer_owner, event)?;
-        let extension = self
-            .extensions
-            .get(&dispatch.owner.extension_id)
-            .ok_or_else(|| {
-                EngineError::ExtensionNotFound(dispatch.owner.extension_id.to_string())
-            })?;
-        if extension.state != ExtensionState::Active {
-            return Err(EngineError::UiActionFailed {
-                extension_id: dispatch.owner.extension_id.to_string(),
-                component_id: dispatch.owner.component_id.to_string(),
-                action_id: dispatch.event.action_id.to_string(),
-                reason: String::from("surface owner extension is not active"),
-            });
-        }
-        let component = extension
-            .components
-            .iter()
-            .find(|component| component.id() == &dispatch.owner.component_id)
-            .ok_or_else(|| EngineError::UiActionFailed {
-                extension_id: dispatch.owner.extension_id.to_string(),
-                component_id: dispatch.owner.component_id.to_string(),
-                action_id: dispatch.event.action_id.to_string(),
-                reason: String::from("surface owner component is not loaded"),
-            })?;
-        let component_handle = component.handle.clone();
+        let (logical_id, scope_id, component_handle) = {
+            let extension = self
+                .extensions
+                .get(&dispatch.owner.instance_id)
+                .ok_or_else(|| {
+                    EngineError::ExtensionInstanceNotFound(dispatch.owner.instance_id.to_string())
+                })?;
+            if extension.state != ExtensionState::Active {
+                return Err(EngineError::UiActionFailed {
+                    extension_id: extension.manifest.id.to_string(),
+                    component_id: dispatch.owner.component_id.to_string(),
+                    action_id: dispatch.event.action_id.to_string(),
+                    reason: String::from("surface owner extension instance is not active"),
+                });
+            }
+            let component = extension
+                .components
+                .iter()
+                .find(|component| component.id() == &dispatch.owner.component_id)
+                .ok_or_else(|| EngineError::UiActionFailed {
+                    extension_id: extension.manifest.id.to_string(),
+                    component_id: dispatch.owner.component_id.to_string(),
+                    action_id: dispatch.event.action_id.to_string(),
+                    reason: String::from("surface owner component is not loaded"),
+                })?;
+            (
+                extension.manifest.id.clone(),
+                extension.scope_id.clone(),
+                component.handle.clone(),
+            )
+        };
+
         let owner = dispatch.owner.clone();
         let action_id = dispatch.event.action_id.to_string();
-
-        let mut context = EngineComponentContext::new(
-            owner.extension_id.clone(),
+        let identity = ComponentIdentity::new(
+            logical_id.clone(),
+            owner.instance_id.clone(),
+            scope_id,
             owner.component_id.clone(),
+        );
+        let mut context = EngineComponentContext::new(
+            identity,
             &mut self.runtime_effects,
             &self.secrets,
             &self.services,
@@ -726,7 +964,7 @@ impl ExtensionEngine {
         managed
             .handle_ui_action(&mut context, &dispatch.event)
             .map_err(|error| EngineError::UiActionFailed {
-                extension_id: owner.extension_id.to_string(),
+                extension_id: logical_id.to_string(),
                 component_id: owner.component_id.to_string(),
                 action_id,
                 reason: error.to_string(),
@@ -748,32 +986,40 @@ impl ExtensionEngine {
         self.services.call(consumer, contract, request)
     }
 
-    /// Resolves the current active contract composition.
+    /// Resolves active contract composition in the default runtime scope.
     pub fn composition_snapshot(&self) -> CompositionSnapshot {
+        self.composition_snapshot_for_scope(&default_scope_id())
+    }
+
+    /// Resolves active contract composition in one exact runtime scope.
+    pub fn composition_snapshot_for_scope(&self, scope_id: &RuntimeScopeId) -> CompositionSnapshot {
         let mut definitions = Vec::new();
         let mut providers = Vec::new();
         let mut consumers = Vec::new();
 
-        for extension in self
-            .extensions
-            .values()
-            .filter(|extension| extension.state == ExtensionState::Active)
-        {
+        for extension in self.extensions.values().filter(|extension| {
+            extension.state == ExtensionState::Active && &extension.scope_id == scope_id
+        }) {
             definitions.extend(extension.contract_definitions.iter().cloned());
             providers.extend(extension.contract_providers.iter().cloned());
             consumers.extend(extension.contract_consumers.iter().cloned());
         }
 
+        let empty_preferences = HashMap::new();
+        let preferred = self
+            .preferred_contract_providers
+            .get(scope_id)
+            .unwrap_or(&empty_preferences);
         resolve_contracts(
             &definitions,
             &providers,
             &consumers,
-            &self.preferred_contract_providers,
+            preferred,
             &self.secrets,
         )
     }
 
-    /// Returns a list of all currently active contribution descriptors across registered extensions.
+    /// Returns all contribution descriptors owned by registered non-stopped instances.
     pub fn active_contributions(&self) -> Vec<ContributionDescriptor> {
         self.extensions
             .values()
@@ -786,31 +1032,68 @@ impl ExtensionEngine {
             .collect()
     }
 
-    /// Returns the owner of an active contribution, if it is registered.
+    /// Returns the owner of a contribution in the default runtime scope.
     pub fn active_contribution_owner(
         &self,
         contribution_id: &ContributionId,
     ) -> Option<(&ExtensionId, &ComponentId)> {
+        self.active_contribution_owner_in_scope(&default_scope_id(), contribution_id)
+    }
+
+    /// Returns the logical extension and component owning a contribution in one scope.
+    pub fn active_contribution_owner_in_scope(
+        &self,
+        scope_id: &RuntimeScopeId,
+        contribution_id: &ContributionId,
+    ) -> Option<(&ExtensionId, &ComponentId)> {
         self.extensions
-            .iter()
-            .filter(|(_, ext)| ext.state != ExtensionState::Stopped)
-            .find_map(|(extension_id, ext)| {
+            .values()
+            .filter(|ext| ext.state != ExtensionState::Stopped && &ext.scope_id == scope_id)
+            .find_map(|ext| {
                 ext.contributions
                     .iter()
                     .find(|contrib| contrib.descriptor.id == *contribution_id)
-                    .map(|contrib| (extension_id, &contrib.component_id))
+                    .map(|contrib| (&ext.manifest.id, &contrib.component_id))
             })
     }
 
-    /// Returns all active runtime effects together with their extension and component owner.
+    /// Returns all active runtime effects using legacy logical-extension ownership.
     pub fn active_runtime_effects(
         &self,
     ) -> Vec<(&RuntimeEffectId, &ExtensionId, &ComponentId, &RuntimeEffect)> {
+        self.runtime_effects
+            .active_effects()
+            .into_iter()
+            .filter_map(|(effect_id, owner, effect)| {
+                self.extensions.get(&owner.instance_id).map(|extension| {
+                    (
+                        effect_id,
+                        &extension.manifest.id,
+                        &owner.component_id,
+                        effect,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Returns all active runtime effects with their exact runtime principal.
+    pub fn active_runtime_effect_principals(
+        &self,
+    ) -> Vec<(&RuntimeEffectId, &ComponentRef, &RuntimeEffect)> {
         self.runtime_effects.active_effects()
     }
 
-    /// Returns the current lifecycle state of an extension, if registered.
+    /// Returns lifecycle state of the default instance of one logical extension.
     pub fn extension_state(&self, extension_id: &ExtensionId) -> Option<ExtensionState> {
-        self.extensions.get(extension_id).map(|ext| ext.state)
+        self.extension_instance_state(&default_instance_id(extension_id))
+    }
+
+    /// Returns lifecycle state of one concrete extension runtime instance.
+    pub fn extension_instance_state(
+        &self,
+        instance_id: &ExtensionInstanceId,
+    ) -> Option<ExtensionState> {
+        self.extensions.get(instance_id).map(|ext| ext.state)
     }
 }

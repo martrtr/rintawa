@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::types::ExtensionInstanceId;
+
 use super::{UiActionId, UiNodeId, UiSurfaceId};
 
 /// Typed payload carried by a portable UI action.
@@ -17,7 +19,9 @@ pub enum UiActionPayload {
 /// One semantic action emitted by the active UI Layer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiActionEvent {
-    /// Surface that produced the action.
+    /// Runtime instance that owns the surface that produced the action.
+    pub owner_instance_id: ExtensionInstanceId,
+    /// Surface that produced the action within its owning instance.
     pub surface_id: UiSurfaceId,
     /// Node that produced the action.
     pub node_id: UiNodeId,

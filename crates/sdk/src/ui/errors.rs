@@ -5,12 +5,12 @@ use thiserror::Error;
 /// Failure while registering, mounting, patching, or dispatching portable UI.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum UiError {
-    /// An extension has already registered UI metadata.
-    #[error("extension `{0}` is already registered with the UI Runtime")]
-    ExtensionAlreadyRegistered(String),
-    /// An extension has no UI Runtime registration.
-    #[error("extension `{0}` is not registered with the UI Runtime")]
-    ExtensionNotRegistered(String),
+    /// An extension runtime instance has already registered UI metadata.
+    #[error("extension instance `{0}` is already registered with the UI Runtime")]
+    InstanceAlreadyRegistered(String),
+    /// An extension runtime instance has no UI Runtime registration.
+    #[error("extension instance `{0}` is not registered with the UI Runtime")]
+    InstanceNotRegistered(String),
     /// The UI Runtime cannot access its internal state.
     #[error("UI Runtime is unavailable")]
     RuntimeUnavailable,
@@ -23,6 +23,9 @@ pub enum UiError {
     /// The caller is not the active UI Layer.
     #[error("caller is not the active UI Layer")]
     LayerNotOwner,
+    /// The active layer cannot access a surface in another runtime scope.
+    #[error("UI target runtime scope is not visible to the active layer")]
+    ScopeNotVisible,
     /// The UI Layer uses an unsupported protocol major version.
     #[error("unsupported portable UI protocol version: expected {expected}, got {actual}")]
     UnsupportedProtocol {

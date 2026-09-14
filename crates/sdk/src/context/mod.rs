@@ -11,7 +11,7 @@ use crate::{
     runtime_effects::RuntimeEffect,
     secrets::{SecretPath, SecretValue},
     services::{ServiceCallError, ServiceCallResult},
-    types::{ComponentId, ExtensionId, RuntimeEffectId},
+    types::{ComponentId, ExtensionId, ExtensionInstanceId, RuntimeEffectId, RuntimeScopeId},
     ui::{UiPatchBatch, UiResult, UiSurfaceContribution, UiSurfaceId, UiSurfaceSnapshot},
 };
 
@@ -20,8 +20,14 @@ use crate::{
 /// This trait provides access to the component's identity and the APIs
 /// it can use during execution.
 pub trait ComponentContext {
-    /// Returns the ID of the extension that owns this component.
+    /// Returns the logical ID of the extension software that owns this component.
     fn extension_id(&self) -> &ExtensionId;
+
+    /// Returns the opaque ID of this concrete extension runtime instance.
+    fn extension_instance_id(&self) -> &ExtensionInstanceId;
+
+    /// Returns the runtime composition scope containing this instance.
+    fn runtime_scope_id(&self) -> &RuntimeScopeId;
 
     /// Returns the ID of this component.
     fn component_id(&self) -> &ComponentId;

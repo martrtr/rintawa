@@ -15,8 +15,8 @@ use std::{
 
 use keyring::Entry;
 use rintawa_sdk::{
+    contracts::ComponentRef,
     secrets::{SecretAccessError, SecretPath, SecretPathPattern, SecretValue},
-    types::{ComponentId, ExtensionId},
 };
 use tracing::warn;
 
@@ -120,21 +120,6 @@ impl SecretVault for InMemorySecretVault {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct SecretPrincipal {
-    extension_id: ExtensionId,
-    component_id: ComponentId,
-}
-
-impl SecretPrincipal {
-    fn new(extension_id: ExtensionId, component_id: ComponentId) -> Self {
-        Self {
-            extension_id,
-            component_id,
-        }
-    }
-}
-
 /// Rintawa's trusted policy and storage facade for secrets.
 ///
 /// Clones share both the policy and vault. This lets a WASM runtime retain a
@@ -142,7 +127,7 @@ impl SecretPrincipal {
 #[derive(Clone)]
 pub struct SecretManager {
     vault: Arc<dyn SecretVault>,
-    read_grants: Arc<RwLock<HashMap<SecretPrincipal, Vec<SecretPathPattern>>>>,
+    read_grants: Arc<RwLock<HashMap<ComponentRef, Vec<SecretPathPattern>>>>,
     policy_revision: Arc<AtomicU64>,
 }
 
@@ -186,11 +171,10 @@ impl SecretManager {
     /// Grants one component read access to a requested exact path or domain.
     pub fn grant_read(
         &self,
-        extension_id: ExtensionId,
-        component_id: ComponentId,
+        owner: ComponentRef,
         pattern: SecretPathPattern,
     ) -> Result<(), SecretAccessError> {
-        let principal = SecretPrincipal::new(extension_id, component_id);
+        let principal = owner;
         let mut grants = self
             .read_grants
             .write()
@@ -208,13 +192,8 @@ impl SecretManager {
     }
 
     /// Returns whether one component currently holds a grant covering `pattern`.
-    pub(crate) fn has_read_grant(
-        &self,
-        extension_id: &ExtensionId,
-        component_id: &ComponentId,
-        pattern: &SecretPathPattern,
-    ) -> bool {
-        let principal = SecretPrincipal::new(extension_id.clone(), component_id.clone());
+    pub(crate) fn has_read_grant(&self, owner: &ComponentRef, pattern: &SecretPathPattern) -> bool {
+        let principal = owner.clone();
         self.read_grants
             .read()
             .ok()
@@ -229,14 +208,9 @@ impl SecretManager {
     }
 
     /// Revokes every secret grant held by one component.
-    pub fn revoke_component(&self, extension_id: &ExtensionId, component_id: &ComponentId) {
+    pub fn revoke_component(&self, owner: &ComponentRef) {
         if let Ok(mut grants) = self.read_grants.write()
-            && grants
-                .remove(&SecretPrincipal::new(
-                    extension_id.clone(),
-                    component_id.clone(),
-                ))
-                .is_some()
+            && grants.remove(owner).is_some()
         {
             self.policy_revision.fetch_add(1, Ordering::Relaxed);
         }
@@ -244,11 +218,10 @@ impl SecretManager {
 
     pub(crate) fn read_for_component(
         &self,
-        extension_id: &ExtensionId,
-        component_id: &ComponentId,
+        owner: &ComponentRef,
         path: &SecretPath,
     ) -> Result<SecretValue, SecretAccessError> {
-        let principal = SecretPrincipal::new(extension_id.clone(), component_id.clone());
+        let principal = owner.clone();
         let grants = self
             .read_grants
             .read()
@@ -269,9 +242,14 @@ impl SecretManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rintawa_sdk::types::ExtensionInstanceId;
 
     fn manager() -> SecretManager {
         SecretManager::with_vault(Arc::new(InMemorySecretVault::default()))
+    }
+
+    fn owner(instance: &str, component: &str) -> ComponentRef {
+        ComponentRef::new(ExtensionInstanceId::new(instance), component)
     }
 
     #[test]
@@ -279,30 +257,32 @@ mod tests {
         let manager = manager();
         let allowed_path = SecretPath::parse("ai.api_keys.openai").unwrap();
         let denied_path = SecretPath::parse("ai.provider_tokens.openai").unwrap();
-        let extension = ExtensionId::new("official_ai");
-        let component = ComponentId::new("provider");
+        let allowed_owner = owner("official_ai.instance-a", "provider");
 
         manager
             .store(&allowed_path, &SecretValue::new("test-key"))
             .unwrap();
         manager
             .grant_read(
-                extension.clone(),
-                component.clone(),
+                allowed_owner.clone(),
                 SecretPathPattern::parse("ai.api_keys.*").unwrap(),
             )
             .unwrap();
 
         let value = manager
-            .read_for_component(&extension, &component, &allowed_path)
+            .read_for_component(&allowed_owner, &allowed_path)
             .unwrap();
         assert_eq!(value.expose_secret(), "test-key");
         assert!(matches!(
-            manager.read_for_component(&extension, &component, &denied_path),
+            manager.read_for_component(&allowed_owner, &denied_path),
             Err(SecretAccessError::AccessDenied)
         ));
         assert!(matches!(
-            manager.read_for_component(&extension, &ComponentId::new("other"), &allowed_path),
+            manager.read_for_component(&owner("official_ai.instance-a", "other"), &allowed_path),
+            Err(SecretAccessError::AccessDenied)
+        ));
+        assert!(matches!(
+            manager.read_for_component(&owner("official_ai.instance-b", "provider"), &allowed_path),
             Err(SecretAccessError::AccessDenied)
         ));
     }
@@ -311,21 +291,19 @@ mod tests {
     fn test_should_revoke_component_secret_access() {
         let manager = manager();
         let path = SecretPath::parse("ai.api_keys.openai").unwrap();
-        let extension = ExtensionId::new("official_ai");
-        let component = ComponentId::new("provider");
+        let owner = owner("official_ai.instance-a", "provider");
 
         manager.store(&path, &SecretValue::new("test-key")).unwrap();
         manager
             .grant_read(
-                extension.clone(),
-                component.clone(),
+                owner.clone(),
                 SecretPathPattern::parse("ai.api_keys.*").unwrap(),
             )
             .unwrap();
-        manager.revoke_component(&extension, &component);
+        manager.revoke_component(&owner);
 
         assert!(matches!(
-            manager.read_for_component(&extension, &component, &path),
+            manager.read_for_component(&owner, &path),
             Err(SecretAccessError::AccessDenied)
         ));
     }

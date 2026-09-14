@@ -138,6 +138,7 @@ fn test_portable_ui_lifecycle_and_action_dispatch() -> Result<()> {
     engine.attach_ui_layer(layer.clone(), layer_descriptor())?;
 
     let event = UiActionEvent {
+        owner_instance_id: ExtensionInstanceId::new("feature"),
         surface_id: UiSurfaceId::new("example.main"),
         node_id: UiNodeId::new("button"),
         action_id: UiActionId::new("example.run"),

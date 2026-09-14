@@ -9,7 +9,10 @@ use rintawa_sdk::{
     runtime_effects::RuntimeEffect,
     secrets::{SecretPath, SecretValue},
     services::{ServiceCallError, ServiceCallResult},
-    types::{ComponentId, ContributionId, ExtensionId, RuntimeEffectId},
+    types::{
+        ComponentId, ContributionId, ExtensionId, ExtensionInstanceId, RuntimeEffectId,
+        RuntimeScopeId,
+    },
     ui::{UiPatchBatch, UiResult, UiSurfaceContribution, UiSurfaceId, UiSurfaceSnapshot},
 };
 use std::collections::HashSet;
@@ -24,34 +27,64 @@ use crate::{
     services::ServiceRuntime,
 };
 
+/// Runtime identity supplied by the host for one concrete component activation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ComponentIdentity {
+    pub(crate) extension_id: ExtensionId,
+    pub(crate) instance_id: ExtensionInstanceId,
+    pub(crate) scope_id: RuntimeScopeId,
+    pub(crate) component_id: ComponentId,
+}
+
+impl ComponentIdentity {
+    pub(crate) fn new(
+        extension_id: ExtensionId,
+        instance_id: ExtensionInstanceId,
+        scope_id: RuntimeScopeId,
+        component_id: ComponentId,
+    ) -> Self {
+        Self {
+            extension_id,
+            instance_id,
+            scope_id,
+            component_id,
+        }
+    }
+
+    pub(crate) fn owner(&self) -> rintawa_sdk::contracts::ComponentRef {
+        rintawa_sdk::contracts::ComponentRef::new(
+            self.instance_id.clone(),
+            self.component_id.clone(),
+        )
+    }
+}
+
 /// Engine logger redirecting SDK logs to the `tracing` ecosystem.
 #[derive(Debug, Clone)]
 pub struct EngineLogger {
-    extension_id: ExtensionId,
-    component_id: ComponentId,
+    identity: ComponentIdentity,
 }
 
 impl EngineLogger {
-    /// Creates a new logger scoped to an extension and component.
-    pub fn new(extension_id: ExtensionId, component_id: ComponentId) -> Self {
-        Self {
-            extension_id,
-            component_id,
-        }
+    /// Creates a logger scoped to one concrete component activation.
+    pub(crate) fn new(identity: ComponentIdentity) -> Self {
+        Self { identity }
     }
 }
 
 impl LoggerApi for EngineLogger {
     fn log(&self, level: LogLevel, message: &str) {
-        let ext = self.extension_id.as_str();
-        let comp = self.component_id.as_str();
+        let ext = self.identity.extension_id.as_str();
+        let instance = self.identity.instance_id.as_str();
+        let scope = self.identity.scope_id.as_str();
+        let comp = self.identity.component_id.as_str();
 
         match level {
-            LogLevel::Trace => trace!(target: "extension", ext, comp, "{message}"),
-            LogLevel::Debug => debug!(target: "extension", ext, comp, "{message}"),
-            LogLevel::Info => info!(target: "extension", ext, comp, "{message}"),
-            LogLevel::Warn => warn!(target: "extension", ext, comp, "{message}"),
-            LogLevel::Error => error!(target: "extension", ext, comp, "{message}"),
+            LogLevel::Trace => trace!(target: "extension", ext, instance, scope, comp, "{message}"),
+            LogLevel::Debug => debug!(target: "extension", ext, instance, scope, comp, "{message}"),
+            LogLevel::Info => info!(target: "extension", ext, instance, scope, comp, "{message}"),
+            LogLevel::Warn => warn!(target: "extension", ext, instance, scope, comp, "{message}"),
+            LogLevel::Error => error!(target: "extension", ext, instance, scope, comp, "{message}"),
         }
     }
 }
@@ -67,25 +100,22 @@ pub(crate) struct RegistrationBuffers<'a> {
 
 /// Registration context provided to components during initialization.
 pub struct EngineRegistrationContext<'a> {
-    extension_id: ExtensionId,
-    component_id: ComponentId,
+    identity: ComponentIdentity,
     logger: EngineLogger,
     buffers: RegistrationBuffers<'a>,
-    active_contribution_ids: &'a HashSet<ContributionId>,
+    active_contribution_ids: &'a HashSet<(RuntimeScopeId, ContributionId)>,
 }
 
 impl<'a> EngineRegistrationContext<'a> {
     /// Creates a new registration context instance.
     pub(crate) fn new(
-        extension_id: ExtensionId,
-        component_id: ComponentId,
+        identity: ComponentIdentity,
         buffers: RegistrationBuffers<'a>,
-        active_contribution_ids: &'a HashSet<ContributionId>,
+        active_contribution_ids: &'a HashSet<(RuntimeScopeId, ContributionId)>,
     ) -> Self {
-        let logger = EngineLogger::new(extension_id.clone(), component_id.clone());
+        let logger = EngineLogger::new(identity.clone());
         Self {
-            extension_id,
-            component_id,
+            identity,
             logger,
             buffers,
             active_contribution_ids,
@@ -95,11 +125,19 @@ impl<'a> EngineRegistrationContext<'a> {
 
 impl<'a> ComponentContext for EngineRegistrationContext<'a> {
     fn extension_id(&self) -> &ExtensionId {
-        &self.extension_id
+        &self.identity.extension_id
+    }
+
+    fn extension_instance_id(&self) -> &ExtensionInstanceId {
+        &self.identity.instance_id
+    }
+
+    fn runtime_scope_id(&self) -> &RuntimeScopeId {
+        &self.identity.scope_id
     }
 
     fn component_id(&self) -> &ComponentId {
-        &self.component_id
+        &self.identity.component_id
     }
 
     fn logger(&self) -> &dyn LoggerApi {
@@ -109,7 +147,9 @@ impl<'a> ComponentContext for EngineRegistrationContext<'a> {
 
 impl<'a> RegistrationContext for EngineRegistrationContext<'a> {
     fn register(&mut self, contribution: ContributionDescriptor) -> ExtensionResult<()> {
-        if self.active_contribution_ids.contains(&contribution.id)
+        if self
+            .active_contribution_ids
+            .contains(&(self.identity.scope_id.clone(), contribution.id.clone()))
             || self
                 .buffers
                 .contributions
@@ -126,10 +166,7 @@ impl<'a> RegistrationContext for EngineRegistrationContext<'a> {
     }
 
     fn define_contract(&mut self, definition: ContractDefinition) -> ExtensionResult<()> {
-        let owner = rintawa_sdk::contracts::ComponentRef::new(
-            self.extension_id.clone(),
-            self.component_id.clone(),
-        );
+        let owner = self.identity.owner();
         if self.buffers.contract_definitions.iter().any(|registered| {
             registered.owner == owner && registered.definition.contract == definition.contract
         }) {
@@ -144,10 +181,7 @@ impl<'a> RegistrationContext for EngineRegistrationContext<'a> {
     }
 
     fn provide_contract(&mut self, provider: ContractProvider) -> ExtensionResult<()> {
-        let owner = rintawa_sdk::contracts::ComponentRef::new(
-            self.extension_id.clone(),
-            self.component_id.clone(),
-        );
+        let owner = self.identity.owner();
         if self.buffers.contract_providers.iter().any(|registered| {
             registered.owner == owner && registered.provider.contract == provider.contract
         }) {
@@ -162,10 +196,7 @@ impl<'a> RegistrationContext for EngineRegistrationContext<'a> {
     }
 
     fn consume_contract(&mut self, consumer: ContractConsumer) -> ExtensionResult<()> {
-        let owner = rintawa_sdk::contracts::ComponentRef::new(
-            self.extension_id.clone(),
-            self.component_id.clone(),
-        );
+        let owner = self.identity.owner();
         if self.buffers.contract_consumers.iter().any(|registered| {
             registered.owner == owner && registered.consumer.contract == consumer.contract
         }) {
@@ -180,10 +211,7 @@ impl<'a> RegistrationContext for EngineRegistrationContext<'a> {
     }
 
     fn register_ui_surface(&mut self, surface: UiSurfaceContribution) -> ExtensionResult<()> {
-        let owner = rintawa_sdk::contracts::ComponentRef::new(
-            self.extension_id.clone(),
-            self.component_id.clone(),
-        );
+        let owner = self.identity.owner();
         if self
             .buffers
             .ui_surfaces
@@ -202,8 +230,7 @@ impl<'a> RegistrationContext for EngineRegistrationContext<'a> {
 
 /// Context provided to components during start and stop execution phases.
 pub struct EngineComponentContext<'a> {
-    extension_id: ExtensionId,
-    component_id: ComponentId,
+    identity: ComponentIdentity,
     logger: EngineLogger,
     runtime_effects: &'a mut RuntimeEffectRegistry,
     secrets: &'a SecretManager,
@@ -215,18 +242,16 @@ pub struct EngineComponentContext<'a> {
 impl<'a> EngineComponentContext<'a> {
     /// Creates a new execution context.
     pub(crate) fn new(
-        extension_id: ExtensionId,
-        component_id: ComponentId,
+        identity: ComponentIdentity,
         runtime_effects: &'a mut RuntimeEffectRegistry,
         secrets: &'a SecretManager,
         services: &'a ServiceRuntime,
         ui: &'a UiRuntime,
         execution_active: bool,
     ) -> Self {
-        let logger = EngineLogger::new(extension_id.clone(), component_id.clone());
+        let logger = EngineLogger::new(identity.clone());
         Self {
-            extension_id,
-            component_id,
+            identity,
             logger,
             runtime_effects,
             secrets,
@@ -239,11 +264,19 @@ impl<'a> EngineComponentContext<'a> {
 
 impl ComponentContext for EngineComponentContext<'_> {
     fn extension_id(&self) -> &ExtensionId {
-        &self.extension_id
+        &self.identity.extension_id
+    }
+
+    fn extension_instance_id(&self) -> &ExtensionInstanceId {
+        &self.identity.instance_id
+    }
+
+    fn runtime_scope_id(&self) -> &RuntimeScopeId {
+        &self.identity.scope_id
     }
 
     fn component_id(&self) -> &ComponentId {
-        &self.component_id
+        &self.identity.component_id
     }
 
     fn logger(&self) -> &dyn LoggerApi {
@@ -254,18 +287,17 @@ impl ComponentContext for EngineComponentContext<'_> {
         &mut self,
         effect: RuntimeEffect,
     ) -> ExtensionResult<RuntimeEffectId> {
-        self.runtime_effects
-            .register(self.extension_id.clone(), self.component_id.clone(), effect)
+        self.runtime_effects.register(self.identity.owner(), effect)
     }
 
     fn revoke_runtime_effect(&mut self, effect_id: &RuntimeEffectId) -> ExtensionResult<()> {
         self.runtime_effects
-            .revoke(effect_id, &self.extension_id, &self.component_id)
+            .revoke(effect_id, &self.identity.owner())
     }
 
     fn revoke_all_runtime_effects(&mut self) -> ExtensionResult<()> {
         self.runtime_effects
-            .revoke_component(&self.extension_id, &self.component_id);
+            .revoke_component(&self.identity.owner());
         Ok(())
     }
 
@@ -277,7 +309,7 @@ impl ComponentContext for EngineComponentContext<'_> {
         }
 
         self.secrets
-            .read_for_component(&self.extension_id, &self.component_id, path)
+            .read_for_component(&self.identity.owner(), path)
             .map_err(ExtensionError::from)
     }
 
@@ -289,52 +321,28 @@ impl ComponentContext for EngineComponentContext<'_> {
         if !self.execution_active {
             return Err(ServiceCallError::Unavailable);
         }
-        self.services.call_from_execution(
-            &rintawa_sdk::contracts::ComponentRef::new(
-                self.extension_id.clone(),
-                self.component_id.clone(),
-            ),
-            contract,
-            request,
-        )
+        self.services
+            .call_from_execution(&self.identity.owner(), contract, request)
     }
 
     fn mount_ui_surface(&mut self, snapshot: UiSurfaceSnapshot) -> UiResult<()> {
         if !self.execution_active {
             return Err(rintawa_sdk::ui::UiError::OwnerInactive);
         }
-        self.ui.mount_surface(
-            &rintawa_sdk::contracts::ComponentRef::new(
-                self.extension_id.clone(),
-                self.component_id.clone(),
-            ),
-            snapshot,
-        )
+        self.ui.mount_surface(&self.identity.owner(), snapshot)
     }
 
     fn patch_ui_surface(&mut self, batch: UiPatchBatch) -> UiResult<()> {
         if !self.execution_active {
             return Err(rintawa_sdk::ui::UiError::OwnerInactive);
         }
-        self.ui.apply_patches(
-            &rintawa_sdk::contracts::ComponentRef::new(
-                self.extension_id.clone(),
-                self.component_id.clone(),
-            ),
-            batch,
-        )
+        self.ui.apply_patches(&self.identity.owner(), batch)
     }
 
     fn unmount_ui_surface(&mut self, surface_id: &UiSurfaceId) -> UiResult<()> {
         if !self.execution_active {
             return Err(rintawa_sdk::ui::UiError::OwnerInactive);
         }
-        self.ui.unmount_surface(
-            &rintawa_sdk::contracts::ComponentRef::new(
-                self.extension_id.clone(),
-                self.component_id.clone(),
-            ),
-            surface_id,
-        )
+        self.ui.unmount_surface(&self.identity.owner(), surface_id)
     }
 }

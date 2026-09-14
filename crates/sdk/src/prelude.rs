@@ -36,7 +36,8 @@ pub use crate::services::{ServiceCallError, ServiceCallResult};
 pub use crate::traits::Component;
 
 pub use crate::types::{
-    ComponentId, ComponentTarget, ContractId, ContributionId, ExtensionId, RuntimeEffectId,
+    ComponentId, ComponentTarget, ContractId, ContributionId, ExtensionId, ExtensionInstanceId,
+    RuntimeEffectId, RuntimeScopeId,
 };
 
 pub use crate::ui::{

@@ -113,6 +113,14 @@ pub enum EngineError {
     #[error("extension `{0}` is already registered")]
     ExtensionAlreadyExists(String),
 
+    /// The specified extension runtime instance was not found in the engine.
+    #[error("extension instance `{0}` not found")]
+    ExtensionInstanceNotFound(String),
+
+    /// The specified extension runtime instance is already registered.
+    #[error("extension instance `{0}` is already registered")]
+    ExtensionInstanceAlreadyExists(String),
+
     /// A component failed while handling a validated portable UI action.
     #[error(
         "component `{component_id}` in extension `{extension_id}` failed UI action `{action_id}`: {reason}"

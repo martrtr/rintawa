@@ -232,10 +232,9 @@ fn test_provider_grants_control_binding_eligibility() -> anyhow::Result<()> {
     assert_eq!(snapshot.bindings.len(), 1);
     assert!(snapshot.unresolved.is_empty());
 
-    engine.secret_manager().revoke_component(
-        &ExtensionId::new("secured-provider"),
-        &ComponentId::new("runtime"),
-    );
+    engine
+        .secret_manager()
+        .revoke_component(&ComponentRef::new("secured-provider", "runtime"));
     let snapshot = engine.composition_snapshot();
     assert!(snapshot.bindings.is_empty());
     assert_eq!(

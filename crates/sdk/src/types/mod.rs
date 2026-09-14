@@ -61,7 +61,15 @@ macro_rules! string_id {
     };
 }
 
-string_id!(ExtensionId, "An identifier for an extension package.");
+string_id!(ExtensionId, "A logical identifier for extension software.");
+string_id!(
+    ExtensionInstanceId,
+    "An opaque identifier for one runtime activation of an extension."
+);
+string_id!(
+    RuntimeScopeId,
+    "An opaque identifier for one runtime composition scope."
+);
 string_id!(
     ComponentId,
     "An identifier for a component in an extension."

@@ -201,15 +201,13 @@ fn requirements_satisfied(
     requirements: &[ContractGrantRequirement],
 ) -> bool {
     requirements.iter().all(|requirement| match requirement {
-        ContractGrantRequirement::SecretRead { pattern } => {
-            secrets.has_read_grant(&owner.extension_id, &owner.component_id, pattern)
-        }
+        ContractGrantRequirement::SecretRead { pattern } => secrets.has_read_grant(owner, pattern),
     })
 }
 
 fn component_ref_key(component: &ComponentRef) -> (&str, &str) {
     (
-        component.extension_id.as_str(),
+        component.instance_id.as_str(),
         component.component_id.as_str(),
     )
 }

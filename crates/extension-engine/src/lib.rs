@@ -654,9 +654,13 @@ mod tests {
         engine.unregister_extension(&extension_id)?;
 
         assert!(matches!(
-            engine
-                .secret_manager()
-                .read_for_component(&extension_id, &component_id, &secret_path),
+            engine.secret_manager().read_for_component(
+                &rintawa_sdk::contracts::ComponentRef::new(
+                    extension_id.as_str(),
+                    component_id.clone(),
+                ),
+                &secret_path,
+            ),
             Err(SecretAccessError::AccessDenied)
         ));
 

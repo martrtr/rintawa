@@ -22,7 +22,7 @@ use rintawa_sdk::{
     secrets::{SecretAccessError, SecretPath, SecretPathPattern},
     services::ServiceCallError,
     traits::Component,
-    types::{ComponentId, ExtensionId, RuntimeEffectId},
+    types::{ComponentId, ExtensionId, ExtensionInstanceId, RuntimeEffectId, RuntimeScopeId},
     ui::{
         UiActionEvent, UiCapabilityId, UiError, UiPatchBatch, UiPlacementHint,
         UiSurfaceContribution, UiSurfaceId, UiSurfaceSnapshot,
@@ -140,6 +140,8 @@ use bindings::rintawa::engine::{
 pub struct WasmHostState {
     component_id: ComponentId,
     extension_id: Option<ExtensionId>,
+    instance_id: Option<ExtensionInstanceId>,
+    scope_id: Option<RuntimeScopeId>,
     registration_scope: Option<WasmRegistrationScope>,
     runtime_effects_active: bool,
     next_effect_handle: u64,
@@ -234,6 +236,8 @@ impl WasmHostState {
         Self {
             component_id,
             extension_id: None,
+            instance_id: None,
+            scope_id: None,
             registration_scope: None,
             runtime_effects_active: false,
             next_effect_handle: 0,
@@ -256,7 +260,12 @@ impl WasmHostState {
         &self.component_id
     }
 
-    fn begin_registration(&mut self, extension_id: ExtensionId) -> ExtensionResult<()> {
+    fn begin_registration(
+        &mut self,
+        extension_id: ExtensionId,
+        instance_id: ExtensionInstanceId,
+        scope_id: RuntimeScopeId,
+    ) -> ExtensionResult<()> {
         if self.registration_scope.is_some() {
             return Err(ExtensionError::Message(String::from(
                 "WASM component registration is already in progress",
@@ -282,6 +291,8 @@ impl WasmHostState {
             ui_surface_ids: HashSet::new(),
         });
         self.extension_id = Some(extension_id);
+        self.instance_id = Some(instance_id);
+        self.scope_id = Some(scope_id);
         Ok(())
     }
 
@@ -302,16 +313,24 @@ impl WasmHostState {
     fn cancel_registration(&mut self) {
         self.registration_scope = None;
         self.extension_id = None;
+        self.instance_id = None;
+        self.scope_id = None;
     }
 
     fn validate_execution_owner(&self, ctx: &dyn ComponentContext) -> ExtensionResult<()> {
-        let Some(extension_id) = &self.extension_id else {
+        let (Some(extension_id), Some(instance_id), Some(scope_id)) =
+            (&self.extension_id, &self.instance_id, &self.scope_id)
+        else {
             return Err(ExtensionError::Message(String::from(
                 "WASM component has not completed registration",
             )));
         };
 
-        if ctx.extension_id() != extension_id || ctx.component_id() != &self.component_id {
+        if ctx.extension_id() != extension_id
+            || ctx.extension_instance_id() != instance_id
+            || ctx.runtime_scope_id() != scope_id
+            || ctx.component_id() != &self.component_id
+        {
             return Err(ExtensionError::Message(String::from(
                 "WASM component received a context for a different owner",
             )));
@@ -665,12 +684,12 @@ impl WasmHostState {
     }
 
     fn ui_owner(&self) -> Result<rintawa_sdk::contracts::ComponentRef, PortableUiError> {
-        let extension_id = self
-            .extension_id
+        let instance_id = self
+            .instance_id
             .as_ref()
             .ok_or(PortableUiError::Unavailable)?;
         Ok(rintawa_sdk::contracts::ComponentRef::new(
-            extension_id.clone(),
+            instance_id.clone(),
             self.component_id.clone(),
         ))
     }
@@ -729,14 +748,18 @@ impl WasmHostState {
             return Err(SecretError::AccessNotActive);
         }
 
-        let extension_id = self
-            .extension_id
+        let instance_id = self
+            .instance_id
             .as_ref()
             .ok_or(SecretError::AccessNotActive)?;
         let path = SecretPath::parse(path).map_err(|_| SecretError::InvalidPath)?;
+        let owner = rintawa_sdk::contracts::ComponentRef::new(
+            instance_id.clone(),
+            self.component_id.clone(),
+        );
 
         self.secrets
-            .read_for_component(extension_id, &self.component_id, &path)
+            .read_for_component(&owner, &path)
             .map(|value| value.expose_secret().to_string())
             .map_err(|error| match error {
                 SecretAccessError::InvalidPath => SecretError::InvalidPath,
@@ -943,12 +966,12 @@ impl ServicesHost for WasmHostState {
         if !self.service_access_active {
             return Err(ServiceTransportError::Unavailable);
         }
-        let extension_id = self
-            .extension_id
+        let instance_id = self
+            .instance_id
             .as_ref()
             .ok_or(ServiceTransportError::Unavailable)?;
         let caller = rintawa_sdk::contracts::ComponentRef::new(
-            extension_id.clone(),
+            instance_id.clone(),
             self.component_id.clone(),
         );
         let contract = ContractKey::new(contract, ContractVersion::new(version));
@@ -1281,10 +1304,11 @@ impl Component for WasmComponent {
         let registrations = {
             let instance = self.instance_mut()?;
             Self::set_callback_fuel(&mut instance.store, &budget, "register")?;
-            instance
-                .store
-                .data_mut()
-                .begin_registration(ctx.extension_id().clone())?;
+            instance.store.data_mut().begin_registration(
+                ctx.extension_id().clone(),
+                ctx.extension_instance_id().clone(),
+                ctx.runtime_scope_id().clone(),
+            )?;
 
             let registration_result = instance
                 .plugin
@@ -1465,6 +1489,20 @@ mod tests {
     };
     use std::sync::Arc;
 
+    fn test_instance_id() -> ExtensionInstanceId {
+        ExtensionInstanceId::new("test-instance")
+    }
+
+    fn test_scope_id() -> RuntimeScopeId {
+        RuntimeScopeId::new("test")
+    }
+
+    fn begin_test_registration(state: &mut WasmHostState, extension_id: ExtensionId) {
+        state
+            .begin_registration(extension_id, test_instance_id(), test_scope_id())
+            .unwrap();
+    }
+
     struct TestLogger;
 
     impl LoggerApi for TestLogger {
@@ -1473,6 +1511,8 @@ mod tests {
 
     struct TestRuntimeContext {
         extension_id: ExtensionId,
+        instance_id: ExtensionInstanceId,
+        scope_id: RuntimeScopeId,
         component_id: ComponentId,
         logger: TestLogger,
         effects: HashMap<RuntimeEffectId, RuntimeEffect>,
@@ -1485,6 +1525,8 @@ mod tests {
         fn new() -> Self {
             Self {
                 extension_id: ExtensionId::new("rintawa.chat"),
+                instance_id: test_instance_id(),
+                scope_id: test_scope_id(),
                 component_id: ComponentId::new("chat-runtime"),
                 logger: TestLogger,
                 effects: HashMap::new(),
@@ -1502,6 +1544,14 @@ mod tests {
     impl ComponentContext for TestRuntimeContext {
         fn extension_id(&self) -> &ExtensionId {
             &self.extension_id
+        }
+
+        fn extension_instance_id(&self) -> &ExtensionInstanceId {
+            &self.instance_id
+        }
+
+        fn runtime_scope_id(&self) -> &RuntimeScopeId {
+            &self.scope_id
         }
 
         fn component_id(&self) -> &ComponentId {
@@ -1584,9 +1634,7 @@ mod tests {
             UiRuntime::new(),
             &budget,
         );
-        state
-            .begin_registration(ExtensionId::new("example.extension"))
-            .unwrap();
+        begin_test_registration(&mut state, ExtensionId::new("example.extension"));
 
         assert!(matches!(
             PortableUiHost::register_surface(
@@ -1623,9 +1671,7 @@ mod tests {
             UiRuntime::new(),
             &budget,
         );
-        state
-            .begin_registration(ExtensionId::new("example.extension"))
-            .unwrap();
+        begin_test_registration(&mut state, ExtensionId::new("example.extension"));
 
         assert!(matches!(
             PortableUiHost::register_surface(
@@ -1657,9 +1703,7 @@ mod tests {
     #[test]
     fn test_should_commit_wasm_capability_contributions_only_after_registration_finishes() {
         let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
-        state
-            .begin_registration(ExtensionId::new("rintawa.chat"))
-            .unwrap();
+        begin_test_registration(&mut state, ExtensionId::new("rintawa.chat"));
 
         RegistrationHost::register_capability(
             &mut state,
@@ -1681,9 +1725,7 @@ mod tests {
     #[test]
     fn test_should_stage_wasm_contract_registrations() {
         let mut state = WasmHostState::new(ComponentId::new("runtime"));
-        state
-            .begin_registration(ExtensionId::new("example.extension"))
-            .unwrap();
+        begin_test_registration(&mut state, ExtensionId::new("example.extension"));
 
         RegistrationHost::define_contract(
             &mut state,
@@ -1729,7 +1771,7 @@ mod tests {
     fn test_should_stage_and_apply_wasm_portable_ui_operations() {
         let mut state = WasmHostState::new(ComponentId::new("runtime"));
         let extension_id = ExtensionId::new("example.extension");
-        state.begin_registration(extension_id.clone()).unwrap();
+        begin_test_registration(&mut state, extension_id.clone());
 
         PortableUiHost::register_surface(
             &mut state,
@@ -1745,13 +1787,14 @@ mod tests {
         assert_eq!(registrations.ui_surfaces[0].id.as_str(), "example.main");
 
         let owner = rintawa_sdk::contracts::ComponentRef::new(
-            extension_id.clone(),
+            test_instance_id(),
             ComponentId::new("runtime"),
         );
         state
             .ui
-            .register_extension(
-                extension_id.clone(),
+            .register_instance(
+                test_instance_id(),
+                test_scope_id(),
                 vec![rintawa_ui_runtime::OwnedUiSurfaceContribution {
                     owner: owner.clone(),
                     contribution: registrations.ui_surfaces[0].clone(),
@@ -1775,7 +1818,10 @@ mod tests {
         state.finish_service_execution();
         assert_eq!(state.ui.presentation_surfaces().len(), 0);
 
-        state.ui.set_extension_active(&extension_id, true).unwrap();
+        state
+            .ui
+            .set_instance_active(&test_instance_id(), true)
+            .unwrap();
         assert_eq!(state.ui.presentation_surfaces().len(), 1);
 
         let patch = UiPatchBatch {
@@ -1801,9 +1847,7 @@ mod tests {
     #[test]
     fn test_should_reject_wasm_service_calls_outside_execution_scope() {
         let mut state = WasmHostState::new(ComponentId::new("runtime"));
-        state
-            .begin_registration(ExtensionId::new("example.extension"))
-            .unwrap();
+        begin_test_registration(&mut state, ExtensionId::new("example.extension"));
         state.finish_registration().unwrap();
 
         assert!(matches!(
@@ -1865,14 +1909,13 @@ mod tests {
             .unwrap();
         manager
             .grant_read(
-                extension_id.clone(),
-                component_id.clone(),
+                rintawa_sdk::contracts::ComponentRef::new(test_instance_id(), component_id.clone()),
                 SecretPathPattern::parse("ai.api_keys.*").unwrap(),
             )
             .unwrap();
 
         let mut state = WasmHostState::with_secret_manager(component_id, manager);
-        state.begin_registration(extension_id).unwrap();
+        begin_test_registration(&mut state, extension_id);
         state.finish_registration().unwrap();
 
         assert!(matches!(

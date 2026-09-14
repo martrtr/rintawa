@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     secrets::SecretPathPattern,
-    types::{ComponentId, ContractId, ExtensionId},
+    types::{ComponentId, ContractId, ExtensionInstanceId},
 };
 
 /// A major version of a public contract.
@@ -57,20 +57,23 @@ impl fmt::Display for ContractKey {
     }
 }
 
-/// Identifies one component across extension packages.
+/// Identifies one component within one concrete extension runtime instance.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ComponentRef {
-    /// Extension package identifier.
-    pub extension_id: ExtensionId,
-    /// Component identifier within the package.
+    /// Opaque runtime instance that owns the component.
+    pub instance_id: ExtensionInstanceId,
+    /// Component identifier within the extension instance.
     pub component_id: ComponentId,
 }
 
 impl ComponentRef {
     /// Creates a component reference.
-    pub fn new(extension_id: impl Into<ExtensionId>, component_id: impl Into<ComponentId>) -> Self {
+    pub fn new(
+        instance_id: impl Into<ExtensionInstanceId>,
+        component_id: impl Into<ComponentId>,
+    ) -> Self {
         Self {
-            extension_id: extension_id.into(),
+            instance_id: instance_id.into(),
             component_id: component_id.into(),
         }
     }

@@ -3,16 +3,16 @@
 use std::collections::HashMap;
 
 use rintawa_sdk::{
+    contracts::ComponentRef,
     errors::{ExtensionError, ExtensionResult},
     runtime_effects::RuntimeEffect,
-    types::{ComponentId, ExtensionId, RuntimeEffectId},
+    types::{ExtensionInstanceId, RuntimeEffectId},
 };
 
 /// An effect together with the component that owns it.
 #[derive(Debug, Clone)]
 struct OwnedRuntimeEffect {
-    extension_id: ExtensionId,
-    component_id: ComponentId,
+    owner: ComponentRef,
     effect: RuntimeEffect,
 }
 
@@ -27,15 +27,14 @@ impl RuntimeEffectRegistry {
     /// Registers one validated effect for an active component.
     pub(crate) fn register(
         &mut self,
-        extension_id: ExtensionId,
-        component_id: ComponentId,
+        owner: ComponentRef,
         effect: RuntimeEffect,
     ) -> ExtensionResult<RuntimeEffectId> {
         validate_runtime_effect(&effect)?;
 
         let effect_id = RuntimeEffectId::new(format!(
             "{}.{}.effect.{}",
-            extension_id, component_id, self.next_effect_sequence
+            owner.instance_id, owner.component_id, self.next_effect_sequence
         ));
         self.next_effect_sequence = self.next_effect_sequence.checked_add(1).ok_or_else(|| {
             ExtensionError::Message(String::from(
@@ -43,14 +42,8 @@ impl RuntimeEffectRegistry {
             ))
         })?;
 
-        self.effects.insert(
-            effect_id.clone(),
-            OwnedRuntimeEffect {
-                extension_id,
-                component_id,
-                effect,
-            },
-        );
+        self.effects
+            .insert(effect_id.clone(), OwnedRuntimeEffect { owner, effect });
         Ok(effect_id)
     }
 
@@ -58,8 +51,7 @@ impl RuntimeEffectRegistry {
     pub(crate) fn revoke(
         &mut self,
         effect_id: &RuntimeEffectId,
-        extension_id: &ExtensionId,
-        component_id: &ComponentId,
+        caller: &ComponentRef,
     ) -> ExtensionResult<()> {
         let Some(owner) = self.effects.get(effect_id) else {
             return Err(ExtensionError::RuntimeEffectNotOwned(
@@ -67,7 +59,7 @@ impl RuntimeEffectRegistry {
             ));
         };
 
-        if owner.extension_id != *extension_id || owner.component_id != *component_id {
+        if owner.owner != *caller {
             return Err(ExtensionError::RuntimeEffectNotOwned(
                 effect_id.as_str().to_string(),
             ));
@@ -77,38 +69,23 @@ impl RuntimeEffectRegistry {
         Ok(())
     }
 
-    /// Removes all effects owned by an extension after failed start, stop, or crash.
-    pub(crate) fn revoke_extension(&mut self, extension_id: &ExtensionId) {
+    /// Removes all effects owned by one extension instance after stop or crash.
+    pub(crate) fn revoke_instance(&mut self, instance_id: &ExtensionInstanceId) {
         self.effects
-            .retain(|_, owner| owner.extension_id != *extension_id);
+            .retain(|_, effect| effect.owner.instance_id != *instance_id);
     }
 
     /// Removes all effects owned by one component after a component-level failure.
-    pub(crate) fn revoke_component(
-        &mut self,
-        extension_id: &ExtensionId,
-        component_id: &ComponentId,
-    ) {
-        self.effects.retain(|_, owner| {
-            owner.extension_id != *extension_id || owner.component_id != *component_id
-        });
+    pub(crate) fn revoke_component(&mut self, owner: &ComponentRef) {
+        self.effects.retain(|_, effect| effect.owner != *owner);
     }
 
-    /// Returns all currently installed effects with their owner.
-    pub(crate) fn active_effects(
-        &self,
-    ) -> Vec<(&RuntimeEffectId, &ExtensionId, &ComponentId, &RuntimeEffect)> {
+    /// Returns all currently installed effects with their runtime owner.
+    pub(crate) fn active_effects(&self) -> Vec<(&RuntimeEffectId, &ComponentRef, &RuntimeEffect)> {
         let mut effects: Vec<_> = self
             .effects
             .iter()
-            .map(|(effect_id, owner)| {
-                (
-                    effect_id,
-                    &owner.extension_id,
-                    &owner.component_id,
-                    &owner.effect,
-                )
-            })
+            .map(|(effect_id, effect)| (effect_id, &effect.owner, &effect.effect))
             .collect();
         effects.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
         effects
@@ -130,24 +107,22 @@ fn validate_runtime_effect(effect: &RuntimeEffect) -> ExtensionResult<()> {
 mod tests {
     use super::*;
 
+    fn owner(instance: &str, component: &str) -> ComponentRef {
+        ComponentRef::new(instance, component)
+    }
+
     #[test]
     fn test_should_reject_revocation_by_a_different_component() {
         let mut registry = RuntimeEffectRegistry::default();
-        let extension_id = ExtensionId::new("rintawa.chat");
-        let component_id = ComponentId::new("chat-runtime");
+        let original_owner = owner("chat-a", "chat-runtime");
         let effect_id = registry
             .register(
-                extension_id.clone(),
-                component_id.clone(),
+                original_owner.clone(),
                 RuntimeEffect::event_subscription("dialogue.message"),
             )
             .unwrap();
 
-        let result = registry.revoke(
-            &effect_id,
-            &extension_id,
-            &ComponentId::new("other-component"),
-        );
+        let result = registry.revoke(&effect_id, &owner("chat-a", "other-component"));
 
         assert!(matches!(
             result,
@@ -155,38 +130,57 @@ mod tests {
         ));
         assert_eq!(registry.active_effects().len(), 1);
 
-        registry
-            .revoke(&effect_id, &extension_id, &component_id)
-            .unwrap();
+        registry.revoke(&effect_id, &original_owner).unwrap();
         assert!(registry.active_effects().is_empty());
     }
 
     #[test]
     fn test_should_revoke_only_the_failed_component_effects() {
         let mut registry = RuntimeEffectRegistry::default();
-        let extension_id = ExtensionId::new("rintawa.chat");
-        let failed_component_id = ComponentId::new("failed-runtime");
-        let healthy_component_id = ComponentId::new("healthy-runtime");
+        let failed_owner = owner("chat-a", "failed-runtime");
+        let healthy_owner = owner("chat-a", "healthy-runtime");
 
         registry
             .register(
-                extension_id.clone(),
-                failed_component_id.clone(),
+                failed_owner.clone(),
                 RuntimeEffect::event_subscription("dialogue.failed"),
             )
             .unwrap();
         registry
             .register(
-                extension_id.clone(),
-                healthy_component_id.clone(),
+                healthy_owner.clone(),
                 RuntimeEffect::event_subscription("dialogue.healthy"),
             )
             .unwrap();
 
-        registry.revoke_component(&extension_id, &failed_component_id);
+        registry.revoke_component(&failed_owner);
 
         let effects = registry.active_effects();
         assert_eq!(effects.len(), 1);
-        assert_eq!(effects[0].2, &healthy_component_id);
+        assert_eq!(effects[0].1, &healthy_owner);
+    }
+
+    #[test]
+    fn test_should_isolate_same_component_between_instances() {
+        let mut registry = RuntimeEffectRegistry::default();
+        let owner_a = owner("chat-a", "runtime");
+        let owner_b = owner("chat-b", "runtime");
+        registry
+            .register(
+                owner_a.clone(),
+                RuntimeEffect::event_subscription("dialogue.a"),
+            )
+            .unwrap();
+        registry
+            .register(
+                owner_b.clone(),
+                RuntimeEffect::event_subscription("dialogue.b"),
+            )
+            .unwrap();
+
+        registry.revoke_instance(&owner_a.instance_id);
+        let effects = registry.active_effects();
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].1, &owner_b);
     }
 }
