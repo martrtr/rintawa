@@ -16,6 +16,7 @@ rust-version = "1.98"
 [workspace.dependencies]
 anyhow = "1"
 thiserror = "2"
+tempfile = "3"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -24,4 +25,5 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 
 toml = "0.9"
+zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 wasmtime = { version = "29", features = ["component-model", "async"] }
