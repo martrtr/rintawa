@@ -121,6 +121,23 @@ pub enum RtwError {
     /// The pack output would be located inside the source tree.
     #[error("RTW pack output `{0}` must not be inside its source directory")]
     OutputInsideSource(String),
+    /// A content digest is malformed or uses an unsupported representation.
+    #[error("invalid artifact digest `{0}`")]
+    InvalidDigest(String),
+    /// A requested content-addressed artifact is not present in the store.
+    #[error("artifact `{0}` is not present in the RTW store")]
+    StoredArtifactNotFound(String),
+    /// Bytes stored under a digest path no longer match that digest.
+    #[error("stored artifact `{0}` failed content-address verification")]
+    StoreCorruption(String),
+    /// A path reserved for store data is not a regular file or directory as required.
+    #[error("invalid RTW store entry `{path}`: {reason}")]
+    InvalidStoreEntry {
+        /// Rejected store path.
+        path: String,
+        /// Human-readable invariant that was violated.
+        reason: &'static str,
+    },
 }
 
 /// Result type used by RTW artifact operations.

@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs::{self, File},
+    fs::File,
     io::{Read, Seek},
     path::Path,
 };
@@ -70,7 +70,12 @@ impl RtwArchive {
     /// handler entry declared by the manifest.
     pub fn open(path: impl AsRef<Path>, limits: RtwLimits) -> RtwResult<Self> {
         let path = path.as_ref();
-        let archive_bytes = fs::metadata(path)?.len();
+        let file = File::open(path)?;
+        Self::from_file(file, limits)
+    }
+
+    pub(crate) fn from_file(file: File, limits: RtwLimits) -> RtwResult<Self> {
+        let archive_bytes = file.metadata()?.len();
         if archive_bytes > limits.max_archive_bytes {
             return Err(RtwError::ArchiveTooLarge {
                 actual: archive_bytes,
@@ -78,7 +83,6 @@ impl RtwArchive {
             });
         }
 
-        let file = File::open(path)?;
         let mut archive = ZipArchive::new(file)?;
         let (entries, entry_indices) = validate_entries(&mut archive, limits)?;
         let manifest = read_manifest(&mut archive, &entry_indices, limits)?;
