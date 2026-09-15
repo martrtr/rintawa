@@ -17,6 +17,8 @@ rust-version = "1.98"
 [workspace.dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+ignore = "0.4"
 thiserror = "2"
 tempfile = "3"
 

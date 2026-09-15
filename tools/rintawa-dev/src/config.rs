@@ -9,7 +9,7 @@ fn default_artifact_root() -> PathBuf {
     PathBuf::from(".")
 }
 
-/// Local build settings for an RTW source tree.
+/// Local build and watch settings for an RTW source tree.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DevConfig {
@@ -21,4 +21,7 @@ pub struct DevConfig {
     /// Build command as program and arguments.
     #[serde(default)]
     pub build: Option<Vec<String>>,
+    /// Gitignore-style patterns excluded from source change detection.
+    #[serde(default, rename = "watch-ignore")]
+    pub watch_ignore_patterns: Vec<String>,
 }

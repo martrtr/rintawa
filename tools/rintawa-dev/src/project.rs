@@ -1,15 +1,20 @@
 use std::{
+    collections::hash_map::DefaultHasher,
     fs,
+    hash::{Hash, Hasher},
     path::{Component as PathComponent, Path, PathBuf},
     process::Command,
+    time::UNIX_EPOCH,
 };
 
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use rintawa_artifacts::{ArtifactDigest, ArtifactStore, RtwLimits, pack_directory};
 use tempfile::TempDir;
 
 use crate::{DEV_CONFIG_FILE, DevConfig, DevError, DevResult};
 
 const DEV_CONFIG_SCHEMA: u32 = 1;
+const DEFAULT_WATCH_IGNORE_PATTERNS: [&str; 3] = [".git/", "target/", "node_modules/"];
 
 /// Local extension project.
 #[derive(Debug, Clone)]
@@ -17,6 +22,10 @@ pub struct DevProject {
     root: PathBuf,
     config: Option<DevConfig>,
 }
+
+/// Opaque source revision used by watch mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceRevision(u64);
 
 /// Temporary RTW snapshot stored in a content-addressed store.
 pub struct PreparedSnapshot {
@@ -81,6 +90,48 @@ impl DevProject {
         })
     }
 
+    /// Computes a source revision for watch mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the project cannot be scanned or ignore patterns are invalid.
+    pub fn source_revision(&self) -> DevResult<SourceRevision> {
+        let ignore_matcher = self.watch_ignore_matcher()?;
+        let generated_root = self.generated_artifact_root();
+        let mut hasher = DefaultHasher::new();
+        fingerprint_directory(
+            &self.root,
+            &self.root,
+            &ignore_matcher,
+            generated_root.as_deref(),
+            &mut hasher,
+        )?;
+        Ok(SourceRevision(hasher.finish()))
+    }
+
+    fn watch_ignore_matcher(&self) -> DevResult<Gitignore> {
+        let mut builder = GitignoreBuilder::new(&self.root);
+        for pattern in DEFAULT_WATCH_IGNORE_PATTERNS {
+            add_watch_ignore_pattern(&mut builder, pattern)?;
+        }
+        if let Some(config) = &self.config {
+            for pattern in &config.watch_ignore_patterns {
+                add_watch_ignore_pattern(&mut builder, pattern)?;
+            }
+        }
+        builder
+            .build()
+            .map_err(|error| DevError::InvalidWatchIgnore(error.to_string()))
+    }
+
+    fn generated_artifact_root(&self) -> Option<PathBuf> {
+        let config = self.config.as_ref()?;
+        if config.build.is_none() || config.artifact_root == Path::new(".") {
+            return None;
+        }
+        Some(self.root.join(&config.artifact_root))
+    }
+
     fn run_build(&self) -> DevResult<()> {
         let Some(command) = self
             .config
@@ -135,12 +186,31 @@ fn validate_config(config: &DevConfig) -> DevResult<()> {
         return Err(DevError::UnsupportedConfigSchema(config.schema));
     }
     validate_relative_path(&config.artifact_root)?;
+    validate_watch_ignore_patterns(&config.watch_ignore_patterns)?;
     if let Some(build) = &config.build
         && (build.is_empty() || build[0].trim().is_empty())
     {
         return Err(DevError::EmptyBuildCommand);
     }
     Ok(())
+}
+
+fn validate_watch_ignore_patterns(patterns: &[String]) -> DevResult<()> {
+    let mut builder = GitignoreBuilder::new(".");
+    for pattern in patterns {
+        add_watch_ignore_pattern(&mut builder, pattern)?;
+    }
+    builder
+        .build()
+        .map(|_| ())
+        .map_err(|error| DevError::InvalidWatchIgnore(error.to_string()))
+}
+
+fn add_watch_ignore_pattern(builder: &mut GitignoreBuilder, pattern: &str) -> DevResult<()> {
+    builder
+        .add_line(None, pattern)
+        .map(|_| ())
+        .map_err(|error| DevError::InvalidWatchIgnore(error.to_string()))
 }
 
 fn validate_relative_path(path: &Path) -> DevResult<()> {
@@ -153,6 +223,51 @@ fn validate_relative_path(path: &Path) -> DevResult<()> {
             PathComponent::ParentDir | PathComponent::RootDir | PathComponent::Prefix(_) => {
                 return Err(DevError::InvalidArtifactRoot(path.display().to_string()));
             }
+        }
+    }
+    Ok(())
+}
+
+fn fingerprint_directory(
+    root: &Path,
+    directory: &Path,
+    ignore_matcher: &Gitignore,
+    generated_root: Option<&Path>,
+    hasher: &mut DefaultHasher,
+) -> std::io::Result<()> {
+    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        let file_type = metadata.file_type();
+        let is_directory = file_type.is_dir();
+        let is_generated = generated_root.is_some_and(|generated| path.starts_with(generated));
+        if is_generated || ignore_matcher.matched(&path, is_directory).is_ignore() {
+            continue;
+        }
+
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+        relative.hash(hasher);
+        is_directory.hash(hasher);
+        file_type.is_file().hash(hasher);
+        file_type.is_symlink().hash(hasher);
+
+        if is_directory {
+            fingerprint_directory(root, &path, ignore_matcher, generated_root, hasher)?;
+            continue;
+        }
+        if file_type.is_symlink() {
+            fs::read_link(&path)?.hash(hasher);
+            continue;
+        }
+
+        metadata.len().hash(hasher);
+        if let Ok(modified) = metadata.modified()
+            && let Ok(duration) = modified.duration_since(UNIX_EPOCH)
+        {
+            duration.as_nanos().hash(hasher);
         }
     }
     Ok(())

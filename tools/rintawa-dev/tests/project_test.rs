@@ -106,3 +106,102 @@ fn test_should_reject_artifact_root_symlink_escape() -> anyhow::Result<()> {
     assert!(matches!(error, DevError::InvalidArtifactRoot(path) if path == "build"));
     Ok(())
 }
+
+#[test]
+fn test_source_revision_should_change_for_project_source() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    write_minimal_rtw_root(temp.path())?;
+    let project = DevProject::open(temp.path())?;
+    let before = project.source_revision()?;
+
+    fs::write(temp.path().join("source.txt"), "changed")?;
+    let after = project.source_revision()?;
+    assert_ne!(before, after);
+    Ok(())
+}
+
+#[test]
+fn test_source_revision_should_ignore_nested_default_directories() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    write_minimal_rtw_root(temp.path())?;
+    fs::create_dir_all(temp.path().join("packages/example/node_modules"))?;
+    let project = DevProject::open(temp.path())?;
+    let before = project.source_revision()?;
+
+    fs::write(
+        temp.path().join("packages/example/node_modules/noise.js"),
+        "ignored",
+    )?;
+    let after = project.source_revision()?;
+    assert_eq!(before, after);
+    Ok(())
+}
+
+#[test]
+fn test_source_revision_should_honor_gitignore_style_patterns() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    write_minimal_rtw_root(temp.path())?;
+    fs::write(
+        temp.path().join("rintawa-dev.toml"),
+        concat!(
+            "schema = 1\n",
+            "watch-ignore = [\"*.tmp\", \"**/build/\", \"packages/**/cache/\"]\n",
+        ),
+    )?;
+    fs::create_dir_all(temp.path().join("src/build"))?;
+    fs::create_dir_all(temp.path().join("packages/example/cache"))?;
+    let project = DevProject::open(temp.path())?;
+    let before = project.source_revision()?;
+
+    fs::write(temp.path().join("scratch.tmp"), "ignored")?;
+    fs::write(temp.path().join("src/build/generated"), "ignored")?;
+    fs::write(
+        temp.path().join("packages/example/cache/generated"),
+        "ignored",
+    )?;
+    let after = project.source_revision()?;
+    assert_eq!(before, after);
+    Ok(())
+}
+
+#[test]
+fn test_source_revision_should_honor_gitignore_negation() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    write_minimal_rtw_root(temp.path())?;
+    fs::write(
+        temp.path().join("rintawa-dev.toml"),
+        "schema = 1\nwatch-ignore = [\"*.tmp\", \"!keep.tmp\"]\n",
+    )?;
+    let project = DevProject::open(temp.path())?;
+    let before = project.source_revision()?;
+
+    fs::write(temp.path().join("discard.tmp"), "ignored")?;
+    assert_eq!(before, project.source_revision()?);
+    fs::write(temp.path().join("keep.tmp"), "watched")?;
+    assert_ne!(before, project.source_revision()?);
+    Ok(())
+}
+
+#[test]
+fn test_source_revision_should_ignore_recreated_artifact_root() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    write_minimal_rtw_root(temp.path())?;
+    fs::create_dir_all(temp.path().join("build/rtw"))?;
+    fs::write(
+        temp.path().join("rintawa-dev.toml"),
+        concat!(
+            "schema = 1\n",
+            "artifact-root = \"build/rtw\"\n",
+            "build = [\"placeholder-build-command\"]\n",
+        ),
+    )?;
+    let project = DevProject::open(temp.path())?;
+    let before = project.source_revision()?;
+
+    fs::remove_dir_all(temp.path().join("build/rtw"))?;
+    fs::create_dir_all(temp.path().join("build/rtw"))?;
+    fs::write(temp.path().join("build/rtw/generated"), "ignored")?;
+    let after = project.source_revision()?;
+    assert_eq!(before, after);
+    Ok(())
+}
