@@ -1,10 +1,57 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use rintawa_artifacts::{ArtifactStore, RtwLimits, pack_directory};
 use rintawa_extension_engine::{
-    EngineError, EngineResult, ExtensionEngine, ExtensionState, RtwExtensionLoader,
+    EngineError, EngineResult, ExtensionEngine, ExtensionState, RtwComponentHost,
+    RtwComponentHostResult, RtwComponentSource, RtwExtensionLoader,
 };
-use rintawa_sdk::types::{ExtensionInstanceId, RuntimeScopeId};
+use rintawa_sdk::{
+    manifest::ComponentDescriptor,
+    traits::Component,
+    types::{ComponentId, ExtensionInstanceId, RuntimeScopeId},
+};
+
+struct TestComponentHost {
+    observed: Arc<Mutex<Vec<u8>>>,
+}
+
+struct TestHostedComponent {
+    id: ComponentId,
+}
+
+impl Component for TestHostedComponent {
+    fn id(&self) -> &ComponentId {
+        &self.id
+    }
+}
+
+impl RtwComponentHost for TestComponentHost {
+    fn target(&self) -> &str {
+        "test.runtime@1"
+    }
+
+    fn load_component(
+        &self,
+        source: &mut RtwComponentSource<'_>,
+        descriptor: &ComponentDescriptor,
+    ) -> RtwComponentHostResult<Box<dyn Component>> {
+        let entry = descriptor.entry.as_deref().ok_or_else(|| {
+            rintawa_extension_engine::RtwComponentHostError::InvalidDescriptor(String::from(
+                "entry is required",
+            ))
+        })?;
+        let path = source.resolve_component_entry(entry)?;
+        let bytes = source.read(&path)?;
+        *self.observed.lock().expect("test mutex should be valid") = bytes;
+        Ok(Box::new(TestHostedComponent {
+            id: descriptor.id.clone(),
+        }))
+    }
+}
 
 const TEST_WASM_COMPONENT: &str = include_str!("fixtures/stateful_component.wat");
 
@@ -379,4 +426,112 @@ fn test_should_reject_extension_manifest_above_loader_limit() -> EngineResult<()
     ));
     assert_eq!(engine.extension_instance_state(&instance_id), None);
     Ok(())
+}
+
+#[test]
+fn test_should_load_required_component_through_registered_target_host() -> EngineResult<()> {
+    let temp = tempfile::tempdir()?;
+    let source = temp.path().join("source");
+    write_rtw_source(
+        &source,
+        "rintawa.extension@1",
+        br#"
+id = "hosted-extension"
+name = "Hosted Extension"
+version = "0.1.0"
+sdk = "^0.0"
+
+[[components]]
+id = "hosted"
+kind = "runtime"
+target = "test.runtime@1"
+entry = "payload.bin"
+"#,
+    )?;
+    fs::write(source.join("payload.bin"), b"hosted payload")?;
+    let (store, digest) = import_source(&source, temp.path())?;
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut loader = RtwExtensionLoader::new();
+    loader.register_component_host(Arc::new(TestComponentHost {
+        observed: observed.clone(),
+    }))?;
+    let instance_id = ExtensionInstanceId::new("hosted-instance");
+    let mut engine = ExtensionEngine::new();
+
+    loader.load_stored_extension(
+        &mut engine,
+        &store,
+        &digest,
+        instance_id.clone(),
+        RuntimeScopeId::new("hosted-scope"),
+    )?;
+    engine.start_extension_instance(&instance_id)?;
+
+    assert_eq!(
+        observed
+            .lock()
+            .expect("test mutex should be valid")
+            .as_slice(),
+        b"hosted payload"
+    );
+    assert_eq!(
+        engine.extension_instance_state(&instance_id),
+        Some(ExtensionState::Active)
+    );
+    engine.unregister_extension_instance(&instance_id)?;
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_component_host_for_reserved_wasm_target() {
+    struct ReservedHost;
+
+    impl RtwComponentHost for ReservedHost {
+        fn target(&self) -> &str {
+            "rintawa.runtime.wasm-component@1"
+        }
+
+        fn load_component(
+            &self,
+            _source: &mut RtwComponentSource<'_>,
+            _descriptor: &ComponentDescriptor,
+        ) -> RtwComponentHostResult<Box<dyn Component>> {
+            unreachable!("reserved host must be rejected before use")
+        }
+    }
+
+    let mut loader = RtwExtensionLoader::new();
+    let error = loader
+        .register_component_host(Arc::new(ReservedHost))
+        .expect_err("built-in WASM target must not be replaceable");
+    assert!(matches!(
+        error,
+        EngineError::DuplicateComponentHostTarget(target)
+            if target == "rintawa.runtime.wasm-component@1"
+    ));
+}
+
+#[test]
+fn test_should_reject_noncanonical_component_host_target() {
+    struct NonCanonicalHost;
+
+    impl RtwComponentHost for NonCanonicalHost {
+        fn target(&self) -> &str {
+            " test.runtime@1 "
+        }
+
+        fn load_component(
+            &self,
+            _source: &mut RtwComponentSource<'_>,
+            _descriptor: &ComponentDescriptor,
+        ) -> RtwComponentHostResult<Box<dyn Component>> {
+            unreachable!("invalid host target must be rejected before use")
+        }
+    }
+
+    let mut loader = RtwExtensionLoader::new();
+    let error = loader
+        .register_component_host(Arc::new(NonCanonicalHost))
+        .expect_err("target identifiers must not be normalized implicitly");
+    assert!(matches!(error, EngineError::InvalidComponentHostTarget));
 }

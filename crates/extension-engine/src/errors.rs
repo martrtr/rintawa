@@ -8,6 +8,8 @@ use rintawa_sdk::{
 use std::io;
 use thiserror::Error;
 
+use crate::artifact_host::RtwComponentHostError;
+
 /// One component failure observed while stopping or rolling back an extension.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComponentStopFailure {
@@ -58,6 +60,26 @@ pub enum EngineError {
         component_id: String,
         /// Execution target for which no host is available on this loader path.
         target: String,
+    },
+
+    /// A component target host identifier is empty or otherwise unusable.
+    #[error("component target host identifier must not be empty")]
+    InvalidComponentHostTarget,
+
+    /// A component target already has a host or is reserved by the built-in runtime.
+    #[error("component target host `{0}` is already registered or reserved")]
+    DuplicateComponentHostTarget(String),
+
+    /// A target host failed while creating a component from the RTW artifact.
+    #[error("component `{component_id}` target `{target}` failed to load: {source}")]
+    ComponentHostFailed {
+        /// Component that failed to load.
+        component_id: String,
+        /// Target host selected for the component.
+        target: String,
+        /// Target-host failure.
+        #[source]
+        source: Box<RtwComponentHostError>,
     },
 
     /// An error occurred while parsing an extension manifest.

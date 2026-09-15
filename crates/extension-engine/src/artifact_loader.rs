@@ -1,6 +1,8 @@
 //! Canonical loading of `rintawa.extension@1` content from stored RTW artifacts.
 
-use rintawa_artifacts::{ArtifactDigest, ArtifactPath, ArtifactStore, RtwArchive, RtwError};
+use std::{collections::BTreeMap, sync::Arc};
+
+use rintawa_artifacts::{ArtifactDigest, ArtifactStore, RtwArchive, RtwError};
 use rintawa_sdk::{
     manifest::{ExtensionManifest, WASM_COMPONENT_TARGET_V1},
     traits::Component,
@@ -8,6 +10,7 @@ use rintawa_sdk::{
 };
 
 use crate::{
+    artifact_host::{RtwComponentHost, RtwComponentSource},
     engine::ExtensionEngine,
     errors::{EngineError, EngineResult},
 };
@@ -24,13 +27,36 @@ const MAX_EXTENSION_MANIFEST_BYTES: u64 = 1024 * 1024;
 /// extracts package files into a mutable extension directory. Repository
 /// discovery, version selection, updates, and development-source policy remain
 /// outside the Extension Engine.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct RtwExtensionLoader;
+#[derive(Clone, Default)]
+pub struct RtwExtensionLoader {
+    component_hosts: BTreeMap<String, Arc<dyn RtwComponentHost>>,
+}
 
 impl RtwExtensionLoader {
     /// Creates the built-in RTW extension loader.
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers one external component target host.
+    ///
+    /// The built-in WASM target is reserved and cannot be replaced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty, duplicate, or reserved target identifier.
+    pub fn register_component_host(&mut self, host: Arc<dyn RtwComponentHost>) -> EngineResult<()> {
+        let target = host.target();
+        if target.is_empty() || target != target.trim() {
+            return Err(EngineError::InvalidComponentHostTarget);
+        }
+        if target == WASM_COMPONENT_TARGET_V1 || self.component_hosts.contains_key(target) {
+            return Err(EngineError::DuplicateComponentHostTarget(
+                target.to_string(),
+            ));
+        }
+        self.component_hosts.insert(target.to_string(), host);
+        Ok(())
     }
 
     /// Opens one exact stored artifact and registers its extension instance.
@@ -96,7 +122,10 @@ impl RtwExtensionLoader {
         let extension_id = manifest.id.clone();
 
         for descriptor in &manifest.components {
-            if descriptor.required && descriptor.target.as_str() != WASM_COMPONENT_TARGET_V1 {
+            let target = descriptor.target.as_str();
+            let is_supported =
+                target == WASM_COMPONENT_TARGET_V1 || self.component_hosts.contains_key(target);
+            if descriptor.required && !is_supported {
                 return Err(EngineError::UnsupportedRequiredComponentTarget {
                     component_id: descriptor.id.to_string(),
                     target: descriptor.target.to_string(),
@@ -104,39 +133,46 @@ impl RtwExtensionLoader {
             }
         }
 
-        let mut components: Vec<Box<dyn Component>> = Vec::new();
-        if manifest
+        let wasm_engine = manifest
             .components
             .iter()
             .any(|descriptor| descriptor.target.as_str() == WASM_COMPONENT_TARGET_V1)
-        {
-            let wasm_engine = engine.wasm_runtime_engine()?;
-            for descriptor in manifest
-                .components
-                .iter()
-                .filter(|descriptor| descriptor.target.as_str() == WASM_COMPONENT_TARGET_V1)
-            {
+            .then(|| engine.wasm_runtime_engine())
+            .transpose()?;
+        let mut components: Vec<Box<dyn Component>> = Vec::new();
+
+        for descriptor in &manifest.components {
+            let target = descriptor.target.as_str();
+            if target == WASM_COMPONENT_TARGET_V1 {
+                let runtime = wasm_engine.as_ref().ok_or_else(|| {
+                    EngineError::UnsupportedRequiredComponentTarget {
+                        component_id: descriptor.id.to_string(),
+                        target: descriptor.target.to_string(),
+                    }
+                })?;
                 let entry = descriptor.entry.as_deref().unwrap_or(DEFAULT_WASM_ENTRY);
-                let artifact_path = resolve_component_entry(&manifest_path, entry)?;
-                let bytes = archive.read(&artifact_path)?;
-                let component =
-                    wasm_engine.load_component_from_bytes(descriptor.id.clone(), &bytes)?;
+                let mut source = RtwComponentSource::new(&mut archive, &manifest_path);
+                let artifact_path = source.resolve_component_entry(entry)?;
+                let bytes = source.read(&artifact_path)?;
+                let component = runtime.load_component_from_bytes(descriptor.id.clone(), &bytes)?;
                 components.push(Box::new(component));
+                continue;
+            }
+
+            if let Some(host) = self.component_hosts.get(target) {
+                let mut source = RtwComponentSource::new(&mut archive, &manifest_path);
+                let component = host
+                    .load_component(&mut source, descriptor)
+                    .map_err(|source| EngineError::ComponentHostFailed {
+                        component_id: descriptor.id.to_string(),
+                        target: descriptor.target.to_string(),
+                        source: Box::new(source),
+                    })?;
+                components.push(component);
             }
         }
 
         engine.register_extension_instance(instance_id, scope_id, manifest, components)?;
         Ok(extension_id)
-    }
-}
-
-fn resolve_component_entry(
-    manifest_path: &ArtifactPath,
-    entry: &str,
-) -> Result<ArtifactPath, RtwError> {
-    let entry = ArtifactPath::parse(entry)?;
-    match manifest_path.as_str().rsplit_once('/') {
-        Some((parent, _)) => ArtifactPath::parse(format!("{parent}/{}", entry.as_str())),
-        None => Ok(entry),
     }
 }
