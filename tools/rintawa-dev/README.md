@@ -22,7 +22,7 @@ Run the same snapshot through the Extension Engine:
 cargo run -p rintawa-dev -- run path/to/extension
 ```
 
-Use `--once` to start and stop immediately for lifecycle checks.
+Use `--once` to start and stop immediately for lifecycle checks. Web bundle components expose loopback URLs while running.
 
 Watch and reload after stable source changes:
 

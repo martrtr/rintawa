@@ -36,6 +36,20 @@ pub enum DevError {
     /// Extension loading or lifecycle failed.
     #[error("extension runtime error: {0}")]
     Engine(#[from] EngineError),
+    /// The development Web host failed.
+    #[error("Web host error: {0}")]
+    WebHost(String),
+    /// Shared Web host state is unavailable.
+    #[error("Web host state is unavailable")]
+    WebHostUnavailable,
+    /// Runtime setup failed and cleanup also failed.
+    #[error("runtime setup failed: {setup}; cleanup failed: {cleanup}")]
+    RuntimeSetupCleanupFailed {
+        /// Runtime setup failure.
+        setup: Box<DevError>,
+        /// Cleanup failure after setup failed.
+        cleanup: Box<DevError>,
+    },
     /// Reload state is unavailable.
     #[error("development session is unavailable")]
     SessionUnavailable,

@@ -122,6 +122,30 @@ impl ReloadingDevSession {
         self.session.as_ref().and_then(DevSession::state)
     }
 
+    /// Returns development URLs exposed by the running session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no session exists or Web host state is unavailable.
+    pub fn web_urls(&self) -> DevResult<Vec<String>> {
+        self.session
+            .as_ref()
+            .ok_or(DevError::SessionUnavailable)?
+            .web_urls()
+    }
+
+    /// Processes runtime work owned by the current development session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no session exists or runtime processing fails.
+    pub fn pump(&mut self) -> DevResult<()> {
+        self.session
+            .as_mut()
+            .ok_or(DevError::SessionUnavailable)?
+            .pump()
+    }
+
     /// Stops the running session.
     ///
     /// # Errors
