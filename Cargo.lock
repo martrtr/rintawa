@@ -1487,6 +1487,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "keyring",
+ "rintawa-artifacts",
  "rintawa-sdk",
  "rintawa-ui-runtime",
  "serde",

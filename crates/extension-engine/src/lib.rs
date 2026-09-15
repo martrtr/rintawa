@@ -1,13 +1,15 @@
-//! Rintawa Extension Engine — lifecycle management, directory scanning, and runtime host.
+//! Rintawa Extension Engine — lifecycle management, RTW loading, and runtime hosting.
 //!
 //! Provides core abstractions for:
-//! - Parsing manifests and managing component lifecycles (`register`, `start`, `stop`).
-//! - Dynamic filesystem discovery and state persistence via [`ExtensionLoader`] and [`ExtensionsStateConfig`].
-//! - WASM runtime isolation and contribution side-effect tracking.
+//! - parsing manifests and managing component lifecycles (`register`, `start`, `stop`);
+//! - canonical loading of stored `rintawa.extension@1` RTW artifacts via [`RtwExtensionLoader`];
+//! - transitional directory discovery via [`ExtensionLoader`] and [`ExtensionsStateConfig`];
+//! - WASM runtime isolation, services, portable UI, and owner-scoped runtime effects.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, rustdoc::broken_intra_doc_links)]
 
+mod artifact_loader;
 pub mod composition;
 pub mod context;
 pub mod engine;
@@ -21,6 +23,7 @@ mod services;
 
 mod runtime_effects;
 
+pub use artifact_loader::RtwExtensionLoader;
 pub use composition::{
     CompositionSnapshot, ContractBinding, UnresolvedContract, UnresolvedContractReason,
 };

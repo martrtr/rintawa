@@ -13,6 +13,9 @@ use crate::{
     types::{ComponentId, ComponentTarget, ExtensionId},
 };
 
+/// Versioned execution target for a WebAssembly Component hosted by Rintawa.
+pub const WASM_COMPONENT_TARGET_V1: &str = "rintawa.runtime.wasm-component@1";
+
 /// Represents the role of a component in an extension.
 ///
 /// A runtime component can run on different hosts. Its execution model is
@@ -56,15 +59,17 @@ pub struct ComponentDescriptor {
 
     /// The host contract that runs this component.
     ///
-    /// Initial runtime targets are `"native"` and `"wasm"`; `"web"` is a
-    /// UI target. The target names are stable SDK data, while the host
-    /// implementations remain outside this crate.
+    /// Published WASM packages use [`WASM_COMPONENT_TARGET_V1`]. Short values
+    /// such as `"wasm"`, `"native"`, and `"web"` are legacy MVP host hints and
+    /// are not stable package ABI identifiers.
     pub target: ComponentTarget,
 
     /// The host-specific entry point for this component, when one is needed.
     ///
     /// A statically registered native component may omit this field. A WASM or
-    /// web component normally supplies an entry such as `"runtime.wasm"`.
+    /// web component normally supplies an entry such as `"runtime.wasm"`. For
+    /// `rintawa.extension@1` RTW content, relative entries are resolved from the
+    /// directory containing the extension manifest selected by `rtw.toml`.
     #[serde(default)]
     pub entry: Option<String>,
 
@@ -173,7 +178,8 @@ mod tests {
     }
 
     #[test]
-    fn test_should_parse_wasm_runtime_manifest_with_entry() -> Result<(), toml::de::Error> {
+    fn test_should_parse_versioned_wasm_runtime_manifest_with_entry() -> Result<(), toml::de::Error>
+    {
         let manifest: ExtensionManifest = toml::from_str(
             r#"
                 id = "chat"
@@ -184,14 +190,14 @@ mod tests {
                 [[components]]
                 id = "runtime"
                 kind = "runtime"
-                target = "wasm"
+                target = "rintawa.runtime.wasm-component@1"
                 entry = "runtime.wasm"
                 required = false
             "#,
         )?;
 
         let component = &manifest.components[0];
-        assert_eq!(component.target.as_str(), "wasm");
+        assert_eq!(component.target.as_str(), WASM_COMPONENT_TARGET_V1);
         assert_eq!(component.entry.as_deref(), Some("runtime.wasm"));
         assert!(!component.required);
 

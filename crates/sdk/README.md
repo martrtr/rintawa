@@ -37,7 +37,7 @@ The same component can later use a WIT-based adapter by changing only its
 target and entry:
 
 ```toml
-target = "wasm"
+target = "rintawa.runtime.wasm-component@1"
 entry = "runtime.wasm"
 ```
 

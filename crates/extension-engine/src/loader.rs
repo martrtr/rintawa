@@ -2,7 +2,7 @@
 
 use std::path::{Component as PathComponent, Path};
 
-use rintawa_sdk::{traits::Component, types::ExtensionId};
+use rintawa_sdk::{manifest::WASM_COMPONENT_TARGET_V1, traits::Component, types::ExtensionId};
 use tracing::{info, warn};
 
 use crate::{
@@ -92,7 +92,7 @@ impl ExtensionLoader {
         let mut components: Vec<Box<dyn Component>> = Vec::new();
 
         for comp_desc in &manifest.components {
-            if comp_desc.target.as_str() == "wasm" {
+            if matches!(comp_desc.target.as_str(), "wasm" | WASM_COMPONENT_TARGET_V1) {
                 let wasm_rel_str = comp_desc.entry.as_deref().unwrap_or("runtime.wasm");
                 let wasm_rel_path = Path::new(wasm_rel_str);
 

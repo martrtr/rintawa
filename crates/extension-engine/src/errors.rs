@@ -1,5 +1,6 @@
 //! Error types for the Rintawa Extension Engine.
 
+use rintawa_artifacts::RtwError;
 use rintawa_sdk::{
     errors::ExtensionError, manifest::ManifestValidationError, secrets::SecretAccessError,
     ui::UiError,
@@ -26,6 +27,38 @@ pub enum EngineError {
     /// The specified directory for extensions is invalid.
     #[error("invalid extensions directory: `{0}`")]
     InvalidDirectory(String),
+
+    /// An RTW artifact could not be validated or read.
+    #[error("RTW artifact error: {0}")]
+    Artifact(#[from] RtwError),
+
+    /// The RTW root content type is not the built-in extension schema.
+    #[error("unsupported RTW content type for extension loading: `{0}`")]
+    UnsupportedExtensionArtifactContent(String),
+
+    /// The extension descriptor inside an RTW artifact is not UTF-8 text.
+    #[error("extension manifest `{0}` must be valid UTF-8")]
+    ExtensionManifestEncoding(String),
+
+    /// The extension descriptor exceeds the loader-owned metadata size limit.
+    #[error("extension manifest `{path}` is {actual} bytes, exceeding the {maximum}-byte limit")]
+    ExtensionManifestTooLarge {
+        /// Manifest path inside the RTW artifact.
+        path: String,
+        /// Declared uncompressed manifest size.
+        actual: u64,
+        /// Maximum accepted descriptor size.
+        maximum: u64,
+    },
+
+    /// The artifact declares a required component target this loader cannot host.
+    #[error("required component `{component_id}` uses unsupported target `{target}`")]
+    UnsupportedRequiredComponentTarget {
+        /// Required component that could not be instantiated.
+        component_id: String,
+        /// Execution target for which no host is available on this loader path.
+        target: String,
+    },
 
     /// An error occurred while parsing an extension manifest.
     #[error("failed to parse manifest: {0}")]
