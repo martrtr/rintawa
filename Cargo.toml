@@ -3,6 +3,7 @@ resolver = "3"
 
 members = [
     "crates/*",
+    "tools/*",
 ]
 
 [workspace.package]
@@ -15,6 +16,7 @@ rust-version = "1.98"
 
 [workspace.dependencies]
 anyhow = "1"
+clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 tempfile = "3"
 
