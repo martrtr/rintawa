@@ -1,3 +1,32 @@
+//! Runtime host for packaged Web bundle components.
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs, rustdoc::broken_intra_doc_links)]
+
+use rintawa_extension_engine::EngineError;
+use std::io;
+use thiserror::Error;
+
+/// Errors returned by the packaged Web component host.
+#[derive(Debug, Error)]
+pub enum WebHostError {
+    /// A filesystem, socket, or thread operation failed.
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    /// Extension Engine integration failed.
+    #[error("extension runtime error: {0}")]
+    Engine(#[from] EngineError),
+    /// Shared Web host state is unavailable.
+    #[error("Web host state is unavailable")]
+    Unavailable,
+    /// The Web host failed for another reason.
+    #[error("Web host error: {0}")]
+    Message(String),
+}
+
+/// Result type used by the packaged Web component host.
+pub type WebHostResult<T> = Result<T, WebHostError>;
+
 use std::{
     collections::BTreeMap,
     net::TcpListener,
@@ -38,11 +67,9 @@ use rintawa_web_runtime::{
 };
 use tokio::sync::{oneshot, watch};
 
-use crate::{DevError, DevResult};
-
 const UI_LAYER_CONTRACT_ID: &str = "rintawa.ui.layer";
 const UI_LAYER_CONTRACT_VERSION: u32 = 1;
-const MAX_DEV_WEB_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_WEB_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 const WEBSOCKET_PATH: &str = "/__rintawa/ws";
 
 struct QueuedWebAction {
@@ -57,61 +84,61 @@ struct WebAsset {
     content_type: &'static str,
 }
 
-struct DevWebServer {
+struct WebServer {
     url: String,
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
-impl DevWebServer {
-    fn stop(mut self) -> DevResult<()> {
+impl WebServer {
+    fn stop(mut self) -> WebHostResult<()> {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
         if let Some(thread) = self.thread.take() {
             thread
                 .join()
-                .map_err(|_| DevError::WebHost(String::from("Web host thread panicked")))?;
+                .map_err(|_| WebHostError::Message(String::from("Web host thread panicked")))?;
         }
         Ok(())
     }
 }
 
-struct DevWebComponentState {
+struct WebComponentState {
     component_id: ComponentId,
     descriptor: WebBundleDescriptor,
     entry_path: String,
     assets: Arc<BTreeMap<String, WebAsset>>,
     action_sender: mpsc::Sender<QueuedWebAction>,
     owner: Mutex<Option<ComponentRef>>,
-    server: Mutex<Option<DevWebServer>>,
+    server: Mutex<Option<WebServer>>,
     state_sender: watch::Sender<Option<String>>,
     last_state: Mutex<Option<String>>,
 }
 
-impl DevWebComponentState {
-    fn owner(&self) -> DevResult<Option<ComponentRef>> {
+impl WebComponentState {
+    fn owner(&self) -> WebHostResult<Option<ComponentRef>> {
         self.owner
             .lock()
             .map(|owner| owner.clone())
-            .map_err(|_| DevError::WebHostUnavailable)
+            .map_err(|_| WebHostError::Unavailable)
     }
 
-    fn url(&self) -> DevResult<Option<String>> {
+    fn url(&self) -> WebHostResult<Option<String>> {
         self.server
             .lock()
             .map(|server| server.as_ref().map(|server| server.url.clone()))
-            .map_err(|_| DevError::WebHostUnavailable)
+            .map_err(|_| WebHostError::Unavailable)
     }
 
-    fn start(&self, owner: ComponentRef) -> DevResult<()> {
+    fn start(&self, owner: ComponentRef) -> WebHostResult<()> {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(DevError::Io)?;
+            .map_err(WebHostError::Io)?;
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let state = Arc::new(WebServerState {
             descriptor: self.descriptor.clone(),
@@ -139,46 +166,37 @@ impl DevWebComponentState {
                 });
             })?;
 
-        let server = DevWebServer {
+        let server = WebServer {
             url: format!("http://{address}/"),
             shutdown: Some(shutdown_sender),
             thread: Some(thread),
         };
-        *self
-            .owner
-            .lock()
-            .map_err(|_| DevError::WebHostUnavailable)? = Some(owner);
-        *self
-            .server
-            .lock()
-            .map_err(|_| DevError::WebHostUnavailable)? = Some(server);
+        *self.owner.lock().map_err(|_| WebHostError::Unavailable)? = Some(owner);
+        *self.server.lock().map_err(|_| WebHostError::Unavailable)? = Some(server);
         Ok(())
     }
 
-    fn stop(&self) -> DevResult<()> {
+    fn stop(&self) -> WebHostResult<()> {
         let server = self
             .server
             .lock()
-            .map_err(|_| DevError::WebHostUnavailable)?
+            .map_err(|_| WebHostError::Unavailable)?
             .take();
-        *self
-            .owner
-            .lock()
-            .map_err(|_| DevError::WebHostUnavailable)? = None;
+        *self.owner.lock().map_err(|_| WebHostError::Unavailable)? = None;
         if let Some(server) = server {
             server.stop()?;
         }
         Ok(())
     }
 
-    fn publish(&self, message: HostToRendererMessage) -> DevResult<()> {
+    fn publish(&self, message: HostToRendererMessage) -> WebHostResult<()> {
         let encoded = serde_json::to_string(&message).map_err(|error| {
-            DevError::WebHost(format!("failed to encode Web UI state: {error}"))
+            WebHostError::Message(format!("failed to encode Web UI state: {error}"))
         })?;
         let mut last_state = self
             .last_state
             .lock()
-            .map_err(|_| DevError::WebHostUnavailable)?;
+            .map_err(|_| WebHostError::Unavailable)?;
         if last_state.as_ref() == Some(&encoded) {
             return Ok(());
         }
@@ -188,11 +206,11 @@ impl DevWebComponentState {
     }
 }
 
-struct DevWebComponent {
-    state: Arc<DevWebComponentState>,
+struct WebComponent {
+    state: Arc<WebComponentState>,
 }
 
-impl Component for DevWebComponent {
+impl Component for WebComponent {
     fn id(&self) -> &ComponentId {
         &self.state.component_id
     }
@@ -229,20 +247,20 @@ impl Component for DevWebComponent {
     }
 }
 
-impl Drop for DevWebComponent {
+impl Drop for WebComponent {
     fn drop(&mut self) {
         let _ = self.state.stop();
     }
 }
 
-/// Development host for packaged Web bundle components.
-pub struct DevWebComponentHost {
-    components: Mutex<Vec<Arc<DevWebComponentState>>>,
+/// Host for packaged Web bundle components.
+pub struct WebComponentHost {
+    components: Mutex<Vec<Arc<WebComponentState>>>,
     action_sender: mpsc::Sender<QueuedWebAction>,
     action_receiver: Mutex<mpsc::Receiver<QueuedWebAction>>,
 }
 
-impl DevWebComponentHost {
+impl WebComponentHost {
     /// Creates an empty Web component host.
     pub fn new() -> Self {
         let (action_sender, action_receiver) = mpsc::channel();
@@ -253,7 +271,8 @@ impl DevWebComponentHost {
         }
     }
 
-    pub(crate) fn attach_layers(&self, engine: &mut ExtensionEngine) -> DevResult<()> {
+    /// Attaches every active Web UI-layer component to its runtime scope.
+    pub fn attach_layers(&self, engine: &mut ExtensionEngine) -> WebHostResult<()> {
         for component in self.components()? {
             if let Some(owner) = component.owner()?
                 && let Some(descriptor) = component.descriptor.ui_layer_descriptor()
@@ -264,11 +283,12 @@ impl DevWebComponentHost {
         Ok(())
     }
 
-    pub(crate) fn pump(&self, engine: &mut ExtensionEngine) -> DevResult<()> {
+    /// Routes queued renderer actions and publishes current Portable UI state.
+    pub fn pump(&self, engine: &mut ExtensionEngine) -> WebHostResult<()> {
         let actions: Vec<_> = self
             .action_receiver
             .lock()
-            .map_err(|_| DevError::WebHostUnavailable)?
+            .map_err(|_| WebHostError::Unavailable)?
             .try_iter()
             .collect();
         for action in actions {
@@ -280,7 +300,8 @@ impl DevWebComponentHost {
         self.publish_state(engine)
     }
 
-    pub(crate) fn urls(&self) -> DevResult<Vec<String>> {
+    /// Returns local URLs exposed by currently running Web bundle components.
+    pub fn urls(&self) -> WebHostResult<Vec<String>> {
         self.components()?
             .into_iter()
             .filter_map(|component| match component.url() {
@@ -291,14 +312,14 @@ impl DevWebComponentHost {
             .collect()
     }
 
-    fn components(&self) -> DevResult<Vec<Arc<DevWebComponentState>>> {
+    fn components(&self) -> WebHostResult<Vec<Arc<WebComponentState>>> {
         self.components
             .lock()
             .map(|components| components.clone())
-            .map_err(|_| DevError::WebHostUnavailable)
+            .map_err(|_| WebHostError::Unavailable)
     }
 
-    fn publish_state(&self, engine: &ExtensionEngine) -> DevResult<()> {
+    fn publish_state(&self, engine: &ExtensionEngine) -> WebHostResult<()> {
         for component in self.components()? {
             let Some(owner) = component.owner()? else {
                 continue;
@@ -310,13 +331,13 @@ impl DevWebComponentHost {
     }
 }
 
-impl Default for DevWebComponentHost {
+impl Default for WebComponentHost {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl RtwComponentHost for DevWebComponentHost {
+impl RtwComponentHost for WebComponentHost {
     fn target(&self) -> &str {
         WEB_BUNDLE_TARGET_V1
     }
@@ -353,9 +374,9 @@ impl RtwComponentHost for DevWebComponentHost {
             }
             let bytes = source.read(&path)?;
             total_bytes = total_bytes.saturating_add(bytes.len());
-            if total_bytes > MAX_DEV_WEB_BUNDLE_BYTES {
+            if total_bytes > MAX_WEB_BUNDLE_BYTES {
                 return Err(RtwComponentHostError::Host(format!(
-                    "Web bundle exceeds the {MAX_DEV_WEB_BUNDLE_BYTES}-byte development host limit"
+                    "Web bundle exceeds the {MAX_WEB_BUNDLE_BYTES}-byte Web host limit"
                 )));
             }
             assets.insert(
@@ -373,7 +394,7 @@ impl RtwComponentHost for DevWebComponentHost {
         }
 
         let (state_sender, _) = watch::channel(None);
-        let state = Arc::new(DevWebComponentState {
+        let state = Arc::new(WebComponentState {
             component_id: component.id.clone(),
             descriptor,
             entry_path: entry_path.to_string(),
@@ -390,7 +411,7 @@ impl RtwComponentHost for DevWebComponentHost {
                 RtwComponentHostError::Host(String::from("Web host state is unavailable"))
             })?
             .push(state.clone());
-        Ok(Box::new(DevWebComponent { state }))
+        Ok(Box::new(WebComponent { state }))
     }
 }
 

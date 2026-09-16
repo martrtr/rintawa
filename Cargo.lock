@@ -1944,6 +1944,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "rintawa"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "rintawa-host",
+]
+
+[[package]]
 name = "rintawa-artifacts"
 version = "0.0.1"
 dependencies = [
@@ -1961,20 +1971,18 @@ name = "rintawa-dev"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "axum",
  "clap",
  "ctrlc",
- "futures-util",
  "ignore",
  "rintawa-artifacts",
  "rintawa-extension-engine",
  "rintawa-sdk",
+ "rintawa-web-host",
  "rintawa-web-runtime",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
- "tokio",
  "toml 0.9.12+spec-1.1.0",
 ]
 
@@ -1997,6 +2005,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rintawa-host"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "rintawa-artifacts",
+ "rintawa-extension-engine",
+ "rintawa-sdk",
+ "rintawa-web-host",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.20",
+ "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
 name = "rintawa-sdk"
 version = "0.0.1"
 dependencies = [
@@ -2013,6 +2036,20 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "rintawa-sdk",
+]
+
+[[package]]
+name = "rintawa-web-host"
+version = "0.0.1"
+dependencies = [
+ "axum",
+ "futures-util",
+ "rintawa-extension-engine",
+ "rintawa-sdk",
+ "rintawa-web-runtime",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]

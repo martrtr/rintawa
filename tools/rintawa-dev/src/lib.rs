@@ -8,7 +8,6 @@ mod error;
 mod project;
 mod reload;
 mod session;
-mod web;
 
 pub use config::{DEV_CONFIG_FILE, DevConfig};
 pub use error::{DevError, DevResult};

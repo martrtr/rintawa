@@ -88,20 +88,31 @@ impl RtwExtensionLoader {
         self.load_archive(engine, archive, instance_id, scope_id)
     }
 
-    fn load_archive(
+    /// Reads and validates the extension manifest from one exact stored artifact.
+    ///
+    /// This performs the same content-type, size, encoding, and manifest validation
+    /// used by runtime loading without registering or starting the extension.
+    pub fn read_stored_manifest(
         &self,
-        engine: &mut ExtensionEngine,
-        mut archive: RtwArchive,
-        instance_id: ExtensionInstanceId,
-        scope_id: RuntimeScopeId,
-    ) -> EngineResult<ExtensionId> {
+        engine: &ExtensionEngine,
+        store: &ArtifactStore,
+        digest: &ArtifactDigest,
+    ) -> EngineResult<ExtensionManifest> {
+        let mut archive = store.open_artifact(digest)?;
+        self.read_manifest(engine, &mut archive)
+    }
+
+    fn read_manifest(
+        &self,
+        engine: &ExtensionEngine,
+        archive: &mut RtwArchive,
+    ) -> EngineResult<ExtensionManifest> {
         let content = &archive.manifest().content;
         if content.id() != EXTENSION_CONTENT_ID || content.major() != EXTENSION_CONTENT_MAJOR {
             return Err(EngineError::UnsupportedExtensionArtifactContent(
                 content.to_string(),
             ));
         }
-
         let manifest_path = archive.manifest().entry.clone();
         let manifest_size = archive
             .entries()
@@ -118,7 +129,18 @@ impl RtwExtensionLoader {
         let manifest_bytes = archive.read(&manifest_path)?;
         let raw_manifest = std::str::from_utf8(&manifest_bytes)
             .map_err(|_| EngineError::ExtensionManifestEncoding(manifest_path.to_string()))?;
-        let manifest: ExtensionManifest = engine.parse_manifest(raw_manifest)?;
+        engine.parse_manifest(raw_manifest)
+    }
+
+    fn load_archive(
+        &self,
+        engine: &mut ExtensionEngine,
+        mut archive: RtwArchive,
+        instance_id: ExtensionInstanceId,
+        scope_id: RuntimeScopeId,
+    ) -> EngineResult<ExtensionId> {
+        let manifest_path = archive.manifest().entry.clone();
+        let manifest = self.read_manifest(engine, &mut archive)?;
         let extension_id = manifest.id.clone();
 
         for descriptor in &manifest.components {

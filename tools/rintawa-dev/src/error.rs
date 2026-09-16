@@ -36,12 +36,9 @@ pub enum DevError {
     /// Extension loading or lifecycle failed.
     #[error("extension runtime error: {0}")]
     Engine(#[from] EngineError),
-    /// The development Web host failed.
-    #[error("Web host error: {0}")]
-    WebHost(String),
-    /// Shared Web host state is unavailable.
-    #[error("Web host state is unavailable")]
-    WebHostUnavailable,
+    /// The packaged Web host failed.
+    #[error(transparent)]
+    WebHost(#[from] rintawa_web_host::WebHostError),
     /// Runtime setup failed and cleanup also failed.
     #[error("runtime setup failed: {setup}; cleanup failed: {cleanup}")]
     RuntimeSetupCleanupFailed {

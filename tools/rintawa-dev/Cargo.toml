@@ -10,15 +10,12 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
-axum.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
 ignore.workspace = true
-futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
-tokio.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 
@@ -26,3 +23,4 @@ rintawa-artifacts = { path = "../../crates/artifacts" }
 rintawa-extension-engine = { path = "../../crates/extension-engine" }
 rintawa-sdk = { path = "../../crates/sdk" }
 rintawa-web-runtime = { path = "../../crates/web-runtime" }
+rintawa-web-host = { path = "../../crates/web-host" }
