@@ -1230,10 +1230,34 @@ impl ExtensionEngine {
         eligible_instances.extend(ordered_instances.iter().cloned());
 
         let mut composition = CompositionSnapshot::default();
+        let mut definition_dependencies = Vec::new();
         for scope_id in scopes {
             let scoped = self.resolve_composition_for_scope(&scope_id, |extension| {
                 eligible_instances.contains(&extension.instance_id)
             });
+            for binding in scoped.bindings.iter().filter(|binding| binding.required) {
+                let is_platform_owned = self
+                    .platform_contract_definitions
+                    .get(&scope_id)
+                    .is_some_and(|definitions| definitions.contains_key(&binding.contract));
+                if is_platform_owned {
+                    continue;
+                }
+                if let Some(owner) = self
+                    .extensions
+                    .values()
+                    .filter(|extension| {
+                        eligible_instances.contains(&extension.instance_id)
+                            && extension.scope_id == scope_id
+                    })
+                    .flat_map(|extension| extension.contract_definitions.iter())
+                    .find(|owned| owned.definition.contract == binding.contract)
+                    .map(|owned| owned.owner.clone())
+                {
+                    definition_dependencies
+                        .push((owner.instance_id, binding.consumer.instance_id.clone()));
+                }
+            }
             composition.bindings.extend(scoped.bindings);
             composition.unresolved.extend(scoped.unresolved);
         }
@@ -1242,6 +1266,7 @@ impl ExtensionEngine {
             &composition,
             ordered_instances,
             &active_instances,
+            &definition_dependencies,
         )?)
     }
 
@@ -1309,6 +1334,24 @@ impl ExtensionEngine {
             preferred,
             &self.secrets,
         )
+    }
+
+    /// Returns the extension-owned definition endpoint for one loaded scoped contract.
+    ///
+    /// Platform-owned definitions intentionally return `None` because they have no
+    /// extension lifecycle dependency. The lookup is lifecycle-agnostic and is meant
+    /// for bootstrap topology planning rather than runtime availability.
+    pub fn contract_definition_owner_in_scope(
+        &self,
+        scope_id: &RuntimeScopeId,
+        contract: &ContractKey,
+    ) -> Option<ComponentRef> {
+        self.extensions
+            .values()
+            .filter(|extension| &extension.scope_id == scope_id)
+            .flat_map(|extension| extension.contract_definitions.iter())
+            .find(|owned| owned.definition.contract == *contract)
+            .map(|owned| owned.owner.clone())
     }
 
     /// Resolves the registered contract topology in the default runtime scope.

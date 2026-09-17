@@ -242,6 +242,55 @@ fn test_should_order_required_provider_before_consumer_and_preserve_ties() -> an
 }
 
 #[test]
+fn test_should_order_separate_contract_definition_owner_before_consumer() -> anyhow::Result<()> {
+    let contract = contract("example.separate-definition");
+    let mut engine = ExtensionEngine::new();
+
+    engine.register_extension(
+        manifest("provider"),
+        vec![Box::new(
+            ContractComponent::new("runtime").providing(ContractProvider::new(contract.clone())),
+        )],
+    )?;
+    engine.register_extension(
+        manifest("consumer"),
+        vec![Box::new(
+            ContractComponent::new("runtime")
+                .consuming(ContractConsumer::new(contract.clone(), true)),
+        )],
+    )?;
+    engine.register_extension(
+        manifest("definition"),
+        vec![Box::new(ContractComponent::new("runtime").defining(
+            ContractDefinition::new(contract, ContractResolutionPolicy::Single),
+        ))],
+    )?;
+
+    let requested = vec![
+        ExtensionInstanceId::new("provider"),
+        ExtensionInstanceId::new("consumer"),
+        ExtensionInstanceId::new("definition"),
+    ];
+    let plan = engine.plan_extension_activation(&requested)?;
+    assert_eq!(
+        plan.ordered_instances(),
+        &[
+            ExtensionInstanceId::new("provider"),
+            ExtensionInstanceId::new("definition"),
+            ExtensionInstanceId::new("consumer"),
+        ]
+    );
+    for instance_id in plan.ordered_instances() {
+        engine.start_extension_instance(instance_id)?;
+    }
+    assert_eq!(
+        engine.extension_instance_state(&ExtensionInstanceId::new("consumer")),
+        Some(ExtensionState::Active)
+    );
+    Ok(())
+}
+
+#[test]
 fn test_should_reject_unresolved_required_consumer_activation() -> anyhow::Result<()> {
     let contract = contract("example.required-missing");
     let definition = ContractDefinition::new(contract.clone(), ContractResolutionPolicy::Single);

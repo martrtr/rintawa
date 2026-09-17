@@ -8,6 +8,63 @@ use rintawa_sdk::{
     types::RuntimeScopeId,
 };
 
+const TEST_TARGET_PROVIDER_COMPONENT: &[u8] =
+    include_bytes!("../../extension-engine/tests/fixtures/target-provider/component.wasm");
+
+fn build_target_provider(root: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let source = root.join("target-provider-source");
+    fs::create_dir_all(&source)?;
+    fs::write(
+        source.join("rtw.toml"),
+        "format = 1\ncontent = \"rintawa.extension@1\"\nentry = \"manifest.toml\"\n",
+    )?;
+    fs::write(
+        source.join("manifest.toml"),
+        r#"id = "bootstrap.target-provider"
+name = "Target Provider"
+version = "0.1.0"
+sdk = "^0.0"
+
+[[components]]
+id = "runtime"
+kind = "runtime"
+target = "rintawa.runtime.wasm-component@1"
+entry = "provider.wasm"
+"#,
+    )?;
+    fs::write(source.join("provider.wasm"), TEST_TARGET_PROVIDER_COMPONENT)?;
+    let artifact = root.join("target-provider.rtw");
+    pack_directory(&source, &artifact, RtwLimits::default())?;
+    Ok(artifact)
+}
+
+fn build_target_dependent(root: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let source = root.join("target-dependent-source");
+    fs::create_dir_all(&source)?;
+    fs::write(
+        source.join("rtw.toml"),
+        "format = 1\ncontent = \"rintawa.extension@1\"\nentry = \"manifest.toml\"\n",
+    )?;
+    fs::write(
+        source.join("manifest.toml"),
+        r#"id = "bootstrap.target-dependent"
+name = "Target Dependent"
+version = "0.1.0"
+sdk = "^0.0"
+
+[[components]]
+id = "hosted"
+kind = "runtime"
+target = "test.wasm-target@1"
+entry = "payload.bin"
+"#,
+    )?;
+    fs::write(source.join("payload.bin"), b"hosted payload")?;
+    let artifact = root.join("target-dependent.rtw");
+    pack_directory(&source, &artifact, RtwLimits::default())?;
+    Ok(artifact)
+}
+
 fn build_extension(
     root: &std::path::Path,
     version: &str,
@@ -177,6 +234,56 @@ fn test_should_fail_explicit_unavailable_host_shell_without_fallback() -> anyhow
             reason: UnresolvedContractReason::PreferredProviderUnavailable,
             ..
         }
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_should_revisit_deferred_activation_after_runtime_provider_starts() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let dependent = build_target_dependent(root.path())?;
+    let provider = build_target_provider(root.path())?;
+    let home = HostHome::open(root.path().join("home"))?;
+
+    home.install_local_rtw(&dependent, Some(true))?;
+    home.install_local_rtw(&provider, Some(true))?;
+    let profile = home.load_profile()?;
+    assert_eq!(profile.activations[0].subject, "bootstrap.target-dependent");
+    assert_eq!(profile.activations[1].subject, "bootstrap.target-provider");
+
+    let runtime = HostRuntime::start(&home)?;
+    runtime.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn test_should_report_fixed_point_when_required_execution_target_never_appears()
+-> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let dependent = build_target_dependent(root.path())?;
+    let home = HostHome::open(root.path().join("home"))?;
+    home.install_local_rtw(&dependent, Some(true))?;
+
+    let error = match HostRuntime::start(&home) {
+        Ok(runtime) => {
+            runtime.shutdown()?;
+            anyhow::bail!("bootstrap should not ignore a permanently deferred activation");
+        }
+        Err(error) => error,
+    };
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("bootstrap.target-dependent"));
+    assert!(diagnostic.contains("test.wasm-target@1"));
+    assert!(matches!(
+        error,
+        HostError::BootstrapStalled(stall)
+            if stall.blocked.is_empty()
+                && stall.batch_error.is_none()
+                && stall.deferred.len() == 1
+                && stall.deferred[0].instance_id.as_str() == "bootstrap.target-dependent"
+                && stall.deferred[0].missing_required_targets.len() == 1
+                && stall.deferred[0].missing_required_targets[0].component_id.as_str() == "hosted"
+                && stall.deferred[0].missing_required_targets[0].target.as_str() == "test.wasm-target@1"
     ));
     Ok(())
 }

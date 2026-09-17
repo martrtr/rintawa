@@ -46,6 +46,8 @@ use crate::{
 };
 use rintawa_ui_runtime::UiRuntime;
 
+const TARGET_PROVIDER_EXPORT_NAME: &str = "rintawa:engine/target-provider@0.0.1";
+
 #[derive(Default)]
 struct JsonSizeCounter {
     bytes: usize,
@@ -1423,6 +1425,15 @@ pub struct WasmComponent {
     execution_targets: ExecutionTargetRegistry,
     budget: WasmExecutionBudget,
     runtime: Arc<Mutex<WasmSharedRuntime>>,
+}
+
+impl WasmComponent {
+    pub(crate) fn supports_execution_target_provider(&self) -> bool {
+        self.component
+            .component_type()
+            .get_export(&self.engine, TARGET_PROVIDER_EXPORT_NAME)
+            .is_some()
+    }
 }
 
 struct WasmSharedRuntime {

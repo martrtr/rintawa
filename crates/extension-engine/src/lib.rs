@@ -30,7 +30,10 @@ pub use activation::{ActivationPlan, ActivationPlanError};
 pub use artifact_host::{
     RtwComponentHost, RtwComponentHostError, RtwComponentHostResult, RtwComponentSource,
 };
-pub use artifact_loader::RtwExtensionLoader;
+pub use artifact_loader::{
+    DeferredExecutionTarget, DeferredExtensionLoad, RegisteredExtensionLoad,
+    RtwExtensionLoadOutcome, RtwExtensionLoader,
+};
 pub use composition::{
     CompositionSnapshot, ContractBinding, UnresolvedContract, UnresolvedContractReason,
 };

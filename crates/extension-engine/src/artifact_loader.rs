@@ -6,7 +6,7 @@ use rintawa_artifacts::{ArtifactDigest, ArtifactStore, RtwArchive, RtwError};
 use rintawa_sdk::{
     manifest::{ExtensionManifest, WASM_COMPONENT_TARGET_V1},
     traits::Component,
-    types::{ExtensionId, ExtensionInstanceId, RuntimeScopeId},
+    types::{ComponentId, ComponentTarget, ExtensionId, ExtensionInstanceId, RuntimeScopeId},
 };
 
 use crate::{
@@ -31,6 +31,53 @@ const MAX_EXTENSION_MANIFEST_BYTES: u64 = 1024 * 1024;
 /// from the owner-scoped registry of the supplied [`ExtensionEngine`].
 #[derive(Clone, Copy, Default)]
 pub struct RtwExtensionLoader;
+
+/// One required component whose execution target is not available yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredExecutionTarget {
+    /// Component waiting for a target host.
+    pub component_id: ComponentId,
+    /// Exact versioned execution target that is currently unavailable.
+    pub target: ComponentTarget,
+}
+
+/// Side-effect-free deferral returned by staged RTW extension loading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredExtensionLoad {
+    /// Logical extension identity read from the validated manifest.
+    pub extension_id: ExtensionId,
+    first_missing_required_target: DeferredExecutionTarget,
+    additional_missing_required_targets: Vec<DeferredExecutionTarget>,
+}
+
+impl DeferredExtensionLoad {
+    /// Returns every required execution target that is unavailable in manifest order.
+    pub fn missing_required_targets(&self) -> impl Iterator<Item = &DeferredExecutionTarget> {
+        std::iter::once(&self.first_missing_required_target)
+            .chain(self.additional_missing_required_targets.iter())
+    }
+}
+
+/// Metadata returned after one extension artifact is fully registered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredExtensionLoad {
+    /// Logical extension identity read from the validated manifest.
+    pub extension_id: ExtensionId,
+    /// Whether at least one built-in WASM component exports the target-provider ABI.
+    ///
+    /// This marks an activation as eligible for early bootstrap-provider scheduling;
+    /// it does not guarantee that `start()` will actually publish a target.
+    pub can_publish_execution_targets: bool,
+}
+
+/// Outcome of one staged attempt to load an exact RTW extension artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RtwExtensionLoadOutcome {
+    /// The extension instance was fully registered in the engine.
+    Loaded(RegisteredExtensionLoad),
+    /// Loading made no side effects because required execution targets are unavailable.
+    Deferred(DeferredExtensionLoad),
+}
 
 impl RtwExtensionLoader {
     /// Creates the built-in RTW extension loader.
@@ -63,8 +110,39 @@ impl RtwExtensionLoader {
         instance_id: ExtensionInstanceId,
         scope_id: RuntimeScopeId,
     ) -> EngineResult<ExtensionId> {
+        match self.try_load_stored_extension(engine, store, digest, instance_id, scope_id)? {
+            RtwExtensionLoadOutcome::Loaded(loaded) => Ok(loaded.extension_id),
+            RtwExtensionLoadOutcome::Deferred(deferred) => {
+                let missing = deferred.first_missing_required_target;
+                Err(EngineError::UnsupportedRequiredComponentTarget {
+                    component_id: missing.component_id.to_string(),
+                    target: missing.target.to_string(),
+                })
+            }
+        }
+    }
+
+    /// Attempts to register one exact artifact without treating missing targets as failure.
+    ///
+    /// Required non-root execution targets are preflighted before any component is
+    /// instantiated or registered. If one or more are unavailable, the method returns
+    /// [`RtwExtensionLoadOutcome::Deferred`] and leaves `engine` unchanged. This is the
+    /// loader boundary used by fixed-point bootstrap.
+    ///
+    /// # Errors
+    ///
+    /// Returns artifact, manifest, component-host, WASM, or registration failures.
+    /// Missing required execution targets are represented by a deferred outcome instead.
+    pub fn try_load_stored_extension(
+        &self,
+        engine: &mut ExtensionEngine,
+        store: &ArtifactStore,
+        digest: &ArtifactDigest,
+        instance_id: ExtensionInstanceId,
+        scope_id: RuntimeScopeId,
+    ) -> EngineResult<RtwExtensionLoadOutcome> {
         let archive = store.open_artifact(digest)?;
-        self.load_archive(engine, archive, instance_id, scope_id)
+        self.try_load_archive(engine, archive, instance_id, scope_id)
     }
 
     /// Reads and validates the extension manifest from one exact stored artifact.
@@ -111,18 +189,19 @@ impl RtwExtensionLoader {
         engine.parse_manifest(raw_manifest)
     }
 
-    fn load_archive(
+    fn try_load_archive(
         &self,
         engine: &mut ExtensionEngine,
         mut archive: RtwArchive,
         instance_id: ExtensionInstanceId,
         scope_id: RuntimeScopeId,
-    ) -> EngineResult<ExtensionId> {
+    ) -> EngineResult<RtwExtensionLoadOutcome> {
         let manifest_path = archive.manifest().entry.clone();
         let manifest = self.read_manifest(engine, &mut archive)?;
         let extension_id = manifest.id.clone();
 
         let mut resolved_hosts = BTreeMap::new();
+        let mut missing_required_targets = Vec::new();
         for descriptor in &manifest.components {
             let target = descriptor.target.as_str();
             if target == WASM_COMPONENT_TARGET_V1 {
@@ -133,11 +212,21 @@ impl RtwExtensionLoader {
                     .entry(target.to_string())
                     .or_insert(registered);
             } else if descriptor.required {
-                return Err(EngineError::UnsupportedRequiredComponentTarget {
-                    component_id: descriptor.id.to_string(),
-                    target: descriptor.target.to_string(),
+                missing_required_targets.push(DeferredExecutionTarget {
+                    component_id: descriptor.id.clone(),
+                    target: descriptor.target.clone(),
                 });
             }
+        }
+        if let Some(first_missing_required_target) = missing_required_targets.first().cloned() {
+            return Ok(RtwExtensionLoadOutcome::Deferred(DeferredExtensionLoad {
+                extension_id,
+                first_missing_required_target,
+                additional_missing_required_targets: missing_required_targets
+                    .into_iter()
+                    .skip(1)
+                    .collect(),
+            }));
         }
 
         let wasm_engine = manifest
@@ -148,6 +237,7 @@ impl RtwExtensionLoader {
             .transpose()?;
         let mut components: Vec<Box<dyn Component>> = Vec::new();
         let mut execution_target_dependencies = Vec::new();
+        let mut can_publish_execution_targets = false;
 
         for descriptor in &manifest.components {
             let target = descriptor.target.as_str();
@@ -163,6 +253,7 @@ impl RtwExtensionLoader {
                 let artifact_path = source.resolve_component_entry(entry)?;
                 let bytes = source.read(&artifact_path)?;
                 let component = runtime.load_component_from_bytes(descriptor.id.clone(), &bytes)?;
+                can_publish_execution_targets |= component.supports_execution_target_provider();
                 components.push(Box::new(component));
                 continue;
             }
@@ -192,6 +283,9 @@ impl RtwExtensionLoader {
             components,
             execution_target_dependencies,
         )?;
-        Ok(extension_id)
+        Ok(RtwExtensionLoadOutcome::Loaded(RegisteredExtensionLoad {
+            extension_id,
+            can_publish_execution_targets,
+        }))
     }
 }

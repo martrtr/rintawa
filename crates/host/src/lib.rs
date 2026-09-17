@@ -10,12 +10,18 @@
 mod profile;
 mod runtime;
 
-use std::path::{Path, PathBuf};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use rintawa_artifacts::{
     ArtifactDigest, ArtifactStore, ContentType, ImportDisposition, RtwArchive, RtwLimits,
 };
-use rintawa_extension_engine::{ExtensionEngine, RtwExtensionLoader, UnresolvedContractReason};
+use rintawa_extension_engine::{
+    ActivationPlanError, DeferredExecutionTarget, ExtensionEngine, RtwExtensionLoader,
+    UnresolvedContractReason,
+};
 use rintawa_sdk::{
     contracts::{ComponentRef, ContractKey},
     types::{ExtensionInstanceId, RuntimeScopeId},
@@ -30,6 +36,70 @@ pub const HOST_SCOPE: &str = "host";
 /// File name of the current baseline host profile.
 pub const BASELINE_PROFILE_FILE: &str = "baseline.toml";
 const EXTENSION_CONTENT_V1: &str = "rintawa.extension@1";
+
+/// One baseline activation deferred because required execution targets are unavailable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapDeferredActivation {
+    /// Handler-defined activation identity from the baseline profile.
+    pub subject: String,
+    /// Concrete runtime instance that could not be registered yet.
+    pub instance_id: ExtensionInstanceId,
+    /// Logical extension identity read from the validated artifact manifest.
+    pub extension_id: String,
+    /// Required execution targets currently missing from the Engine registry.
+    pub missing_required_targets: Vec<DeferredExecutionTarget>,
+}
+
+/// One registered baseline activation blocked by required contract composition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapBlockedActivation {
+    /// Concrete runtime instance that could not enter `Active`.
+    pub instance_id: ExtensionInstanceId,
+    /// Exact activation-planner reason observed for this instance.
+    pub reason: ActivationPlanError,
+}
+
+/// Structured diagnostics produced when baseline bootstrap reaches a fixed point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapStall {
+    /// Activations waiting for execution targets that never appeared.
+    pub deferred: Vec<BootstrapDeferredActivation>,
+    /// Registered activations blocked by required contract composition.
+    pub blocked: Vec<BootstrapBlockedActivation>,
+    /// Batch-level planner failure, including dependency-cycle diagnostics when available.
+    pub batch_error: Option<ActivationPlanError>,
+}
+
+impl fmt::Display for BootstrapStall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("baseline bootstrap reached a fixed point")?;
+        for activation in &self.deferred {
+            write!(
+                formatter,
+                "; instance `{}` ({}) waits for",
+                activation.instance_id, activation.extension_id
+            )?;
+            for missing in &activation.missing_required_targets {
+                write!(
+                    formatter,
+                    " component `{}` target `{}`",
+                    missing.component_id, missing.target
+                )?;
+            }
+        }
+        for activation in &self.blocked {
+            write!(
+                formatter,
+                "; instance `{}` is blocked: {}",
+                activation.instance_id, activation.reason
+            )?;
+        }
+        if let Some(error) = &self.batch_error {
+            write!(formatter, "; batch activation plan: {error}")?;
+        }
+        Ok(())
+    }
+}
 
 /// Errors returned by local host composition operations.
 #[derive(Debug, Error)]
@@ -90,6 +160,9 @@ pub enum HostError {
         /// Provider-resolution failure.
         reason: UnresolvedContractReason,
     },
+    /// Baseline bootstrap reached a fixed point without satisfying every activation.
+    #[error("{0}")]
+    BootstrapStalled(Box<BootstrapStall>),
     /// A persisted activation uses a content type for which this host has no handler.
     #[error("no activation handler is available for RTW content `{0}`")]
     UnsupportedContent(String),

@@ -7,7 +7,7 @@ use std::{
 use rintawa_artifacts::{ArtifactStore, RtwLimits, pack_directory};
 use rintawa_extension_engine::{
     EngineError, EngineResult, ExtensionEngine, ExtensionState, RtwComponentHost,
-    RtwComponentHostResult, RtwComponentSource, RtwExtensionLoader,
+    RtwComponentHostResult, RtwComponentSource, RtwExtensionLoadOutcome, RtwExtensionLoader,
 };
 use rintawa_sdk::{
     contracts::ComponentRef,
@@ -151,13 +151,19 @@ entry = "provider.wasm"
     fs::create_dir_all(&artifacts)?;
     let (store, digest) = import_source(&source, &artifacts)?;
     let instance_id = ExtensionInstanceId::new(instance);
-    RtwExtensionLoader::new().load_stored_extension(
+    let outcome = RtwExtensionLoader::new().try_load_stored_extension(
         engine,
         &store,
         &digest,
         instance_id.clone(),
         RuntimeScopeId::new("baseline"),
     )?;
+    assert!(matches!(
+        outcome,
+        RtwExtensionLoadOutcome::Loaded(ref loaded)
+            if loaded.extension_id.as_str() == "wasm-target-provider"
+                && loaded.can_publish_execution_targets
+    ));
     Ok(instance_id)
 }
 
@@ -247,6 +253,25 @@ required = true
     let (store, digest) = import_source(&source, temp.path())?;
     let instance_id = ExtensionInstanceId::new("native-only-instance");
     let mut engine = ExtensionEngine::new();
+
+    let deferred = RtwExtensionLoader::new().try_load_stored_extension(
+        &mut engine,
+        &store,
+        &digest,
+        instance_id.clone(),
+        RuntimeScopeId::new("default"),
+    )?;
+    assert!(matches!(
+        deferred,
+        RtwExtensionLoadOutcome::Deferred(ref deferred)
+            if deferred.extension_id.as_str() == "native-only"
+                && deferred.missing_required_targets().count() == 1
+                && deferred.missing_required_targets().next().is_some_and(|missing| {
+                    missing.component_id.as_str() == "runtime"
+                        && missing.target.as_str() == "example.runtime.native@1"
+                })
+    ));
+    assert_eq!(engine.extension_instance_state(&instance_id), None);
 
     let error = RtwExtensionLoader::new()
         .load_stored_extension(
