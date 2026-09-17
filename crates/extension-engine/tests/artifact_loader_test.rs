@@ -10,9 +10,10 @@ use rintawa_extension_engine::{
     RtwComponentHostResult, RtwComponentSource, RtwExtensionLoader,
 };
 use rintawa_sdk::{
-    manifest::ComponentDescriptor,
+    contracts::ComponentRef,
+    manifest::{ComponentDescriptor, ExtensionManifest},
     traits::Component,
-    types::{ComponentId, ExtensionInstanceId, RuntimeScopeId},
+    types::{ComponentId, ExtensionId, ExtensionInstanceId, RuntimeScopeId},
 };
 
 struct TestComponentHost {
@@ -54,6 +55,30 @@ impl RtwComponentHost for TestComponentHost {
 }
 
 const TEST_WASM_COMPONENT: &str = include_str!("fixtures/stateful_component.wat");
+
+fn register_active_target_owner(
+    engine: &mut ExtensionEngine,
+    instance: &str,
+    component: &str,
+) -> EngineResult<ComponentRef> {
+    let instance_id = ExtensionInstanceId::new(instance);
+    engine.register_extension_instance(
+        instance_id.clone(),
+        RuntimeScopeId::new("bootstrap"),
+        ExtensionManifest {
+            id: ExtensionId::new(format!("{instance}.extension")),
+            name: format!("{instance} extension"),
+            version: String::from("0.1.0"),
+            sdk: String::from("^0.0"),
+            components: Vec::new(),
+        },
+        vec![Box::new(TestHostedComponent {
+            id: ComponentId::new(component),
+        })],
+    )?;
+    engine.start_extension_instance(&instance_id)?;
+    Ok(ComponentRef::new(instance_id, component))
+}
 
 fn write_rtw_source(root: &Path, content: &str, manifest: &[u8]) -> EngineResult<()> {
     fs::create_dir_all(root)?;
@@ -429,7 +454,7 @@ fn test_should_reject_extension_manifest_above_loader_limit() -> EngineResult<()
 }
 
 #[test]
-fn test_should_load_required_component_through_registered_target_host() -> EngineResult<()> {
+fn test_should_load_required_component_through_engine_owned_target_registry() -> EngineResult<()> {
     let temp = tempfile::tempdir()?;
     let source = temp.path().join("source");
     write_rtw_source(
@@ -451,14 +476,21 @@ entry = "payload.bin"
     fs::write(source.join("payload.bin"), b"hosted payload")?;
     let (store, digest) = import_source(&source, temp.path())?;
     let observed = Arc::new(Mutex::new(Vec::new()));
-    let mut loader = RtwExtensionLoader::new();
-    loader.register_component_host(Arc::new(TestComponentHost {
-        observed: observed.clone(),
-    }))?;
     let instance_id = ExtensionInstanceId::new("hosted-instance");
     let mut engine = ExtensionEngine::new();
+    let owner = register_active_target_owner(&mut engine, "target-provider", "runtime")?;
+    engine.register_execution_target_host(
+        &owner,
+        Arc::new(TestComponentHost {
+            observed: observed.clone(),
+        }),
+    )?;
 
-    loader.load_stored_extension(
+    assert_eq!(
+        engine.execution_target_owner("test.runtime@1"),
+        Some(owner.clone())
+    );
+    RtwExtensionLoader::new().load_stored_extension(
         &mut engine,
         &store,
         &digest,
@@ -478,7 +510,43 @@ entry = "payload.bin"
         engine.extension_instance_state(&instance_id),
         Some(ExtensionState::Active)
     );
+
+    let unregister_error = engine
+        .unregister_extension_instance(&owner.instance_id)
+        .expect_err("target provider must not unregister while a dependent remains registered");
+    assert!(matches!(
+        unregister_error,
+        EngineError::ExecutionTargetProviderInUse {
+            provider_instance_id,
+            dependents,
+        } if provider_instance_id == "target-provider"
+            && dependents == vec![String::from("hosted-instance")]
+    ));
+    assert_eq!(
+        engine.extension_instance_state(&owner.instance_id),
+        Some(ExtensionState::Active)
+    );
+    assert_eq!(
+        engine.execution_target_owner("test.runtime@1"),
+        Some(owner.clone())
+    );
+
+    let error = engine
+        .stop_extension_instance(&owner.instance_id)
+        .expect_err("target provider must not stop while a dependent remains registered");
+    assert!(matches!(
+        error,
+        EngineError::ExecutionTargetProviderInUse {
+            provider_instance_id,
+            dependents,
+        } if provider_instance_id == "target-provider"
+            && dependents == vec![String::from("hosted-instance")]
+    ));
+
     engine.unregister_extension_instance(&instance_id)?;
+    engine.stop_extension_instance(&owner.instance_id)?;
+    assert_eq!(engine.execution_target_owner("test.runtime@1"), None);
+    engine.unregister_extension_instance(&owner.instance_id)?;
     Ok(())
 }
 
@@ -500,9 +568,11 @@ fn test_should_reject_component_host_for_reserved_wasm_target() {
         }
     }
 
-    let mut loader = RtwExtensionLoader::new();
-    let error = loader
-        .register_component_host(Arc::new(ReservedHost))
+    let mut engine = ExtensionEngine::new();
+    let owner = register_active_target_owner(&mut engine, "reserved-provider", "runtime")
+        .expect("test target owner should start");
+    let error = engine
+        .register_execution_target_host(&owner, Arc::new(ReservedHost))
         .expect_err("built-in WASM target must not be replaceable");
     assert!(matches!(
         error,
@@ -529,9 +599,76 @@ fn test_should_reject_noncanonical_component_host_target() {
         }
     }
 
-    let mut loader = RtwExtensionLoader::new();
-    let error = loader
-        .register_component_host(Arc::new(NonCanonicalHost))
+    let mut engine = ExtensionEngine::new();
+    let owner = register_active_target_owner(&mut engine, "invalid-provider", "runtime")
+        .expect("test target owner should start");
+    let error = engine
+        .register_execution_target_host(&owner, Arc::new(NonCanonicalHost))
         .expect_err("target identifiers must not be normalized implicitly");
     assert!(matches!(error, EngineError::InvalidComponentHostTarget));
+}
+
+#[test]
+fn test_should_reject_execution_target_registration_from_inactive_owner() -> EngineResult<()> {
+    let mut engine = ExtensionEngine::new();
+    let instance_id = ExtensionInstanceId::new("inactive-provider");
+    engine.register_extension_instance(
+        instance_id.clone(),
+        RuntimeScopeId::new("bootstrap"),
+        ExtensionManifest {
+            id: ExtensionId::new("inactive-provider.extension"),
+            name: String::from("Inactive Provider"),
+            version: String::from("0.1.0"),
+            sdk: String::from("^0.0"),
+            components: Vec::new(),
+        },
+        vec![Box::new(TestHostedComponent {
+            id: ComponentId::new("runtime"),
+        })],
+    )?;
+    let owner = ComponentRef::new(instance_id, "runtime");
+    let error = engine
+        .register_execution_target_host(
+            &owner,
+            Arc::new(TestComponentHost {
+                observed: Arc::new(Mutex::new(Vec::new())),
+            }),
+        )
+        .expect_err("registered but inactive components must not publish execution targets");
+    assert!(matches!(
+        error,
+        EngineError::ExecutionTargetOwnerInactive {
+            instance_id,
+            component_id,
+        } if instance_id == "inactive-provider" && component_id == "runtime"
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_duplicate_execution_target_from_another_owner() -> EngineResult<()> {
+    let mut engine = ExtensionEngine::new();
+    let first = register_active_target_owner(&mut engine, "first-provider", "runtime")?;
+    let second = register_active_target_owner(&mut engine, "second-provider", "runtime")?;
+    engine.register_execution_target_host(
+        &first,
+        Arc::new(TestComponentHost {
+            observed: Arc::new(Mutex::new(Vec::new())),
+        }),
+    )?;
+
+    let error = engine
+        .register_execution_target_host(
+            &second,
+            Arc::new(TestComponentHost {
+                observed: Arc::new(Mutex::new(Vec::new())),
+            }),
+        )
+        .expect_err("one execution target must have one process-global owner");
+    assert!(matches!(
+        error,
+        EngineError::DuplicateComponentHostTarget(target) if target == "test.runtime@1"
+    ));
+    assert_eq!(engine.execution_target_owner("test.runtime@1"), Some(first));
+    Ok(())
 }

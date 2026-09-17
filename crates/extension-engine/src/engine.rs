@@ -22,6 +22,7 @@ use std::{
 
 use crate::{
     activation::{ActivationPlan, build_activation_plan},
+    artifact_host::RtwComponentHost,
     composition::{
         CompositionSnapshot, OwnedContractConsumer, OwnedContractDefinition, OwnedContractProvider,
         UnresolvedContractReason, resolve_contract_providers, resolve_contracts,
@@ -30,6 +31,7 @@ use crate::{
         ComponentIdentity, EngineComponentContext, EngineRegistrationContext, RegistrationBuffers,
     },
     errors::{ComponentStopFailure, EngineError, EngineResult},
+    execution_targets::{ExecutionTargetDependency, ExecutionTargetRegistry},
     runtime::WasmRuntimeEngine,
     runtime_effects::RuntimeEffectRegistry,
     secrets::SecretManager,
@@ -60,6 +62,7 @@ struct ManagedExtension {
     contract_definitions: Vec<OwnedContractDefinition>,
     contract_providers: Vec<OwnedContractProvider>,
     contract_consumers: Vec<OwnedContractConsumer>,
+    execution_target_dependencies: Vec<ExecutionTargetDependency>,
 }
 
 struct ManagedComponent {
@@ -127,6 +130,7 @@ pub struct ExtensionEngine {
     preferred_contract_providers: HashMap<RuntimeScopeId, HashMap<ContractKey, ComponentRef>>,
     platform_contract_definitions:
         HashMap<RuntimeScopeId, HashMap<ContractKey, ContractDefinition>>,
+    execution_targets: ExecutionTargetRegistry,
 }
 
 /// Runtime scope used by legacy convenience APIs that do not specify one.
@@ -153,6 +157,7 @@ impl Default for ExtensionEngine {
             ui: UiRuntime::new(),
             preferred_contract_providers: HashMap::new(),
             platform_contract_definitions: HashMap::new(),
+            execution_targets: ExecutionTargetRegistry::default(),
         }
     }
 }
@@ -178,7 +183,93 @@ impl ExtensionEngine {
             ui: UiRuntime::new(),
             preferred_contract_providers: HashMap::new(),
             platform_contract_definitions: HashMap::new(),
+            execution_targets: ExecutionTargetRegistry::default(),
         }
+    }
+
+    /// Registers one non-built-in component execution target owned by an active component.
+    ///
+    /// Execution-target identifiers are process-global ABI identities rather than
+    /// runtime-scope composition roles. The built-in WASM target is reserved and
+    /// cannot be replaced. The registration is automatically revoked when the
+    /// owning extension instance stops or unregisters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::ExtensionInstanceNotFound`] when the owner instance
+    /// is unknown, [`EngineError::ExecutionTargetOwnerInactive`] when the owner
+    /// component is absent or inactive, or a target validation/conflict error.
+    pub fn register_execution_target_host(
+        &self,
+        owner: &ComponentRef,
+        host: Arc<dyn RtwComponentHost>,
+    ) -> EngineResult<()> {
+        let extension = self
+            .extensions
+            .get(&owner.instance_id)
+            .ok_or_else(|| EngineError::ExtensionInstanceNotFound(owner.instance_id.to_string()))?;
+        let owner_is_active = extension.state == ExtensionState::Active
+            && extension
+                .components
+                .iter()
+                .any(|component| component.id() == &owner.component_id);
+        if !owner_is_active {
+            return Err(EngineError::ExecutionTargetOwnerInactive {
+                instance_id: owner.instance_id.to_string(),
+                component_id: owner.component_id.to_string(),
+            });
+        }
+        self.execution_targets.register(owner.clone(), host)
+    }
+
+    /// Returns the active component that owns a registered execution target.
+    pub fn execution_target_owner(&self, target: &str) -> Option<ComponentRef> {
+        self.execution_targets.owner(target)
+    }
+
+    pub(crate) fn resolve_component_host(
+        &self,
+        target: &str,
+    ) -> Option<crate::execution_targets::RegisteredExecutionTargetHost> {
+        self.execution_targets.resolve(target)
+    }
+
+    fn execution_target_dependents_of(
+        &self,
+        provider_instance_id: &ExtensionInstanceId,
+    ) -> Vec<ExtensionInstanceId> {
+        let mut dependents: Vec<_> = self
+            .extensions
+            .values()
+            .filter(|extension| &extension.instance_id != provider_instance_id)
+            .filter(|extension| {
+                extension
+                    .execution_target_dependencies
+                    .iter()
+                    .any(|dependency| &dependency.provider.instance_id == provider_instance_id)
+            })
+            .map(|extension| extension.instance_id.clone())
+            .collect();
+        dependents.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        dependents.dedup();
+        dependents
+    }
+
+    fn ensure_execution_target_provider_not_in_use(
+        &self,
+        provider_instance_id: &ExtensionInstanceId,
+    ) -> EngineResult<()> {
+        let dependents = self.execution_target_dependents_of(provider_instance_id);
+        if dependents.is_empty() {
+            return Ok(());
+        }
+        Err(EngineError::ExecutionTargetProviderInUse {
+            provider_instance_id: provider_instance_id.to_string(),
+            dependents: dependents
+                .into_iter()
+                .map(|instance| instance.to_string())
+                .collect(),
+        })
     }
 
     /// Returns the trusted host secret manager used by this engine.
@@ -358,7 +449,24 @@ impl ExtensionEngine {
         instance_id: ExtensionInstanceId,
         scope_id: RuntimeScopeId,
         manifest: ExtensionManifest,
+        components: Vec<Box<dyn Component>>,
+    ) -> EngineResult<()> {
+        self.register_extension_instance_with_target_dependencies(
+            instance_id,
+            scope_id,
+            manifest,
+            components,
+            Vec::new(),
+        )
+    }
+
+    pub(crate) fn register_extension_instance_with_target_dependencies(
+        &mut self,
+        instance_id: ExtensionInstanceId,
+        scope_id: RuntimeScopeId,
+        manifest: ExtensionManifest,
         mut components: Vec<Box<dyn Component>>,
+        execution_target_dependencies: Vec<ExecutionTargetDependency>,
     ) -> EngineResult<()> {
         manifest.validate()?;
 
@@ -463,6 +571,7 @@ impl ExtensionEngine {
             contract_definitions,
             contract_providers,
             contract_consumers,
+            execution_target_dependencies,
         };
 
         self.extensions.insert(instance_id, managed);
@@ -677,6 +786,8 @@ impl ExtensionEngine {
                 }
 
                 runtime_effects.revoke_instance(&concrete_instance_id);
+                self.execution_targets
+                    .revoke_instance(&concrete_instance_id);
                 self.ui.set_instance_active(&concrete_instance_id, false)?;
                 self.services.set_active(&concrete_instance_id, false);
 
@@ -737,14 +848,20 @@ impl ExtensionEngine {
         &mut self,
         instance_id: &ExtensionInstanceId,
     ) -> EngineResult<()> {
+        let state = self
+            .extensions
+            .get(instance_id)
+            .map(|extension| extension.state)
+            .ok_or_else(|| EngineError::ExtensionInstanceNotFound(instance_id.to_string()))?;
+        if state == ExtensionState::Stopped {
+            return Ok(());
+        }
+        self.ensure_execution_target_provider_not_in_use(instance_id)?;
+
         let (extensions, runtime_effects) = (&mut self.extensions, &mut self.runtime_effects);
         let ext = extensions
             .get_mut(instance_id)
             .ok_or_else(|| EngineError::ExtensionInstanceNotFound(instance_id.to_string()))?;
-
-        if ext.state == ExtensionState::Stopped {
-            return Ok(());
-        }
 
         let logical_id = ext.manifest.id.clone();
         let scope_id = ext.scope_id.clone();
@@ -784,6 +901,8 @@ impl ExtensionEngine {
         }
 
         runtime_effects.revoke_instance(&concrete_instance_id);
+        self.execution_targets
+            .revoke_instance(&concrete_instance_id);
         ext.state = ExtensionState::Stopped;
 
         if stop_failures.is_empty() {
@@ -819,6 +938,7 @@ impl ExtensionEngine {
         &mut self,
         instance_id: &ExtensionInstanceId,
     ) -> EngineResult<()> {
+        self.ensure_execution_target_provider_not_in_use(instance_id)?;
         if let Some(ext) = self.extensions.get(instance_id) {
             if ext.state == ExtensionState::Active {
                 self.stop_extension_instance(instance_id)?;
@@ -851,6 +971,7 @@ impl ExtensionEngine {
             }
             self.services.unregister_instance(instance_id);
             self.ui.unregister_instance(instance_id);
+            self.execution_targets.revoke_instance(instance_id);
         }
         Ok(())
     }

@@ -16,11 +16,10 @@ use crate::{
 /// Versioned execution target for a WebAssembly Component hosted by Rintawa.
 pub const WASM_COMPONENT_TARGET_V1: &str = "rintawa.runtime.wasm-component@1";
 
-/// Represents the role of a component in an extension.
+/// Coarse package classification for a component.
 ///
-/// A runtime component can run on different hosts. Its execution model is
-/// selected by [`ComponentDescriptor::target`], for example `"native"` or
-/// `"wasm"`. A UI component uses a host-specific target such as `"web"`.
+/// Product roles are expressed through versioned contracts, not through this
+/// enum. [`ComponentDescriptor::target`] independently selects the execution ABI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ComponentKind {
@@ -57,19 +56,18 @@ pub struct ComponentDescriptor {
     /// The kind of component this is.
     pub kind: ComponentKind,
 
-    /// The host contract that runs this component.
+    /// The versioned execution target that runs this component.
     ///
-    /// Published WASM packages use [`WASM_COMPONENT_TARGET_V1`]. Short values
-    /// such as `"wasm"`, `"native"`, and `"web"` are legacy MVP host hints and
-    /// are not stable package ABI identifiers.
+    /// Published WASM packages use [`WASM_COMPONENT_TARGET_V1`]. Other targets
+    /// are provider-defined ABI identities registered through the host execution-
+    /// target registry; presentation roles remain separate versioned contracts.
     pub target: ComponentTarget,
 
-    /// The host-specific entry point for this component, when one is needed.
+    /// The target-specific entry point for this component, when one is needed.
     ///
-    /// A statically registered native component may omit this field. A WASM or
-    /// web component normally supplies an entry such as `"runtime.wasm"`. For
-    /// `rintawa.extension@1` RTW content, relative entries are resolved from the
-    /// directory containing the extension manifest selected by `rtw.toml`.
+    /// For `rintawa.extension@1` RTW content, relative entries are resolved from
+    /// the directory containing the extension manifest selected by `rtw.toml`.
+    /// Interpretation beyond that path boundary belongs to the selected target host.
     #[serde(default)]
     pub entry: Option<String>,
 

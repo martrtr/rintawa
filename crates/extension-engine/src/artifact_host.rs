@@ -88,6 +88,10 @@ impl<'a> RtwComponentSource<'a> {
 }
 
 /// Creates runtime components for one versioned RTW execution target.
+///
+/// Hosts are registered through [`crate::ExtensionEngine::register_execution_target_host`].
+/// The engine owns target identity, provider ownership, and lifecycle revocation;
+/// [`crate::RtwExtensionLoader`] only resolves the current engine registry.
 pub trait RtwComponentHost: Send + Sync {
     /// Returns the exact component target handled by this host.
     fn target(&self) -> &str;

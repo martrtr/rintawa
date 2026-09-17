@@ -70,6 +70,28 @@ pub enum EngineError {
     #[error("component target host `{0}` is already registered or reserved")]
     DuplicateComponentHostTarget(String),
 
+    /// An execution-target host owner is not an active loaded component.
+    #[error(
+        "component `{component_id}` in extension instance `{instance_id}` cannot own an execution target because it is not active"
+    )]
+    ExecutionTargetOwnerInactive {
+        /// Runtime instance containing the target-host owner.
+        instance_id: String,
+        /// Component expected to own the target host.
+        component_id: String,
+    },
+
+    /// One or more registered extension instances still depend on this runtime provider.
+    #[error(
+        "extension instance `{provider_instance_id}` cannot stop while execution-target dependents remain registered: {dependents:?}"
+    )]
+    ExecutionTargetProviderInUse {
+        /// Provider runtime instance that owns one or more execution targets.
+        provider_instance_id: String,
+        /// Registered dependent instances that were instantiated through the provider.
+        dependents: Vec<String>,
+    },
+
     /// A target host failed while creating a component from the RTW artifact.
     #[error("component `{component_id}` target `{target}` failed to load: {source}")]
     ComponentHostFailed {
