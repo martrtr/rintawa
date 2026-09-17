@@ -62,8 +62,8 @@ pub enum EngineError {
         target: String,
     },
 
-    /// A component target host identifier is empty or otherwise unusable.
-    #[error("component target host identifier must not be empty")]
+    /// A component target host identifier is not a canonical versioned target.
+    #[error("component target host identifier must be a canonical versioned execution target")]
     InvalidComponentHostTarget,
 
     /// A component target already has a host or is reserved by the built-in runtime.

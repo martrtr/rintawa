@@ -226,7 +226,7 @@ mod tests {
             [[components]]
             id = "runtime"
             kind = "runtime"
-            target = "native"
+            target = "example.runtime.native@1"
         "#;
 
         let manifest = engine.parse_manifest(manifest_toml)?;
@@ -552,7 +552,7 @@ mod tests {
                 [[components]]
                 id = "provider"
                 kind = "runtime"
-                target = "native"
+                target = "example.runtime.native@1"
 
                 [components.permissions]
                 secret-read = ["ai.api_keys.*"]
@@ -606,7 +606,7 @@ mod tests {
                 [[components]]
                 id = "provider"
                 kind = "runtime"
-                target = "native"
+                target = "example.runtime.native@1"
 
                 [components.permissions]
                 secret-read = ["ai.api_keys.*"]
@@ -645,7 +645,7 @@ mod tests {
                 [[components]]
                 id = "optional_provider"
                 kind = "runtime"
-                target = "wasm"
+                target = "example.runtime.wasm@1"
                 required = false
 
                 [components.permissions]
@@ -688,7 +688,7 @@ mod tests {
                 ComponentDescriptor {
                     id: ComponentId::new("provider"),
                     kind: ComponentKind::Runtime,
-                    target: ComponentTarget::new("native"),
+                    target: ComponentTarget::new("example.runtime.native@1"),
                     entry: None,
                     required: true,
                     permissions: ComponentPermissions {
@@ -698,7 +698,7 @@ mod tests {
                 ComponentDescriptor {
                     id: ComponentId::new("provider"),
                     kind: ComponentKind::Runtime,
-                    target: ComponentTarget::new("native"),
+                    target: ComponentTarget::new("example.runtime.native@1"),
                     entry: None,
                     required: true,
                     permissions: ComponentPermissions::default(),

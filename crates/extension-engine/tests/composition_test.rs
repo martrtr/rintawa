@@ -499,7 +499,7 @@ fn test_provider_grants_control_binding_eligibility() -> anyhow::Result<()> {
         components: vec![ComponentDescriptor {
             id: ComponentId::new("runtime"),
             kind: ComponentKind::Runtime,
-            target: ComponentTarget::new("native"),
+            target: ComponentTarget::new("example.runtime.native@1"),
             entry: None,
             required: true,
             permissions: ComponentPermissions {
@@ -614,7 +614,7 @@ fn test_consumer_grant_controls_binding_eligibility() -> anyhow::Result<()> {
         components: vec![ComponentDescriptor {
             id: ComponentId::new("runtime"),
             kind: ComponentKind::Runtime,
-            target: ComponentTarget::new("native"),
+            target: ComponentTarget::new("example.runtime.native@1"),
             entry: None,
             required: true,
             permissions: ComponentPermissions {

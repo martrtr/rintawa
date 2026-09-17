@@ -21,7 +21,7 @@ fn test_extension_loader_and_state_persistence() -> EngineResult<()> {
         [[components]]
         id = "chat-native"
         kind = "runtime"
-        target = "native"
+        target = "example.runtime.native@1"
     "#;
     fs::write(ext_dir.join("manifest.toml"), manifest_content)?;
 
@@ -76,12 +76,12 @@ fn test_loader_rejects_duplicate_component_ids_before_artifact_loading() -> Engi
         [[components]]
         id = "runtime"
         kind = "runtime"
-        target = "wasm"
+        target = "example.runtime.wasm@1"
         entry = "does-not-exist-a.wasm"
         [[components]]
         id = "runtime"
         kind = "runtime"
-        target = "wasm"
+        target = "example.runtime.wasm@1"
         entry = "does-not-exist-b.wasm"
     "#,
     )?;

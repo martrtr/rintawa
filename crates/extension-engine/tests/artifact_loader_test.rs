@@ -55,6 +55,8 @@ impl RtwComponentHost for TestComponentHost {
 }
 
 const TEST_WASM_COMPONENT: &str = include_str!("fixtures/stateful_component.wat");
+const TEST_TARGET_PROVIDER_COMPONENT: &[u8] =
+    include_bytes!("fixtures/target-provider/component.wasm");
 
 fn register_active_target_owner(
     engine: &mut ExtensionEngine,
@@ -120,6 +122,43 @@ fn import_source(
     let store = ArtifactStore::open(root.join("store"), RtwLimits::default())?;
     let digest = store.import(&artifact)?.digest().clone();
     Ok((store, digest))
+}
+
+fn load_wasm_target_provider(
+    engine: &mut ExtensionEngine,
+    root: &Path,
+    instance: &str,
+) -> EngineResult<ExtensionInstanceId> {
+    let source = root.join(format!("{instance}-source"));
+    write_rtw_source(
+        &source,
+        "rintawa.extension@1",
+        br#"
+id = "wasm-target-provider"
+name = "WASM Target Provider"
+version = "0.1.0"
+sdk = "^0.0"
+
+[[components]]
+id = "runtime"
+kind = "runtime"
+target = "rintawa.runtime.wasm-component@1"
+entry = "provider.wasm"
+"#,
+    )?;
+    fs::write(source.join("provider.wasm"), TEST_TARGET_PROVIDER_COMPONENT)?;
+    let artifacts = root.join(format!("{instance}-artifacts"));
+    fs::create_dir_all(&artifacts)?;
+    let (store, digest) = import_source(&source, &artifacts)?;
+    let instance_id = ExtensionInstanceId::new(instance);
+    RtwExtensionLoader::new().load_stored_extension(
+        engine,
+        &store,
+        &digest,
+        instance_id.clone(),
+        RuntimeScopeId::new("baseline"),
+    )?;
+    Ok(instance_id)
 }
 
 #[test]
@@ -201,7 +240,7 @@ sdk = "^0.0"
 [[components]]
 id = "runtime"
 kind = "runtime"
-target = "native"
+target = "example.runtime.native@1"
 required = true
 "#,
     )?;
@@ -222,7 +261,7 @@ required = true
     assert!(matches!(
         error,
         EngineError::UnsupportedRequiredComponentTarget { component_id, target }
-            if component_id == "runtime" && target == "native"
+            if component_id == "runtime" && target == "example.runtime.native@1"
     ));
     assert_eq!(engine.extension_instance_state(&instance_id), None);
     Ok(())
@@ -450,6 +489,181 @@ fn test_should_reject_extension_manifest_above_loader_limit() -> EngineResult<()
             if path == "manifest.toml" && actual == 1024 * 1024 + 1 && maximum == 1024 * 1024
     ));
     assert_eq!(engine.extension_instance_state(&instance_id), None);
+    Ok(())
+}
+
+#[test]
+fn test_should_publish_wasm_execution_target_and_load_dependent_through_bounded_artifact()
+-> EngineResult<()> {
+    let temp = tempfile::tempdir()?;
+    let mut engine = ExtensionEngine::new();
+    let provider_instance =
+        load_wasm_target_provider(&mut engine, temp.path(), "wasm-target-provider-instance")?;
+    engine.start_extension_instance(&provider_instance)?;
+
+    assert_eq!(
+        engine.execution_target_owner("test.wasm-target@1"),
+        Some(ComponentRef::new(provider_instance.clone(), "runtime"))
+    );
+
+    let dependent_source = temp.path().join("dependent-source");
+    write_rtw_source(
+        &dependent_source,
+        "rintawa.extension@1",
+        br#"
+id = "wasm-target-dependent"
+name = "WASM Target Dependent"
+version = "0.1.0"
+sdk = "^0.0"
+
+[[components]]
+id = "hosted"
+kind = "runtime"
+target = "test.wasm-target@1"
+entry = "payload.bin"
+"#,
+    )?;
+    fs::write(dependent_source.join("payload.bin"), b"hosted payload")?;
+    let dependent_artifacts = temp.path().join("dependent-artifacts");
+    fs::create_dir_all(&dependent_artifacts)?;
+    let (dependent_store, dependent_digest) =
+        import_source(&dependent_source, &dependent_artifacts)?;
+    let dependent_instance = ExtensionInstanceId::new("wasm-target-dependent-instance");
+
+    RtwExtensionLoader::new().load_stored_extension(
+        &mut engine,
+        &dependent_store,
+        &dependent_digest,
+        dependent_instance.clone(),
+        RuntimeScopeId::new("baseline"),
+    )?;
+    engine.start_extension_instance(&dependent_instance)?;
+    assert_eq!(
+        engine.extension_instance_state(&dependent_instance),
+        Some(ExtensionState::Active)
+    );
+
+    engine.unregister_extension_instance(&dependent_instance)?;
+    engine.stop_extension_instance(&provider_instance)?;
+    assert_eq!(engine.execution_target_owner("test.wasm-target@1"), None);
+    engine.unregister_extension_instance(&provider_instance)?;
+    Ok(())
+}
+
+#[test]
+fn test_should_preserve_existing_target_when_wasm_provider_publication_conflicts()
+-> EngineResult<()> {
+    struct ExistingTargetHost;
+
+    impl RtwComponentHost for ExistingTargetHost {
+        fn target(&self) -> &str {
+            "test.wasm-target@1"
+        }
+
+        fn load_component(
+            &self,
+            _source: &mut RtwComponentSource<'_>,
+            _descriptor: &ComponentDescriptor,
+        ) -> RtwComponentHostResult<Box<dyn Component>> {
+            unreachable!("conflicting provider must fail before component loading")
+        }
+    }
+
+    let temp = tempfile::tempdir()?;
+    let mut engine = ExtensionEngine::new();
+    let existing_owner =
+        register_active_target_owner(&mut engine, "existing-target-provider", "runtime")?;
+    engine.register_execution_target_host(&existing_owner, Arc::new(ExistingTargetHost))?;
+
+    let provider_instance =
+        load_wasm_target_provider(&mut engine, temp.path(), "conflicting-wasm-provider")?;
+    let error = engine
+        .start_extension_instance(&provider_instance)
+        .expect_err("duplicate target publication must fail provider startup");
+
+    assert!(matches!(
+        error,
+        EngineError::LifecycleFailed {
+            component_id,
+            reason,
+            ..
+        } if component_id == "runtime" && reason.contains("could not publish execution target")
+    ));
+    assert_eq!(
+        engine.execution_target_owner("test.wasm-target@1"),
+        Some(existing_owner.clone())
+    );
+    assert_eq!(
+        engine.extension_instance_state(&provider_instance),
+        Some(ExtensionState::Registered)
+    );
+
+    engine.unregister_extension_instance(&provider_instance)?;
+    engine.stop_extension_instance(&existing_owner.instance_id)?;
+    engine.unregister_extension_instance(&existing_owner.instance_id)?;
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_wasm_target_artifact_read_above_runtime_budget() -> EngineResult<()> {
+    let temp = tempfile::tempdir()?;
+    let mut engine = ExtensionEngine::new();
+    let provider_instance =
+        load_wasm_target_provider(&mut engine, temp.path(), "bounded-read-provider")?;
+    engine.start_extension_instance(&provider_instance)?;
+
+    let dependent_source = temp.path().join("oversized-dependent-source");
+    write_rtw_source(
+        &dependent_source,
+        "rintawa.extension@1",
+        br#"
+id = "oversized-target-dependent"
+name = "Oversized Target Dependent"
+version = "0.1.0"
+sdk = "^0.0"
+
+[[components]]
+id = "hosted"
+kind = "runtime"
+target = "test.wasm-target@1"
+entry = "payload.bin"
+"#,
+    )?;
+    fs::write(
+        dependent_source.join("payload.bin"),
+        vec![b'x'; 8 * 1024 * 1024 + 1],
+    )?;
+    let dependent_artifacts = temp.path().join("oversized-dependent-artifacts");
+    fs::create_dir_all(&dependent_artifacts)?;
+    let (dependent_store, dependent_digest) =
+        import_source(&dependent_source, &dependent_artifacts)?;
+    let dependent_instance = ExtensionInstanceId::new("oversized-target-dependent-instance");
+
+    let error = RtwExtensionLoader::new()
+        .load_stored_extension(
+            &mut engine,
+            &dependent_store,
+            &dependent_digest,
+            dependent_instance.clone(),
+            RuntimeScopeId::new("baseline"),
+        )
+        .expect_err("target provider must not read an artifact entry above its WASM budget");
+    assert!(matches!(
+        error,
+        EngineError::ComponentHostFailed {
+            component_id,
+            target,
+            ..
+        } if component_id == "hosted" && target == "test.wasm-target@1"
+    ));
+    assert_eq!(engine.extension_instance_state(&dependent_instance), None);
+    assert_eq!(
+        engine.execution_target_owner("test.wasm-target@1"),
+        Some(ComponentRef::new(provider_instance.clone(), "runtime"))
+    );
+
+    engine.stop_extension_instance(&provider_instance)?;
+    engine.unregister_extension_instance(&provider_instance)?;
     Ok(())
 }
 

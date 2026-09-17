@@ -24,8 +24,9 @@ pub use crate::contributions::{ContributionDescriptor, ContributionKind};
 pub use crate::errors::{ExtensionError, ExtensionResult};
 
 pub use crate::manifest::{
-    ComponentDescriptor, ComponentKind, ComponentPermissions, ExtensionManifest,
-    ManifestValidationError, WASM_COMPONENT_TARGET_V1,
+    ComponentDescriptor, ComponentKind, ComponentPermissions, ComponentTargetValidationError,
+    ExtensionManifest, ManifestValidationError, WASM_COMPONENT_TARGET_V1,
+    validate_component_target,
 };
 
 pub use crate::runtime_effects::RuntimeEffect;

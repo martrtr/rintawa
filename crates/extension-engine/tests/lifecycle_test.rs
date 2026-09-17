@@ -53,7 +53,7 @@ fn test_sdk_and_engine_integration_lifecycle() -> EngineResult<()> {
         [[components]]
         id = "chat-runtime"
         kind = "runtime"
-        target = "native"
+        target = "example.runtime.native@1"
     "#;
 
     let manifest = engine.parse_manifest(raw_manifest)?;

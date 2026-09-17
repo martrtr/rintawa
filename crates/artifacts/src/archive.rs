@@ -53,6 +53,7 @@ pub struct ArtifactEntry {
 
 /// A validated RTW ZIP archive backed by a file.
 pub struct RtwArchive {
+    source_file: File,
     archive: ZipArchive<File>,
     manifest: RtwManifest,
     entries: BTreeMap<ArtifactPath, ArtifactEntry>,
@@ -83,6 +84,7 @@ impl RtwArchive {
             });
         }
 
+        let source_file = file.try_clone()?;
         let mut archive = ZipArchive::new(file)?;
         let (entries, entry_indices) = validate_entries(&mut archive, limits)?;
         let manifest = read_manifest(&mut archive, &entry_indices, limits)?;
@@ -92,6 +94,7 @@ impl RtwArchive {
         }
 
         Ok(Self {
+            source_file,
             archive,
             manifest,
             entries,
@@ -102,6 +105,19 @@ impl RtwArchive {
     /// Returns the validated root RTW manifest.
     pub fn manifest(&self) -> &RtwManifest {
         &self.manifest
+    }
+    /// Creates an independently seekable, fully revalidated view of this artifact.
+    ///
+    /// The fork refers to the same already-open artifact file but owns an independent
+    /// file descriptor and ZIP cursor. Validation is repeated so callers never receive
+    /// a read view based on stale or partially trusted archive metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O or RTW validation error if the underlying file cannot be cloned
+    /// or no longer satisfies the original archive policy.
+    pub fn fork(&self) -> RtwResult<Self> {
+        Self::from_file(self.source_file.try_clone()?, self.limits)
     }
 
     /// Returns metadata for regular files in canonical path order.
@@ -121,6 +137,25 @@ impl RtwArchive {
     /// Returns [`RtwError::EntryNotFound`] for an unknown path, or another RTW
     /// error if decompression or bounded reading fails.
     pub fn read(&mut self, path: &ArtifactPath) -> RtwResult<Vec<u8>> {
+        self.read_with_limit(path, self.limits.max_entry_bytes)
+    }
+
+    /// Reads one regular file with an additional caller-provided byte limit.
+    ///
+    /// The effective limit never exceeds the archive policy configured at open
+    /// time. Declared uncompressed size is checked before allocating or
+    /// decompressing the entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RtwError::EntryNotFound`] for an unknown path,
+    /// [`RtwError::EntryTooLarge`] when the entry exceeds the effective limit,
+    /// or another RTW error if bounded decompression fails.
+    pub fn read_with_limit(
+        &mut self,
+        path: &ArtifactPath,
+        maximum_bytes: u64,
+    ) -> RtwResult<Vec<u8>> {
         let index = self
             .entry_indices
             .get(path)
@@ -135,7 +170,7 @@ impl RtwArchive {
             index,
             path.as_str(),
             entry.uncompressed_size,
-            self.limits.max_entry_bytes,
+            maximum_bytes.min(self.limits.max_entry_bytes),
         )
     }
 }

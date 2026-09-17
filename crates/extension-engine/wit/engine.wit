@@ -104,6 +104,41 @@ interface runtime-effects {
     unsubscribe-event: func(handle: handle) -> result<_, error>;
 }
 
+/// Dynamic execution targets published by an active runtime-provider component.
+interface execution-targets {
+    /// A host-owned, read-only view of one validated RTW artifact.
+    resource artifact-source {
+        /// Returns canonical regular-file paths in stable order.
+        paths: func() -> list<string>;
+
+        /// Resolves an entry relative to the extension manifest directory.
+        resolve-component-entry: func(entry: string) -> result<string, artifact-error>;
+
+        /// Resolves an entry relative to another file in the same artifact.
+        resolve-relative: func(base-file: string, entry: string) -> result<string, artifact-error>;
+
+        /// Reads one canonical regular file with host-owned archive limits.
+        read: func(path: string) -> result<list<u8>, artifact-error>;
+    }
+
+    /// Failure while using the bounded artifact view.
+    variant artifact-error {
+        invalid-path,
+        not-found,
+        unavailable,
+    }
+
+    /// Failure while publishing one versioned execution target.
+    variant registration-error {
+        runtime-not-active,
+        invalid-target,
+        target-conflict,
+    }
+
+    /// Publishes one target owned by the current component activation.
+    register-target: func(target: string) -> result<_, registration-error>;
+}
+
 /// Read-only secrets capability available only while guest code is executing.
 interface secrets {
     /// A secret-read failure that does not disclose values or host internals.
@@ -190,6 +225,59 @@ interface portable-ui {
     unmount-surface: func(surface-id: string) -> result<_, error>;
 }
 
+/// Optional callbacks implemented only by components that publish execution targets.
+interface target-provider {
+    use execution-targets.{artifact-source};
+
+    record component-descriptor {
+        id: string,
+        kind: string,
+        target: string,
+        entry: option<string>,
+        required: bool,
+    }
+
+    type component-handle = u64;
+
+    variant error {
+        invalid-descriptor,
+        unknown-component,
+        rejected,
+        unavailable,
+    }
+
+    /// Creates provider-local state from a validated artifact view.
+    /// The borrowed artifact resource is valid only for this callback.
+    load-component: func(
+        target: string,
+        descriptor: component-descriptor,
+        source: borrow<artifact-source>,
+    ) -> result<component-handle, error>;
+
+    /// Collects declarations for the hosted component before activation.
+    register-component: func(handle: component-handle) -> result<_, error>;
+
+    /// Activates the hosted component under the dependent component principal.
+    start-component: func(handle: component-handle) -> result<_, error>;
+
+    /// Deactivates the hosted component while preserving restartable provider state.
+    stop-component: func(handle: component-handle) -> result<_, error>;
+
+    /// Permanently releases provider-local state after the proxy is unloaded.
+    drop-component: func(handle: component-handle) -> result<_, error>;
+
+    /// Handles one validated portable UI action for the dependent component.
+    handle-ui-action: func(handle: component-handle, action-json: list<u8>) -> result<_, error>;
+
+    /// Handles one service request for a contract provided by the dependent component.
+    handle-service: func(
+        handle: component-handle,
+        contract: string,
+        version: u32,
+        payload: list<u8>,
+    ) -> result<list<u8>, error>;
+}
+
 /// Guest lifecycle and event handlers implemented by the WASM plugin.
 interface guest {
     /// Initial plugin registration callback.
@@ -226,8 +314,28 @@ world plugin {
     import host;
     import registration;
     import runtime-effects;
+    import execution-targets;
     import secrets;
     import services;
     import portable-ui;
     export guest;
+}
+
+/// Optional typed view of the same instance for runtime-provider callbacks.
+world target-provider-plugin {
+    import execution-targets;
+    export target-provider;
+}
+
+/// Combined authoring world for a WASM runtime-provider component.
+world runtime-provider-plugin {
+    import host;
+    import registration;
+    import runtime-effects;
+    import execution-targets;
+    import secrets;
+    import services;
+    import portable-ui;
+    export guest;
+    export target-provider;
 }

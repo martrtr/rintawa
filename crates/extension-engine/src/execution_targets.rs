@@ -7,7 +7,7 @@ use std::{
 
 use rintawa_sdk::{
     contracts::ComponentRef,
-    manifest::{ComponentDescriptor, WASM_COMPONENT_TARGET_V1},
+    manifest::{ComponentDescriptor, WASM_COMPONENT_TARGET_V1, validate_component_target},
     types::{ComponentId, ComponentTarget, ExtensionInstanceId},
 };
 
@@ -78,6 +78,16 @@ impl ExecutionTargetRegistry {
         self.resolve(target).map(|registered| registered.owner)
     }
 
+    pub(crate) fn revoke_component(&self, owner: &ComponentRef) {
+        let mut state = match self.state.write() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state
+            .hosts
+            .retain(|_, registered| &registered.owner != owner);
+    }
+
     pub(crate) fn revoke_instance(&self, instance_id: &ExtensionInstanceId) {
         let mut state = match self.state.write() {
             Ok(state) => state,
@@ -90,9 +100,7 @@ impl ExecutionTargetRegistry {
 }
 
 fn validate_target(target: &str) -> EngineResult<()> {
-    if target.is_empty() || target != target.trim() {
-        return Err(EngineError::InvalidComponentHostTarget);
-    }
+    validate_component_target(target).map_err(|_| EngineError::InvalidComponentHostTarget)?;
     if target == WASM_COMPONENT_TARGET_V1 {
         return Err(EngineError::DuplicateComponentHostTarget(
             target.to_string(),

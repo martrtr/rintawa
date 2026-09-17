@@ -295,6 +295,7 @@ impl ExtensionEngine {
             self.secrets.clone(),
             self.services.clone(),
             self.ui.clone(),
+            self.execution_targets.clone(),
         )
     }
 

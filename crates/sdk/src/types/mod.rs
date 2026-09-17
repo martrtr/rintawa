@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn test_component_target_json_round_trip() -> serde_json::Result<()> {
-        let original = ComponentTarget::new("wasm");
+        let original = ComponentTarget::new("example.runtime.wasm@1");
         let encoded = serde_json::to_string(&original)?;
         let decoded: ComponentTarget = serde_json::from_str(&encoded)?;
 

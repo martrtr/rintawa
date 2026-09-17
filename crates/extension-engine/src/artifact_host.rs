@@ -85,6 +85,48 @@ impl<'a> RtwComponentSource<'a> {
     pub fn read(&mut self, path: &ArtifactPath) -> Result<Vec<u8>, RtwError> {
         self.archive.read(path)
     }
+
+    pub(crate) fn fork_owned(&self) -> Result<OwnedRtwComponentSource, RtwError> {
+        Ok(OwnedRtwComponentSource {
+            archive: self.archive.fork()?,
+            extension_manifest_path: self.extension_manifest_path.clone(),
+        })
+    }
+}
+
+/// Owned validated RTW view used by bounded guest artifact resources.
+pub struct OwnedRtwComponentSource {
+    archive: RtwArchive,
+    extension_manifest_path: ArtifactPath,
+}
+
+impl OwnedRtwComponentSource {
+    pub(crate) fn resolve_component_entry(&self, entry: &str) -> Result<ArtifactPath, RtwError> {
+        resolve_relative_entry(&self.extension_manifest_path, entry)
+    }
+
+    pub(crate) fn resolve_relative_to(
+        &self,
+        base_file: &ArtifactPath,
+        entry: &str,
+    ) -> Result<ArtifactPath, RtwError> {
+        resolve_relative_entry(base_file, entry)
+    }
+
+    pub(crate) fn paths(&self) -> Vec<ArtifactPath> {
+        self.archive
+            .entries()
+            .map(|entry| entry.path.clone())
+            .collect()
+    }
+
+    pub(crate) fn read_with_limit(
+        &mut self,
+        path: &ArtifactPath,
+        maximum_bytes: u64,
+    ) -> Result<Vec<u8>, RtwError> {
+        self.archive.read_with_limit(path, maximum_bytes)
+    }
 }
 
 /// Creates runtime components for one versioned RTW execution target.

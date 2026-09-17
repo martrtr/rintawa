@@ -2,7 +2,7 @@
 //!
 //! Provides sandboxed Component Model lifecycle execution for Rintawa WASM extensions.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -32,11 +32,15 @@ use rintawa_sdk::{
 use tracing::{debug, error, info, trace, warn};
 use wasmtime::{
     Engine, Store, StoreLimits, StoreLimitsBuilder, Trap,
-    component::{Component as WasmtimeComponent, Linker},
+    component::{Component as WasmtimeComponent, Instance, Linker, Resource, ResourceTable},
 };
 
 use crate::{
+    artifact_host::{
+        RtwComponentHost, RtwComponentHostError, RtwComponentHostResult, RtwComponentSource,
+    },
     errors::{EngineError, EngineResult},
+    execution_targets::ExecutionTargetRegistry,
     secrets::SecretManager,
     services::ServiceRuntime,
 };
@@ -83,6 +87,8 @@ pub struct WasmExecutionBudget {
     pub fuel_per_callback: u64,
     /// Maximum byte length of an inbound event topic or payload.
     pub max_host_message_bytes: usize,
+    /// Maximum bytes returned by one bounded target-artifact resource read.
+    pub max_artifact_read_bytes: usize,
 }
 
 impl Default for WasmExecutionBudget {
@@ -96,6 +102,7 @@ impl Default for WasmExecutionBudget {
             max_memories: 8,
             fuel_per_callback: 10_000_000,
             max_host_message_bytes: 1024 * 1024,
+            max_artifact_read_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -118,11 +125,32 @@ mod bindings {
         path: "wit/engine.wit",
         world: "plugin",
         async: false,
+        with: {
+            "rintawa:engine/execution-targets/artifact-source":
+                crate::artifact_host::OwnedRtwComponentSource,
+        },
+    });
+}
+
+#[allow(missing_docs)]
+mod target_provider_bindings {
+    wasmtime::component::bindgen!({
+        path: "wit/engine.wit",
+        world: "target-provider-plugin",
+        async: false,
+        with: {
+            "rintawa:engine/execution-targets/artifact-source":
+                crate::artifact_host::OwnedRtwComponentSource,
+        },
     });
 }
 
 use bindings::Plugin;
 use bindings::rintawa::engine::{
+    execution_targets::{
+        ArtifactError as TargetArtifactError, Host as ExecutionTargetsHost, HostArtifactSource,
+        RegistrationError as TargetRegistrationError,
+    },
     host::{Host as HostOperations, LogLevel, PublishError},
     portable_ui::{
         Error as PortableUiError, Host as PortableUiHost, PlacementHint as WitPlacementHint,
@@ -135,6 +163,10 @@ use bindings::rintawa::engine::{
     secrets::{Error as SecretError, Host as SecretsHost},
     services::{Error as ServiceTransportError, Host as ServicesHost},
 };
+use target_provider_bindings::TargetProviderPlugin;
+use target_provider_bindings::exports::rintawa::engine::target_provider::{
+    ComponentDescriptor as WitTargetComponentDescriptor, Error as WitTargetError,
+};
 
 /// Internal host state stored inside the Wasmtime Store context.
 pub struct WasmHostState {
@@ -142,6 +174,7 @@ pub struct WasmHostState {
     extension_id: Option<ExtensionId>,
     instance_id: Option<ExtensionInstanceId>,
     scope_id: Option<RuntimeScopeId>,
+    execution_owner: Option<rintawa_sdk::contracts::ComponentRef>,
     registration_scope: Option<WasmRegistrationScope>,
     runtime_effects_active: bool,
     next_effect_handle: u64,
@@ -155,7 +188,11 @@ pub struct WasmHostState {
     service_access_active: bool,
     ui_access_active: bool,
     max_host_message_bytes: usize,
+    max_artifact_read_bytes: usize,
+    execution_target_registration_active: bool,
+    pending_execution_targets: Vec<String>,
     resource_limits: StoreLimits,
+    resource_table: ResourceTable,
 }
 
 /// Registrations produced by one guest `register` invocation before the host
@@ -184,6 +221,7 @@ struct WasmRegistrations {
 /// A guest request that is committed through the Engine-owned effect registry.
 enum WasmRuntimeEffectOperation {
     Subscribe {
+        owner: rintawa_sdk::contracts::ComponentRef,
         handle: String,
         topic: String,
     },
@@ -196,6 +234,7 @@ enum WasmRuntimeEffectOperation {
 /// The Engine effect currently associated with one opaque guest handle.
 #[derive(Clone)]
 struct ActiveWasmRuntimeEffect {
+    owner: rintawa_sdk::contracts::ComponentRef,
     effect_id: RuntimeEffectId,
     effect: RuntimeEffect,
 }
@@ -238,6 +277,7 @@ impl WasmHostState {
             extension_id: None,
             instance_id: None,
             scope_id: None,
+            execution_owner: None,
             registration_scope: None,
             runtime_effects_active: false,
             next_effect_handle: 0,
@@ -251,7 +291,11 @@ impl WasmHostState {
             service_access_active: false,
             ui_access_active: false,
             max_host_message_bytes: budget.max_host_message_bytes,
+            max_artifact_read_bytes: budget.max_artifact_read_bytes,
+            execution_target_registration_active: false,
+            pending_execution_targets: Vec::new(),
             resource_limits: budget.store_limits(),
+            resource_table: ResourceTable::new(),
         }
     }
 
@@ -296,6 +340,31 @@ impl WasmHostState {
         Ok(())
     }
 
+    fn begin_target_component_registration(&mut self) -> ExtensionResult<()> {
+        if self.registration_scope.is_some() {
+            return Err(ExtensionError::Message(String::from(
+                "WASM target-component registration is already in progress",
+            )));
+        }
+        self.registration_scope = Some(WasmRegistrationScope {
+            contributions: Vec::new(),
+            capabilities: HashSet::new(),
+            definitions: Vec::new(),
+            definition_keys: HashSet::new(),
+            providers: Vec::new(),
+            provider_keys: HashSet::new(),
+            consumers: Vec::new(),
+            consumer_keys: HashSet::new(),
+            ui_surfaces: Vec::new(),
+            ui_surface_ids: HashSet::new(),
+        });
+        Ok(())
+    }
+
+    fn cancel_target_component_registration(&mut self) {
+        self.registration_scope = None;
+    }
+
     fn finish_registration(&mut self) -> ExtensionResult<WasmRegistrations> {
         let scope = self.registration_scope.take().ok_or_else(|| {
             ExtensionError::Message(String::from("WASM component registration is not active"))
@@ -315,6 +384,19 @@ impl WasmHostState {
         self.extension_id = None;
         self.instance_id = None;
         self.scope_id = None;
+    }
+
+    fn registered_owner(&self) -> Option<rintawa_sdk::contracts::ComponentRef> {
+        self.instance_id.as_ref().map(|instance_id| {
+            rintawa_sdk::contracts::ComponentRef::new(
+                instance_id.clone(),
+                self.component_id.clone(),
+            )
+        })
+    }
+
+    fn current_execution_owner(&self) -> Option<&rintawa_sdk::contracts::ComponentRef> {
+        self.execution_owner.as_ref()
     }
 
     fn validate_execution_owner(&self, ctx: &dyn ComponentContext) -> ExtensionResult<()> {
@@ -341,12 +423,15 @@ impl WasmHostState {
 
     fn discard_guest_execution(&mut self) {
         self.registration_scope = None;
+        self.execution_owner = None;
         self.runtime_effects_active = false;
         self.pending_effects.clear();
         self.pending_revocations.clear();
         self.secret_access_active = false;
         self.service_access_active = false;
         self.ui_access_active = false;
+        self.execution_target_registration_active = false;
+        self.pending_execution_targets.clear();
     }
 
     fn queue_capability(&mut self, name: String) -> Result<(), RegistrationError> {
@@ -472,6 +557,10 @@ impl WasmHostState {
             return Err(RuntimeEffectError::InvalidTopic);
         }
 
+        let owner = self
+            .current_execution_owner()
+            .cloned()
+            .ok_or(RuntimeEffectError::RuntimeNotActive)?;
         let handle = format!("effect-{}", self.next_effect_handle);
         self.next_effect_handle = self
             .next_effect_handle
@@ -479,6 +568,7 @@ impl WasmHostState {
             .ok_or(RuntimeEffectError::RuntimeNotActive)?;
         self.pending_effects
             .push(WasmRuntimeEffectOperation::Subscribe {
+                owner,
                 handle: handle.clone(),
                 topic,
             });
@@ -504,21 +594,54 @@ impl WasmHostState {
         let Some(effect) = self.effect_handles.get(&handle).cloned() else {
             return Err(RuntimeEffectError::UnknownEffect);
         };
+        if self.current_execution_owner() != Some(&effect.owner) {
+            return Err(RuntimeEffectError::UnknownEffect);
+        }
         self.pending_revocations.insert(handle.clone());
         self.pending_effects
             .push(WasmRuntimeEffectOperation::Unsubscribe { handle, effect });
         Ok(())
     }
 
-    /// Opens the only guest execution scope that can create effects or read secrets.
+    /// Opens the normal guest execution scope for the provider component itself.
     fn begin_guest_execution(&mut self) {
+        self.execution_owner = self.registered_owner();
         self.runtime_effects_active = true;
+        self.secret_access_active = true;
+        self.service_access_active = true;
+        self.ui_access_active = true;
+        self.execution_target_registration_active = false;
+    }
+
+    fn begin_delegated_guest_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
+        self.execution_owner = Some(owner);
+        self.runtime_effects_active = true;
+        self.secret_access_active = true;
+        self.service_access_active = true;
+        self.ui_access_active = true;
+        self.execution_target_registration_active = false;
+    }
+
+    fn begin_start_execution(&mut self) {
+        self.begin_guest_execution();
+        self.execution_target_registration_active = true;
+        self.pending_execution_targets.clear();
+    }
+
+    fn take_pending_execution_targets(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_execution_targets)
+    }
+
+    fn begin_service_execution(&mut self) {
+        self.execution_owner = self.registered_owner();
+        self.runtime_effects_active = false;
         self.secret_access_active = true;
         self.service_access_active = true;
         self.ui_access_active = true;
     }
 
-    fn begin_service_execution(&mut self) {
+    fn begin_delegated_service_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
+        self.execution_owner = Some(owner);
         self.runtime_effects_active = false;
         self.secret_access_active = true;
         self.service_access_active = true;
@@ -526,9 +649,11 @@ impl WasmHostState {
     }
 
     fn finish_service_execution(&mut self) {
+        self.execution_owner = None;
         self.secret_access_active = false;
         self.service_access_active = false;
         self.ui_access_active = false;
+        self.execution_target_registration_active = false;
     }
 
     /// Closes guest access before committing its queued runtime effects.
@@ -537,8 +662,11 @@ impl WasmHostState {
         self.secret_access_active = false;
         self.service_access_active = false;
         self.ui_access_active = false;
+        self.execution_target_registration_active = false;
 
-        self.commit_runtime_effects(ctx)
+        let result = self.commit_runtime_effects(ctx);
+        self.execution_owner = None;
+        result
     }
 
     /// Commits reversible effects requested by the just-completed guest callback.
@@ -547,13 +675,21 @@ impl WasmHostState {
         let mut revoked_effects = Vec::new();
         for operation in std::mem::take(&mut self.pending_effects) {
             let operation_result = match operation {
-                WasmRuntimeEffectOperation::Subscribe { handle, topic } => {
+                WasmRuntimeEffectOperation::Subscribe {
+                    owner,
+                    handle,
+                    topic,
+                } => {
                     let effect = RuntimeEffect::event_subscription(topic);
                     ctx.register_runtime_effect(effect.clone())
                         .map(|effect_id| {
                             self.effect_handles.insert(
                                 handle.clone(),
-                                ActiveWasmRuntimeEffect { effect_id, effect },
+                                ActiveWasmRuntimeEffect {
+                                    owner,
+                                    effect_id,
+                                    effect,
+                                },
                             );
                             registered_handles.push(handle);
                         })
@@ -606,6 +742,7 @@ impl WasmHostState {
                     self.effect_handles.insert(
                         handle.clone(),
                         ActiveWasmRuntimeEffect {
+                            owner: effect.owner,
                             effect_id,
                             effect: effect.effect,
                         },
@@ -629,8 +766,13 @@ impl WasmHostState {
         ctx: &mut dyn ComponentContext,
         operation_error: ExtensionError,
     ) -> ExtensionError {
+        let owner = rintawa_sdk::contracts::ComponentRef::new(
+            ctx.extension_instance_id().clone(),
+            ctx.component_id().clone(),
+        );
         self.discard_guest_execution();
-        self.effect_handles.clear();
+        self.effect_handles
+            .retain(|_, effect| effect.owner != owner);
         if let Err(cleanup_error) = ctx.revoke_all_runtime_effects() {
             return ExtensionError::RuntimeEffectCleanupFailed {
                 operation: operation_error.to_string(),
@@ -638,6 +780,13 @@ impl WasmHostState {
             };
         }
         operation_error
+    }
+
+    fn forget_effect_handles_for_owner(&mut self, owner: &rintawa_sdk::contracts::ComponentRef) {
+        self.effect_handles
+            .retain(|_, effect| &effect.owner != owner);
+        self.pending_revocations
+            .retain(|handle| self.effect_handles.contains_key(handle));
     }
 
     fn queue_ui_surface(
@@ -684,14 +833,9 @@ impl WasmHostState {
     }
 
     fn ui_owner(&self) -> Result<rintawa_sdk::contracts::ComponentRef, PortableUiError> {
-        let instance_id = self
-            .instance_id
-            .as_ref()
-            .ok_or(PortableUiError::Unavailable)?;
-        Ok(rintawa_sdk::contracts::ComponentRef::new(
-            instance_id.clone(),
-            self.component_id.clone(),
-        ))
+        self.current_execution_owner()
+            .cloned()
+            .ok_or(PortableUiError::Unavailable)
     }
 
     fn validate_ui_message_size(&self, message_bytes: usize) -> Result<(), PortableUiError> {
@@ -748,18 +892,13 @@ impl WasmHostState {
             return Err(SecretError::AccessNotActive);
         }
 
-        let instance_id = self
-            .instance_id
-            .as_ref()
+        let owner = self
+            .current_execution_owner()
             .ok_or(SecretError::AccessNotActive)?;
         let path = SecretPath::parse(path).map_err(|_| SecretError::InvalidPath)?;
-        let owner = rintawa_sdk::contracts::ComponentRef::new(
-            instance_id.clone(),
-            self.component_id.clone(),
-        );
 
         self.secrets
-            .read_for_component(&owner, &path)
+            .read_for_component(owner, &path)
             .map(|value| value.expose_secret().to_string())
             .map_err(|error| match error {
                 SecretAccessError::InvalidPath => SecretError::InvalidPath,
@@ -767,6 +906,109 @@ impl WasmHostState {
                 SecretAccessError::NotFound => SecretError::NotFound,
                 SecretAccessError::Unavailable => SecretError::Unavailable,
             })
+    }
+}
+
+impl ExecutionTargetsHost for WasmHostState {
+    fn register_target(&mut self, target: String) -> Result<(), TargetRegistrationError> {
+        if !self.execution_target_registration_active {
+            return Err(TargetRegistrationError::RuntimeNotActive);
+        }
+        if rintawa_sdk::manifest::validate_component_target(&target).is_err()
+            || target == rintawa_sdk::manifest::WASM_COMPONENT_TARGET_V1
+        {
+            return Err(TargetRegistrationError::InvalidTarget);
+        }
+        if self
+            .pending_execution_targets
+            .iter()
+            .any(|existing| existing == &target)
+        {
+            return Err(TargetRegistrationError::TargetConflict);
+        }
+        self.pending_execution_targets.push(target);
+        Ok(())
+    }
+}
+
+impl HostArtifactSource for WasmHostState {
+    fn paths(
+        &mut self,
+        source: Resource<crate::artifact_host::OwnedRtwComponentSource>,
+    ) -> Vec<String> {
+        match self.resource_table.get(&source) {
+            Ok(source) => source
+                .paths()
+                .into_iter()
+                .map(|path| path.to_string())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn resolve_component_entry(
+        &mut self,
+        source: Resource<crate::artifact_host::OwnedRtwComponentSource>,
+        entry: String,
+    ) -> Result<String, TargetArtifactError> {
+        let source = self
+            .resource_table
+            .get(&source)
+            .map_err(|_| TargetArtifactError::Unavailable)?;
+        source
+            .resolve_component_entry(&entry)
+            .map(|path| path.to_string())
+            .map_err(map_target_artifact_error)
+    }
+
+    fn resolve_relative(
+        &mut self,
+        source: Resource<crate::artifact_host::OwnedRtwComponentSource>,
+        base_file: String,
+        entry: String,
+    ) -> Result<String, TargetArtifactError> {
+        let base_file =
+            rintawa_artifacts::ArtifactPath::parse(base_file).map_err(map_target_artifact_error)?;
+        let source = self
+            .resource_table
+            .get(&source)
+            .map_err(|_| TargetArtifactError::Unavailable)?;
+        source
+            .resolve_relative_to(&base_file, &entry)
+            .map(|path| path.to_string())
+            .map_err(map_target_artifact_error)
+    }
+
+    fn read(
+        &mut self,
+        source: Resource<crate::artifact_host::OwnedRtwComponentSource>,
+        path: String,
+    ) -> Result<Vec<u8>, TargetArtifactError> {
+        let path =
+            rintawa_artifacts::ArtifactPath::parse(path).map_err(map_target_artifact_error)?;
+        let source = self
+            .resource_table
+            .get_mut(&source)
+            .map_err(|_| TargetArtifactError::Unavailable)?;
+        let maximum_bytes = u64::try_from(self.max_artifact_read_bytes).unwrap_or(u64::MAX);
+        source
+            .read_with_limit(&path, maximum_bytes)
+            .map_err(map_target_artifact_error)
+    }
+
+    fn drop(
+        &mut self,
+        source: Resource<crate::artifact_host::OwnedRtwComponentSource>,
+    ) -> wasmtime::Result<()> {
+        Ok(self.resource_table.delete(source).map(|_| ())?)
+    }
+}
+
+fn map_target_artifact_error(error: rintawa_artifacts::RtwError) -> TargetArtifactError {
+    match error {
+        rintawa_artifacts::RtwError::InvalidPath { .. } => TargetArtifactError::InvalidPath,
+        rintawa_artifacts::RtwError::EntryNotFound(_) => TargetArtifactError::NotFound,
+        _ => TargetArtifactError::Unavailable,
     }
 }
 
@@ -966,14 +1208,10 @@ impl ServicesHost for WasmHostState {
         if !self.service_access_active {
             return Err(ServiceTransportError::Unavailable);
         }
-        let instance_id = self
-            .instance_id
-            .as_ref()
+        let caller = self
+            .current_execution_owner()
+            .cloned()
             .ok_or(ServiceTransportError::Unavailable)?;
-        let caller = rintawa_sdk::contracts::ComponentRef::new(
-            instance_id.clone(),
-            self.component_id.clone(),
-        );
         let contract = ContractKey::new(contract, ContractVersion::new(version));
         self.services
             .call_from_execution(&caller, &contract, &payload)
@@ -1000,6 +1238,7 @@ pub struct WasmRuntimeEngine {
     secrets: SecretManager,
     services: ServiceRuntime,
     ui: UiRuntime,
+    execution_targets: ExecutionTargetRegistry,
     budget: WasmExecutionBudget,
 }
 
@@ -1048,21 +1287,35 @@ impl WasmRuntimeEngine {
         budget: WasmExecutionBudget,
     ) -> EngineResult<Self> {
         let services = ServiceRuntime::new(secrets.clone());
-        Self::with_host_services_and_budget(secrets, services, UiRuntime::new(), budget)
+        Self::with_host_services_and_budget(
+            secrets,
+            services,
+            UiRuntime::new(),
+            ExecutionTargetRegistry::default(),
+            budget,
+        )
     }
 
     pub(crate) fn with_host_services(
         secrets: SecretManager,
         services: ServiceRuntime,
         ui: UiRuntime,
+        execution_targets: ExecutionTargetRegistry,
     ) -> EngineResult<Self> {
-        Self::with_host_services_and_budget(secrets, services, ui, WasmExecutionBudget::default())
+        Self::with_host_services_and_budget(
+            secrets,
+            services,
+            ui,
+            execution_targets,
+            WasmExecutionBudget::default(),
+        )
     }
 
     fn with_host_services_and_budget(
         secrets: SecretManager,
         services: ServiceRuntime,
         ui: UiRuntime,
+        execution_targets: ExecutionTargetRegistry,
         budget: WasmExecutionBudget,
     ) -> EngineResult<Self> {
         let mut config = wasmtime::Config::new();
@@ -1077,6 +1330,7 @@ impl WasmRuntimeEngine {
             secrets,
             services,
             ui,
+            execution_targets,
             budget,
         })
     }
@@ -1107,9 +1361,12 @@ impl WasmRuntimeEngine {
             secrets: self.secrets.clone(),
             services: self.services.clone(),
             ui: self.ui.clone(),
+            execution_targets: self.execution_targets.clone(),
             budget: self.budget.clone(),
-            instance: None,
-            failed_lifecycle_callback: None,
+            runtime: Arc::new(Mutex::new(WasmSharedRuntime {
+                instance: None,
+                failed_lifecycle_callback: None,
+            })),
         })
     }
 
@@ -1163,7 +1420,12 @@ pub struct WasmComponent {
     secrets: SecretManager,
     services: ServiceRuntime,
     ui: UiRuntime,
+    execution_targets: ExecutionTargetRegistry,
     budget: WasmExecutionBudget,
+    runtime: Arc<Mutex<WasmSharedRuntime>>,
+}
+
+struct WasmSharedRuntime {
     instance: Option<WasmInstance>,
     failed_lifecycle_callback: Option<&'static str>,
 }
@@ -1175,24 +1437,480 @@ pub struct WasmComponent {
 /// guest state and invalidate component-owned runtime resources.
 struct WasmInstance {
     store: Store<WasmHostState>,
+    instance: Instance,
     plugin: Plugin,
+    target_provider: Option<TargetProviderPlugin>,
+}
+
+#[derive(Clone)]
+struct WasmTargetProviderEndpoint {
+    runtime: Arc<Mutex<WasmSharedRuntime>>,
+    budget: WasmExecutionBudget,
+}
+
+struct WasmExecutionTargetHost {
+    target: String,
+    provider: WasmTargetProviderEndpoint,
+}
+
+struct WasmExecutionTargetProxy {
+    id: ComponentId,
+    handle: u64,
+    provider: WasmTargetProviderEndpoint,
+}
+
+impl WasmTargetProviderEndpoint {
+    fn runtime(&self) -> RtwComponentHostResult<MutexGuard<'_, WasmSharedRuntime>> {
+        match self.runtime.try_lock() {
+            Ok(runtime) => Ok(runtime),
+            Err(TryLockError::WouldBlock) => Err(RtwComponentHostError::Host(String::from(
+                "WASM target-provider runtime is busy",
+            ))),
+            Err(TryLockError::Poisoned(_)) => Err(RtwComponentHostError::Host(String::from(
+                "WASM target-provider runtime lock was poisoned",
+            ))),
+        }
+    }
+
+    fn live_instance(runtime: &mut WasmSharedRuntime) -> RtwComponentHostResult<&mut WasmInstance> {
+        if runtime.failed_lifecycle_callback.is_some() {
+            return Err(RtwComponentHostError::Host(String::from(
+                "WASM target-provider runtime is unavailable after lifecycle failure",
+            )));
+        }
+        runtime.instance.as_mut().ok_or_else(|| {
+            RtwComponentHostError::Host(String::from("WASM target-provider is not running"))
+        })
+    }
+
+    fn ensure_target_provider(instance: &mut WasmInstance) -> ExtensionResult<()> {
+        if instance.target_provider.is_none() {
+            let provider = TargetProviderPlugin::new(&mut instance.store, &instance.instance)
+                .map_err(|error| {
+                    ExtensionError::Message(format!(
+                        "WASM component published an execution target without target-provider exports: {error}"
+                    ))
+                })?;
+            instance.target_provider = Some(provider);
+        }
+        Ok(())
+    }
+
+    fn load_component(
+        &self,
+        target: &str,
+        source: &RtwComponentSource<'_>,
+        descriptor: &rintawa_sdk::manifest::ComponentDescriptor,
+    ) -> RtwComponentHostResult<u64> {
+        let owned_source = source.fork_owned()?;
+        let mut runtime = self.runtime()?;
+        let instance = Self::live_instance(&mut runtime)?;
+        WasmComponent::set_callback_fuel(&mut instance.store, &self.budget, "target load")
+            .map_err(|error| RtwComponentHostError::Host(error.to_string()))?;
+        Self::ensure_target_provider(instance)
+            .map_err(|error| RtwComponentHostError::Host(error.to_string()))?;
+        let source_resource = instance
+            .store
+            .data_mut()
+            .resource_table
+            .push(owned_source)
+            .map_err(|error| RtwComponentHostError::Host(error.to_string()))?;
+        let borrowed_source = Resource::new_borrow(source_resource.rep());
+        let kind = match descriptor.kind {
+            rintawa_sdk::manifest::ComponentKind::Runtime => String::from("runtime"),
+            rintawa_sdk::manifest::ComponentKind::Ui => String::from("ui"),
+        };
+        let descriptor = WitTargetComponentDescriptor {
+            id: descriptor.id.to_string(),
+            kind,
+            target: descriptor.target.to_string(),
+            entry: descriptor.entry.clone(),
+            required: descriptor.required,
+        };
+        let provider = instance.target_provider.as_ref().ok_or_else(|| {
+            RtwComponentHostError::Host(String::from("target-provider export view is unavailable"))
+        })?;
+        let result = provider
+            .rintawa_engine_target_provider()
+            .call_load_component(&mut instance.store, target, &descriptor, borrowed_source)
+            .map_err(|error| RtwComponentHostError::Host(error.to_string()));
+        let cleanup = instance
+            .store
+            .data_mut()
+            .resource_table
+            .delete(source_resource)
+            .map_err(|error| RtwComponentHostError::Host(error.to_string()));
+        let provider_result = result?;
+        cleanup?;
+        provider_result.map_err(|error| {
+            RtwComponentHostError::Host(format!(
+                "WASM target-provider load callback failed: {error:?}"
+            ))
+        })
+    }
+}
+
+fn map_wit_target_host_error(operation: &'static str, error: WitTargetError) -> ExtensionError {
+    ExtensionError::Message(format!(
+        "WASM target-provider `{operation}` callback failed: {error:?}"
+    ))
+}
+
+impl WasmTargetProviderEndpoint {
+    fn runtime_for_callback(&self) -> ExtensionResult<MutexGuard<'_, WasmSharedRuntime>> {
+        match self.runtime.try_lock() {
+            Ok(runtime) => Ok(runtime),
+            Err(TryLockError::WouldBlock) => Err(ExtensionError::Message(String::from(
+                "WASM target-provider runtime is busy",
+            ))),
+            Err(TryLockError::Poisoned(_)) => Err(ExtensionError::Message(String::from(
+                "WASM target-provider runtime lock was poisoned",
+            ))),
+        }
+    }
+
+    fn live_instance_for_callback(
+        runtime: &mut WasmSharedRuntime,
+    ) -> ExtensionResult<&mut WasmInstance> {
+        if runtime.failed_lifecycle_callback.is_some() {
+            return Err(ExtensionError::Message(String::from(
+                "WASM target-provider runtime is unavailable after lifecycle failure",
+            )));
+        }
+        runtime.instance.as_mut().ok_or_else(|| {
+            ExtensionError::Message(String::from("WASM target-provider is not running"))
+        })
+    }
+
+    fn register_component(&self, handle: u64) -> ExtensionResult<WasmRegistrations> {
+        let mut runtime = self.runtime_for_callback()?;
+        let instance = Self::live_instance_for_callback(&mut runtime)?;
+        WasmComponent::set_callback_fuel(&mut instance.store, &self.budget, "target register")?;
+        instance
+            .store
+            .data_mut()
+            .begin_target_component_registration()?;
+        let result = instance
+            .target_provider
+            .as_ref()
+            .ok_or_else(|| {
+                ExtensionError::Message(String::from("target-provider export view is unavailable"))
+            })?
+            .rintawa_engine_target_provider()
+            .call_register_component(&mut instance.store, handle)
+            .map_err(|error| WasmComponent::execution_error("target register", error));
+        match result {
+            Ok(Ok(())) => instance.store.data_mut().finish_registration(),
+            Ok(Err(error)) => {
+                instance
+                    .store
+                    .data_mut()
+                    .cancel_target_component_registration();
+                Err(map_wit_target_host_error("register", error))
+            }
+            Err(error) => {
+                instance
+                    .store
+                    .data_mut()
+                    .cancel_target_component_registration();
+                Err(error)
+            }
+        }
+    }
+
+    fn start_component(&self, handle: u64, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
+        let owner = rintawa_sdk::contracts::ComponentRef::new(
+            ctx.extension_instance_id().clone(),
+            ctx.component_id().clone(),
+        );
+        let mut runtime = self.runtime_for_callback()?;
+        let instance = Self::live_instance_for_callback(&mut runtime)?;
+        WasmComponent::set_callback_fuel(&mut instance.store, &self.budget, "target start")?;
+        instance
+            .store
+            .data_mut()
+            .begin_delegated_guest_execution(owner);
+        let result = instance
+            .target_provider
+            .as_ref()
+            .ok_or_else(|| {
+                ExtensionError::Message(String::from("target-provider export view is unavailable"))
+            })?
+            .rintawa_engine_target_provider()
+            .call_start_component(&mut instance.store, handle)
+            .map_err(|error| WasmComponent::execution_error("target start", error));
+        match result {
+            Ok(Ok(())) => instance.store.data_mut().finish_guest_execution(ctx),
+            Ok(Err(error)) => {
+                let error = map_wit_target_host_error("start", error);
+                Err(instance.store.data_mut().abort_guest_execution(ctx, error))
+            }
+            Err(error) => Err(instance.store.data_mut().abort_guest_execution(ctx, error)),
+        }
+    }
+
+    fn stop_component(&self, handle: u64, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
+        let owner = rintawa_sdk::contracts::ComponentRef::new(
+            ctx.extension_instance_id().clone(),
+            ctx.component_id().clone(),
+        );
+        let mut runtime = self.runtime_for_callback()?;
+        let instance = Self::live_instance_for_callback(&mut runtime)?;
+        WasmComponent::set_callback_fuel(&mut instance.store, &self.budget, "target stop")?;
+        let result = instance
+            .target_provider
+            .as_ref()
+            .ok_or_else(|| {
+                ExtensionError::Message(String::from("target-provider export view is unavailable"))
+            })?
+            .rintawa_engine_target_provider()
+            .call_stop_component(&mut instance.store, handle)
+            .map_err(|error| WasmComponent::execution_error("target stop", error))?
+            .map_err(|error| map_wit_target_host_error("stop", error));
+        instance
+            .store
+            .data_mut()
+            .forget_effect_handles_for_owner(&owner);
+        result
+    }
+
+    fn handle_ui_action(
+        &self,
+        handle: u64,
+        ctx: &mut dyn ComponentContext,
+        payload: &[u8],
+    ) -> ExtensionResult<()> {
+        if payload.len() > self.budget.max_host_message_bytes {
+            return Err(ExtensionError::HostMessageTooLarge {
+                operation: "target UI action",
+                actual_bytes: payload.len(),
+                maximum_bytes: self.budget.max_host_message_bytes,
+            });
+        }
+        let owner = rintawa_sdk::contracts::ComponentRef::new(
+            ctx.extension_instance_id().clone(),
+            ctx.component_id().clone(),
+        );
+        let mut runtime = self.runtime_for_callback()?;
+        let instance = Self::live_instance_for_callback(&mut runtime)?;
+        WasmComponent::set_callback_fuel(&mut instance.store, &self.budget, "target UI action")?;
+        instance
+            .store
+            .data_mut()
+            .begin_delegated_guest_execution(owner);
+        let result = instance
+            .target_provider
+            .as_ref()
+            .ok_or_else(|| {
+                ExtensionError::Message(String::from("target-provider export view is unavailable"))
+            })?
+            .rintawa_engine_target_provider()
+            .call_handle_ui_action(&mut instance.store, handle, payload)
+            .map_err(|error| WasmComponent::execution_error("target UI action", error));
+        match result {
+            Ok(Ok(())) => instance.store.data_mut().finish_guest_execution(ctx),
+            Ok(Err(error)) => {
+                let error = map_wit_target_host_error("UI action", error);
+                Err(instance.store.data_mut().abort_guest_execution(ctx, error))
+            }
+            Err(error) => Err(instance.store.data_mut().abort_guest_execution(ctx, error)),
+        }
+    }
+
+    fn handle_service(
+        &self,
+        handle: u64,
+        ctx: &mut dyn ComponentContext,
+        contract: &ContractKey,
+        request: &[u8],
+    ) -> ExtensionResult<Vec<u8>> {
+        if request.len() > self.budget.max_host_message_bytes {
+            return Err(ExtensionError::HostMessageTooLarge {
+                operation: "target service request",
+                actual_bytes: request.len(),
+                maximum_bytes: self.budget.max_host_message_bytes,
+            });
+        }
+        let owner = rintawa_sdk::contracts::ComponentRef::new(
+            ctx.extension_instance_id().clone(),
+            ctx.component_id().clone(),
+        );
+        let mut runtime = self.runtime_for_callback()?;
+        let instance = Self::live_instance_for_callback(&mut runtime)?;
+        WasmComponent::set_callback_fuel(&mut instance.store, &self.budget, "target service")?;
+        instance
+            .store
+            .data_mut()
+            .begin_delegated_service_execution(owner);
+        let result = instance
+            .target_provider
+            .as_ref()
+            .ok_or_else(|| {
+                ExtensionError::Message(String::from("target-provider export view is unavailable"))
+            })?
+            .rintawa_engine_target_provider()
+            .call_handle_service(
+                &mut instance.store,
+                handle,
+                contract.id.as_str(),
+                contract.version.major(),
+                request,
+            )
+            .map_err(|error| WasmComponent::execution_error("target service", error));
+        instance.store.data_mut().finish_service_execution();
+        let response = result?.map_err(|error| map_wit_target_host_error("service", error))?;
+        if response.len() > self.budget.max_host_message_bytes {
+            return Err(ExtensionError::HostMessageTooLarge {
+                operation: "target service response",
+                actual_bytes: response.len(),
+                maximum_bytes: self.budget.max_host_message_bytes,
+            });
+        }
+        Ok(response)
+    }
+
+    fn drop_component(&self, handle: u64) -> ExtensionResult<()> {
+        let mut runtime = self.runtime_for_callback()?;
+        let instance = Self::live_instance_for_callback(&mut runtime)?;
+        WasmComponent::set_callback_fuel(&mut instance.store, &self.budget, "target drop")?;
+        instance
+            .target_provider
+            .as_ref()
+            .ok_or_else(|| {
+                ExtensionError::Message(String::from("target-provider export view is unavailable"))
+            })?
+            .rintawa_engine_target_provider()
+            .call_drop_component(&mut instance.store, handle)
+            .map_err(|error| WasmComponent::execution_error("target drop", error))?
+            .map_err(|error| map_wit_target_host_error("drop", error))
+    }
+}
+
+impl RtwComponentHost for WasmExecutionTargetHost {
+    fn target(&self) -> &str {
+        &self.target
+    }
+
+    fn load_component(
+        &self,
+        source: &mut RtwComponentSource<'_>,
+        descriptor: &rintawa_sdk::manifest::ComponentDescriptor,
+    ) -> RtwComponentHostResult<Box<dyn Component>> {
+        let handle = self
+            .provider
+            .load_component(&self.target, source, descriptor)?;
+        Ok(Box::new(WasmExecutionTargetProxy {
+            id: descriptor.id.clone(),
+            handle,
+            provider: self.provider.clone(),
+        }))
+    }
+}
+
+impl Component for WasmExecutionTargetProxy {
+    fn id(&self) -> &ComponentId {
+        &self.id
+    }
+
+    fn register(&mut self, ctx: &mut dyn RegistrationContext) -> ExtensionResult<()> {
+        let registrations = self.provider.register_component(self.handle)?;
+        apply_wasm_registrations(registrations, ctx)
+    }
+
+    fn start(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
+        self.provider.start_component(self.handle, ctx)
+    }
+
+    fn stop(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
+        self.provider.stop_component(self.handle, ctx)
+    }
+
+    fn handle_ui_action(
+        &mut self,
+        ctx: &mut dyn ComponentContext,
+        event: &UiActionEvent,
+    ) -> ExtensionResult<()> {
+        let payload = serde_json::to_vec(event).map_err(|error| {
+            ExtensionError::Message(format!("could not encode target UI action: {error}"))
+        })?;
+        self.provider.handle_ui_action(self.handle, ctx, &payload)
+    }
+
+    fn service_message_limit(&self) -> Option<usize> {
+        Some(self.provider.budget.max_host_message_bytes)
+    }
+
+    fn handle_service(
+        &mut self,
+        ctx: &mut dyn ComponentContext,
+        contract: &ContractKey,
+        request: &[u8],
+    ) -> ExtensionResult<Vec<u8>> {
+        self.provider
+            .handle_service(self.handle, ctx, contract, request)
+    }
+}
+
+impl Drop for WasmExecutionTargetProxy {
+    fn drop(&mut self) {
+        if let Err(error) = self.provider.drop_component(self.handle) {
+            warn!(component = %self.id, error = %error, "WASM target-provider drop callback failed");
+        }
+    }
+}
+
+fn apply_wasm_registrations(
+    registrations: WasmRegistrations,
+    ctx: &mut dyn RegistrationContext,
+) -> ExtensionResult<()> {
+    for contribution in registrations.contributions {
+        ctx.register(contribution)?;
+    }
+    for definition in registrations.definitions {
+        ctx.define_contract(definition)?;
+    }
+    for provider in registrations.providers {
+        ctx.provide_contract(provider)?;
+    }
+    for consumer in registrations.consumers {
+        ctx.consume_contract(consumer)?;
+    }
+    for surface in registrations.ui_surfaces {
+        ctx.register_ui_surface(surface)?;
+    }
+    Ok(())
 }
 
 impl WasmComponent {
+    fn runtime(&self) -> ExtensionResult<MutexGuard<'_, WasmSharedRuntime>> {
+        match self.runtime.try_lock() {
+            Ok(runtime) => Ok(runtime),
+            Err(TryLockError::WouldBlock) => Err(ExtensionError::Message(String::from(
+                "WASM runtime state is busy",
+            ))),
+            Err(TryLockError::Poisoned(_)) => Err(ExtensionError::Message(String::from(
+                "WASM runtime state lock was poisoned",
+            ))),
+        }
+    }
+
     /// Instantiates the guest component once and returns its live instance.
     ///
     /// # Errors
     ///
     /// Returns an error when Wasmtime cannot instantiate the component or when
     /// it does not satisfy the generated WIT world contract.
-    fn instance_mut(&mut self) -> ExtensionResult<&mut WasmInstance> {
-        if let Some(operation) = self.failed_lifecycle_callback {
+    fn ensure_instance<'a>(
+        &self,
+        runtime: &'a mut WasmSharedRuntime,
+    ) -> ExtensionResult<&'a mut WasmInstance> {
+        if let Some(operation) = runtime.failed_lifecycle_callback {
             return Err(ExtensionError::Message(format!(
                 "WASM component instance was discarded after failed `{operation}` callback; reload required"
             )));
         }
 
-        if self.instance.is_none() {
+        if runtime.instance.is_none() {
             let host_state = WasmHostState::with_host_services_and_budget(
                 self.id.clone(),
                 self.secrets.clone(),
@@ -1203,13 +1921,22 @@ impl WasmComponent {
             let mut store = Store::new(&self.engine, host_state);
             store.limiter(|state| &mut state.resource_limits);
             Self::set_callback_fuel(&mut store, &self.budget, "instantiate")?;
-            let plugin = Plugin::instantiate(&mut store, &self.component, &self.linker)
+            let instance = self
+                .linker
+                .instantiate(&mut store, &self.component)
                 .map_err(|err| Self::execution_error("instantiate", err))?;
+            let plugin = Plugin::new(&mut store, &instance)
+                .map_err(|err| Self::execution_error("bind plugin exports", err))?;
 
-            self.instance = Some(WasmInstance { store, plugin });
+            runtime.instance = Some(WasmInstance {
+                store,
+                instance,
+                plugin,
+                target_provider: None,
+            });
         }
 
-        self.instance.as_mut().ok_or_else(|| {
+        runtime.instance.as_mut().ok_or_else(|| {
             ExtensionError::Message(String::from("WASM component instance was not initialized"))
         })
     }
@@ -1265,7 +1992,8 @@ impl WasmComponent {
         self.validate_inbound_message("event topic", topic.len())?;
         self.validate_inbound_message("event payload", payload.len())?;
         let budget = self.budget.clone();
-        let instance = self.instance_mut()?;
+        let mut runtime = self.runtime()?;
+        let instance = self.ensure_instance(&mut runtime)?;
 
         instance.store.data().validate_execution_owner(ctx)?;
         Self::set_callback_fuel(&mut instance.store, &budget, "event dispatch")?;
@@ -1302,7 +2030,8 @@ impl Component for WasmComponent {
     fn register(&mut self, ctx: &mut dyn RegistrationContext) -> ExtensionResult<()> {
         let budget = self.budget.clone();
         let registrations = {
-            let instance = self.instance_mut()?;
+            let mut runtime = self.runtime()?;
+            let instance = self.ensure_instance(&mut runtime)?;
             Self::set_callback_fuel(&mut instance.store, &budget, "register")?;
             instance.store.data_mut().begin_registration(
                 ctx.extension_id().clone(),
@@ -1323,35 +2052,21 @@ impl Component for WasmComponent {
             instance.store.data_mut().finish_registration()?
         };
 
-        for contribution in registrations.contributions {
-            ctx.register(contribution)?;
-        }
-        for definition in registrations.definitions {
-            ctx.define_contract(definition)?;
-        }
-        for provider in registrations.providers {
-            ctx.provide_contract(provider)?;
-        }
-        for consumer in registrations.consumers {
-            ctx.consume_contract(consumer)?;
-        }
-        for surface in registrations.ui_surfaces {
-            ctx.register_ui_surface(surface)?;
-        }
-
-        Ok(())
+        apply_wasm_registrations(registrations, ctx)
     }
 
     fn start(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
         let budget = self.budget.clone();
         let mut guest_failed = false;
+        let mut pending_targets = Vec::new();
+        let mut runtime = self.runtime()?;
         let result = {
-            let instance = self.instance_mut()?;
+            let instance = self.ensure_instance(&mut runtime)?;
 
             instance.store.data().validate_execution_owner(ctx)?;
             Self::set_callback_fuel(&mut instance.store, &budget, "start")?;
 
-            instance.store.data_mut().begin_guest_execution();
+            instance.store.data_mut().begin_start_execution();
 
             let start_result = instance
                 .plugin
@@ -1367,21 +2082,53 @@ impl Component for WasmComponent {
                 instance.store.data_mut().discard_guest_execution();
                 Err(error)
             } else {
-                Ok(())
+                pending_targets = instance.store.data_mut().take_pending_execution_targets();
+                if pending_targets.is_empty() {
+                    Ok(())
+                } else {
+                    WasmTargetProviderEndpoint::ensure_target_provider(instance)
+                }
             }
         };
 
         if guest_failed {
-            self.instance = None;
-            self.failed_lifecycle_callback = Some("start");
+            runtime.instance = None;
+            runtime.failed_lifecycle_callback = Some("start");
+        }
+        drop(runtime);
+        result?;
+
+        if pending_targets.is_empty() {
+            return Ok(());
         }
 
-        result
+        let owner = rintawa_sdk::contracts::ComponentRef::new(
+            ctx.extension_instance_id().clone(),
+            ctx.component_id().clone(),
+        );
+        let provider = WasmTargetProviderEndpoint {
+            runtime: self.runtime.clone(),
+            budget: self.budget.clone(),
+        };
+        for target in pending_targets {
+            let host = Arc::new(WasmExecutionTargetHost {
+                target,
+                provider: provider.clone(),
+            });
+            if let Err(error) = self.execution_targets.register(owner.clone(), host) {
+                self.execution_targets.revoke_component(&owner);
+                return Err(ExtensionError::Message(format!(
+                    "could not publish execution target: {error}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn stop(&mut self, _ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
         let budget = self.budget.clone();
-        let stop_result = if let Some(instance) = self.instance.as_mut() {
+        let mut runtime = self.runtime()?;
+        let stop_result = if let Some(instance) = runtime.instance.as_mut() {
             let result =
                 Self::set_callback_fuel(&mut instance.store, &budget, "stop").and_then(|()| {
                     instance
@@ -1398,8 +2145,8 @@ impl Component for WasmComponent {
         };
 
         if let Err(error) = stop_result {
-            self.instance = None;
-            self.failed_lifecycle_callback = Some("stop");
+            runtime.instance = None;
+            runtime.failed_lifecycle_callback = Some("stop");
             return Err(error);
         }
 
@@ -1417,8 +2164,9 @@ impl Component for WasmComponent {
         self.validate_inbound_message("UI action", payload.len())?;
         let budget = self.budget.clone();
         let mut guest_failed = false;
+        let mut runtime = self.runtime()?;
         let result = {
-            let instance = self.instance_mut()?;
+            let instance = self.ensure_instance(&mut runtime)?;
             instance.store.data().validate_execution_owner(ctx)?;
             Self::set_callback_fuel(&mut instance.store, &budget, "UI action")?;
             instance.store.data_mut().begin_guest_execution();
@@ -1441,8 +2189,8 @@ impl Component for WasmComponent {
         };
 
         if guest_failed {
-            self.instance = None;
-            self.failed_lifecycle_callback = Some("UI action");
+            runtime.instance = None;
+            runtime.failed_lifecycle_callback = Some("UI action");
         }
         result
     }
@@ -1456,7 +2204,8 @@ impl Component for WasmComponent {
         self.validate_inbound_message("service contract", contract.id.as_str().len())?;
         self.validate_inbound_message("service request", request.len())?;
         let budget = self.budget.clone();
-        let instance = self.instance_mut()?;
+        let mut runtime = self.runtime()?;
+        let instance = self.ensure_instance(&mut runtime)?;
 
         instance.store.data().validate_execution_owner(ctx)?;
         Self::set_callback_fuel(&mut instance.store, &budget, "service request")?;
@@ -1487,7 +2236,7 @@ mod tests {
         secrets::{SecretPath, SecretPathPattern, SecretValue},
         types::ExtensionId,
     };
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     fn test_instance_id() -> ExtensionInstanceId {
         ExtensionInstanceId::new("test-instance")
@@ -1601,7 +2350,14 @@ mod tests {
         context.effects.insert(effect_id.clone(), effect.clone());
         state.effect_handles.insert(
             String::from("guest-handle"),
-            ActiveWasmRuntimeEffect { effect_id, effect },
+            ActiveWasmRuntimeEffect {
+                owner: rintawa_sdk::contracts::ComponentRef::new(
+                    test_instance_id(),
+                    ComponentId::new("chat-runtime"),
+                ),
+                effect_id,
+                effect,
+            },
         );
         state.begin_guest_execution();
 
@@ -1864,6 +2620,10 @@ mod tests {
     #[test]
     fn test_should_install_and_revoke_wasm_runtime_effects_with_handles() {
         let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
+        begin_test_registration(&mut state, ExtensionId::new("rintawa.chat"));
+        let _ = state
+            .finish_registration()
+            .expect("test registration should finish");
         let mut context = TestRuntimeContext::new();
 
         state.begin_guest_execution();
@@ -1944,6 +2704,10 @@ mod tests {
     #[test]
     fn test_should_roll_back_effects_when_a_callback_batch_fails() {
         let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
+        begin_test_registration(&mut state, ExtensionId::new("rintawa.chat"));
+        let _ = state
+            .finish_registration()
+            .expect("test registration should finish");
         let mut context = TestRuntimeContext::new();
         context.fail_registration_on(2);
 
@@ -1962,6 +2726,10 @@ mod tests {
     #[test]
     fn test_should_report_a_failed_rollback_without_retaining_a_stale_handle() {
         let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
+        begin_test_registration(&mut state, ExtensionId::new("rintawa.chat"));
+        let _ = state
+            .finish_registration()
+            .expect("test registration should finish");
         let mut context = TestRuntimeContext::new();
 
         state.begin_guest_execution();
@@ -1987,5 +2755,132 @@ mod tests {
             state.unsubscribe_event(active_handle),
             Err(RuntimeEffectError::UnknownEffect)
         ));
+    }
+
+    #[test]
+    fn test_should_reject_unversioned_execution_target_from_guest_start() {
+        let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
+        begin_test_registration(&mut state, ExtensionId::new("rintawa.chat"));
+        let _ = state
+            .finish_registration()
+            .expect("test registration should finish");
+
+        state.begin_start_execution();
+        assert!(matches!(
+            ExecutionTargetsHost::register_target(&mut state, String::from("runtime")),
+            Err(TargetRegistrationError::InvalidTarget)
+        ));
+        assert!(state.pending_execution_targets.is_empty());
+    }
+
+    #[test]
+    fn test_should_discard_pending_execution_targets_when_start_scope_aborts() {
+        let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
+        begin_test_registration(&mut state, ExtensionId::new("rintawa.chat"));
+        let _ = state
+            .finish_registration()
+            .expect("test registration should finish");
+
+        state.begin_start_execution();
+        assert!(
+            ExecutionTargetsHost::register_target(&mut state, String::from("example.runtime@1"))
+                .is_ok()
+        );
+        assert_eq!(
+            state.pending_execution_targets,
+            vec![String::from("example.runtime@1")]
+        );
+
+        state.discard_guest_execution();
+        assert!(state.pending_execution_targets.is_empty());
+    }
+
+    #[test]
+    fn test_should_reject_target_publication_without_provider_exports() {
+        let runtime_engine = WasmRuntimeEngine::new().expect("test WASM runtime should initialize");
+        let component = runtime_engine
+            .load_component_from_bytes(
+                ComponentId::new("ordinary-component"),
+                include_str!("../../tests/fixtures/stateful_component.wat").as_bytes(),
+            )
+            .expect("ordinary test component should compile");
+        let mut runtime = component
+            .runtime()
+            .expect("test runtime lock should be available");
+        let instance = component
+            .ensure_instance(&mut runtime)
+            .expect("ordinary test component should instantiate");
+
+        let error = WasmTargetProviderEndpoint::ensure_target_provider(instance)
+            .expect_err("ordinary component must not satisfy target-provider exports");
+        assert!(
+            error
+                .to_string()
+                .contains("without target-provider exports")
+        );
+    }
+
+    #[test]
+    fn test_should_fail_fast_when_target_provider_runtime_is_reentered() {
+        let runtime = Arc::new(Mutex::new(WasmSharedRuntime {
+            instance: None,
+            failed_lifecycle_callback: None,
+        }));
+        let endpoint = WasmTargetProviderEndpoint {
+            runtime: runtime.clone(),
+            budget: WasmExecutionBudget::default(),
+        };
+        let guard = runtime
+            .lock()
+            .expect("test runtime lock should be available");
+
+        let error = match endpoint.runtime_for_callback() {
+            Ok(_) => {
+                panic!("reentrant target-provider callback must not block or acquire the lock")
+            }
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("runtime is busy"));
+        drop(guard);
+    }
+
+    #[test]
+    fn test_should_preserve_other_owner_effect_handles_after_delegated_abort() {
+        let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
+        let owner = rintawa_sdk::contracts::ComponentRef::new(
+            test_instance_id(),
+            ComponentId::new("chat-runtime"),
+        );
+        let other_owner = rintawa_sdk::contracts::ComponentRef::new(
+            test_instance_id(),
+            ComponentId::new("other-runtime"),
+        );
+        state.effect_handles.insert(
+            String::from("own"),
+            ActiveWasmRuntimeEffect {
+                owner: owner.clone(),
+                effect_id: RuntimeEffectId::new("own-effect"),
+                effect: RuntimeEffect::event_subscription("own.topic"),
+            },
+        );
+        state.effect_handles.insert(
+            String::from("other"),
+            ActiveWasmRuntimeEffect {
+                owner: other_owner,
+                effect_id: RuntimeEffectId::new("other-effect"),
+                effect: RuntimeEffect::event_subscription("other.topic"),
+            },
+        );
+        let mut context = TestRuntimeContext::new();
+        state.begin_delegated_guest_execution(owner);
+
+        let error = state.abort_guest_execution(
+            &mut context,
+            ExtensionError::Message(String::from("simulated delegated failure")),
+        );
+
+        assert_eq!(error.to_string(), "simulated delegated failure");
+        assert!(!state.effect_handles.contains_key("own"));
+        assert!(state.effect_handles.contains_key("other"));
     }
 }
