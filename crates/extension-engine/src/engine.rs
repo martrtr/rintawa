@@ -993,13 +993,45 @@ impl ExtensionEngine {
 
     /// Resolves active contract composition in one exact runtime scope.
     pub fn composition_snapshot_for_scope(&self, scope_id: &RuntimeScopeId) -> CompositionSnapshot {
+        self.resolve_composition_for_scope(scope_id, |state| state == ExtensionState::Active)
+    }
+
+    /// Resolves the registered contract topology in the default runtime scope.
+    ///
+    /// Unlike [`Self::composition_snapshot`], this includes declarations from
+    /// registered and stopped instances as well as active ones. It is intended
+    /// for host-side activation planning only; it does not describe currently
+    /// callable services or other live runtime availability.
+    pub fn composition_topology_snapshot(&self) -> CompositionSnapshot {
+        self.composition_topology_snapshot_for_scope(&default_scope_id())
+    }
+
+    /// Resolves the registered contract topology in one exact runtime scope.
+    ///
+    /// The topology contains every loaded instance in the scope regardless of
+    /// lifecycle state. Runtime routing must continue to use
+    /// [`Self::composition_snapshot_for_scope`], which is active-only.
+    pub fn composition_topology_snapshot_for_scope(
+        &self,
+        scope_id: &RuntimeScopeId,
+    ) -> CompositionSnapshot {
+        self.resolve_composition_for_scope(scope_id, |_| true)
+    }
+
+    fn resolve_composition_for_scope(
+        &self,
+        scope_id: &RuntimeScopeId,
+        include: impl Fn(ExtensionState) -> bool,
+    ) -> CompositionSnapshot {
         let mut definitions = Vec::new();
         let mut providers = Vec::new();
         let mut consumers = Vec::new();
 
-        for extension in self.extensions.values().filter(|extension| {
-            extension.state == ExtensionState::Active && &extension.scope_id == scope_id
-        }) {
+        for extension in self
+            .extensions
+            .values()
+            .filter(|extension| include(extension.state) && &extension.scope_id == scope_id)
+        {
             definitions.extend(extension.contract_definitions.iter().cloned());
             providers.extend(extension.contract_providers.iter().cloned());
             consumers.extend(extension.contract_consumers.iter().cloned());

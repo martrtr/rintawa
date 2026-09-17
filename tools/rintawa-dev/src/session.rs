@@ -1,11 +1,8 @@
-use std::sync::Arc;
-
 use rintawa_artifacts::ArtifactDigest;
 use rintawa_extension_engine::{ExtensionEngine, ExtensionState, RtwExtensionLoader};
 use rintawa_sdk::types::{ExtensionId, ExtensionInstanceId, RuntimeScopeId};
 
 use crate::{DevError, DevProject, DevResult, PreparedSnapshot};
-use rintawa_web_host::WebComponentHost;
 
 /// Running local extension snapshot.
 pub struct DevSession {
@@ -13,7 +10,6 @@ pub struct DevSession {
     engine: ExtensionEngine,
     instance_id: ExtensionInstanceId,
     extension_id: ExtensionId,
-    web_host: Arc<WebComponentHost>,
 }
 
 impl DevSession {
@@ -37,9 +33,7 @@ impl DevSession {
         scope_id: RuntimeScopeId,
     ) -> DevResult<Self> {
         let mut engine = ExtensionEngine::new();
-        let web_host = Arc::new(WebComponentHost::new());
-        let mut loader = RtwExtensionLoader::new();
-        loader.register_component_host(web_host.clone())?;
+        let loader = RtwExtensionLoader::new();
         let extension_id = loader.load_stored_extension(
             &mut engine,
             snapshot.store(),
@@ -48,26 +42,12 @@ impl DevSession {
             scope_id,
         )?;
         engine.start_extension_instance(&instance_id)?;
-        if let Err(setup_error) = web_host
-            .attach_layers(&mut engine)
-            .and_then(|()| web_host.pump(&mut engine))
-            .map_err(DevError::from)
-        {
-            return match cleanup_engine(&mut engine, &instance_id) {
-                Ok(()) => Err(setup_error),
-                Err(cleanup_error) => Err(DevError::RuntimeSetupCleanupFailed {
-                    setup: Box::new(setup_error),
-                    cleanup: Box::new(cleanup_error),
-                }),
-            };
-        }
 
         Ok(Self {
             snapshot,
             engine,
             instance_id,
             extension_id,
-            web_host,
         })
     }
 
@@ -89,24 +69,6 @@ impl DevSession {
     /// Returns the current runtime state.
     pub fn state(&self) -> Option<ExtensionState> {
         self.engine.extension_instance_state(&self.instance_id)
-    }
-
-    /// Returns development URLs exposed by running Web bundle components.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when Web host state is unavailable.
-    pub fn web_urls(&self) -> DevResult<Vec<String>> {
-        Ok(self.web_host.urls()?)
-    }
-
-    /// Processes queued Web UI actions and publishes current portable UI state.
-    ///
-    /// # Errors
-    ///
-    /// Returns an engine or Web host error.
-    pub fn pump(&mut self) -> DevResult<()> {
-        Ok(self.web_host.pump(&mut self.engine)?)
     }
 
     /// Stops and unregisters the extension instance.

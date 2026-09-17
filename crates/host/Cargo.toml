@@ -18,7 +18,6 @@ tempfile.workspace = true
 rintawa-artifacts = { path = "../artifacts" }
 rintawa-extension-engine = { path = "../extension-engine" }
 rintawa-sdk = { path = "../sdk" }
-rintawa-web-host = { path = "../web-host" }
 
 [dev-dependencies]
 anyhow.workspace = true

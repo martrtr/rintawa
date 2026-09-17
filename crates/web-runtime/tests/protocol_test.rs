@@ -14,6 +14,7 @@ fn descriptor() -> WebBundleDescriptor {
 schema = 1
 bridge-protocol-major = 1
 entry = "web/index.html"
+listen-port = 41001
 
 [ui-layer]
 protocol-major = 1
@@ -21,6 +22,11 @@ capabilities = ["rintawa.ui.text@1"]
 "#,
     )
     .expect("test descriptor should parse")
+}
+
+#[test]
+fn test_should_read_packaged_listen_port() {
+    assert_eq!(descriptor().listen_port, Some(41001));
 }
 
 #[test]
@@ -92,4 +98,21 @@ entry = "web/index.html"
     .expect("descriptor without UI role should parse");
     assert!(descriptor.ui_layer.is_none());
     assert!(descriptor.ui_layer_descriptor().is_none());
+}
+
+#[test]
+fn test_should_reject_zero_packaged_listen_port() {
+    let error = WebBundleDescriptor::parse(
+        br#"
+schema = 1
+bridge-protocol-major = 1
+entry = "web/index.html"
+listen-port = 0
+"#,
+    )
+    .expect_err("zero port should be rejected");
+    assert!(matches!(
+        error,
+        rintawa_web_runtime::WebRuntimeError::InvalidListenPort
+    ));
 }

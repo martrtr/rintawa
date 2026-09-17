@@ -86,7 +86,7 @@ fn run(path: PathBuf, instance_id: String, scope_id: String, should_run_once: bo
         Some(interrupt_receiver()?)
     };
     let project = DevProject::open(path)?;
-    let mut session = DevSession::start(
+    let session = DevSession::start(
         &project,
         ExtensionInstanceId::new(instance_id),
         RuntimeScopeId::new(scope_id),
@@ -94,18 +94,9 @@ fn run(path: PathBuf, instance_id: String, scope_id: String, should_run_once: bo
     println!("extension = {}", session.extension_id());
     println!("digest = {}", session.digest());
     println!("instance = {}", session.instance_id());
-    for url in session.web_urls()? {
-        println!("web = {url}");
-    }
-
     if let Some(receiver) = interrupt {
         println!("running; press Ctrl+C to stop");
-        loop {
-            match receiver.recv_timeout(Duration::from_millis(50)) {
-                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => session.pump()?,
-            }
-        }
+        let _ = receiver.recv();
     }
     session.shutdown()?;
     Ok(())
@@ -131,9 +122,6 @@ fn watch(
         println!("extension = {}", session.extension_id());
         println!("digest = {}", session.digest());
     }
-    for url in runner.web_urls()? {
-        println!("web = {url}");
-    }
     println!("watching; press Ctrl+C to stop");
 
     let interval = Duration::from_millis(poll_interval_ms);
@@ -145,8 +133,6 @@ fn watch(
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
-        runner.pump()?;
-
         let revision = match runner.source_revision() {
             Ok(revision) => revision,
             Err(error) => {
@@ -168,9 +154,6 @@ fn watch(
             Ok(ReloadOutcome::Unchanged) => println!("source changed; RTW bytes unchanged"),
             Ok(ReloadOutcome::Reloaded { previous, current }) => {
                 println!("reloaded {previous} -> {current}");
-                for url in runner.web_urls()? {
-                    println!("web = {url}");
-                }
             }
             Err(error) => {
                 eprintln!("reload failed: {error}");

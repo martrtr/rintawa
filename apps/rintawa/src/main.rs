@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf, sync::mpsc, time::Duration};
+use std::{env, path::PathBuf, sync::mpsc};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -32,7 +32,7 @@ enum Commands {
     Disable { id: String },
     /// Start the pre-world baseline composition from persisted exact digests.
     Run {
-        /// Start, print endpoints, pump once, then shut down.
+        /// Start the composition once, then shut down.
         #[arg(long)]
         once: bool,
     },
@@ -98,20 +98,11 @@ fn set_enabled(home: &HostHome, id: String, enabled: bool) -> Result<()> {
 }
 
 fn run(home: &HostHome, once: bool) -> Result<()> {
-    let mut runtime = HostRuntime::start(home)?;
-    for url in runtime.web_urls()? {
-        println!("web = {url}");
-    }
-    runtime.pump()?;
+    let runtime = HostRuntime::start(home)?;
     if !once {
         println!("running; press Ctrl+C to stop");
         let receiver = interrupt_receiver()?;
-        loop {
-            match receiver.recv_timeout(Duration::from_millis(50)) {
-                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => runtime.pump()?,
-            }
-        }
+        let _ = receiver.recv();
     }
     runtime.shutdown()?;
     Ok(())

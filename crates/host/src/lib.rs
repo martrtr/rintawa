@@ -37,9 +37,6 @@ pub enum HostError {
     /// Extension inspection or lifecycle failed.
     #[error(transparent)]
     Engine(#[from] rintawa_extension_engine::EngineError),
-    /// The packaged Web host failed.
-    #[error(transparent)]
-    WebHost(#[from] rintawa_web_host::WebHostError),
     /// A filesystem operation failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

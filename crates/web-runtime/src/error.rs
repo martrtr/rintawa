@@ -26,6 +26,10 @@ pub enum WebRuntimeError {
     #[error("unsupported web bundle descriptor schema {0}")]
     UnsupportedDescriptorSchema(u32),
 
+    /// A packaged listen port cannot use the ephemeral-port sentinel.
+    #[error("web bundle listen-port must be between 1 and 65535")]
+    InvalidListenPort,
+
     /// The Web bridge protocol version is not supported.
     #[error("unsupported web UI bridge protocol major {0}")]
     UnsupportedBridgeProtocol(u32),

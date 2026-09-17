@@ -22,5 +22,3 @@ toml.workspace = true
 rintawa-artifacts = { path = "../../crates/artifacts" }
 rintawa-extension-engine = { path = "../../crates/extension-engine" }
 rintawa-sdk = { path = "../../crates/sdk" }
-rintawa-web-runtime = { path = "../../crates/web-runtime" }
-rintawa-web-host = { path = "../../crates/web-host" }

@@ -27,6 +27,12 @@ pub struct WebBundleDescriptor {
     pub bridge_protocol_major: u32,
     /// HTML entry point relative to this descriptor.
     pub entry: ArtifactPath,
+    /// Preferred loopback TCP port for this packaged Web bundle.
+    ///
+    /// When omitted, the Web host asks the OS for an ephemeral port. Development
+    /// tooling may also override this value to allow concurrent sessions.
+    #[serde(default, rename = "listen-port")]
+    pub listen_port: Option<u16>,
     /// Optional Portable UI Layer role exposed by this Web component.
     #[serde(default, rename = "ui-layer")]
     pub ui_layer: Option<WebUiLayerDescriptor>,
@@ -69,6 +75,9 @@ impl WebBundleDescriptor {
     pub fn validate(&self) -> WebRuntimeResult<()> {
         if self.schema != WEB_BUNDLE_DESCRIPTOR_SCHEMA {
             return Err(WebRuntimeError::UnsupportedDescriptorSchema(self.schema));
+        }
+        if self.listen_port == Some(0) {
+            return Err(WebRuntimeError::InvalidListenPort);
         }
         if self.bridge_protocol_major != WEB_UI_BRIDGE_PROTOCOL_MAJOR {
             return Err(WebRuntimeError::UnsupportedBridgeProtocol(

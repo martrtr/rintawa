@@ -131,6 +131,60 @@ fn test_single_provider_resolution_is_deterministic_and_overridable() -> anyhow:
 }
 
 #[test]
+fn test_registered_topology_is_visible_before_runtime_activation() -> anyhow::Result<()> {
+    let contract = contract("example.bootstrap-topology");
+    let definition = ContractDefinition::new(contract.clone(), ContractResolutionPolicy::Single);
+    let mut engine = ExtensionEngine::new();
+
+    engine.register_extension(
+        manifest("provider"),
+        vec![Box::new(
+            ContractComponent::new("runtime")
+                .defining(definition)
+                .providing(ContractProvider::new(contract.clone())),
+        )],
+    )?;
+    engine.register_extension(
+        manifest("consumer"),
+        vec![Box::new(
+            ContractComponent::new("runtime")
+                .consuming(ContractConsumer::new(contract.clone(), true)),
+        )],
+    )?;
+
+    let active = engine.composition_snapshot();
+    assert!(active.bindings.is_empty());
+    assert!(active.unresolved.is_empty());
+
+    let topology = engine.composition_topology_snapshot();
+    assert_eq!(topology.bindings.len(), 1);
+    assert!(topology.unresolved.is_empty());
+    assert_eq!(
+        topology.bindings[0].providers,
+        vec![ComponentRef::new("provider", "runtime")]
+    );
+
+    engine.start_extension(&ExtensionId::new("consumer"))?;
+    let active = engine.composition_snapshot();
+    assert!(active.bindings.is_empty());
+    assert_eq!(active.unresolved.len(), 1);
+    assert_eq!(
+        active.unresolved[0].reason,
+        UnresolvedContractReason::UndefinedContract
+    );
+
+    let topology = engine.composition_topology_snapshot();
+    assert_eq!(topology.bindings.len(), 1);
+    assert!(topology.unresolved.is_empty());
+
+    engine.start_extension(&ExtensionId::new("provider"))?;
+    let active = engine.composition_snapshot();
+    assert_eq!(active.bindings.len(), 1);
+    assert!(active.unresolved.is_empty());
+    Ok(())
+}
+
+#[test]
 fn test_multiple_provider_resolution_binds_all_providers_in_stable_order() -> anyhow::Result<()> {
     let contract = contract("example.multiple");
     let definition = ContractDefinition::new(contract.clone(), ContractResolutionPolicy::Multiple);
