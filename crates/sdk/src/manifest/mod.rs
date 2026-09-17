@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
+    runtime_permissions::RuntimePermission,
     secrets::SecretPathPattern,
     types::{ComponentId, ComponentTarget, ExtensionId},
 };
@@ -119,6 +120,9 @@ pub struct ComponentPermissions {
     /// Secret domains the extension may ask the host to grant for reading.
     #[serde(default, rename = "secret-read")]
     pub secret_read: Vec<SecretPathPattern>,
+    /// Host runtime capabilities this component may ask policy to approve.
+    #[serde(default, rename = "runtime")]
+    pub runtime: Vec<RuntimePermission>,
 }
 
 /// Describes a single component declared by an extension.
@@ -314,6 +318,10 @@ mod tests {
                 required: true,
                 permissions: ComponentPermissions {
                     secret_read: vec![SecretPathPattern::parse("ai.api_keys.*")?],
+                    runtime: vec![
+                        RuntimePermission::BackgroundTask,
+                        RuntimePermission::LoopbackListen,
+                    ],
                 },
             }],
         };
@@ -342,12 +350,20 @@ mod tests {
 
                 [components.permissions]
                 secret-read = ["ai.api_keys.*"]
+                runtime = ["background-task", "loopback-listen"]
             "#,
         )?;
 
         assert_eq!(
             manifest.components[0].permissions.secret_read,
             vec![SecretPathPattern::parse("ai.api_keys.*").unwrap()]
+        );
+        assert_eq!(
+            manifest.components[0].permissions.runtime,
+            vec![
+                RuntimePermission::BackgroundTask,
+                RuntimePermission::LoopbackListen
+            ]
         );
 
         Ok(())

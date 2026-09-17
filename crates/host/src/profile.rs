@@ -3,6 +3,7 @@ use std::{collections::HashSet, io::Write, path::Path};
 use rintawa_artifacts::{ArtifactDigest, ContentType};
 use rintawa_sdk::{
     contracts::{ComponentRef, ContractKey, ContractVersion},
+    runtime_permissions::RuntimePermission,
     types::{ComponentId, ContractId, ExtensionInstanceId, RuntimeScopeId},
 };
 use serde::{Deserialize, Serialize};
@@ -11,8 +12,9 @@ use tempfile::NamedTempFile;
 use crate::{HostError, HostResult};
 
 /// Current baseline profile schema.
-pub const PROFILE_SCHEMA: u32 = 2;
+pub const PROFILE_SCHEMA: u32 = 3;
 const LEGACY_PROFILE_SCHEMA_V1: u32 = 1;
+const LEGACY_PROFILE_SCHEMA_V2: u32 = 2;
 
 /// One exact activation selected for the pre-world host composition.
 ///
@@ -81,6 +83,44 @@ impl PreferredProviderSelection {
     }
 }
 
+/// One explicit host-approved runtime permission for an exact baseline component.
+///
+/// The extension manifest must request the permission separately. This record is
+/// profile policy only and never expands package-declared capabilities.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct RuntimePermissionGrant {
+    /// Runtime scope containing the component principal.
+    pub scope_id: RuntimeScopeId,
+    /// Concrete runtime instance receiving the approval.
+    pub instance_id: ExtensionInstanceId,
+    /// Component within the runtime instance.
+    pub component_id: ComponentId,
+    /// Exact runtime capability approved by the host profile.
+    pub permission: RuntimePermission,
+}
+
+impl RuntimePermissionGrant {
+    /// Creates one persisted approval for an exact component principal.
+    pub fn new(
+        scope_id: RuntimeScopeId,
+        owner: ComponentRef,
+        permission: RuntimePermission,
+    ) -> Self {
+        Self {
+            scope_id,
+            instance_id: owner.instance_id,
+            component_id: owner.component_id,
+            permission,
+        }
+    }
+
+    /// Returns the exact component principal receiving this approval.
+    pub fn owner(&self) -> ComponentRef {
+        ComponentRef::new(self.instance_id.clone(), self.component_id.clone())
+    }
+}
+
 /// Persistent baseline composition used before any State Engine world is opened.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -93,6 +133,9 @@ pub struct BaselineProfile {
     /// Explicit provider choices applied before activation planning.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub preferred_providers: Vec<PreferredProviderSelection>,
+    /// Explicit runtime capabilities approved for exact component principals.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_permissions: Vec<RuntimePermissionGrant>,
 }
 
 impl Default for BaselineProfile {
@@ -101,6 +144,7 @@ impl Default for BaselineProfile {
             schema: PROFILE_SCHEMA,
             activations: Vec::new(),
             preferred_providers: Vec::new(),
+            runtime_permissions: Vec::new(),
         }
     }
 }
@@ -114,7 +158,9 @@ impl BaselineProfile {
         let mut profile: Self = toml::from_str(&source)?;
         match profile.schema {
             PROFILE_SCHEMA => {}
-            LEGACY_PROFILE_SCHEMA_V1 => profile.schema = PROFILE_SCHEMA,
+            LEGACY_PROFILE_SCHEMA_V1 | LEGACY_PROFILE_SCHEMA_V2 => {
+                profile.schema = PROFILE_SCHEMA;
+            }
             unsupported => return Err(HostError::UnsupportedProfileSchema(unsupported)),
         }
         profile.validate()?;
@@ -151,6 +197,23 @@ impl BaselineProfile {
                 });
             }
         }
+        let mut runtime_grants = HashSet::new();
+        for grant in &self.runtime_permissions {
+            let key = (
+                grant.scope_id.clone(),
+                grant.instance_id.clone(),
+                grant.component_id.clone(),
+                grant.permission,
+            );
+            if !runtime_grants.insert(key) {
+                return Err(HostError::DuplicateRuntimePermissionGrant {
+                    scope_id: grant.scope_id.to_string(),
+                    instance_id: grant.instance_id.to_string(),
+                    component_id: grant.component_id.to_string(),
+                    permission: grant.permission.to_string(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -172,6 +235,26 @@ impl BaselineProfile {
     ) {
         self.preferred_providers.retain(|selection| {
             &selection.scope_id != scope_id || &selection.contract() != contract
+        });
+    }
+
+    pub(crate) fn grant_runtime_permission(&mut self, grant: RuntimePermissionGrant) {
+        if !self.runtime_permissions.contains(&grant) {
+            self.runtime_permissions.push(grant);
+        }
+    }
+
+    pub(crate) fn revoke_runtime_permission(
+        &mut self,
+        scope_id: &RuntimeScopeId,
+        owner: &ComponentRef,
+        permission: RuntimePermission,
+    ) {
+        self.runtime_permissions.retain(|grant| {
+            &grant.scope_id != scope_id
+                || grant.instance_id != owner.instance_id
+                || grant.component_id != owner.component_id
+                || grant.permission != permission
         });
     }
 

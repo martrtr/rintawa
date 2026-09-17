@@ -24,11 +24,15 @@ use rintawa_extension_engine::{
 };
 use rintawa_sdk::{
     contracts::{ComponentRef, ContractKey},
+    runtime_permissions::RuntimePermission,
     types::{ExtensionInstanceId, RuntimeScopeId},
 };
 use thiserror::Error;
 
-pub use profile::{ActivationRecord, BaselineProfile, PROFILE_SCHEMA, PreferredProviderSelection};
+pub use profile::{
+    ActivationRecord, BaselineProfile, PROFILE_SCHEMA, PreferredProviderSelection,
+    RuntimePermissionGrant,
+};
 pub use runtime::HostRuntime;
 
 /// Stable runtime scope used by the pre-world/bootstrap composition.
@@ -135,6 +139,20 @@ pub enum HostError {
         /// Contract selected more than once.
         contract: String,
     },
+    /// The baseline profile contains the same runtime capability approval more than once.
+    #[error(
+        "duplicate runtime permission `{permission}` for component `{component_id}` in instance `{instance_id}` scope `{scope_id}`"
+    )]
+    DuplicateRuntimePermissionGrant {
+        /// Runtime scope containing the duplicate approval.
+        scope_id: String,
+        /// Runtime instance receiving the duplicate approval.
+        instance_id: String,
+        /// Component receiving the duplicate approval.
+        component_id: String,
+        /// Runtime permission approved more than once.
+        permission: String,
+    },
     /// A preferred provider references an activation not installed in the baseline profile.
     #[error("preferred provider instance `{0}` is not installed in the baseline profile")]
     PreferredProviderActivationNotFound(String),
@@ -150,6 +168,44 @@ pub enum HostError {
         /// Scope of the installed activation.
         actual_scope: String,
     },
+    /// A runtime permission approval references an activation absent from the baseline profile.
+    #[error("runtime permission instance `{0}` is not installed in the baseline profile")]
+    RuntimePermissionActivationNotFound(String),
+    /// A runtime permission approval references an activation in another runtime scope.
+    #[error(
+        "runtime permission instance `{instance_id}` belongs to scope `{actual_scope}`, not `{selected_scope}`"
+    )]
+    RuntimePermissionScopeMismatch {
+        /// Runtime instance receiving the approval.
+        instance_id: String,
+        /// Scope selected by policy.
+        selected_scope: String,
+        /// Scope containing the installed activation.
+        actual_scope: String,
+    },
+    /// A runtime permission approval references a component absent from the exact artifact.
+    #[error(
+        "component `{component_id}` is not present in runtime permission instance `{instance_id}`"
+    )]
+    RuntimePermissionComponentNotFound {
+        /// Runtime instance containing the exact artifact.
+        instance_id: String,
+        /// Missing component identifier.
+        component_id: String,
+    },
+    /// A runtime permission approval would exceed the exact artifact manifest request.
+    #[error(
+        "runtime permission `{permission}` was not requested by component `{component_id}` in instance `{instance_id}`"
+    )]
+    RuntimePermissionNotRequested {
+        /// Runtime instance containing the component.
+        instance_id: String,
+        /// Component whose manifest did not request the permission.
+        component_id: String,
+        /// Permission policy attempted to approve.
+        permission: String,
+    },
+
     /// A host-consumed contract role could not resolve its selected active provider.
     #[error("contract `{contract}` in scope `{scope_id}` is unavailable: {reason}")]
     ContractRoleUnavailable {
@@ -300,6 +356,77 @@ impl HostHome {
     pub fn set_enabled(&self, subject: &str, enabled: bool) -> HostResult<()> {
         let mut profile = self.load_profile()?;
         profile.set_enabled(subject, enabled)?;
+        profile.save(&self.profile_path)
+    }
+
+    /// Persists one explicit runtime capability approval for an exact baseline component.
+    ///
+    /// The activation must exist in the same scope and its exact stored manifest must
+    /// request the permission. This method never expands package-declared capability
+    /// requests.
+    pub fn grant_runtime_permission(
+        &self,
+        scope_id: RuntimeScopeId,
+        owner: ComponentRef,
+        permission: RuntimePermission,
+    ) -> HostResult<()> {
+        let mut profile = self.load_profile()?;
+        let activation = profile
+            .activations
+            .iter()
+            .find(|activation| activation.instance_id == owner.instance_id)
+            .ok_or_else(|| {
+                HostError::RuntimePermissionActivationNotFound(owner.instance_id.to_string())
+            })?;
+        if activation.scope_id != scope_id {
+            return Err(HostError::RuntimePermissionScopeMismatch {
+                instance_id: owner.instance_id.to_string(),
+                selected_scope: scope_id.to_string(),
+                actual_scope: activation.scope_id.to_string(),
+            });
+        }
+        if activation.content.to_string() != EXTENSION_CONTENT_V1 {
+            return Err(HostError::UnsupportedContent(
+                activation.content.to_string(),
+            ));
+        }
+        let engine = ExtensionEngine::new();
+        let manifest = RtwExtensionLoader::new().read_stored_manifest(
+            &engine,
+            &self.store,
+            &activation.artifact,
+        )?;
+        let component = manifest
+            .components
+            .iter()
+            .find(|component| component.id == owner.component_id)
+            .ok_or_else(|| HostError::RuntimePermissionComponentNotFound {
+                instance_id: owner.instance_id.to_string(),
+                component_id: owner.component_id.to_string(),
+            })?;
+        if !component.permissions.runtime.contains(&permission) {
+            return Err(HostError::RuntimePermissionNotRequested {
+                instance_id: owner.instance_id.to_string(),
+                component_id: owner.component_id.to_string(),
+                permission: permission.to_string(),
+            });
+        }
+        profile.grant_runtime_permission(RuntimePermissionGrant::new(scope_id, owner, permission));
+        profile.save(&self.profile_path)
+    }
+
+    /// Removes one persisted runtime capability approval.
+    ///
+    /// Revocation intentionally does not inspect the current artifact so stale or
+    /// broken policy can always be repaired.
+    pub fn revoke_runtime_permission(
+        &self,
+        scope_id: &RuntimeScopeId,
+        owner: &ComponentRef,
+        permission: RuntimePermission,
+    ) -> HostResult<()> {
+        let mut profile = self.load_profile()?;
+        profile.revoke_runtime_permission(scope_id, owner, permission);
         profile.save(&self.profile_path)
     }
 

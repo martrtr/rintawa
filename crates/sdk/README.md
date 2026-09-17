@@ -10,11 +10,12 @@ Version 0.0.1 deliberately establishes only the portable foundation:
 - a logging API and common error type.
 
 The SDK does not contain an Extension Engine, Wasmtime, React, state/storage/AI
-APIs, general permission enforcement, dependency resolution, or a System
-scheduler. Secret-read requests are an exception: the SDK can declare them,
-but only the Rintawa host can grant and serve them.
-Those are host or engine responsibilities and will be introduced only when a
-real end-to-end pipeline needs them.
+APIs, permission enforcement, dependency resolution, or a System scheduler. It
+only defines capability requests in public data contracts: secret-read patterns
+and coarse runtime permissions. A request never grants access by itself; only the
+Rintawa host can approve a concrete component principal and serve the capability.
+Enforcement, resource ownership, scheduling, and network implementation remain
+host or engine responsibilities.
 
 ## Runtime targets
 
@@ -46,6 +47,32 @@ Presentation technology is likewise outside this SDK. A shell, UI layer, TUI,
 versioned contracts independently of its execution target. For example, the
 platform-owned `rintawa.host.shell@1` binding selects the primary Host Shell; it
 does not imply Web, React, an Android Activity, or any specific runtime.
+
+## Runtime capability requests
+
+A component may request coarse host capabilities in its manifest:
+
+```toml
+[[components]]
+id = "runtime"
+kind = "runtime"
+target = "rintawa.runtime.wasm-component@1"
+entry = "runtime.wasm"
+
+[components.permissions]
+runtime = ["background-task", "loopback-listen", "loopback-connect"]
+```
+
+These values are requests, not grants. Host policy approves an exact component
+principal separately. `background-task` maps to cooperative host-pumped work;
+it is not a guest thread. The current network boundary is deliberately narrower
+than general network access: `loopback-listen` and `loopback-connect` expose
+bounded host-owned TCP handles restricted to the local loopback interface. They
+do not grant DNS, arbitrary outbound sockets, filesystem access, or raw OS file
+descriptors.
+
+Execution through another runtime provider does not inherit that provider's
+runtime permissions. Delegated components execute under their own principal.
 
 ## Lifecycle
 

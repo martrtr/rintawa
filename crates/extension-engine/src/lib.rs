@@ -25,6 +25,7 @@ pub mod state;
 mod services;
 
 mod runtime_effects;
+mod runtime_permissions;
 
 pub use activation::{ActivationPlan, ActivationPlanError};
 pub use artifact_host::{
@@ -632,6 +633,63 @@ mod tests {
     }
 
     #[test]
+    fn test_should_grant_only_manifest_requested_runtime_permissions() -> EngineResult<()> {
+        let mut engine = ExtensionEngine::new();
+        let manifest = engine.parse_manifest(
+            r#"
+                id = "runtime_permissions"
+                name = "Runtime Permissions"
+                version = "0.0.1"
+                sdk = "^0.0"
+
+                [[components]]
+                id = "runtime"
+                kind = "runtime"
+                target = "example.runtime.native@1"
+
+                [components.permissions]
+                runtime = ["background-task", "loopback-listen"]
+            "#,
+        )?;
+        let extension_id = manifest.id.clone();
+        let component_id = ComponentId::new("runtime");
+        engine.register_extension(
+            manifest,
+            vec![Box::new(DummyRuntime {
+                id: component_id.clone(),
+            })],
+        )?;
+
+        engine.grant_requested_runtime_permission(
+            &extension_id,
+            &component_id,
+            RuntimePermission::BackgroundTask,
+        )?;
+        engine.grant_requested_runtime_permission(
+            &extension_id,
+            &component_id,
+            RuntimePermission::LoopbackListen,
+        )?;
+        assert!(matches!(
+            engine.grant_requested_runtime_permission(
+                &extension_id,
+                &component_id,
+                RuntimePermission::LoopbackConnect,
+            ),
+            Err(EngineError::RuntimePermissionNotRequested { .. })
+        ));
+        assert!(matches!(
+            engine.grant_requested_runtime_permission(
+                &extension_id,
+                &ComponentId::new("missing"),
+                RuntimePermission::BackgroundTask,
+            ),
+            Err(EngineError::RuntimePermissionComponentNotFound { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn test_should_revoke_secret_grants_for_manifest_only_components() -> EngineResult<()> {
         let secret_manager = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
         let secret_path = SecretPath::parse("ai.api_keys.openai").unwrap();
@@ -696,6 +754,7 @@ mod tests {
                     required: true,
                     permissions: ComponentPermissions {
                         secret_read: vec![SecretPathPattern::parse("ai.api_keys.*").unwrap()],
+                        runtime: Vec::new(),
                     },
                 },
                 ComponentDescriptor {

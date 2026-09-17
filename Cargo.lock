@@ -1688,6 +1688,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "rintawa-host",
+ "rintawa-sdk",
 ]
 
 [[package]]

@@ -553,6 +553,7 @@ fn test_provider_grants_control_binding_eligibility() -> anyhow::Result<()> {
             required: true,
             permissions: ComponentPermissions {
                 secret_read: vec![secret_pattern.clone()],
+                runtime: Vec::new(),
             },
         }],
     };
@@ -668,6 +669,7 @@ fn test_consumer_grant_controls_binding_eligibility() -> anyhow::Result<()> {
             required: true,
             permissions: ComponentPermissions {
                 secret_read: vec![secret_pattern.clone()],
+                runtime: Vec::new(),
             },
         }],
     };

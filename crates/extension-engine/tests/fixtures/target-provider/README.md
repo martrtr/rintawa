@@ -11,4 +11,6 @@ its normal `start` callback and reads `payload.bin` only through the borrowed
 `artifact-source` resource before returning a provider-local component handle.
 
 The checked-in component must be regenerated whenever the provider WIT ABI
-changes. It must not gain filesystem, CAS-path, network, or Web-specific APIs.
+changes. Although the generic authoring world exposes host-gated task/loopback
+imports, this fixture must not use those capabilities. It must not gain filesystem
+or CAS-path access, raw host resources, or any Web-specific API.

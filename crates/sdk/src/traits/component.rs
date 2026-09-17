@@ -57,6 +57,22 @@ pub trait Component: Send {
         Ok(())
     }
 
+    /// Executes due owner-scoped runtime work and returns the next requested wake-up delay.
+    ///
+    /// Components that do not own cooperative background work return `None`. Hosts
+    /// may call this repeatedly while the component is active; implementations must
+    /// not block indefinitely.
+    ///
+    /// # Errors
+    ///
+    /// Returns a component-specific runtime failure when scheduled work cannot execute.
+    fn poll_runtime(
+        &mut self,
+        _ctx: &mut dyn ComponentContext,
+    ) -> ExtensionResult<Option<std::time::Duration>> {
+        Ok(None)
+    }
+
     /// Handles one validated semantic action from the active UI Layer.
     ///
     /// # Errors

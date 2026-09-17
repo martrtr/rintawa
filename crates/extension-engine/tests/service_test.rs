@@ -273,6 +273,7 @@ fn test_secret_policy_revision_invalidates_cached_route() -> Result<()> {
             required: true,
             permissions: ComponentPermissions {
                 secret_read: vec![pattern.clone()],
+                runtime: Vec::new(),
             },
         }],
     };

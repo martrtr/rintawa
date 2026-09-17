@@ -104,6 +104,80 @@ interface runtime-effects {
     unsubscribe-event: func(handle: handle) -> result<_, error>;
 }
 
+/// Owner-scoped cooperative background tasks.
+interface runtime-tasks {
+    /// Opaque host task handle.
+    type handle = u64;
+
+    /// Failure while scheduling or cancelling a background task.
+    variant error {
+        runtime-not-active,
+        permission-denied,
+        invalid-interval,
+        limit-exceeded,
+        unknown-task,
+        unavailable,
+    }
+
+    /// Schedules a periodic callback owned by the current root WASM component.
+    ///
+    /// The host executes callbacks cooperatively from its runtime pump; no guest
+    /// thread is created. Remaining tasks are revoked on stop or callback failure.
+    spawn-periodic: func(interval-ms: u32) -> result<handle, error>;
+
+    /// Cancels one task previously created by the current owner.
+    cancel: func(handle: handle) -> result<_, error>;
+}
+
+/// Bounded TCP operations restricted to the local loopback interface.
+interface network {
+    /// Opaque listener or stream handle.
+    type handle = u64;
+
+    /// Result of binding a loopback listener. Port zero requests an ephemeral port.
+    record listener {
+        handle: handle,
+        port: u16,
+    }
+
+    /// One nonblocking stream read.
+    record read-result {
+        data: list<u8>,
+        eof: bool,
+    }
+
+    /// Failure while using a host-owned loopback TCP resource.
+    variant error {
+        access-not-active,
+        permission-denied,
+        invalid-port,
+        limit-exceeded,
+        unknown-handle,
+        wrong-kind,
+        would-block,
+        message-too-large,
+        unavailable,
+    }
+
+    /// Binds a nonblocking IPv4 TCP listener to 127.0.0.1 only.
+    listen-loopback: func(port: u16) -> result<listener, error>;
+
+    /// Opens a TCP connection to 127.0.0.1 only.
+    connect-loopback: func(port: u16) -> result<handle, error>;
+
+    /// Accepts one pending stream without blocking.
+    accept: func(listener: handle) -> result<option<handle>, error>;
+
+    /// Reads at most `max-bytes` without blocking.
+    read: func(socket: handle, max-bytes: u32) -> result<read-result, error>;
+
+    /// Writes at most one bounded payload; partial writes return their byte count.
+    write: func(socket: handle, data: list<u8>) -> result<u32, error>;
+
+    /// Closes one listener or stream owned by the current component.
+    close: func(handle: handle) -> result<_, error>;
+}
+
 /// Dynamic execution targets published by an active runtime-provider component.
 interface execution-targets {
     /// A host-owned, read-only view of one validated RTW artifact.
@@ -225,6 +299,12 @@ interface portable-ui {
     unmount-surface: func(surface-id: string) -> result<_, error>;
 }
 
+/// Optional callback surface for components that schedule background tasks.
+interface task-handler {
+    /// Executes one due periodic task under its owning component principal.
+    on-task: func(handle: u64);
+}
+
 /// Optional callbacks implemented only by components that publish execution targets.
 interface target-provider {
     use execution-targets.{artifact-source};
@@ -314,6 +394,8 @@ world plugin {
     import host;
     import registration;
     import runtime-effects;
+    import runtime-tasks;
+    import network;
     import execution-targets;
     import secrets;
     import services;
@@ -327,15 +409,53 @@ world target-provider-plugin {
     export target-provider;
 }
 
+/// Optional typed view of the same instance for cooperative task callbacks.
+world task-plugin {
+    export task-handler;
+}
+
+/// Combined authoring world for an ordinary WASM component with background tasks.
+world task-runtime-plugin {
+    import host;
+    import registration;
+    import runtime-effects;
+    import runtime-tasks;
+    import network;
+    import execution-targets;
+    import secrets;
+    import services;
+    import portable-ui;
+    export guest;
+    export task-handler;
+}
+
 /// Combined authoring world for a WASM runtime-provider component.
 world runtime-provider-plugin {
     import host;
     import registration;
     import runtime-effects;
+    import runtime-tasks;
+    import network;
     import execution-targets;
     import secrets;
     import services;
     import portable-ui;
     export guest;
     export target-provider;
+}
+
+/// Combined authoring world for a runtime provider that also schedules tasks.
+world runtime-provider-task-plugin {
+    import host;
+    import registration;
+    import runtime-effects;
+    import runtime-tasks;
+    import network;
+    import execution-targets;
+    import secrets;
+    import services;
+    import portable-ui;
+    export guest;
+    export target-provider;
+    export task-handler;
 }

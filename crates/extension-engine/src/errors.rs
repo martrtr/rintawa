@@ -142,6 +142,34 @@ pub enum EngineError {
         component_id: String,
     },
 
+    /// A requested runtime capability was not declared by the component manifest.
+    #[error(
+        "runtime permission `{permission}` was not requested by component `{component_id}` in extension `{extension_id}`"
+    )]
+    RuntimePermissionNotRequested {
+        /// Logical extension containing the component.
+        extension_id: String,
+        /// Component for which policy attempted to grant access.
+        component_id: String,
+        /// Exact runtime permission policy attempted to approve.
+        permission: String,
+    },
+
+    /// Runtime permission policy referenced a component absent from the manifest.
+    #[error(
+        "component `{component_id}` was not found in extension `{extension_id}` for runtime permission policy"
+    )]
+    RuntimePermissionComponentNotFound {
+        /// Logical extension containing the component.
+        extension_id: String,
+        /// Missing component identifier.
+        component_id: String,
+    },
+
+    /// The host-owned runtime permission policy store is unavailable.
+    #[error("runtime permission policy is unavailable")]
+    RuntimePermissionUnavailable,
+
     /// A WASM component artifact exceeded the host-owned byte limit.
     #[error(
         "WASM component `{component_id}` is at least {observed_bytes} bytes, exceeding the {maximum_bytes}-byte limit"
@@ -162,6 +190,19 @@ pub enum EngineError {
     /// An error occurred during Wasmtime runtime operations.
     #[error("WASM runtime error: {0}")]
     WasmRuntime(#[from] wasmtime::Error),
+
+    /// An active component failed while executing cooperative runtime work.
+    #[error(
+        "component `{component_id}` in extension `{extension_id}` failed runtime polling: {reason}"
+    )]
+    RuntimePollFailed {
+        /// Logical extension owning the component.
+        extension_id: String,
+        /// Component that failed during the runtime pump.
+        component_id: String,
+        /// Component-reported execution failure.
+        reason: String,
+    },
 
     /// Portable UI registration, lifecycle, patching, or action validation failed.
     #[error("portable UI error: {0}")]

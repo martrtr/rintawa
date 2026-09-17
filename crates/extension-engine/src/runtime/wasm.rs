@@ -2,12 +2,14 @@
 //!
 //! Provides sandboxed Component Model lifecycle execution for Rintawa WASM extensions.
 
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
+    net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream},
     path::Path,
+    sync::{Arc, Mutex, MutexGuard, TryLockError},
+    time::{Duration, Instant},
 };
 
 use rintawa_sdk::{
@@ -19,6 +21,7 @@ use rintawa_sdk::{
     contributions::{ContributionDescriptor, ContributionKind},
     errors::{ExtensionError, ExtensionResult},
     runtime_effects::RuntimeEffect,
+    runtime_permissions::RuntimePermission,
     secrets::{SecretAccessError, SecretPath, SecretPathPattern},
     services::ServiceCallError,
     traits::Component,
@@ -41,12 +44,14 @@ use crate::{
     },
     errors::{EngineError, EngineResult},
     execution_targets::ExecutionTargetRegistry,
+    runtime_permissions::RuntimePermissionManager,
     secrets::SecretManager,
     services::ServiceRuntime,
 };
 use rintawa_ui_runtime::UiRuntime;
 
 const TARGET_PROVIDER_EXPORT_NAME: &str = "rintawa:engine/target-provider@0.0.1";
+const TASK_HANDLER_EXPORT_NAME: &str = "rintawa:engine/task-handler@0.0.1";
 
 #[derive(Default)]
 struct JsonSizeCounter {
@@ -91,6 +96,16 @@ pub struct WasmExecutionBudget {
     pub max_host_message_bytes: usize,
     /// Maximum bytes returned by one bounded target-artifact resource read.
     pub max_artifact_read_bytes: usize,
+    /// Maximum cooperative background tasks owned by one WASM component.
+    pub max_background_tasks: usize,
+    /// Smallest periodic task interval accepted from a guest.
+    pub min_background_task_interval_ms: u32,
+    /// Maximum live loopback listener/stream handles owned by one component.
+    pub max_network_handles: usize,
+    /// Maximum payload accepted by one loopback read or write.
+    pub max_network_io_bytes: usize,
+    /// Maximum time a loopback connect host call may block.
+    pub loopback_connect_timeout_ms: u64,
 }
 
 impl Default for WasmExecutionBudget {
@@ -105,6 +120,11 @@ impl Default for WasmExecutionBudget {
             fuel_per_callback: 10_000_000,
             max_host_message_bytes: 1024 * 1024,
             max_artifact_read_bytes: 8 * 1024 * 1024,
+            max_background_tasks: 8,
+            min_background_task_interval_ms: 10,
+            max_network_handles: 64,
+            max_network_io_bytes: 64 * 1024,
+            loopback_connect_timeout_ms: 250,
         }
     }
 }
@@ -147,6 +167,15 @@ mod target_provider_bindings {
     });
 }
 
+#[allow(missing_docs)]
+mod task_bindings {
+    wasmtime::component::bindgen!({
+        path: "wit/engine.wit",
+        world: "task-plugin",
+        async: false,
+    });
+}
+
 use bindings::Plugin;
 use bindings::rintawa::engine::{
     execution_targets::{
@@ -154,6 +183,10 @@ use bindings::rintawa::engine::{
         RegistrationError as TargetRegistrationError,
     },
     host::{Host as HostOperations, LogLevel, PublishError},
+    network::{
+        Error as NetworkError, Host as NetworkHost, Listener as WitNetworkListener,
+        ReadResult as WitNetworkReadResult,
+    },
     portable_ui::{
         Error as PortableUiError, Host as PortableUiHost, PlacementHint as WitPlacementHint,
     },
@@ -162,6 +195,7 @@ use bindings::rintawa::engine::{
         Host as RegistrationHost, ResolutionPolicy as WitResolutionPolicy,
     },
     runtime_effects::{Error as RuntimeEffectError, Host as RuntimeEffectsHost},
+    runtime_tasks::{Error as RuntimeTaskError, Host as RuntimeTasksHost},
     secrets::{Error as SecretError, Host as SecretsHost},
     services::{Error as ServiceTransportError, Host as ServicesHost},
 };
@@ -169,6 +203,7 @@ use target_provider_bindings::TargetProviderPlugin;
 use target_provider_bindings::exports::rintawa::engine::target_provider::{
     ComponentDescriptor as WitTargetComponentDescriptor, Error as WitTargetError,
 };
+use task_bindings::TaskPlugin;
 
 /// Internal host state stored inside the Wasmtime Store context.
 pub struct WasmHostState {
@@ -183,6 +218,19 @@ pub struct WasmHostState {
     effect_handles: HashMap<String, ActiveWasmRuntimeEffect>,
     pending_effects: Vec<WasmRuntimeEffectOperation>,
     pending_revocations: HashSet<String>,
+    runtime_permissions: RuntimePermissionManager,
+    task_access_active: bool,
+    task_handler_available: bool,
+    next_task_handle: u64,
+    active_tasks: HashMap<u64, ActiveWasmTask>,
+    network_access_active: bool,
+    next_network_handle: u64,
+    network_handles: HashMap<u64, OwnedNetworkHandle>,
+    max_background_tasks: usize,
+    min_background_task_interval_ms: u32,
+    max_network_handles: usize,
+    max_network_io_bytes: usize,
+    loopback_connect_timeout_ms: u64,
     secrets: SecretManager,
     services: ServiceRuntime,
     ui: UiRuntime,
@@ -241,6 +289,28 @@ struct ActiveWasmRuntimeEffect {
     effect: RuntimeEffect,
 }
 
+struct ActiveWasmTask {
+    owner: rintawa_sdk::contracts::ComponentRef,
+    interval: Duration,
+    next_due: Instant,
+}
+
+enum NetworkHandleKind {
+    Listener(TcpListener),
+    Stream(TcpStream),
+}
+
+struct OwnedNetworkHandle {
+    owner: rintawa_sdk::contracts::ComponentRef,
+    kind: NetworkHandleKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RuntimePermissionCheck {
+    Denied,
+    Unavailable,
+}
+
 impl WasmHostState {
     /// Creates a new host state instance.
     pub fn new(component_id: ComponentId) -> Self {
@@ -251,6 +321,8 @@ impl WasmHostState {
             secrets,
             services,
             UiRuntime::new(),
+            RuntimePermissionManager::default(),
+            false,
             &WasmExecutionBudget::default(),
         )
     }
@@ -263,6 +335,8 @@ impl WasmHostState {
             secrets,
             services,
             UiRuntime::new(),
+            RuntimePermissionManager::default(),
+            false,
             &WasmExecutionBudget::default(),
         )
     }
@@ -272,6 +346,8 @@ impl WasmHostState {
         secrets: SecretManager,
         services: ServiceRuntime,
         ui: UiRuntime,
+        runtime_permissions: RuntimePermissionManager,
+        task_handler_available: bool,
         budget: &WasmExecutionBudget,
     ) -> Self {
         Self {
@@ -286,6 +362,19 @@ impl WasmHostState {
             effect_handles: HashMap::new(),
             pending_effects: Vec::new(),
             pending_revocations: HashSet::new(),
+            runtime_permissions,
+            task_access_active: false,
+            task_handler_available,
+            next_task_handle: 0,
+            active_tasks: HashMap::new(),
+            network_access_active: false,
+            next_network_handle: 0,
+            network_handles: HashMap::new(),
+            max_background_tasks: budget.max_background_tasks,
+            min_background_task_interval_ms: budget.min_background_task_interval_ms,
+            max_network_handles: budget.max_network_handles,
+            max_network_io_bytes: budget.max_network_io_bytes,
+            loopback_connect_timeout_ms: budget.loopback_connect_timeout_ms,
             secrets,
             services,
             ui,
@@ -343,6 +432,14 @@ impl WasmHostState {
     }
 
     fn begin_target_component_registration(&mut self) -> ExtensionResult<()> {
+        self.execution_owner = None;
+        self.runtime_effects_active = false;
+        self.task_access_active = false;
+        self.network_access_active = false;
+        self.secret_access_active = false;
+        self.service_access_active = false;
+        self.ui_access_active = false;
+        self.execution_target_registration_active = false;
         if self.registration_scope.is_some() {
             return Err(ExtensionError::Message(String::from(
                 "WASM target-component registration is already in progress",
@@ -427,6 +524,8 @@ impl WasmHostState {
         self.registration_scope = None;
         self.execution_owner = None;
         self.runtime_effects_active = false;
+        self.task_access_active = false;
+        self.network_access_active = false;
         self.pending_effects.clear();
         self.pending_revocations.clear();
         self.secret_access_active = false;
@@ -609,6 +708,8 @@ impl WasmHostState {
     fn begin_guest_execution(&mut self) {
         self.execution_owner = self.registered_owner();
         self.runtime_effects_active = true;
+        self.task_access_active = true;
+        self.network_access_active = true;
         self.secret_access_active = true;
         self.service_access_active = true;
         self.ui_access_active = true;
@@ -618,6 +719,8 @@ impl WasmHostState {
     fn begin_delegated_guest_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
         self.execution_owner = Some(owner);
         self.runtime_effects_active = true;
+        self.task_access_active = false;
+        self.network_access_active = false;
         self.secret_access_active = true;
         self.service_access_active = true;
         self.ui_access_active = true;
@@ -637,6 +740,8 @@ impl WasmHostState {
     fn begin_service_execution(&mut self) {
         self.execution_owner = self.registered_owner();
         self.runtime_effects_active = false;
+        self.task_access_active = false;
+        self.network_access_active = false;
         self.secret_access_active = true;
         self.service_access_active = true;
         self.ui_access_active = true;
@@ -645,6 +750,8 @@ impl WasmHostState {
     fn begin_delegated_service_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
         self.execution_owner = Some(owner);
         self.runtime_effects_active = false;
+        self.task_access_active = false;
+        self.network_access_active = false;
         self.secret_access_active = true;
         self.service_access_active = true;
         self.ui_access_active = true;
@@ -652,6 +759,8 @@ impl WasmHostState {
 
     fn finish_service_execution(&mut self) {
         self.execution_owner = None;
+        self.task_access_active = false;
+        self.network_access_active = false;
         self.secret_access_active = false;
         self.service_access_active = false;
         self.ui_access_active = false;
@@ -661,6 +770,8 @@ impl WasmHostState {
     /// Closes guest access before committing its queued runtime effects.
     fn finish_guest_execution(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
         self.runtime_effects_active = false;
+        self.task_access_active = false;
+        self.network_access_active = false;
         self.secret_access_active = false;
         self.service_access_active = false;
         self.ui_access_active = false;
@@ -775,6 +886,7 @@ impl WasmHostState {
         self.discard_guest_execution();
         self.effect_handles
             .retain(|_, effect| effect.owner != owner);
+        self.revoke_runtime_resources_for_owner(&owner);
         if let Err(cleanup_error) = ctx.revoke_all_runtime_effects() {
             return ExtensionError::RuntimeEffectCleanupFailed {
                 operation: operation_error.to_string(),
@@ -789,6 +901,88 @@ impl WasmHostState {
             .retain(|_, effect| &effect.owner != owner);
         self.pending_revocations
             .retain(|handle| self.effect_handles.contains_key(handle));
+    }
+
+    fn root_runtime_owner(&self) -> Option<rintawa_sdk::contracts::ComponentRef> {
+        let current = self.current_execution_owner()?;
+        let registered = self.registered_owner()?;
+        (current == &registered).then_some(registered)
+    }
+
+    fn runtime_permission_owner(
+        &self,
+        permission: RuntimePermission,
+    ) -> Result<rintawa_sdk::contracts::ComponentRef, RuntimePermissionCheck> {
+        let owner = self
+            .root_runtime_owner()
+            .ok_or(RuntimePermissionCheck::Denied)?;
+        match self.runtime_permissions.has_grant(&owner, permission) {
+            Ok(true) => Ok(owner),
+            Ok(false) => Err(RuntimePermissionCheck::Denied),
+            Err(()) => Err(RuntimePermissionCheck::Unavailable),
+        }
+    }
+
+    fn allocate_network_handle(
+        &mut self,
+        owner: rintawa_sdk::contracts::ComponentRef,
+        kind: NetworkHandleKind,
+    ) -> Result<u64, NetworkError> {
+        let owned_count = self
+            .network_handles
+            .values()
+            .filter(|resource| resource.owner == owner)
+            .count();
+        if owned_count >= self.max_network_handles {
+            return Err(NetworkError::LimitExceeded);
+        }
+        let handle = self.next_network_handle;
+        self.next_network_handle = self
+            .next_network_handle
+            .checked_add(1)
+            .ok_or(NetworkError::Unavailable)?;
+        self.network_handles
+            .insert(handle, OwnedNetworkHandle { owner, kind });
+        Ok(handle)
+    }
+
+    fn revoke_runtime_resources_for_owner(&mut self, owner: &rintawa_sdk::contracts::ComponentRef) {
+        self.active_tasks.retain(|_, task| &task.owner != owner);
+        self.network_handles
+            .retain(|_, resource| &resource.owner != owner);
+    }
+
+    fn next_task_due_in(
+        &self,
+        owner: &rintawa_sdk::contracts::ComponentRef,
+        now: Instant,
+    ) -> Option<Duration> {
+        self.active_tasks
+            .values()
+            .filter(|task| &task.owner == owner)
+            .map(|task| task.next_due.saturating_duration_since(now))
+            .min()
+    }
+
+    fn due_task_handles(
+        &self,
+        owner: &rintawa_sdk::contracts::ComponentRef,
+        now: Instant,
+    ) -> Vec<u64> {
+        let mut handles: Vec<_> = self
+            .active_tasks
+            .iter()
+            .filter(|(_, task)| &task.owner == owner && task.next_due <= now)
+            .map(|(handle, _)| *handle)
+            .collect();
+        handles.sort_unstable();
+        handles
+    }
+
+    fn reschedule_task(&mut self, handle: u64, now: Instant) {
+        if let Some(task) = self.active_tasks.get_mut(&handle) {
+            task.next_due = now + task.interval;
+        }
     }
 
     fn queue_ui_surface(
@@ -1122,6 +1316,248 @@ impl RuntimeEffectsHost for WasmHostState {
     }
 }
 
+impl RuntimeTasksHost for WasmHostState {
+    fn spawn_periodic(&mut self, interval_ms: u32) -> Result<u64, RuntimeTaskError> {
+        if !self.task_access_active {
+            return Err(RuntimeTaskError::RuntimeNotActive);
+        }
+        if !self.task_handler_available {
+            return Err(RuntimeTaskError::Unavailable);
+        }
+        let owner = self
+            .runtime_permission_owner(RuntimePermission::BackgroundTask)
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => RuntimeTaskError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => RuntimeTaskError::Unavailable,
+            })?;
+        if interval_ms < self.min_background_task_interval_ms || interval_ms == 0 {
+            return Err(RuntimeTaskError::InvalidInterval);
+        }
+        let owned_count = self
+            .active_tasks
+            .values()
+            .filter(|task| task.owner == owner)
+            .count();
+        if owned_count >= self.max_background_tasks {
+            return Err(RuntimeTaskError::LimitExceeded);
+        }
+        let handle = self.next_task_handle;
+        self.next_task_handle = self
+            .next_task_handle
+            .checked_add(1)
+            .ok_or(RuntimeTaskError::Unavailable)?;
+        let interval = Duration::from_millis(u64::from(interval_ms));
+        self.active_tasks.insert(
+            handle,
+            ActiveWasmTask {
+                owner,
+                interval,
+                next_due: Instant::now() + interval,
+            },
+        );
+        Ok(handle)
+    }
+
+    fn cancel(&mut self, handle: u64) -> Result<(), RuntimeTaskError> {
+        if !self.task_access_active {
+            return Err(RuntimeTaskError::RuntimeNotActive);
+        }
+        let owner = self
+            .runtime_permission_owner(RuntimePermission::BackgroundTask)
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => RuntimeTaskError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => RuntimeTaskError::Unavailable,
+            })?;
+        let Some(task) = self.active_tasks.get(&handle) else {
+            return Err(RuntimeTaskError::UnknownTask);
+        };
+        if task.owner != owner {
+            return Err(RuntimeTaskError::UnknownTask);
+        }
+        self.active_tasks.remove(&handle);
+        Ok(())
+    }
+}
+
+impl NetworkHost for WasmHostState {
+    fn listen_loopback(&mut self, port: u16) -> Result<WitNetworkListener, NetworkError> {
+        if !self.network_access_active {
+            return Err(NetworkError::AccessNotActive);
+        }
+        let owner = self
+            .runtime_permission_owner(RuntimePermission::LoopbackListen)
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => NetworkError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => NetworkError::Unavailable,
+            })?;
+        let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+        let listener = TcpListener::bind(address).map_err(|_| NetworkError::Unavailable)?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| NetworkError::Unavailable)?;
+        let bound_port = listener
+            .local_addr()
+            .map_err(|_| NetworkError::Unavailable)?
+            .port();
+        let handle = self.allocate_network_handle(owner, NetworkHandleKind::Listener(listener))?;
+        Ok(WitNetworkListener {
+            handle,
+            port: bound_port,
+        })
+    }
+
+    fn connect_loopback(&mut self, port: u16) -> Result<u64, NetworkError> {
+        if !self.network_access_active {
+            return Err(NetworkError::AccessNotActive);
+        }
+        if port == 0 {
+            return Err(NetworkError::InvalidPort);
+        }
+        let owner = self
+            .runtime_permission_owner(RuntimePermission::LoopbackConnect)
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => NetworkError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => NetworkError::Unavailable,
+            })?;
+        let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+        let stream = TcpStream::connect_timeout(
+            &address.into(),
+            Duration::from_millis(self.loopback_connect_timeout_ms),
+        )
+        .map_err(|_| NetworkError::Unavailable)?;
+        stream
+            .set_nonblocking(true)
+            .map_err(|_| NetworkError::Unavailable)?;
+        self.allocate_network_handle(owner, NetworkHandleKind::Stream(stream))
+    }
+
+    fn accept(&mut self, listener: u64) -> Result<Option<u64>, NetworkError> {
+        if !self.network_access_active {
+            return Err(NetworkError::AccessNotActive);
+        }
+        let owner = self
+            .root_runtime_owner()
+            .ok_or(NetworkError::PermissionDenied)?;
+        if self
+            .network_handles
+            .values()
+            .filter(|resource| resource.owner == owner)
+            .count()
+            >= self.max_network_handles
+        {
+            return Err(NetworkError::LimitExceeded);
+        }
+        let accepted = {
+            let Some(resource) = self.network_handles.get(&listener) else {
+                return Err(NetworkError::UnknownHandle);
+            };
+            if resource.owner != owner {
+                return Err(NetworkError::UnknownHandle);
+            }
+            let NetworkHandleKind::Listener(listener) = &resource.kind else {
+                return Err(NetworkError::WrongKind);
+            };
+            match listener.accept() {
+                Ok((stream, _)) => Some(stream),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => None,
+                Err(_) => return Err(NetworkError::Unavailable),
+            }
+        };
+        let Some(stream) = accepted else {
+            return Ok(None);
+        };
+        stream
+            .set_nonblocking(true)
+            .map_err(|_| NetworkError::Unavailable)?;
+        self.allocate_network_handle(owner, NetworkHandleKind::Stream(stream))
+            .map(Some)
+    }
+
+    fn read(&mut self, socket: u64, max_bytes: u32) -> Result<WitNetworkReadResult, NetworkError> {
+        if !self.network_access_active {
+            return Err(NetworkError::AccessNotActive);
+        }
+        let owner = self
+            .root_runtime_owner()
+            .ok_or(NetworkError::PermissionDenied)?;
+        let requested = usize::try_from(max_bytes).map_err(|_| NetworkError::MessageTooLarge)?;
+        if requested > self.max_network_io_bytes {
+            return Err(NetworkError::MessageTooLarge);
+        }
+        let Some(resource) = self.network_handles.get_mut(&socket) else {
+            return Err(NetworkError::UnknownHandle);
+        };
+        if resource.owner != owner {
+            return Err(NetworkError::UnknownHandle);
+        }
+        let NetworkHandleKind::Stream(stream) = &mut resource.kind else {
+            return Err(NetworkError::WrongKind);
+        };
+        if requested == 0 {
+            return Ok(WitNetworkReadResult {
+                data: Vec::new(),
+                eof: false,
+            });
+        }
+        let mut data = vec![0_u8; requested];
+        match stream.read(&mut data) {
+            Ok(0) => Ok(WitNetworkReadResult {
+                data: Vec::new(),
+                eof: true,
+            }),
+            Ok(read) => {
+                data.truncate(read);
+                Ok(WitNetworkReadResult { data, eof: false })
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => Err(NetworkError::WouldBlock),
+            Err(_) => Err(NetworkError::Unavailable),
+        }
+    }
+
+    fn write(&mut self, socket: u64, data: Vec<u8>) -> Result<u32, NetworkError> {
+        if !self.network_access_active {
+            return Err(NetworkError::AccessNotActive);
+        }
+        let owner = self
+            .root_runtime_owner()
+            .ok_or(NetworkError::PermissionDenied)?;
+        if data.len() > self.max_network_io_bytes {
+            return Err(NetworkError::MessageTooLarge);
+        }
+        let Some(resource) = self.network_handles.get_mut(&socket) else {
+            return Err(NetworkError::UnknownHandle);
+        };
+        if resource.owner != owner {
+            return Err(NetworkError::UnknownHandle);
+        }
+        let NetworkHandleKind::Stream(stream) = &mut resource.kind else {
+            return Err(NetworkError::WrongKind);
+        };
+        match stream.write(&data) {
+            Ok(written) => u32::try_from(written).map_err(|_| NetworkError::MessageTooLarge),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => Err(NetworkError::WouldBlock),
+            Err(_) => Err(NetworkError::Unavailable),
+        }
+    }
+
+    fn close(&mut self, handle: u64) -> Result<(), NetworkError> {
+        if !self.network_access_active {
+            return Err(NetworkError::AccessNotActive);
+        }
+        let owner = self
+            .root_runtime_owner()
+            .ok_or(NetworkError::PermissionDenied)?;
+        let Some(resource) = self.network_handles.get(&handle) else {
+            return Err(NetworkError::UnknownHandle);
+        };
+        if resource.owner != owner {
+            return Err(NetworkError::UnknownHandle);
+        }
+        self.network_handles.remove(&handle);
+        Ok(())
+    }
+}
+
 impl SecretsHost for WasmHostState {
     fn read(&mut self, path: String) -> Result<String, SecretError> {
         self.read_secret(path)
@@ -1241,6 +1677,7 @@ pub struct WasmRuntimeEngine {
     services: ServiceRuntime,
     ui: UiRuntime,
     execution_targets: ExecutionTargetRegistry,
+    runtime_permissions: RuntimePermissionManager,
     budget: WasmExecutionBudget,
 }
 
@@ -1294,6 +1731,7 @@ impl WasmRuntimeEngine {
             services,
             UiRuntime::new(),
             ExecutionTargetRegistry::default(),
+            RuntimePermissionManager::default(),
             budget,
         )
     }
@@ -1303,12 +1741,14 @@ impl WasmRuntimeEngine {
         services: ServiceRuntime,
         ui: UiRuntime,
         execution_targets: ExecutionTargetRegistry,
+        runtime_permissions: RuntimePermissionManager,
     ) -> EngineResult<Self> {
         Self::with_host_services_and_budget(
             secrets,
             services,
             ui,
             execution_targets,
+            runtime_permissions,
             WasmExecutionBudget::default(),
         )
     }
@@ -1318,6 +1758,7 @@ impl WasmRuntimeEngine {
         services: ServiceRuntime,
         ui: UiRuntime,
         execution_targets: ExecutionTargetRegistry,
+        runtime_permissions: RuntimePermissionManager,
         budget: WasmExecutionBudget,
     ) -> EngineResult<Self> {
         let mut config = wasmtime::Config::new();
@@ -1333,6 +1774,7 @@ impl WasmRuntimeEngine {
             services,
             ui,
             execution_targets,
+            runtime_permissions,
             budget,
         })
     }
@@ -1351,6 +1793,10 @@ impl WasmRuntimeEngine {
     ) -> EngineResult<WasmComponent> {
         self.ensure_component_size(&id, bytes.len())?;
         let component = WasmtimeComponent::new(&self.engine, bytes)?;
+        let task_handler_available = component
+            .component_type()
+            .get_export(&self.engine, TASK_HANDLER_EXPORT_NAME)
+            .is_some();
         let mut linker = Linker::new(&self.engine);
 
         Plugin::add_to_linker(&mut linker, |state: &mut WasmHostState| state)?;
@@ -1364,6 +1810,8 @@ impl WasmRuntimeEngine {
             services: self.services.clone(),
             ui: self.ui.clone(),
             execution_targets: self.execution_targets.clone(),
+            runtime_permissions: self.runtime_permissions.clone(),
+            task_handler_available,
             budget: self.budget.clone(),
             runtime: Arc::new(Mutex::new(WasmSharedRuntime {
                 instance: None,
@@ -1423,6 +1871,8 @@ pub struct WasmComponent {
     services: ServiceRuntime,
     ui: UiRuntime,
     execution_targets: ExecutionTargetRegistry,
+    runtime_permissions: RuntimePermissionManager,
+    task_handler_available: bool,
     budget: WasmExecutionBudget,
     runtime: Arc<Mutex<WasmSharedRuntime>>,
 }
@@ -1433,6 +1883,18 @@ impl WasmComponent {
             .component_type()
             .get_export(&self.engine, TARGET_PROVIDER_EXPORT_NAME)
             .is_some()
+    }
+
+    fn ensure_task_handler(instance: &mut WasmInstance) -> ExtensionResult<()> {
+        if instance.task_handler.is_none() {
+            let handler = TaskPlugin::new(&mut instance.store, &instance.instance).map_err(|error| {
+                ExtensionError::Message(format!(
+                    "WASM component scheduled a runtime task without task-handler exports: {error}"
+                ))
+            })?;
+            instance.task_handler = Some(handler);
+        }
+        Ok(())
     }
 }
 
@@ -1451,6 +1913,7 @@ struct WasmInstance {
     instance: Instance,
     plugin: Plugin,
     target_provider: Option<TargetProviderPlugin>,
+    task_handler: Option<TaskPlugin>,
 }
 
 #[derive(Clone)]
@@ -1682,6 +2145,10 @@ impl WasmTargetProviderEndpoint {
             .store
             .data_mut()
             .forget_effect_handles_for_owner(&owner);
+        instance
+            .store
+            .data_mut()
+            .revoke_runtime_resources_for_owner(&owner);
         result
     }
 
@@ -1927,6 +2394,8 @@ impl WasmComponent {
                 self.secrets.clone(),
                 self.services.clone(),
                 self.ui.clone(),
+                self.runtime_permissions.clone(),
+                self.task_handler_available,
                 &self.budget,
             );
             let mut store = Store::new(&self.engine, host_state);
@@ -1944,6 +2413,7 @@ impl WasmComponent {
                 instance,
                 plugin,
                 target_provider: None,
+                task_handler: None,
             });
         }
 
@@ -2148,8 +2618,15 @@ impl Component for WasmComponent {
                         .call_stop(&mut instance.store)
                         .map_err(|err| Self::execution_error("stop", err))
                 });
+            let owner = instance.store.data().registered_owner();
             instance.store.data_mut().discard_guest_execution();
             instance.store.data_mut().effect_handles.clear();
+            if let Some(owner) = owner {
+                instance
+                    .store
+                    .data_mut()
+                    .revoke_runtime_resources_for_owner(&owner);
+            }
             result
         } else {
             return Ok(());
@@ -2162,6 +2639,71 @@ impl Component for WasmComponent {
         }
 
         Ok(())
+    }
+
+    fn poll_runtime(
+        &mut self,
+        ctx: &mut dyn ComponentContext,
+    ) -> ExtensionResult<Option<Duration>> {
+        let owner = rintawa_sdk::contracts::ComponentRef::new(
+            ctx.extension_instance_id().clone(),
+            ctx.component_id().clone(),
+        );
+        let budget = self.budget.clone();
+        let mut guest_failed = false;
+        let mut runtime = self.runtime()?;
+        let result = {
+            let instance = self.ensure_instance(&mut runtime)?;
+            instance.store.data().validate_execution_owner(ctx)?;
+            let now = Instant::now();
+            let due = instance.store.data().due_task_handles(&owner, now);
+            if due.is_empty() {
+                Ok(instance.store.data().next_task_due_in(&owner, now))
+            } else {
+                Self::ensure_task_handler(instance)?;
+                let mut failure = None;
+                for handle in due {
+                    if !instance.store.data().active_tasks.contains_key(&handle) {
+                        continue;
+                    }
+                    Self::set_callback_fuel(&mut instance.store, &budget, "runtime task")?;
+                    instance.store.data_mut().begin_guest_execution();
+                    let callback = match instance.task_handler.as_ref() {
+                        Some(handler) => handler
+                            .rintawa_engine_task_handler()
+                            .call_on_task(&mut instance.store, handle)
+                            .map_err(|error| Self::execution_error("runtime task", error)),
+                        None => Err(ExtensionError::Message(String::from(
+                            "task-handler export view is unavailable",
+                        ))),
+                    };
+                    if let Err(error) = callback {
+                        failure = Some(instance.store.data_mut().abort_guest_execution(ctx, error));
+                        break;
+                    }
+                    if let Err(error) = instance.store.data_mut().finish_guest_execution(ctx) {
+                        failure = Some(instance.store.data_mut().abort_guest_execution(ctx, error));
+                        break;
+                    }
+                    instance
+                        .store
+                        .data_mut()
+                        .reschedule_task(handle, Instant::now());
+                }
+                if let Some(error) = failure {
+                    guest_failed = true;
+                    Err(error)
+                } else {
+                    let now = Instant::now();
+                    Ok(instance.store.data().next_task_due_in(&owner, now))
+                }
+            }
+        };
+        if guest_failed {
+            runtime.instance = None;
+            runtime.failed_lifecycle_callback = Some("runtime task");
+        }
+        result
     }
 
     fn handle_ui_action(
@@ -2399,6 +2941,8 @@ mod tests {
             secrets,
             services,
             UiRuntime::new(),
+            RuntimePermissionManager::default(),
+            false,
             &budget,
         );
         begin_test_registration(&mut state, ExtensionId::new("example.extension"));
@@ -2436,6 +2980,8 @@ mod tests {
             secrets,
             services,
             UiRuntime::new(),
+            RuntimePermissionManager::default(),
+            false,
             &budget,
         );
         begin_test_registration(&mut state, ExtensionId::new("example.extension"));
@@ -2804,6 +3350,149 @@ mod tests {
 
         state.discard_guest_execution();
         assert!(state.pending_execution_targets.is_empty());
+    }
+
+    #[test]
+    fn test_should_require_explicit_runtime_permission_for_background_tasks() {
+        let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
+        begin_test_registration(&mut state, ExtensionId::new("rintawa.chat"));
+        state.finish_registration().unwrap();
+        state.task_handler_available = true;
+        state.begin_guest_execution();
+
+        assert!(matches!(
+            RuntimeTasksHost::spawn_periodic(&mut state, 10),
+            Err(RuntimeTaskError::PermissionDenied)
+        ));
+
+        let owner = state.registered_owner().unwrap();
+        state
+            .runtime_permissions
+            .grant(owner, RuntimePermission::BackgroundTask)
+            .unwrap();
+        let handle = RuntimeTasksHost::spawn_periodic(&mut state, 10).unwrap();
+        assert!(state.active_tasks.contains_key(&handle));
+        RuntimeTasksHost::cancel(&mut state, handle).unwrap();
+        assert!(state.active_tasks.is_empty());
+    }
+
+    #[test]
+    fn test_should_bound_background_task_count_and_interval() {
+        let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
+        begin_test_registration(&mut state, ExtensionId::new("rintawa.chat"));
+        state.finish_registration().unwrap();
+        state.task_handler_available = true;
+        state.max_background_tasks = 1;
+        state.min_background_task_interval_ms = 25;
+        let owner = state.registered_owner().unwrap();
+        state
+            .runtime_permissions
+            .grant(owner, RuntimePermission::BackgroundTask)
+            .unwrap();
+        state.begin_guest_execution();
+
+        assert!(matches!(
+            RuntimeTasksHost::spawn_periodic(&mut state, 10),
+            Err(RuntimeTaskError::InvalidInterval)
+        ));
+        let _ = RuntimeTasksHost::spawn_periodic(&mut state, 25).unwrap();
+        assert!(matches!(
+            RuntimeTasksHost::spawn_periodic(&mut state, 25),
+            Err(RuntimeTaskError::LimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn test_should_not_expose_task_or_network_capabilities_to_delegated_principal() {
+        let mut state = WasmHostState::new(ComponentId::new("provider-runtime"));
+        begin_test_registration(&mut state, ExtensionId::new("runtime.provider"));
+        state.finish_registration().unwrap();
+        state.task_handler_available = true;
+        let root_owner = state.registered_owner().unwrap();
+        state
+            .runtime_permissions
+            .grant(root_owner.clone(), RuntimePermission::BackgroundTask)
+            .unwrap();
+        state
+            .runtime_permissions
+            .grant(root_owner, RuntimePermission::LoopbackListen)
+            .unwrap();
+
+        state.task_access_active = true;
+        state.network_access_active = true;
+        state.begin_delegated_guest_execution(rintawa_sdk::contracts::ComponentRef::new(
+            "dependent-instance",
+            "hosted-component",
+        ));
+        assert!(matches!(
+            RuntimeTasksHost::spawn_periodic(&mut state, 10),
+            Err(RuntimeTaskError::RuntimeNotActive)
+        ));
+        assert!(matches!(
+            NetworkHost::listen_loopback(&mut state, 0),
+            Err(NetworkError::AccessNotActive)
+        ));
+    }
+
+    #[test]
+    fn test_should_exchange_bounded_bytes_through_owner_scoped_loopback_handles() {
+        let mut state = WasmHostState::new(ComponentId::new("runtime"));
+        begin_test_registration(&mut state, ExtensionId::new("runtime.provider"));
+        state.finish_registration().unwrap();
+        let owner = state.registered_owner().unwrap();
+        state
+            .runtime_permissions
+            .grant(owner.clone(), RuntimePermission::LoopbackListen)
+            .unwrap();
+        state
+            .runtime_permissions
+            .grant(owner.clone(), RuntimePermission::LoopbackConnect)
+            .unwrap();
+        state.begin_guest_execution();
+
+        let listener = NetworkHost::listen_loopback(&mut state, 0).unwrap();
+        assert_ne!(listener.port, 0);
+        let client = NetworkHost::connect_loopback(&mut state, listener.port).unwrap();
+        let server = (0..50)
+            .find_map(|_| match NetworkHost::accept(&mut state, listener.handle) {
+                Ok(Some(handle)) => Some(handle),
+                Ok(None) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    None
+                }
+                Err(error) => panic!("loopback accept failed: {error:?}"),
+            })
+            .expect("loopback connection should become acceptable");
+
+        let empty_read = NetworkHost::read(&mut state, server, 0)
+            .expect("zero-length read should validate the handle without consuming the stream");
+        assert!(empty_read.data.is_empty());
+        assert!(!empty_read.eof);
+
+        assert!(matches!(
+            NetworkHost::write(&mut state, client, b"ping".to_vec()),
+            Ok(4)
+        ));
+        let received = (0..50)
+            .find_map(|_| match NetworkHost::read(&mut state, server, 16) {
+                Ok(result) if !result.data.is_empty() => Some(result),
+                Ok(_) | Err(NetworkError::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    None
+                }
+                Err(error) => panic!("loopback read failed: {error:?}"),
+            })
+            .expect("loopback payload should become readable");
+        assert_eq!(received.data, b"ping");
+        assert!(!received.eof);
+
+        state.max_network_io_bytes = 3;
+        assert!(matches!(
+            NetworkHost::write(&mut state, client, b"four".to_vec()),
+            Err(NetworkError::MessageTooLarge)
+        ));
+        state.revoke_runtime_resources_for_owner(&owner);
+        assert!(state.network_handles.is_empty());
     }
 
     #[test]

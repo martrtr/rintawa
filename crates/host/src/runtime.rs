@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
 use rintawa_extension_engine::{
     ActivationPlanError, EngineError, ExtensionEngine, RtwExtensionLoadOutcome, RtwExtensionLoader,
@@ -91,11 +91,24 @@ impl HostRuntime {
                         activation.scope_id.clone(),
                     )? {
                         RtwExtensionLoadOutcome::Loaded(loaded) => {
+                            // Registration is already a completed lifecycle transition.
+                            // Record it before applying any fallible host policy so startup
+                            // rollback always unregisters this instance explicitly.
+                            registered_set.insert(activation.instance_id.clone());
+                            registered.push(activation.instance_id.clone());
                             if loaded.can_publish_execution_targets {
                                 bootstrap_instances.insert(activation.instance_id.clone());
                             }
-                            registered_set.insert(activation.instance_id.clone());
-                            registered.push(activation.instance_id);
+                            for grant in profile.runtime_permissions.iter().filter(|grant| {
+                                grant.scope_id == activation.scope_id
+                                    && grant.instance_id == activation.instance_id
+                            }) {
+                                engine.grant_requested_runtime_permission_for_instance(
+                                    &activation.instance_id,
+                                    &grant.component_id,
+                                    grant.permission,
+                                )?;
+                            }
                             made_progress = true;
                         }
                         RtwExtensionLoadOutcome::Deferred(waiting) => {
@@ -248,6 +261,14 @@ impl HostRuntime {
     /// `None` is a valid headless composition with no eligible Host Shell provider.
     pub fn host_shell_provider(&self) -> Option<&ComponentRef> {
         self.host_shell_provider.as_ref()
+    }
+
+    /// Executes one cooperative runtime pump for active baseline components.
+    ///
+    /// The returned duration is the earliest requested next wake-up. `None` means
+    /// no active component currently owns scheduled cooperative work.
+    pub fn poll_runtime(&mut self) -> HostResult<Option<Duration>> {
+        Ok(self.engine.poll_runtime()?)
     }
 
     /// Stops and unregisters every baseline runtime instance in reverse activation order.

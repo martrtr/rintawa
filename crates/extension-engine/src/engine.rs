@@ -5,6 +5,7 @@ use rintawa_sdk::{
     contributions::ContributionDescriptor,
     manifest::ExtensionManifest,
     runtime_effects::RuntimeEffect,
+    runtime_permissions::RuntimePermission,
     secrets::SecretPathPattern,
     traits::Component,
     types::{
@@ -18,6 +19,7 @@ use rintawa_ui_runtime::{UiPresentationSurface, UiRuntime};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use crate::{
@@ -34,6 +36,7 @@ use crate::{
     execution_targets::{ExecutionTargetDependency, ExecutionTargetRegistry},
     runtime::WasmRuntimeEngine,
     runtime_effects::RuntimeEffectRegistry,
+    runtime_permissions::RuntimePermissionManager,
     secrets::SecretManager,
     services::{ComponentHandle, ServiceInstanceRegistration, ServiceRuntime},
 };
@@ -124,6 +127,7 @@ pub struct ExtensionEngine {
     extensions: HashMap<ExtensionInstanceId, ManagedExtension>,
     active_contributions: HashSet<(RuntimeScopeId, ContributionId)>,
     runtime_effects: RuntimeEffectRegistry,
+    runtime_permissions: RuntimePermissionManager,
     secrets: SecretManager,
     services: ServiceRuntime,
     ui: UiRuntime,
@@ -152,6 +156,7 @@ impl Default for ExtensionEngine {
             extensions: HashMap::new(),
             active_contributions: HashSet::new(),
             runtime_effects: RuntimeEffectRegistry::default(),
+            runtime_permissions: RuntimePermissionManager::default(),
             secrets,
             services,
             ui: UiRuntime::new(),
@@ -178,6 +183,7 @@ impl ExtensionEngine {
             extensions: HashMap::new(),
             active_contributions: HashSet::new(),
             runtime_effects: RuntimeEffectRegistry::default(),
+            runtime_permissions: RuntimePermissionManager::default(),
             secrets,
             services,
             ui: UiRuntime::new(),
@@ -296,6 +302,7 @@ impl ExtensionEngine {
             self.services.clone(),
             self.ui.clone(),
             self.execution_targets.clone(),
+            self.runtime_permissions.clone(),
         )
     }
 
@@ -648,6 +655,72 @@ impl ExtensionEngine {
         Ok(())
     }
 
+    /// Approves one manifest-requested runtime permission for the default instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::grant_requested_runtime_permission_for_instance`].
+    pub fn grant_requested_runtime_permission(
+        &self,
+        extension_id: &ExtensionId,
+        component_id: &ComponentId,
+        permission: RuntimePermission,
+    ) -> EngineResult<()> {
+        let instance_id = default_instance_id(extension_id);
+        if !self.extensions.contains_key(&instance_id) {
+            return Err(EngineError::ExtensionNotFound(extension_id.to_string()));
+        }
+        self.grant_requested_runtime_permission_for_instance(&instance_id, component_id, permission)
+    }
+
+    /// Approves one exact runtime permission for a concrete component principal.
+    ///
+    /// A host cannot grant a capability that the component did not request in its
+    /// manifest. The grant survives stop/restart but is removed on unregister.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::ExtensionInstanceNotFound`] for an unknown instance,
+    /// [`EngineError::RuntimePermissionComponentNotFound`] for an undeclared component,
+    /// [`EngineError::RuntimePermissionNotRequested`] when policy would expand the
+    /// manifest request, or [`EngineError::RuntimePermissionUnavailable`] when the
+    /// internal policy store cannot be accessed.
+    pub fn grant_requested_runtime_permission_for_instance(
+        &self,
+        instance_id: &ExtensionInstanceId,
+        component_id: &ComponentId,
+        permission: RuntimePermission,
+    ) -> EngineResult<()> {
+        let extension = self
+            .extensions
+            .get(instance_id)
+            .ok_or_else(|| EngineError::ExtensionInstanceNotFound(instance_id.to_string()))?;
+        let Some(component) = extension
+            .manifest
+            .components
+            .iter()
+            .find(|component| &component.id == component_id)
+        else {
+            return Err(EngineError::RuntimePermissionComponentNotFound {
+                extension_id: extension.manifest.id.to_string(),
+                component_id: component_id.to_string(),
+            });
+        };
+        if !component.permissions.runtime.contains(&permission) {
+            return Err(EngineError::RuntimePermissionNotRequested {
+                extension_id: extension.manifest.id.to_string(),
+                component_id: component_id.to_string(),
+                permission: permission.to_string(),
+            });
+        }
+        self.runtime_permissions
+            .grant(
+                ComponentRef::new(instance_id.clone(), component_id.clone()),
+                permission,
+            )
+            .map_err(|()| EngineError::RuntimePermissionUnavailable)
+    }
+
     /// Activates the default runtime instance of one logical extension.
     ///
     /// # Errors
@@ -970,6 +1043,13 @@ impl ExtensionEngine {
                     component.id.clone(),
                 ));
             }
+            for component in &extension.manifest.components {
+                self.runtime_permissions
+                    .revoke_component(&ComponentRef::new(
+                        instance_id.clone(),
+                        component.id.clone(),
+                    ));
+            }
             self.services.unregister_instance(instance_id);
             self.ui.unregister_instance(instance_id);
             self.execution_targets.revoke_instance(instance_id);
@@ -1055,6 +1135,77 @@ impl ExtensionEngine {
             }
         }
         self.services.clear_preferred_provider(scope_id, contract);
+    }
+
+    /// Executes one cooperative runtime pump across every active component.
+    ///
+    /// Components are visited in stable runtime-instance/component order. The
+    /// returned duration is the earliest requested next wake-up; `None` means no
+    /// active component currently has scheduled cooperative work.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::RuntimePollFailed`] when an active component cannot
+    /// execute its due runtime work.
+    pub fn poll_runtime(&mut self) -> EngineResult<Option<Duration>> {
+        let mut components = Vec::new();
+        for extension in self
+            .extensions
+            .values()
+            .filter(|extension| extension.state == ExtensionState::Active)
+        {
+            for component in &extension.components {
+                components.push((
+                    extension.manifest.id.clone(),
+                    extension.instance_id.clone(),
+                    extension.scope_id.clone(),
+                    component.id.clone(),
+                    component.handle.clone(),
+                ));
+            }
+        }
+        components.sort_by(|left, right| {
+            left.1
+                .as_str()
+                .cmp(right.1.as_str())
+                .then_with(|| left.3.as_str().cmp(right.3.as_str()))
+        });
+
+        let mut next_wake = None;
+        for (extension_id, instance_id, scope_id, component_id, handle) in components {
+            let identity = ComponentIdentity::new(
+                extension_id.clone(),
+                instance_id,
+                scope_id,
+                component_id.clone(),
+            );
+            let mut context = EngineComponentContext::new(
+                identity,
+                &mut self.runtime_effects,
+                &self.secrets,
+                &self.services,
+                &self.ui,
+                true,
+            );
+            let delay = {
+                let mut component = handle.lock().map_err(|_| EngineError::RuntimePollFailed {
+                    extension_id: extension_id.to_string(),
+                    component_id: component_id.to_string(),
+                    reason: String::from("component lock was poisoned"),
+                })?;
+                component.poll_runtime(&mut context).map_err(|error| {
+                    EngineError::RuntimePollFailed {
+                        extension_id: extension_id.to_string(),
+                        component_id: component_id.to_string(),
+                        reason: error.to_string(),
+                    }
+                })?
+            };
+            if let Some(delay) = delay {
+                next_wake = Some(next_wake.map_or(delay, |current: Duration| current.min(delay)));
+            }
+        }
+        Ok(next_wake)
     }
 
     /// Attaches the selected portable UI Layer for an active extension component.

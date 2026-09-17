@@ -30,6 +30,7 @@ pub use crate::manifest::{
 };
 
 pub use crate::runtime_effects::RuntimeEffect;
+pub use crate::runtime_permissions::{RuntimePermission, RuntimePermissionParseError};
 
 pub use crate::secrets::{SecretAccessError, SecretPath, SecretPathPattern, SecretValue};
 
