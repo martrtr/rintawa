@@ -1,6 +1,6 @@
 //! Contract provider/consumer resolution.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt};
 
 use rintawa_sdk::contracts::{
     ComponentRef, ContractConsumer, ContractDefinition, ContractGrantRequirement, ContractKey,
@@ -34,23 +34,39 @@ pub struct ContractBinding {
     pub consumer: ComponentRef,
     /// Contract being resolved.
     pub contract: ContractKey,
+    /// Whether the consumer declared this binding as required for activation.
+    pub required: bool,
     /// Providers selected by the contract resolution policy.
     pub providers: Vec<ComponentRef>,
 }
 
-/// Reason a consumer currently has no active binding.
+/// Reason a consumer has no binding in the resolved composition set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnresolvedContractReason {
-    /// No active definition exists for the contract.
+    /// No definition exists for the contract in the resolved composition set.
     UndefinedContract,
     /// The consumer lacks one or more host grants required by its endpoint.
     ConsumerIneligible,
-    /// No active provider is registered for the contract.
+    /// No provider exists for the contract in the resolved composition set.
     NoProvider,
     /// Providers exist, but none currently satisfy their host-grant requirements.
     NoEligibleProvider,
     /// The preferred provider is not currently eligible for this contract.
     PreferredProviderUnavailable,
+}
+
+impl fmt::Display for UnresolvedContractReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UndefinedContract => formatter.write_str("undefined contract"),
+            Self::ConsumerIneligible => formatter.write_str("consumer is ineligible"),
+            Self::NoProvider => formatter.write_str("no provider"),
+            Self::NoEligibleProvider => formatter.write_str("no eligible provider"),
+            Self::PreferredProviderUnavailable => {
+                formatter.write_str("preferred provider is unavailable")
+            }
+        }
+    }
 }
 
 /// One unresolved consumer endpoint.
@@ -66,12 +82,17 @@ pub struct UnresolvedContract {
     pub reason: UnresolvedContractReason,
 }
 
-/// Current resolved and unresolved contract state.
+/// Resolved and unresolved contract state for one selected composition set.
+///
+/// The caller determines which extension instances participate in the snapshot.
+/// Active runtime snapshots, full registered-topology snapshots, and activation
+/// planning snapshots therefore share this representation without sharing
+/// availability semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CompositionSnapshot {
-    /// Active bindings.
+    /// Consumer-to-provider bindings resolved within this snapshot.
     pub bindings: Vec<ContractBinding>,
-    /// Active consumer endpoints without a binding.
+    /// Consumer endpoints that could not be bound within this snapshot.
     pub unresolved: Vec<UnresolvedContract>,
 }
 
@@ -178,6 +199,7 @@ pub(crate) fn resolve_contracts(
         snapshot.bindings.push(ContractBinding {
             consumer: owned_consumer.owner.clone(),
             contract: contract.clone(),
+            required: owned_consumer.consumer.required,
             providers: selected,
         });
     }

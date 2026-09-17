@@ -44,11 +44,14 @@ impl HostRuntime {
                 registered.push(activation.instance_id.clone());
             }
 
-            // Start order is intentionally still profile order in this commit.
-            // A deterministic dependency planner will replace this second loop.
-            for activation in activations {
-                engine.start_extension_instance(&activation.instance_id)?;
-                started.push(activation.instance_id);
+            let requested_instances: Vec<_> = activations
+                .iter()
+                .map(|activation| activation.instance_id.clone())
+                .collect();
+            let plan = engine.plan_extension_activation(&requested_instances)?;
+            for instance_id in plan.into_ordered_instances() {
+                engine.start_extension_instance(&instance_id)?;
+                started.push(instance_id);
             }
             Ok(())
         })();

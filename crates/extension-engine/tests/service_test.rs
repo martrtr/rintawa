@@ -279,19 +279,15 @@ fn test_secret_policy_revision_invalidates_cached_route() -> Result<()> {
                 .consuming(ContractConsumer::new(contract.clone(), true)),
         )],
     )?;
-    start(&mut engine, &["secured-provider", "consumer"])?;
-
-    let consumer = ComponentRef::new("consumer", "runtime");
-    assert_eq!(
-        engine.call_service(&consumer, &contract, b"ping"),
-        Err(ServiceCallError::Unavailable)
-    );
-
+    engine.start_extension(&ExtensionId::new("secured-provider"))?;
     engine.grant_requested_secret_read(
         &ExtensionId::new("secured-provider"),
         &ComponentId::new("runtime"),
         pattern,
     )?;
+    engine.start_extension(&ExtensionId::new("consumer"))?;
+
+    let consumer = ComponentRef::new("consumer", "runtime");
     assert_eq!(
         engine.call_service(&consumer, &contract, b"ping")?,
         b"secret-ready"
@@ -505,7 +501,7 @@ fn test_nested_service_cycle_is_detected_before_provider_locking() -> Result<()>
                     ContractResolutionPolicy::Single,
                 ))
                 .providing(ContractProvider::new(a.clone()))
-                .consuming(ContractConsumer::new(b.clone(), true))
+                .consuming(ContractConsumer::new(b.clone(), false))
                 .forwarding(b.clone()),
         )],
     )?;
@@ -518,7 +514,7 @@ fn test_nested_service_cycle_is_detected_before_provider_locking() -> Result<()>
                     ContractResolutionPolicy::Single,
                 ))
                 .providing(ContractProvider::new(b.clone()))
-                .consuming(ContractConsumer::new(a.clone(), true))
+                .consuming(ContractConsumer::new(a.clone(), false))
                 .expecting_cyclic(a.clone()),
         )],
     )?;

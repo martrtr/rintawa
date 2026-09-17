@@ -21,6 +21,7 @@ use std::{
 };
 
 use crate::{
+    activation::{ActivationPlan, build_activation_plan},
     composition::{
         CompositionSnapshot, OwnedContractConsumer, OwnedContractDefinition, OwnedContractProvider,
         resolve_contracts,
@@ -492,21 +493,30 @@ impl ExtensionEngine {
     /// # Errors
     ///
     /// Returns [`EngineError::ExtensionInstanceNotFound`] if the instance is not
-    /// registered, [`EngineError::LifecycleFailed`] if a component fails to start
-    /// or a contribution conflicts inside the same runtime scope, or
-    /// [`EngineError::StartupRollbackFailed`] when rollback callbacks fail.
+    /// registered, [`EngineError::ActivationPlan`] when its required composition
+    /// cannot be satisfied by already active providers, [`EngineError::LifecycleFailed`]
+    /// if a component fails to start or a contribution conflicts inside the same
+    /// runtime scope, or [`EngineError::StartupRollbackFailed`] when rollback
+    /// callbacks fail.
     pub fn start_extension_instance(
         &mut self,
         instance_id: &ExtensionInstanceId,
     ) -> EngineResult<()> {
+        let state = self
+            .extensions
+            .get(instance_id)
+            .map(|extension| extension.state)
+            .ok_or_else(|| EngineError::ExtensionInstanceNotFound(instance_id.to_string()))?;
+        if state == ExtensionState::Active {
+            return Ok(());
+        }
+
+        self.plan_extension_activation(std::slice::from_ref(instance_id))?;
+
         let (extensions, runtime_effects) = (&mut self.extensions, &mut self.runtime_effects);
         let ext = extensions
             .get_mut(instance_id)
             .ok_or_else(|| EngineError::ExtensionInstanceNotFound(instance_id.to_string()))?;
-
-        if ext.state == ExtensionState::Active {
-            return Ok(());
-        }
 
         if ext.state == ExtensionState::Stopped {
             for contrib in &ext.contributions {
@@ -986,6 +996,60 @@ impl ExtensionEngine {
         self.services.call(consumer, contract, request)
     }
 
+    /// Builds a deterministic provider-before-consumer plan for registered instances.
+    ///
+    /// The input order is used only as a stable tie-breaker between instances that
+    /// have no required dependency ordering. Contract resolution remains isolated by
+    /// runtime scope, while already active providers may satisfy dependencies without
+    /// being included in the requested batch. Registered or stopped instances outside
+    /// the requested batch do not participate in provider resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::ExtensionInstanceNotFound`] for an unknown instance,
+    /// or [`EngineError::ActivationPlan`] when required composition is unresolved,
+    /// an instance is duplicated, or required dependencies contain a cycle.
+    pub fn plan_extension_activation(
+        &self,
+        ordered_instances: &[ExtensionInstanceId],
+    ) -> EngineResult<ActivationPlan> {
+        let mut scopes = Vec::new();
+        let mut seen_scopes = HashSet::new();
+        for instance_id in ordered_instances {
+            let extension = self
+                .extensions
+                .get(instance_id)
+                .ok_or_else(|| EngineError::ExtensionInstanceNotFound(instance_id.to_string()))?;
+            if seen_scopes.insert(extension.scope_id.clone()) {
+                scopes.push(extension.scope_id.clone());
+            }
+        }
+
+        let active_instances: HashSet<_> = self
+            .extensions
+            .values()
+            .filter(|extension| extension.state == ExtensionState::Active)
+            .map(|extension| extension.instance_id.clone())
+            .collect();
+        let mut eligible_instances = active_instances.clone();
+        eligible_instances.extend(ordered_instances.iter().cloned());
+
+        let mut composition = CompositionSnapshot::default();
+        for scope_id in scopes {
+            let scoped = self.resolve_composition_for_scope(&scope_id, |extension| {
+                eligible_instances.contains(&extension.instance_id)
+            });
+            composition.bindings.extend(scoped.bindings);
+            composition.unresolved.extend(scoped.unresolved);
+        }
+
+        Ok(build_activation_plan(
+            &composition,
+            ordered_instances,
+            &active_instances,
+        )?)
+    }
+
     /// Resolves active contract composition in the default runtime scope.
     pub fn composition_snapshot(&self) -> CompositionSnapshot {
         self.composition_snapshot_for_scope(&default_scope_id())
@@ -993,15 +1057,19 @@ impl ExtensionEngine {
 
     /// Resolves active contract composition in one exact runtime scope.
     pub fn composition_snapshot_for_scope(&self, scope_id: &RuntimeScopeId) -> CompositionSnapshot {
-        self.resolve_composition_for_scope(scope_id, |state| state == ExtensionState::Active)
+        self.resolve_composition_for_scope(scope_id, |extension| {
+            extension.state == ExtensionState::Active
+        })
     }
 
     /// Resolves the registered contract topology in the default runtime scope.
     ///
     /// Unlike [`Self::composition_snapshot`], this includes declarations from
-    /// registered and stopped instances as well as active ones. It is intended
-    /// for host-side activation planning only; it does not describe currently
-    /// callable services or other live runtime availability.
+    /// registered and stopped instances as well as active ones. It is useful for
+    /// diagnostics and topology inspection, but it does not describe currently
+    /// callable services or the provider set used by an activation batch.
+    /// [`Self::plan_extension_activation`] resolves that batch from active plus
+    /// explicitly scheduled instances only.
     pub fn composition_topology_snapshot(&self) -> CompositionSnapshot {
         self.composition_topology_snapshot_for_scope(&default_scope_id())
     }
@@ -1010,7 +1078,8 @@ impl ExtensionEngine {
     ///
     /// The topology contains every loaded instance in the scope regardless of
     /// lifecycle state. Runtime routing must continue to use
-    /// [`Self::composition_snapshot_for_scope`], which is active-only.
+    /// [`Self::composition_snapshot_for_scope`], which is active-only, while
+    /// activation planning uses a separately filtered eligible instance set.
     pub fn composition_topology_snapshot_for_scope(
         &self,
         scope_id: &RuntimeScopeId,
@@ -1021,7 +1090,7 @@ impl ExtensionEngine {
     fn resolve_composition_for_scope(
         &self,
         scope_id: &RuntimeScopeId,
-        include: impl Fn(ExtensionState) -> bool,
+        include: impl Fn(&ManagedExtension) -> bool,
     ) -> CompositionSnapshot {
         let mut definitions = Vec::new();
         let mut providers = Vec::new();
@@ -1030,7 +1099,7 @@ impl ExtensionEngine {
         for extension in self
             .extensions
             .values()
-            .filter(|extension| include(extension.state) && &extension.scope_id == scope_id)
+            .filter(|extension| include(extension) && &extension.scope_id == scope_id)
         {
             definitions.extend(extension.contract_definitions.iter().cloned());
             providers.extend(extension.contract_providers.iter().cloned());

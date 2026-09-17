@@ -8,7 +8,7 @@ use rintawa_sdk::{
 use std::io;
 use thiserror::Error;
 
-use crate::artifact_host::RtwComponentHostError;
+use crate::{activation::ActivationPlanError, artifact_host::RtwComponentHostError};
 
 /// One component failure observed while stopping or rolling back an extension.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +148,10 @@ pub enum EngineError {
     /// The internal service-routing state is unavailable.
     #[error("service runtime is unavailable")]
     ServiceRuntimeUnavailable,
+
+    /// The requested activation composition cannot produce a valid start order.
+    #[error(transparent)]
+    ActivationPlan(#[from] ActivationPlanError),
 
     /// Active contract definitions disagree about one contract's resolution policy.
     #[error("conflicting definitions for contract `{contract}`: `{existing}` versus `{incoming}`")]
