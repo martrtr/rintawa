@@ -148,20 +148,10 @@ impl ServiceRuntime {
     }
 
     pub(crate) fn unregister_instance(&self, instance_id: &ExtensionInstanceId) {
-        if let Ok(mut state) = self.state.write() {
-            let removed = state.instances.remove(instance_id).is_some();
-            let mut preference_removed = false;
-            for providers in state.preferred_providers.values_mut() {
-                let before = providers.len();
-                providers.retain(|_, provider| &provider.instance_id != instance_id);
-                preference_removed |= providers.len() != before;
-            }
-            state
-                .preferred_providers
-                .retain(|_, providers| !providers.is_empty());
-            if removed || preference_removed {
-                state.topology_changed();
-            }
+        if let Ok(mut state) = self.state.write()
+            && state.instances.remove(instance_id).is_some()
+        {
+            state.topology_changed();
         }
     }
 
@@ -400,11 +390,21 @@ impl ServiceRuntime {
                 continue;
             }
             if instance.is_active {
-                definitions.extend(instance.definitions.iter().cloned());
+                definitions.extend(
+                    instance
+                        .definitions
+                        .iter()
+                        .map(|owned| owned.definition.clone()),
+                );
                 providers.extend(instance.providers.iter().cloned());
                 consumers.extend(instance.consumers.iter().cloned());
             } else if allow_inactive_caller && instance_id == &caller.instance_id {
-                definitions.extend(instance.definitions.iter().cloned());
+                definitions.extend(
+                    instance
+                        .definitions
+                        .iter()
+                        .map(|owned| owned.definition.clone()),
+                );
                 consumers.extend(
                     instance
                         .consumers
@@ -424,8 +424,8 @@ impl ServiceRuntime {
 
         if definitions
             .iter()
-            .find(|entry| entry.definition.contract == *contract)
-            .is_some_and(|entry| entry.definition.protocol != ContractProtocol::Service)
+            .find(|entry| entry.contract == *contract)
+            .is_some_and(|entry| entry.protocol != ContractProtocol::Service)
         {
             return Err(ServiceCallError::NotServiceContract);
         }

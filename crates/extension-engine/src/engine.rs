@@ -1,7 +1,7 @@
 //! Main Extension Engine implementation managing lifecycle and contributions.
 
 use rintawa_sdk::{
-    contracts::{ComponentRef, ContractKey},
+    contracts::{ComponentRef, ContractDefinition, ContractKey, ContractResolutionPolicy},
     contributions::ContributionDescriptor,
     manifest::ExtensionManifest,
     runtime_effects::RuntimeEffect,
@@ -24,7 +24,7 @@ use crate::{
     activation::{ActivationPlan, build_activation_plan},
     composition::{
         CompositionSnapshot, OwnedContractConsumer, OwnedContractDefinition, OwnedContractProvider,
-        resolve_contracts,
+        UnresolvedContractReason, resolve_contract_providers, resolve_contracts,
     },
     context::{
         ComponentIdentity, EngineComponentContext, EngineRegistrationContext, RegistrationBuffers,
@@ -125,6 +125,8 @@ pub struct ExtensionEngine {
     services: ServiceRuntime,
     ui: UiRuntime,
     preferred_contract_providers: HashMap<RuntimeScopeId, HashMap<ContractKey, ComponentRef>>,
+    platform_contract_definitions:
+        HashMap<RuntimeScopeId, HashMap<ContractKey, ContractDefinition>>,
 }
 
 /// Runtime scope used by legacy convenience APIs that do not specify one.
@@ -150,6 +152,7 @@ impl Default for ExtensionEngine {
             services,
             ui: UiRuntime::new(),
             preferred_contract_providers: HashMap::new(),
+            platform_contract_definitions: HashMap::new(),
         }
     }
 }
@@ -174,6 +177,7 @@ impl ExtensionEngine {
             services,
             ui: UiRuntime::new(),
             preferred_contract_providers: HashMap::new(),
+            platform_contract_definitions: HashMap::new(),
         }
     }
 
@@ -236,6 +240,16 @@ impl ExtensionEngine {
 
         for owned in incoming {
             let definition = &owned.definition;
+            if self
+                .platform_contract_definitions
+                .get(scope_id)
+                .is_some_and(|platform| platform.contains_key(&definition.contract))
+            {
+                return Err(EngineError::PlatformContractDefinitionReserved {
+                    contract: definition.contract.to_string(),
+                    scope_id: scope_id.to_string(),
+                });
+            }
             if let Some(existing) = definitions.get(&definition.contract) {
                 let incoming = (definition.resolution, definition.protocol);
                 if *existing != incoming {
@@ -252,6 +266,57 @@ impl ExtensionEngine {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// Defines one platform-owned composition binding inside an exact runtime scope.
+    ///
+    /// Platform-owned definitions let extensions provide stable host roles without
+    /// letting a package redefine the role's resolution policy. Repeating the same
+    /// definition is idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::PlatformContractReservationConflict`] if an extension
+    /// already defined the contract in this scope, or
+    /// [`EngineError::ContractDefinitionConflict`] if the platform already defined
+    /// the same contract with another resolution policy.
+    pub fn define_platform_binding_contract_in_scope(
+        &mut self,
+        scope_id: RuntimeScopeId,
+        contract: ContractKey,
+        resolution: ContractResolutionPolicy,
+    ) -> EngineResult<()> {
+        let has_extension_definition = self.extensions.values().any(|extension| {
+            extension.scope_id == scope_id
+                && extension
+                    .contract_definitions
+                    .iter()
+                    .any(|owned| owned.definition.contract == contract)
+        });
+        if has_extension_definition {
+            return Err(EngineError::PlatformContractReservationConflict {
+                contract: contract.to_string(),
+                scope_id: scope_id.to_string(),
+            });
+        }
+
+        let definition = ContractDefinition::new(contract.clone(), resolution);
+        let definitions = self
+            .platform_contract_definitions
+            .entry(scope_id)
+            .or_default();
+        if let Some(existing) = definitions.get(&contract) {
+            if existing != &definition {
+                return Err(EngineError::ContractDefinitionConflict {
+                    contract: contract.to_string(),
+                    existing: format!("{}/{}", existing.protocol, existing.resolution),
+                    incoming: format!("{}/{}", definition.protocol, definition.resolution),
+                });
+            }
+            return Ok(());
+        }
+        definitions.insert(contract, definition);
         Ok(())
     }
 
@@ -786,12 +851,6 @@ impl ExtensionEngine {
             }
             self.services.unregister_instance(instance_id);
             self.ui.unregister_instance(instance_id);
-
-            for providers in self.preferred_contract_providers.values_mut() {
-                providers.retain(|_, provider| &provider.instance_id != instance_id);
-            }
-            self.preferred_contract_providers
-                .retain(|_, providers| !providers.is_empty());
         }
         Ok(())
     }
@@ -802,7 +861,26 @@ impl ExtensionEngine {
         contract: ContractKey,
         provider: ComponentRef,
     ) {
-        let scope_id = default_scope_id();
+        self.set_preferred_contract_provider_policy_in_scope(
+            default_scope_id(),
+            contract,
+            provider,
+        );
+    }
+
+    /// Stores preferred-provider policy for one exact runtime scope.
+    ///
+    /// Unlike [`Self::set_preferred_contract_provider_in_scope`], this method does
+    /// not require the selected provider to be registered yet. Persistent profile
+    /// policy can therefore be restored before or independently of provider
+    /// availability; resolution reports `PreferredProviderUnavailable` while the
+    /// selected component is absent or ineligible.
+    pub fn set_preferred_contract_provider_policy_in_scope(
+        &mut self,
+        scope_id: RuntimeScopeId,
+        contract: ContractKey,
+        provider: ComponentRef,
+    ) {
         self.preferred_contract_providers
             .entry(scope_id.clone())
             .or_default()
@@ -811,7 +889,7 @@ impl ExtensionEngine {
             .set_preferred_provider(scope_id, contract, provider);
     }
 
-    /// Selects a preferred provider inside one exact runtime scope.
+    /// Selects a currently registered preferred provider inside one exact runtime scope.
     ///
     /// # Errors
     ///
@@ -833,12 +911,7 @@ impl ExtensionEngine {
                 provider.instance_id
             )));
         }
-        self.preferred_contract_providers
-            .entry(scope_id.clone())
-            .or_default()
-            .insert(contract.clone(), provider.clone());
-        self.services
-            .set_preferred_provider(scope_id.clone(), contract, provider);
+        self.set_preferred_contract_provider_policy_in_scope(scope_id.clone(), contract, provider);
         Ok(())
     }
 
@@ -1062,6 +1135,60 @@ impl ExtensionEngine {
         })
     }
 
+    /// Resolves active providers for one contract inside an exact runtime scope.
+    ///
+    /// Platform-owned definitions participate even though they are not owned by an
+    /// extension instance. Extension-owned definitions and providers participate only
+    /// while their instances are active. Preferred-provider policy is applied before
+    /// returning the selected provider set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`UnresolvedContractReason`] when the contract is undefined or no
+    /// eligible provider can satisfy the current policy.
+    pub fn resolve_active_contract_providers_in_scope(
+        &self,
+        scope_id: &RuntimeScopeId,
+        contract: &ContractKey,
+    ) -> Result<Vec<ComponentRef>, UnresolvedContractReason> {
+        let platform_definition = self
+            .platform_contract_definitions
+            .get(scope_id)
+            .and_then(|definitions| definitions.get(contract));
+        let extension_definition = self
+            .extensions
+            .values()
+            .filter(|extension| {
+                extension.state == ExtensionState::Active && &extension.scope_id == scope_id
+            })
+            .flat_map(|extension| extension.contract_definitions.iter())
+            .find(|owned| owned.definition.contract == *contract)
+            .map(|owned| &owned.definition);
+        let definition = platform_definition
+            .or(extension_definition)
+            .ok_or(UnresolvedContractReason::UndefinedContract)?;
+
+        let providers: Vec<_> = self
+            .extensions
+            .values()
+            .filter(|extension| {
+                extension.state == ExtensionState::Active && &extension.scope_id == scope_id
+            })
+            .flat_map(|extension| extension.contract_providers.iter().cloned())
+            .collect();
+        let preferred = self
+            .preferred_contract_providers
+            .get(scope_id)
+            .and_then(|providers| providers.get(contract));
+        resolve_contract_providers(
+            contract,
+            definition.resolution,
+            &providers,
+            preferred,
+            &self.secrets,
+        )
+    }
+
     /// Resolves the registered contract topology in the default runtime scope.
     ///
     /// Unlike [`Self::composition_snapshot`], this includes declarations from
@@ -1092,7 +1219,12 @@ impl ExtensionEngine {
         scope_id: &RuntimeScopeId,
         include: impl Fn(&ManagedExtension) -> bool,
     ) -> CompositionSnapshot {
-        let mut definitions = Vec::new();
+        let mut definitions: Vec<_> = self
+            .platform_contract_definitions
+            .get(scope_id)
+            .into_iter()
+            .flat_map(|definitions| definitions.values().cloned())
+            .collect();
         let mut providers = Vec::new();
         let mut consumers = Vec::new();
 
@@ -1101,7 +1233,12 @@ impl ExtensionEngine {
             .values()
             .filter(|extension| include(extension) && &extension.scope_id == scope_id)
         {
-            definitions.extend(extension.contract_definitions.iter().cloned());
+            definitions.extend(
+                extension
+                    .contract_definitions
+                    .iter()
+                    .map(|owned| owned.definition.clone()),
+            );
             providers.extend(extension.contract_providers.iter().cloned());
             consumers.extend(extension.contract_consumers.iter().cloned());
         }

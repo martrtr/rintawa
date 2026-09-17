@@ -15,11 +15,14 @@ use std::path::{Path, PathBuf};
 use rintawa_artifacts::{
     ArtifactDigest, ArtifactStore, ContentType, ImportDisposition, RtwArchive, RtwLimits,
 };
-use rintawa_extension_engine::{ExtensionEngine, RtwExtensionLoader};
-use rintawa_sdk::types::{ExtensionInstanceId, RuntimeScopeId};
+use rintawa_extension_engine::{ExtensionEngine, RtwExtensionLoader, UnresolvedContractReason};
+use rintawa_sdk::{
+    contracts::{ComponentRef, ContractKey},
+    types::{ExtensionInstanceId, RuntimeScopeId},
+};
 use thiserror::Error;
 
-pub use profile::{ActivationRecord, BaselineProfile, PROFILE_SCHEMA};
+pub use profile::{ActivationRecord, BaselineProfile, PROFILE_SCHEMA, PreferredProviderSelection};
 pub use runtime::HostRuntime;
 
 /// Stable runtime scope used by the pre-world/bootstrap composition.
@@ -52,6 +55,41 @@ pub enum HostError {
     /// No activation with the requested subject exists in the baseline profile.
     #[error("activation `{0}` is not installed in the baseline profile")]
     ActivationNotFound(String),
+    /// The baseline profile contains multiple choices for the same scoped contract.
+    #[error(
+        "duplicate preferred provider selection for contract `{contract}` in scope `{scope_id}`"
+    )]
+    DuplicatePreferredProviderSelection {
+        /// Runtime scope containing the duplicate selection.
+        scope_id: String,
+        /// Contract selected more than once.
+        contract: String,
+    },
+    /// A preferred provider references an activation not installed in the baseline profile.
+    #[error("preferred provider instance `{0}` is not installed in the baseline profile")]
+    PreferredProviderActivationNotFound(String),
+    /// A preferred provider points at an activation in another runtime scope.
+    #[error(
+        "preferred provider instance `{instance_id}` belongs to scope `{actual_scope}`, not `{selected_scope}`"
+    )]
+    PreferredProviderScopeMismatch {
+        /// Provider runtime instance.
+        instance_id: String,
+        /// Scope persisted by the provider selection.
+        selected_scope: String,
+        /// Scope of the installed activation.
+        actual_scope: String,
+    },
+    /// A host-consumed contract role could not resolve its selected active provider.
+    #[error("contract `{contract}` in scope `{scope_id}` is unavailable: {reason}")]
+    ContractRoleUnavailable {
+        /// Runtime scope containing the role.
+        scope_id: String,
+        /// Versioned contract key.
+        contract: String,
+        /// Provider-resolution failure.
+        reason: UnresolvedContractReason,
+    },
     /// A persisted activation uses a content type for which this host has no handler.
     #[error("no activation handler is available for RTW content `{0}`")]
     UnsupportedContent(String),
@@ -189,6 +227,48 @@ impl HostHome {
     pub fn set_enabled(&self, subject: &str, enabled: bool) -> HostResult<()> {
         let mut profile = self.load_profile()?;
         profile.set_enabled(subject, enabled)?;
+        profile.save(&self.profile_path)
+    }
+
+    /// Persists one explicit preferred-provider choice for the baseline composition.
+    ///
+    /// The provider instance must already be installed in the same runtime scope.
+    /// Provider capability itself is validated during bootstrap after registration.
+    pub fn set_preferred_provider(
+        &self,
+        scope_id: RuntimeScopeId,
+        contract: ContractKey,
+        provider: ComponentRef,
+    ) -> HostResult<()> {
+        let mut profile = self.load_profile()?;
+        let activation = profile
+            .activations
+            .iter()
+            .find(|activation| activation.instance_id == provider.instance_id)
+            .ok_or_else(|| {
+                HostError::PreferredProviderActivationNotFound(provider.instance_id.to_string())
+            })?;
+        if activation.scope_id != scope_id {
+            return Err(HostError::PreferredProviderScopeMismatch {
+                instance_id: provider.instance_id.to_string(),
+                selected_scope: scope_id.to_string(),
+                actual_scope: activation.scope_id.to_string(),
+            });
+        }
+        profile.set_preferred_provider(PreferredProviderSelection::new(
+            scope_id, contract, provider,
+        ));
+        profile.save(&self.profile_path)
+    }
+
+    /// Clears an explicit preferred-provider choice from the baseline composition.
+    pub fn clear_preferred_provider(
+        &self,
+        scope_id: &RuntimeScopeId,
+        contract: &ContractKey,
+    ) -> HostResult<()> {
+        let mut profile = self.load_profile()?;
+        profile.clear_preferred_provider(scope_id, contract);
         profile.save(&self.profile_path)
     }
 

@@ -57,6 +57,21 @@ impl fmt::Display for ContractKey {
     }
 }
 
+/// Stable identifier of the platform-owned Host Shell role.
+pub const HOST_SHELL_CONTRACT_ID: &str = "rintawa.host.shell";
+
+/// Major version of the platform-owned Host Shell role.
+pub const HOST_SHELL_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1);
+
+/// Returns the versioned contract key used to select the primary Host Shell.
+///
+/// The Host Shell is a composition role, not an execution target. Platform hosts
+/// define this contract as a single-provider binding while extensions may provide
+/// it without owning the contract definition.
+pub fn host_shell_contract_key() -> ContractKey {
+    ContractKey::new(HOST_SHELL_CONTRACT_ID, HOST_SHELL_CONTRACT_VERSION)
+}
+
 /// Identifies one component within one concrete extension runtime instance.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ComponentRef {

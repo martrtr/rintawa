@@ -153,6 +153,28 @@ pub enum EngineError {
     #[error(transparent)]
     ActivationPlan(#[from] ActivationPlanError),
 
+    /// An extension attempted to define a contract reserved to the platform host.
+    #[error(
+        "platform contract `{contract}` in scope `{scope_id}` cannot be defined by an extension"
+    )]
+    PlatformContractDefinitionReserved {
+        /// Reserved contract key.
+        contract: String,
+        /// Runtime scope containing the platform definition.
+        scope_id: String,
+    },
+
+    /// The platform attempted to reserve a contract already defined by an extension.
+    #[error(
+        "cannot reserve platform contract `{contract}` in scope `{scope_id}` after an extension defined it"
+    )]
+    PlatformContractReservationConflict {
+        /// Contract that can no longer be reserved safely.
+        contract: String,
+        /// Runtime scope containing the conflicting extension definition.
+        scope_id: String,
+    },
+
     /// Active contract definitions disagree about one contract's resolution policy.
     #[error("conflicting definitions for contract `{contract}`: `{existing}` versus `{incoming}`")]
     ContractDefinitionConflict {

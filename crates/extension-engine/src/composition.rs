@@ -97,7 +97,7 @@ pub struct CompositionSnapshot {
 }
 
 pub(crate) fn resolve_contracts(
-    definitions: &[OwnedContractDefinition],
+    definitions: &[ContractDefinition],
     providers: &[OwnedContractProvider],
     consumers: &[OwnedContractConsumer],
     preferred_providers: &HashMap<ContractKey, ComponentRef>,
@@ -109,7 +109,7 @@ pub(crate) fn resolve_contracts(
         let contract = &owned_consumer.consumer.contract;
         let Some(definition) = definitions
             .iter()
-            .find(|candidate| candidate.definition.contract == *contract)
+            .find(|candidate| candidate.contract == *contract)
         else {
             snapshot.unresolved.push(UnresolvedContract {
                 consumer: owned_consumer.owner.clone(),
@@ -134,66 +134,23 @@ pub(crate) fn resolve_contracts(
             continue;
         }
 
-        let mut matching: Vec<_> = providers
-            .iter()
-            .filter(|candidate| candidate.provider.contract == *contract)
-            .collect();
-
-        if matching.is_empty() {
-            snapshot.unresolved.push(UnresolvedContract {
-                consumer: owned_consumer.owner.clone(),
-                contract: contract.clone(),
-                required: owned_consumer.consumer.required,
-                reason: UnresolvedContractReason::NoProvider,
-            });
-            continue;
-        }
-
-        matching.retain(|candidate| {
-            requirements_satisfied(
-                secrets,
-                &candidate.owner,
-                &candidate.provider.required_grants,
-            )
-        });
-        matching.sort_by(|left, right| {
-            component_ref_key(&left.owner).cmp(&component_ref_key(&right.owner))
-        });
-
-        if matching.is_empty() {
-            snapshot.unresolved.push(UnresolvedContract {
-                consumer: owned_consumer.owner.clone(),
-                contract: contract.clone(),
-                required: owned_consumer.consumer.required,
-                reason: UnresolvedContractReason::NoEligibleProvider,
-            });
-            continue;
-        }
-
-        let selected = match definition.definition.resolution {
-            ContractResolutionPolicy::Single => {
-                if let Some(preferred) = preferred_providers.get(contract) {
-                    let Some(provider) = matching
-                        .iter()
-                        .find(|candidate| candidate.owner == *preferred)
-                    else {
-                        snapshot.unresolved.push(UnresolvedContract {
-                            consumer: owned_consumer.owner.clone(),
-                            contract: contract.clone(),
-                            required: owned_consumer.consumer.required,
-                            reason: UnresolvedContractReason::PreferredProviderUnavailable,
-                        });
-                        continue;
-                    };
-                    vec![provider.owner.clone()]
-                } else {
-                    vec![matching[0].owner.clone()]
-                }
+        let selected = match resolve_contract_providers(
+            contract,
+            definition.resolution,
+            providers,
+            preferred_providers.get(contract),
+            secrets,
+        ) {
+            Ok(selected) => selected,
+            Err(reason) => {
+                snapshot.unresolved.push(UnresolvedContract {
+                    consumer: owned_consumer.owner.clone(),
+                    contract: contract.clone(),
+                    required: owned_consumer.consumer.required,
+                    reason,
+                });
+                continue;
             }
-            ContractResolutionPolicy::Multiple => matching
-                .iter()
-                .map(|provider| provider.owner.clone())
-                .collect(),
         };
 
         snapshot.bindings.push(ContractBinding {
@@ -215,6 +172,63 @@ pub(crate) fn resolve_contracts(
             .then_with(|| left.contract.to_string().cmp(&right.contract.to_string()))
     });
     snapshot
+}
+
+pub(crate) fn resolve_contract_providers(
+    contract: &ContractKey,
+    resolution: ContractResolutionPolicy,
+    providers: &[OwnedContractProvider],
+    preferred_provider: Option<&ComponentRef>,
+    secrets: &SecretManager,
+) -> Result<Vec<ComponentRef>, UnresolvedContractReason> {
+    let mut matching: Vec<_> = providers
+        .iter()
+        .filter(|candidate| candidate.provider.contract == *contract)
+        .collect();
+
+    if resolution == ContractResolutionPolicy::Single
+        && let Some(preferred) = preferred_provider
+    {
+        let provider = matching
+            .iter()
+            .find(|candidate| {
+                candidate.owner == *preferred
+                    && requirements_satisfied(
+                        secrets,
+                        &candidate.owner,
+                        &candidate.provider.required_grants,
+                    )
+            })
+            .ok_or(UnresolvedContractReason::PreferredProviderUnavailable)?;
+        return Ok(vec![provider.owner.clone()]);
+    }
+
+    if matching.is_empty() {
+        return Err(UnresolvedContractReason::NoProvider);
+    }
+
+    matching.retain(|candidate| {
+        requirements_satisfied(
+            secrets,
+            &candidate.owner,
+            &candidate.provider.required_grants,
+        )
+    });
+    matching.sort_by(|left, right| {
+        component_ref_key(&left.owner).cmp(&component_ref_key(&right.owner))
+    });
+
+    if matching.is_empty() {
+        return Err(UnresolvedContractReason::NoEligibleProvider);
+    }
+
+    match resolution {
+        ContractResolutionPolicy::Single => Ok(vec![matching[0].owner.clone()]),
+        ContractResolutionPolicy::Multiple => Ok(matching
+            .iter()
+            .map(|provider| provider.owner.clone())
+            .collect()),
+    }
 }
 
 fn requirements_satisfied(

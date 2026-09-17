@@ -5,11 +5,12 @@
 //! storage, AI, or UI rendering. It defines declarative secret-read requests;
 //! the Rintawa host alone evaluates and grants them.
 //!
-//! A runtime component uses `kind = "runtime"` in its manifest. Its execution
-//! model is selected by its target: `"native"` for the initial host and
-//! `"wasm"` when a WIT-based adapter is introduced. React is an implementation
-//! detail of the official Web UI Host; it is not a dependency or public type of
-//! this crate.
+//! A component's execution model is selected by its target. Core permanently
+//! provides the `rintawa.runtime.wasm-component@1` root target; additional targets
+//! are expected to come from extensions rather than feature-specific Core crates.
+//! Product roles are expressed through versioned contracts such as
+//! `rintawa.host.shell@1`, independently from execution target or presentation
+//! technology.
 //!
 //! ## Modules
 //!

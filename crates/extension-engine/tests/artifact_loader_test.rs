@@ -211,21 +211,21 @@ fn test_should_allow_unsupported_optional_component_target_as_metadata() -> Engi
         &source,
         "rintawa.extension@1",
         br#"
-id = "optional-web"
-name = "Optional Web"
+id = "optional-target"
+name = "Optional Target"
 version = "0.1.0"
 sdk = "^0.0"
 
 [[components]]
-id = "web-ui"
+id = "optional-ui"
 kind = "ui"
-target = "web"
+target = "example.runtime.ui@1"
 required = false
 entry = "web/index.html"
 "#,
     )?;
     let (store, digest) = import_source(&source, temp.path())?;
-    let instance_id = ExtensionInstanceId::new("optional-web-instance");
+    let instance_id = ExtensionInstanceId::new("optional-target-instance");
     let mut engine = ExtensionEngine::new();
 
     RtwExtensionLoader::new().load_stored_extension(

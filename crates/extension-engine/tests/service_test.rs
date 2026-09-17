@@ -231,6 +231,24 @@ fn test_preferred_provider_invalidates_cached_route() -> Result<()> {
     );
     assert_eq!(engine.call_service(&consumer, &contract, b"")?, b"z");
 
+    engine.unregister_extension(&ExtensionId::new("z-provider"))?;
+    assert_eq!(
+        engine.call_service(&consumer, &contract, b""),
+        Err(ServiceCallError::Unavailable)
+    );
+
+    engine.register_extension(
+        manifest("z-provider"),
+        vec![Box::new(
+            ServiceComponent::new("runtime")
+                .defining(definition)
+                .providing(ContractProvider::new(contract.clone()))
+                .responding(b"z".to_vec()),
+        )],
+    )?;
+    engine.start_extension(&ExtensionId::new("z-provider"))?;
+    assert_eq!(engine.call_service(&consumer, &contract, b"")?, b"z");
+
     engine.clear_preferred_contract_provider(&contract);
     assert_eq!(engine.call_service(&consumer, &contract, b"")?, b"a");
     Ok(())

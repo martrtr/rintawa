@@ -1,11 +1,17 @@
-use rintawa_extension_engine::{ExtensionEngine, RtwExtensionLoader};
+use rintawa_extension_engine::{ExtensionEngine, RtwExtensionLoader, UnresolvedContractReason};
 
-use crate::{HostError, HostHome, HostResult};
+use rintawa_sdk::{
+    contracts::{ComponentRef, ContractResolutionPolicy, host_shell_contract_key},
+    types::RuntimeScopeId,
+};
+
+use crate::{HOST_SCOPE, HostError, HostHome, HostResult};
 
 /// Running baseline host composition loaded exclusively from exact local RTW digests.
 pub struct HostRuntime {
     engine: ExtensionEngine,
     started_instances: Vec<rintawa_sdk::types::ExtensionInstanceId>,
+    host_shell_provider: Option<ComponentRef>,
 }
 
 impl HostRuntime {
@@ -13,15 +19,24 @@ impl HostRuntime {
     pub fn start(home: &HostHome) -> HostResult<Self> {
         let profile = home.load_profile()?;
         let mut engine = ExtensionEngine::new();
+        let host_scope = RuntimeScopeId::new(HOST_SCOPE);
+        let host_shell_contract = host_shell_contract_key();
+        engine.define_platform_binding_contract_in_scope(
+            host_scope.clone(),
+            host_shell_contract.clone(),
+            ContractResolutionPolicy::Single,
+        )?;
         let loader = RtwExtensionLoader::new();
         let mut registered = Vec::new();
         let mut started = Vec::new();
+        let mut host_shell_provider = None;
 
         let result: HostResult<()> = (|| {
             let activations: Vec<_> = profile
                 .activations
-                .into_iter()
+                .iter()
                 .filter(|item| item.enabled)
+                .cloned()
                 .collect();
 
             // Registration is a separate bootstrap phase. Every baseline
@@ -44,6 +59,14 @@ impl HostRuntime {
                 registered.push(activation.instance_id.clone());
             }
 
+            for selection in &profile.preferred_providers {
+                engine.set_preferred_contract_provider_policy_in_scope(
+                    selection.scope_id.clone(),
+                    selection.contract(),
+                    selection.provider(),
+                );
+            }
+
             let requested_instances: Vec<_> = activations
                 .iter()
                 .map(|activation| activation.instance_id.clone())
@@ -53,6 +76,24 @@ impl HostRuntime {
                 engine.start_extension_instance(&instance_id)?;
                 started.push(instance_id);
             }
+
+            let has_explicit_shell_selection =
+                profile.preferred_providers.iter().any(|selection| {
+                    selection.scope_id == host_scope && selection.contract() == host_shell_contract
+                });
+            host_shell_provider = match engine
+                .resolve_active_contract_providers_in_scope(&host_scope, &host_shell_contract)
+            {
+                Ok(providers) => providers.into_iter().next(),
+                Err(UnresolvedContractReason::NoProvider) if !has_explicit_shell_selection => None,
+                Err(reason) => {
+                    return Err(HostError::ContractRoleUnavailable {
+                        scope_id: host_scope.to_string(),
+                        contract: host_shell_contract.to_string(),
+                        reason,
+                    });
+                }
+            };
             Ok(())
         })();
 
@@ -69,7 +110,15 @@ impl HostRuntime {
         Ok(Self {
             engine,
             started_instances: started,
+            host_shell_provider,
         })
+    }
+
+    /// Returns the selected active provider of the platform Host Shell role.
+    ///
+    /// `None` is a valid headless composition with no eligible Host Shell provider.
+    pub fn host_shell_provider(&self) -> Option<&ComponentRef> {
+        self.host_shell_provider.as_ref()
     }
 
     /// Stops and unregisters every baseline runtime instance in reverse activation order.

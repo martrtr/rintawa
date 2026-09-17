@@ -712,3 +712,113 @@ fn test_conflicting_contract_protocols_are_rejected() -> anyhow::Result<()> {
     ));
     Ok(())
 }
+
+#[test]
+fn test_should_resolve_platform_owned_binding_provider_with_persisted_policy_semantics()
+-> anyhow::Result<()> {
+    let scope = RuntimeScopeId::new("host");
+    let contract = host_shell_contract_key();
+    let mut engine = ExtensionEngine::new();
+    engine.define_platform_binding_contract_in_scope(
+        scope.clone(),
+        contract.clone(),
+        ContractResolutionPolicy::Single,
+    )?;
+
+    for instance in ["a-shell", "z-shell"] {
+        engine.register_extension_instance(
+            ExtensionInstanceId::new(instance),
+            scope.clone(),
+            manifest(instance),
+            vec![Box::new(
+                ContractComponent::new("shell").providing(ContractProvider::new(contract.clone())),
+            )],
+        )?;
+        engine.start_extension_instance(&ExtensionInstanceId::new(instance))?;
+    }
+
+    assert_eq!(
+        engine
+            .resolve_active_contract_providers_in_scope(&scope, &contract)
+            .map_err(|reason| anyhow::anyhow!(reason.to_string()))?,
+        vec![ComponentRef::new("a-shell", "shell")]
+    );
+
+    let selected = ComponentRef::new("z-shell", "shell");
+    engine.set_preferred_contract_provider_policy_in_scope(
+        scope.clone(),
+        contract.clone(),
+        selected.clone(),
+    );
+    assert_eq!(
+        engine
+            .resolve_active_contract_providers_in_scope(&scope, &contract)
+            .map_err(|reason| anyhow::anyhow!(reason.to_string()))?,
+        vec![selected]
+    );
+
+    let selected_instance = ExtensionInstanceId::new("z-shell");
+    engine.stop_extension_instance(&selected_instance)?;
+    engine.unregister_extension_instance(&selected_instance)?;
+    assert_eq!(
+        engine.resolve_active_contract_providers_in_scope(&scope, &contract),
+        Err(UnresolvedContractReason::PreferredProviderUnavailable)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_extension_definition_of_platform_owned_contract() -> anyhow::Result<()> {
+    let scope = RuntimeScopeId::new("host");
+    let contract = host_shell_contract_key();
+    let mut engine = ExtensionEngine::new();
+    engine.define_platform_binding_contract_in_scope(
+        scope.clone(),
+        contract.clone(),
+        ContractResolutionPolicy::Single,
+    )?;
+
+    let error = engine
+        .register_extension_instance(
+            ExtensionInstanceId::new("shell"),
+            scope,
+            manifest("shell"),
+            vec![Box::new(ContractComponent::new("shell").defining(
+                ContractDefinition::new(contract, ContractResolutionPolicy::Single),
+            ))],
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        EngineError::PlatformContractDefinitionReserved { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_platform_reservation_after_extension_definition() -> anyhow::Result<()> {
+    let scope = RuntimeScopeId::new("host");
+    let contract = host_shell_contract_key();
+    let mut engine = ExtensionEngine::new();
+    engine.register_extension_instance(
+        ExtensionInstanceId::new("legacy-owner"),
+        scope.clone(),
+        manifest("legacy-owner"),
+        vec![Box::new(ContractComponent::new("runtime").defining(
+            ContractDefinition::new(contract.clone(), ContractResolutionPolicy::Single),
+        ))],
+    )?;
+
+    let error = engine
+        .define_platform_binding_contract_in_scope(
+            scope,
+            contract,
+            ContractResolutionPolicy::Single,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        EngineError::PlatformContractReservationConflict { .. }
+    ));
+    Ok(())
+}

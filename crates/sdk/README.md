@@ -18,8 +18,9 @@ real end-to-end pipeline needs them.
 
 ## Runtime targets
 
-A component's `kind` defines its role, while its `target` selects the host
-contract. A runtime component initially runs through the native host:
+A component's `target` answers only **how that component is executed**. Product
+roles and composition semantics are expressed separately through versioned
+contracts. Core permanently provides the root WASM execution target:
 
 ```toml
 id = "chat"
@@ -30,25 +31,21 @@ sdk = "^0.0"
 [[components]]
 id = "runtime"
 kind = "runtime"
-target = "native"
-```
-
-The same component can later use a WIT-based adapter by changing only its
-target and entry:
-
-```toml
 target = "rintawa.runtime.wasm-component@1"
 entry = "runtime.wasm"
 ```
 
-WIT will be the WASM ABI. The Rust [`Component`] trait remains the ergonomic
-author-facing interface; Wasmtime belongs to the Extension Engine, never to
-this SDK.
+WIT is the built-in WASM ABI. The Rust [`Component`] trait remains the ergonomic
+author-facing interface; Wasmtime belongs to the Extension Engine, never to this
+SDK. Additional execution targets are not hard-coded product features: the
+bootstrap architecture is designed so extensions can provide new versioned
+targets.
 
-React is likewise not part of this crate. It is an implementation detail of
-the official Web UI Host. A public UI component uses `kind = "ui"` and a
-host-specific target such as `"web"`; Godot or another application can provide
-another compatible UI host without changing runtime components.
+Presentation technology is likewise outside this SDK. A shell, UI layer, TUI,
+3D frontend, or Web frontend should advertise the role it provides through
+versioned contracts independently of its execution target. For example, the
+platform-owned `rintawa.host.shell@1` binding selects the primary Host Shell; it
+does not imply Web, React, an Android Activity, or any specific runtime.
 
 ## Lifecycle
 

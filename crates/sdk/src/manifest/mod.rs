@@ -296,11 +296,11 @@ mod tests {
             [[components]]
             id = "runtime"
             kind = "runtime"
-            target = "wasm"
+            target = "rintawa.runtime.wasm-component@1"
             [[components]]
             id = "settings-ui"
             kind = "ui"
-            target = "web"
+            target = "example.runtime.ui@1"
         "#,
         )?;
         assert_eq!(manifest.validate(), Ok(()));
