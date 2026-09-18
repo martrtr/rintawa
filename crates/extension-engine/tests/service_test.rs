@@ -268,11 +268,12 @@ fn test_secret_policy_revision_invalidates_cached_route() -> Result<()> {
         components: vec![ComponentDescriptor {
             id: ComponentId::new("runtime"),
             kind: ComponentKind::Runtime,
-            target: ComponentTarget::new("native"),
+            target: ComponentTarget::new("example.runtime.native@1"),
             entry: None,
             required: true,
             permissions: ComponentPermissions {
                 secret_read: vec![pattern.clone()],
+                runtime: Vec::new(),
             },
         }],
     };

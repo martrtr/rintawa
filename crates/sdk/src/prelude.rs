@@ -17,18 +17,21 @@ pub use crate::context::{ComponentContext, RegistrationContext};
 pub use crate::contracts::{
     ComponentRef, ContractConsumer, ContractDefinition, ContractGrantRequirement, ContractKey,
     ContractProtocol, ContractProvider, ContractResolutionPolicy, ContractVersion,
-    HOST_SHELL_CONTRACT_ID, HOST_SHELL_CONTRACT_VERSION, host_shell_contract_key,
+    HOST_SHELL_CONTRACT_ID, HOST_SHELL_CONTRACT_VERSION, UI_LAYER_CONTRACT_ID,
+    UI_LAYER_CONTRACT_VERSION, host_shell_contract_key, ui_layer_contract_key,
 };
 pub use crate::contributions::{ContributionDescriptor, ContributionKind};
 
 pub use crate::errors::{ExtensionError, ExtensionResult};
 
 pub use crate::manifest::{
-    ComponentDescriptor, ComponentKind, ComponentPermissions, ExtensionManifest,
-    ManifestValidationError, WASM_COMPONENT_TARGET_V1,
+    ComponentDescriptor, ComponentKind, ComponentPermissions, ComponentTargetValidationError,
+    ExtensionManifest, ManifestValidationError, WASM_COMPONENT_TARGET_V1,
+    validate_component_target,
 };
 
 pub use crate::runtime_effects::RuntimeEffect;
+pub use crate::runtime_permissions::{RuntimePermission, RuntimePermissionParseError};
 
 pub use crate::secrets::{SecretAccessError, SecretPath, SecretPathPattern, SecretValue};
 

@@ -95,6 +95,7 @@ pub(crate) fn build_activation_plan(
     snapshot: &CompositionSnapshot,
     scheduled_instances: &[ExtensionInstanceId],
     active_instances: &HashSet<ExtensionInstanceId>,
+    required_instance_dependencies: &[(ExtensionInstanceId, ExtensionInstanceId)],
 ) -> Result<ActivationPlan, ActivationPlanError> {
     let mut scheduled_indices = HashMap::new();
     for (index, instance_id) in scheduled_instances.iter().enumerate() {
@@ -127,27 +128,36 @@ pub(crate) fn build_activation_plan(
     let mut indegrees = vec![0_usize; instance_count];
     let mut edges = HashSet::new();
 
-    for binding in snapshot.bindings.iter().filter(|entry| entry.required) {
-        let Some(&consumer_index) = scheduled_indices.get(&binding.consumer.instance_id) else {
-            continue;
-        };
-
-        for provider in &binding.providers {
-            if provider.instance_id == binding.consumer.instance_id {
-                continue;
+    {
+        let mut add_dependency = |provider: &ExtensionInstanceId,
+                                  consumer: &ExtensionInstanceId| {
+            if provider == consumer {
+                return;
             }
-            if let Some(&provider_index) = scheduled_indices.get(&provider.instance_id) {
+            let Some(&consumer_index) = scheduled_indices.get(consumer) else {
+                return;
+            };
+            if let Some(&provider_index) = scheduled_indices.get(provider) {
                 if edges.insert((provider_index, consumer_index)) {
                     outgoing[provider_index].push(consumer_index);
                     incoming[consumer_index].push(provider_index);
                     indegrees[consumer_index] += 1;
                 }
-                continue;
+            } else {
+                debug_assert!(
+                    active_instances.contains(provider),
+                    "activation dependency points outside the active or scheduled set"
+                );
             }
-            debug_assert!(
-                active_instances.contains(&provider.instance_id),
-                "activation composition included a provider outside the active or scheduled set"
-            );
+        };
+
+        for binding in snapshot.bindings.iter().filter(|entry| entry.required) {
+            for provider in &binding.providers {
+                add_dependency(&provider.instance_id, &binding.consumer.instance_id);
+            }
+        }
+        for (provider, consumer) in required_instance_dependencies {
+            add_dependency(provider, consumer);
         }
     }
 

@@ -1,15 +1,22 @@
-use rintawa_extension_engine::{EngineResult, WasmExecutionBudget, WasmRuntimeEngine};
+use rintawa_extension_engine::{
+    EngineResult, ExtensionEngine, WasmExecutionBudget, WasmRuntimeEngine,
+};
 use rintawa_sdk::{
     api::{LogLevel, LoggerApi},
     context::{ComponentContext, RegistrationContext},
     contracts::{ContractKey, ContractVersion},
     contributions::ContributionDescriptor,
     errors::{ExtensionError, ExtensionResult},
+    manifest::{
+        ComponentDescriptor, ComponentKind, ComponentPermissions, ExtensionManifest,
+        WASM_COMPONENT_TARGET_V1,
+    },
+    runtime_permissions::RuntimePermission,
     traits::Component,
-    types::{ComponentId, ExtensionId, ExtensionInstanceId, RuntimeScopeId},
+    types::{ComponentId, ComponentTarget, ExtensionId, ExtensionInstanceId, RuntimeScopeId},
     ui::{UiActionEvent, UiActionId, UiActionPayload, UiNodeId, UiSurfaceId},
 };
-use std::fs;
+use std::{fs, time::Duration};
 
 struct TestLogger;
 
@@ -66,6 +73,7 @@ impl RegistrationContext for TestComponentContext {
 }
 
 const STATEFUL_WASM_COMPONENT: &str = include_str!("fixtures/stateful_component.wat");
+const TASK_WASM_COMPONENT: &[u8] = include_bytes!("fixtures/task-runtime/component.wasm");
 
 #[test]
 fn test_wasm_runtime_engine_initialization() -> EngineResult<()> {
@@ -81,6 +89,54 @@ fn test_wasm_runtime_engine_initialization() -> EngineResult<()> {
     let result = runtime.load_component_from_bytes(id, &minimal_wasm_component_bytes);
     assert!(result.is_ok());
 
+    Ok(())
+}
+
+#[test]
+fn test_should_execute_granted_background_task_through_engine_runtime_pump() -> EngineResult<()> {
+    let mut engine = ExtensionEngine::new();
+    let component_id = ComponentId::new("runtime");
+    let component = engine
+        .wasm_runtime_engine()?
+        .load_component_from_bytes(component_id.clone(), TASK_WASM_COMPONENT)?;
+    let manifest = ExtensionManifest {
+        id: ExtensionId::new("task-runtime"),
+        name: String::from("Task Runtime"),
+        version: String::from("0.0.1"),
+        sdk: String::from("^0.0"),
+        components: vec![ComponentDescriptor {
+            id: component_id.clone(),
+            kind: ComponentKind::Runtime,
+            target: ComponentTarget::new(WASM_COMPONENT_TARGET_V1),
+            entry: None,
+            required: true,
+            permissions: ComponentPermissions {
+                secret_read: Vec::new(),
+                runtime: vec![RuntimePermission::BackgroundTask],
+            },
+        }],
+    };
+    let extension_id = manifest.id.clone();
+    engine.register_extension(manifest, vec![Box::new(component)])?;
+    engine.grant_requested_runtime_permission(
+        &extension_id,
+        &component_id,
+        RuntimePermission::BackgroundTask,
+    )?;
+    engine.start_extension(&extension_id)?;
+
+    let delay = engine
+        .poll_runtime()?
+        .expect("task fixture should request a cooperative wake-up");
+    std::thread::sleep(delay + Duration::from_millis(2));
+    assert_eq!(engine.poll_runtime()?, None);
+
+    let effects = engine.active_runtime_effect_principals();
+    assert_eq!(effects.len(), 1);
+    assert_eq!(effects[0].1.component_id, component_id);
+
+    engine.stop_extension(&extension_id)?;
+    assert!(engine.active_runtime_effect_principals().is_empty());
     Ok(())
 }
 

@@ -92,7 +92,7 @@ impl ExtensionLoader {
         let mut components: Vec<Box<dyn Component>> = Vec::new();
 
         for comp_desc in &manifest.components {
-            if matches!(comp_desc.target.as_str(), "wasm" | WASM_COMPONENT_TARGET_V1) {
+            if comp_desc.target.as_str() == WASM_COMPONENT_TARGET_V1 {
                 let wasm_rel_str = comp_desc.entry.as_deref().unwrap_or("runtime.wasm");
                 let wasm_rel_path = Path::new(wasm_rel_str);
 
@@ -113,6 +113,11 @@ impl ExtensionLoader {
                     .load_component_from_file(comp_desc.id.clone(), &wasm_path)?;
 
                 components.push(Box::new(wasm_component));
+            } else if comp_desc.required {
+                return Err(EngineError::UnsupportedRequiredComponentTarget {
+                    component_id: comp_desc.id.to_string(),
+                    target: comp_desc.target.to_string(),
+                });
             }
         }
 

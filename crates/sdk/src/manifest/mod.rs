@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
+    runtime_permissions::RuntimePermission,
     secrets::SecretPathPattern,
     types::{ComponentId, ComponentTarget, ExtensionId},
 };
@@ -16,11 +17,10 @@ use crate::{
 /// Versioned execution target for a WebAssembly Component hosted by Rintawa.
 pub const WASM_COMPONENT_TARGET_V1: &str = "rintawa.runtime.wasm-component@1";
 
-/// Represents the role of a component in an extension.
+/// Coarse package classification for a component.
 ///
-/// A runtime component can run on different hosts. Its execution model is
-/// selected by [`ComponentDescriptor::target`], for example `"native"` or
-/// `"wasm"`. A UI component uses a host-specific target such as `"web"`.
+/// Product roles are expressed through versioned contracts, not through this
+/// enum. [`ComponentDescriptor::target`] independently selects the execution ABI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ComponentKind {
@@ -34,6 +34,88 @@ fn required_by_default() -> bool {
     true
 }
 
+/// Validation failure for one versioned component execution target.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("invalid component target `{value}`: {reason}")]
+pub struct ComponentTargetValidationError {
+    value: String,
+    reason: &'static str,
+}
+
+impl ComponentTargetValidationError {
+    /// Returns the rejected target string.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// Returns the stable validation reason.
+    pub const fn reason(&self) -> &'static str {
+        self.reason
+    }
+}
+
+/// Validates a canonical versioned component execution target.
+///
+/// Targets use `<namespace>.<name>@<major>` identity. Namespace segments use
+/// lowercase ASCII letters, digits, `_`, or `-`, and each segment starts and
+/// ends with an ASCII alphanumeric character.
+///
+/// # Errors
+///
+/// Returns [`ComponentTargetValidationError`] when the target is malformed or
+/// its major version is not canonical unsigned decimal notation.
+pub fn validate_component_target(value: &str) -> Result<(), ComponentTargetValidationError> {
+    let invalid = |reason| ComponentTargetValidationError {
+        value: value.to_string(),
+        reason,
+    };
+    let (id, major) = value
+        .rsplit_once('@')
+        .ok_or_else(|| invalid("expected `<namespace>.<name>@<major>`"))?;
+    if id.len() > 128 {
+        return Err(invalid("identifier must not exceed 128 bytes"));
+    }
+    let segments: Vec<_> = id.split('.').collect();
+    if segments.len() < 2 {
+        return Err(invalid(
+            "identifier must contain at least one namespace separator `.`",
+        ));
+    }
+    for segment in segments {
+        if segment.is_empty() {
+            return Err(invalid("namespace segments cannot be empty"));
+        }
+        if !segment.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+        }) {
+            return Err(invalid(
+                "identifier uses characters outside `[a-z0-9_-]` and `.` separators",
+            ));
+        }
+        let first = segment.as_bytes().first();
+        let last = segment.as_bytes().last();
+        if !first.is_some_and(u8::is_ascii_alphanumeric)
+            || !last.is_some_and(u8::is_ascii_alphanumeric)
+        {
+            return Err(invalid(
+                "namespace segments must start and end with an ASCII letter or digit",
+            ));
+        }
+    }
+    if major.is_empty() || !major.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid(
+            "major version must contain only ASCII decimal digits",
+        ));
+    }
+    if major.len() > 1 && major.starts_with('0') {
+        return Err(invalid("major version must use canonical decimal notation"));
+    }
+    major
+        .parse::<u32>()
+        .map_err(|_| invalid("major version must fit in an unsigned 32-bit integer"))?;
+    Ok(())
+}
+
 /// Permissions a component may request from a Rintawa host.
 ///
 /// A request is only metadata. It does not grant access: Rintawa must approve
@@ -43,6 +125,9 @@ pub struct ComponentPermissions {
     /// Secret domains the extension may ask the host to grant for reading.
     #[serde(default, rename = "secret-read")]
     pub secret_read: Vec<SecretPathPattern>,
+    /// Host runtime capabilities this component may ask policy to approve.
+    #[serde(default, rename = "runtime")]
+    pub runtime: Vec<RuntimePermission>,
 }
 
 /// Describes a single component declared by an extension.
@@ -57,19 +142,18 @@ pub struct ComponentDescriptor {
     /// The kind of component this is.
     pub kind: ComponentKind,
 
-    /// The host contract that runs this component.
+    /// The versioned execution target that runs this component.
     ///
-    /// Published WASM packages use [`WASM_COMPONENT_TARGET_V1`]. Short values
-    /// such as `"wasm"`, `"native"`, and `"web"` are legacy MVP host hints and
-    /// are not stable package ABI identifiers.
+    /// Published WASM packages use [`WASM_COMPONENT_TARGET_V1`]. Other targets
+    /// are provider-defined ABI identities registered through the host execution-
+    /// target registry; presentation roles remain separate versioned contracts.
     pub target: ComponentTarget,
 
-    /// The host-specific entry point for this component, when one is needed.
+    /// The target-specific entry point for this component, when one is needed.
     ///
-    /// A statically registered native component may omit this field. A WASM or
-    /// web component normally supplies an entry such as `"runtime.wasm"`. For
-    /// `rintawa.extension@1` RTW content, relative entries are resolved from the
-    /// directory containing the extension manifest selected by `rtw.toml`.
+    /// For `rintawa.extension@1` RTW content, relative entries are resolved from
+    /// the directory containing the extension manifest selected by `rtw.toml`.
+    /// Interpretation beyond that path boundary belongs to the selected target host.
     #[serde(default)]
     pub entry: Option<String>,
 
@@ -92,6 +176,17 @@ pub enum ManifestValidationError {
         extension_id: ExtensionId,
         /// Component identifier declared more than once.
         component_id: ComponentId,
+    },
+    /// A component declares a malformed or unversioned execution target.
+    #[error("component `{component_id}` in extension `{extension_id}` has {source}")]
+    InvalidComponentTarget {
+        /// Extension containing the invalid target declaration.
+        extension_id: ExtensionId,
+        /// Component containing the invalid target declaration.
+        component_id: ComponentId,
+        /// Exact target validation failure.
+        #[source]
+        source: ComponentTargetValidationError,
     },
 }
 
@@ -131,7 +226,9 @@ impl ExtensionManifest {
     /// # Errors
     ///
     /// Returns [`ManifestValidationError::DuplicateComponentId`] when multiple
-    /// component descriptors declare the same component ID.
+    /// component descriptors declare the same component ID, or
+    /// [`ManifestValidationError::InvalidComponentTarget`] when a component
+    /// target is not a canonical versioned execution identity.
     pub fn validate(&self) -> Result<(), ManifestValidationError> {
         let mut component_ids = HashSet::with_capacity(self.components.len());
         for component in &self.components {
@@ -141,6 +238,13 @@ impl ExtensionManifest {
                     component_id: component.id.clone(),
                 });
             }
+            validate_component_target(component.target.as_str()).map_err(|source| {
+                ManifestValidationError::InvalidComponentTarget {
+                    extension_id: self.id.clone(),
+                    component_id: component.id.clone(),
+                    source,
+                }
+            })?;
         }
         Ok(())
     }
@@ -151,7 +255,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_should_parse_minimal_native_runtime_manifest() -> Result<(), toml::de::Error> {
+    fn test_should_parse_minimal_provider_runtime_manifest() -> Result<(), toml::de::Error> {
         let manifest: ExtensionManifest = toml::from_str(
             r#"
                 id = "chat"
@@ -162,14 +266,14 @@ mod tests {
                 [[components]]
                 id = "runtime"
                 kind = "runtime"
-                target = "native"
+                target = "example.runtime.test@1"
             "#,
         )?;
 
         let component = &manifest.components[0];
         assert_eq!(manifest.id.as_str(), "chat");
         assert_eq!(component.kind, ComponentKind::Runtime);
-        assert_eq!(component.target.as_str(), "native");
+        assert_eq!(component.target.as_str(), "example.runtime.test@1");
         assert_eq!(component.entry, None);
         assert!(component.required);
         assert!(component.permissions.secret_read.is_empty());
@@ -214,11 +318,15 @@ mod tests {
             components: vec![ComponentDescriptor {
                 id: ComponentId::new("runtime"),
                 kind: ComponentKind::Runtime,
-                target: ComponentTarget::new("wasm"),
+                target: ComponentTarget::new("example.runtime.test@1"),
                 entry: Some(String::from("runtime.wasm")),
                 required: true,
                 permissions: ComponentPermissions {
                     secret_read: vec![SecretPathPattern::parse("ai.api_keys.*")?],
+                    runtime: vec![
+                        RuntimePermission::BackgroundTask,
+                        RuntimePermission::LoopbackListen,
+                    ],
                 },
             }],
         };
@@ -243,16 +351,24 @@ mod tests {
                 [[components]]
                 id = "provider"
                 kind = "runtime"
-                target = "native"
+                target = "example.runtime.test@1"
 
                 [components.permissions]
                 secret-read = ["ai.api_keys.*"]
+                runtime = ["background-task", "loopback-listen"]
             "#,
         )?;
 
         assert_eq!(
             manifest.components[0].permissions.secret_read,
             vec![SecretPathPattern::parse("ai.api_keys.*").unwrap()]
+        );
+        assert_eq!(
+            manifest.components[0].permissions.runtime,
+            vec![
+                RuntimePermission::BackgroundTask,
+                RuntimePermission::LoopbackListen
+            ]
         );
 
         Ok(())
@@ -268,11 +384,11 @@ mod tests {
             [[components]]
             id = "runtime"
             kind = "runtime"
-            target = "wasm"
+            target = "example.runtime.test@1"
             [[components]]
             id = "runtime"
             kind = "runtime"
-            target = "native"
+            target = "example.runtime.test@1"
         "#,
         )?;
         assert_eq!(
@@ -282,6 +398,60 @@ mod tests {
                 component_id: ComponentId::new("runtime"),
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_unversioned_component_target() -> Result<(), toml::de::Error> {
+        let manifest: ExtensionManifest = toml::from_str(
+            r#"
+            id = "invalid-target"
+            name = "Invalid Target"
+            version = "0.0.1"
+            sdk = "^0.0"
+            [[components]]
+            id = "runtime"
+            kind = "runtime"
+            target = "runtime"
+        "#,
+        )?;
+
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestValidationError::InvalidComponentTarget {
+                component_id,
+                source,
+                ..
+            }) if component_id == ComponentId::new("runtime")
+                && source.reason() == "expected `<namespace>.<name>@<major>`"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_noncanonical_component_target_major() -> Result<(), toml::de::Error> {
+        let manifest: ExtensionManifest = toml::from_str(
+            r#"
+            id = "invalid-target-major"
+            name = "Invalid Target Major"
+            version = "0.0.1"
+            sdk = "^0.0"
+            [[components]]
+            id = "runtime"
+            kind = "runtime"
+            target = "example.runtime.test@+1"
+        "#,
+        )?;
+
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestValidationError::InvalidComponentTarget {
+                component_id,
+                source,
+                ..
+            }) if component_id == ComponentId::new("runtime")
+                && source.reason() == "major version must contain only ASCII decimal digits"
+        ));
         Ok(())
     }
 

@@ -16,6 +16,7 @@ pub mod composition;
 pub mod context;
 pub mod engine;
 pub mod errors;
+mod execution_targets;
 pub mod loader;
 pub mod runtime;
 pub mod secrets;
@@ -24,12 +25,16 @@ pub mod state;
 mod services;
 
 mod runtime_effects;
+mod runtime_permissions;
 
 pub use activation::{ActivationPlan, ActivationPlanError};
 pub use artifact_host::{
     RtwComponentHost, RtwComponentHostError, RtwComponentHostResult, RtwComponentSource,
 };
-pub use artifact_loader::RtwExtensionLoader;
+pub use artifact_loader::{
+    DeferredExecutionTarget, DeferredExtensionLoad, RegisteredExtensionLoad,
+    RtwExtensionLoadOutcome, RtwExtensionLoader,
+};
 pub use composition::{
     CompositionSnapshot, ContractBinding, UnresolvedContract, UnresolvedContractReason,
 };
@@ -225,7 +230,7 @@ mod tests {
             [[components]]
             id = "runtime"
             kind = "runtime"
-            target = "native"
+            target = "example.runtime.native@1"
         "#;
 
         let manifest = engine.parse_manifest(manifest_toml)?;
@@ -551,7 +556,7 @@ mod tests {
                 [[components]]
                 id = "provider"
                 kind = "runtime"
-                target = "native"
+                target = "example.runtime.native@1"
 
                 [components.permissions]
                 secret-read = ["ai.api_keys.*"]
@@ -605,7 +610,7 @@ mod tests {
                 [[components]]
                 id = "provider"
                 kind = "runtime"
-                target = "native"
+                target = "example.runtime.native@1"
 
                 [components.permissions]
                 secret-read = ["ai.api_keys.*"]
@@ -628,6 +633,63 @@ mod tests {
     }
 
     #[test]
+    fn test_should_grant_only_manifest_requested_runtime_permissions() -> EngineResult<()> {
+        let mut engine = ExtensionEngine::new();
+        let manifest = engine.parse_manifest(
+            r#"
+                id = "runtime_permissions"
+                name = "Runtime Permissions"
+                version = "0.0.1"
+                sdk = "^0.0"
+
+                [[components]]
+                id = "runtime"
+                kind = "runtime"
+                target = "example.runtime.native@1"
+
+                [components.permissions]
+                runtime = ["background-task", "loopback-listen"]
+            "#,
+        )?;
+        let extension_id = manifest.id.clone();
+        let component_id = ComponentId::new("runtime");
+        engine.register_extension(
+            manifest,
+            vec![Box::new(DummyRuntime {
+                id: component_id.clone(),
+            })],
+        )?;
+
+        engine.grant_requested_runtime_permission(
+            &extension_id,
+            &component_id,
+            RuntimePermission::BackgroundTask,
+        )?;
+        engine.grant_requested_runtime_permission(
+            &extension_id,
+            &component_id,
+            RuntimePermission::LoopbackListen,
+        )?;
+        assert!(matches!(
+            engine.grant_requested_runtime_permission(
+                &extension_id,
+                &component_id,
+                RuntimePermission::LoopbackConnect,
+            ),
+            Err(EngineError::RuntimePermissionNotRequested { .. })
+        ));
+        assert!(matches!(
+            engine.grant_requested_runtime_permission(
+                &extension_id,
+                &ComponentId::new("missing"),
+                RuntimePermission::BackgroundTask,
+            ),
+            Err(EngineError::RuntimePermissionComponentNotFound { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn test_should_revoke_secret_grants_for_manifest_only_components() -> EngineResult<()> {
         let secret_manager = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
         let secret_path = SecretPath::parse("ai.api_keys.openai").unwrap();
@@ -644,7 +706,7 @@ mod tests {
                 [[components]]
                 id = "optional_provider"
                 kind = "runtime"
-                target = "wasm"
+                target = "example.runtime.wasm@1"
                 required = false
 
                 [components.permissions]
@@ -687,17 +749,18 @@ mod tests {
                 ComponentDescriptor {
                     id: ComponentId::new("provider"),
                     kind: ComponentKind::Runtime,
-                    target: ComponentTarget::new("native"),
+                    target: ComponentTarget::new("example.runtime.native@1"),
                     entry: None,
                     required: true,
                     permissions: ComponentPermissions {
                         secret_read: vec![SecretPathPattern::parse("ai.api_keys.*").unwrap()],
+                        runtime: Vec::new(),
                     },
                 },
                 ComponentDescriptor {
                     id: ComponentId::new("provider"),
                     kind: ComponentKind::Runtime,
-                    target: ComponentTarget::new("native"),
+                    target: ComponentTarget::new("example.runtime.native@1"),
                     entry: None,
                     required: true,
                     permissions: ComponentPermissions::default(),

@@ -62,13 +62,35 @@ pub enum EngineError {
         target: String,
     },
 
-    /// A component target host identifier is empty or otherwise unusable.
-    #[error("component target host identifier must not be empty")]
+    /// A component target host identifier is not a canonical versioned target.
+    #[error("component target host identifier must be a canonical versioned execution target")]
     InvalidComponentHostTarget,
 
     /// A component target already has a host or is reserved by the built-in runtime.
     #[error("component target host `{0}` is already registered or reserved")]
     DuplicateComponentHostTarget(String),
+
+    /// An execution-target host owner is not an active loaded component.
+    #[error(
+        "component `{component_id}` in extension instance `{instance_id}` cannot own an execution target because it is not active"
+    )]
+    ExecutionTargetOwnerInactive {
+        /// Runtime instance containing the target-host owner.
+        instance_id: String,
+        /// Component expected to own the target host.
+        component_id: String,
+    },
+
+    /// One or more registered extension instances still depend on this runtime provider.
+    #[error(
+        "extension instance `{provider_instance_id}` cannot stop while execution-target dependents remain registered: {dependents:?}"
+    )]
+    ExecutionTargetProviderInUse {
+        /// Provider runtime instance that owns one or more execution targets.
+        provider_instance_id: String,
+        /// Registered dependent instances that were instantiated through the provider.
+        dependents: Vec<String>,
+    },
 
     /// A target host failed while creating a component from the RTW artifact.
     #[error("component `{component_id}` target `{target}` failed to load: {source}")]
@@ -120,6 +142,34 @@ pub enum EngineError {
         component_id: String,
     },
 
+    /// A requested runtime capability was not declared by the component manifest.
+    #[error(
+        "runtime permission `{permission}` was not requested by component `{component_id}` in extension `{extension_id}`"
+    )]
+    RuntimePermissionNotRequested {
+        /// Logical extension containing the component.
+        extension_id: String,
+        /// Component for which policy attempted to grant access.
+        component_id: String,
+        /// Exact runtime permission policy attempted to approve.
+        permission: String,
+    },
+
+    /// Runtime permission policy referenced a component absent from the manifest.
+    #[error(
+        "component `{component_id}` was not found in extension `{extension_id}` for runtime permission policy"
+    )]
+    RuntimePermissionComponentNotFound {
+        /// Logical extension containing the component.
+        extension_id: String,
+        /// Missing component identifier.
+        component_id: String,
+    },
+
+    /// The host-owned runtime permission policy store is unavailable.
+    #[error("runtime permission policy is unavailable")]
+    RuntimePermissionUnavailable,
+
     /// A WASM component artifact exceeded the host-owned byte limit.
     #[error(
         "WASM component `{component_id}` is at least {observed_bytes} bytes, exceeding the {maximum_bytes}-byte limit"
@@ -140,6 +190,19 @@ pub enum EngineError {
     /// An error occurred during Wasmtime runtime operations.
     #[error("WASM runtime error: {0}")]
     WasmRuntime(#[from] wasmtime::Error),
+
+    /// An active component failed while executing cooperative runtime work.
+    #[error(
+        "component `{component_id}` in extension `{extension_id}` failed runtime polling: {reason}"
+    )]
+    RuntimePollFailed {
+        /// Logical extension owning the component.
+        extension_id: String,
+        /// Component that failed during the runtime pump.
+        component_id: String,
+        /// Component-reported execution failure.
+        reason: String,
+    },
 
     /// Portable UI registration, lifecycle, patching, or action validation failed.
     #[error("portable UI error: {0}")]

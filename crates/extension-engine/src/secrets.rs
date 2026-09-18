@@ -209,9 +209,11 @@ impl SecretManager {
 
     /// Revokes every secret grant held by one component.
     pub fn revoke_component(&self, owner: &ComponentRef) {
-        if let Ok(mut grants) = self.read_grants.write()
-            && grants.remove(owner).is_some()
-        {
+        let mut grants = match self.read_grants.write() {
+            Ok(grants) => grants,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if grants.remove(owner).is_some() {
             self.policy_revision.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -285,6 +287,35 @@ mod tests {
             manager.read_for_component(&owner("official_ai.instance-b", "provider"), &allowed_path),
             Err(SecretAccessError::AccessDenied)
         ));
+    }
+
+    #[test]
+    fn test_should_revoke_secret_grant_after_policy_lock_is_poisoned() {
+        let manager = manager();
+        let owner = owner("official_ai.instance-a", "provider");
+        manager
+            .grant_read(
+                owner.clone(),
+                SecretPathPattern::parse("ai.api_keys.*").unwrap(),
+            )
+            .unwrap();
+
+        let poisoner = manager.clone();
+        let _ = std::thread::spawn(move || {
+            let _grants = poisoner
+                .read_grants
+                .write()
+                .expect("test secret policy lock should start healthy");
+            panic!("poison secret policy lock");
+        })
+        .join();
+
+        manager.revoke_component(&owner);
+        let grants = match manager.read_grants.read() {
+            Ok(grants) => grants,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(!grants.contains_key(&owner));
     }
 
     #[test]

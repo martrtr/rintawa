@@ -10,7 +10,7 @@ use rintawa_sdk::{
         UiTextNode,
     },
 };
-use rintawa_ui_runtime::{OwnedUiSurfaceContribution, UiRuntime};
+use rintawa_ui_runtime::{OwnedUiLayerDescriptor, OwnedUiSurfaceContribution, UiRuntime};
 
 fn instance(id: &str) -> ExtensionInstanceId {
     ExtensionInstanceId::new(id)
@@ -85,14 +85,23 @@ fn register_feature(runtime: &UiRuntime, contribution: UiSurfaceContribution) ->
             owner: owner("feature"),
             contribution,
         }],
+        Vec::new(),
     )?;
     Ok(())
 }
 
 fn attach_layer(runtime: &UiRuntime, descriptor: UiLayerDescriptor) -> Result<()> {
-    runtime.register_instance(instance("layer"), scope(), Vec::new())?;
+    runtime.register_instance(
+        instance("layer"),
+        scope(),
+        Vec::new(),
+        vec![OwnedUiLayerDescriptor {
+            owner: owner("layer"),
+            descriptor,
+        }],
+    )?;
     runtime.set_instance_active(&instance("layer"), true)?;
-    runtime.attach_layer(owner("layer"), descriptor)?;
+    runtime.attach_registered_layer(owner("layer"))?;
     Ok(())
 }
 
@@ -124,11 +133,19 @@ fn test_should_reject_layer_missing_required_capability() -> Result<()> {
     )?;
     runtime.mount_surface(&owner("feature"), base_snapshot())?;
     runtime.set_instance_active(&instance("feature"), true)?;
-    runtime.register_instance(instance("layer"), scope(), Vec::new())?;
+    runtime.register_instance(
+        instance("layer"),
+        scope(),
+        Vec::new(),
+        vec![OwnedUiLayerDescriptor {
+            owner: owner("layer"),
+            descriptor: compatible_layer(),
+        }],
+    )?;
     runtime.set_instance_active(&instance("layer"), true)?;
 
     assert_eq!(
-        runtime.attach_layer(owner("layer"), compatible_layer()),
+        runtime.attach_registered_layer(owner("layer")),
         Err(UiError::UnsupportedCapability(String::from(
             "example.canvas@1"
         )))
@@ -269,6 +286,34 @@ fn test_should_route_only_owned_bound_actions_from_active_layer() -> Result<()> 
         runtime.route_action(&owner("layer"), invalid_payload),
         Err(UiError::InvalidActionPayload { .. })
     ));
+    Ok(())
+}
+
+#[test]
+fn test_should_bound_queued_renderer_actions() -> Result<()> {
+    let runtime = UiRuntime::new();
+    register_feature(&runtime, surface())?;
+    runtime.mount_surface(&owner("feature"), base_snapshot())?;
+    runtime.set_instance_active(&instance("feature"), true)?;
+    attach_layer(&runtime, compatible_layer())?;
+
+    let event = UiActionEvent {
+        owner_instance_id: instance("feature"),
+        surface_id: UiSurfaceId::new("example.main"),
+        node_id: "send".into(),
+        action_id: UiActionId::new("example.send"),
+        surface_revision: 1,
+        payload: UiActionPayload::None,
+    };
+
+    for _ in 0..64 {
+        runtime.queue_action(&owner("layer"), event.clone())?;
+    }
+    assert_eq!(
+        runtime.queue_action(&owner("layer"), event),
+        Err(UiError::ActionQueueFull)
+    );
+    assert_eq!(runtime.drain_queued_actions()?.len(), 64);
     Ok(())
 }
 

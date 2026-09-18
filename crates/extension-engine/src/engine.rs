@@ -5,23 +5,26 @@ use rintawa_sdk::{
     contributions::ContributionDescriptor,
     manifest::ExtensionManifest,
     runtime_effects::RuntimeEffect,
+    runtime_permissions::RuntimePermission,
     secrets::SecretPathPattern,
     traits::Component,
     types::{
         ComponentId, ContributionId, ExtensionId, ExtensionInstanceId, RuntimeEffectId,
         RuntimeScopeId,
     },
-    ui::{UiActionEvent, UiLayerDescriptor},
+    ui::{UiActionEvent, UiError, UiLayerDescriptor},
 };
 use rintawa_ui_runtime::{UiPresentationSurface, UiRuntime};
 
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use crate::{
     activation::{ActivationPlan, build_activation_plan},
+    artifact_host::RtwComponentHost,
     composition::{
         CompositionSnapshot, OwnedContractConsumer, OwnedContractDefinition, OwnedContractProvider,
         UnresolvedContractReason, resolve_contract_providers, resolve_contracts,
@@ -30,8 +33,10 @@ use crate::{
         ComponentIdentity, EngineComponentContext, EngineRegistrationContext, RegistrationBuffers,
     },
     errors::{ComponentStopFailure, EngineError, EngineResult},
+    execution_targets::{ExecutionTargetDependency, ExecutionTargetRegistry},
     runtime::WasmRuntimeEngine,
     runtime_effects::RuntimeEffectRegistry,
+    runtime_permissions::RuntimePermissionManager,
     secrets::SecretManager,
     services::{ComponentHandle, ServiceInstanceRegistration, ServiceRuntime},
 };
@@ -60,6 +65,7 @@ struct ManagedExtension {
     contract_definitions: Vec<OwnedContractDefinition>,
     contract_providers: Vec<OwnedContractProvider>,
     contract_consumers: Vec<OwnedContractConsumer>,
+    execution_target_dependencies: Vec<ExecutionTargetDependency>,
 }
 
 struct ManagedComponent {
@@ -121,12 +127,14 @@ pub struct ExtensionEngine {
     extensions: HashMap<ExtensionInstanceId, ManagedExtension>,
     active_contributions: HashSet<(RuntimeScopeId, ContributionId)>,
     runtime_effects: RuntimeEffectRegistry,
+    runtime_permissions: RuntimePermissionManager,
     secrets: SecretManager,
     services: ServiceRuntime,
     ui: UiRuntime,
     preferred_contract_providers: HashMap<RuntimeScopeId, HashMap<ContractKey, ComponentRef>>,
     platform_contract_definitions:
         HashMap<RuntimeScopeId, HashMap<ContractKey, ContractDefinition>>,
+    execution_targets: ExecutionTargetRegistry,
 }
 
 /// Runtime scope used by legacy convenience APIs that do not specify one.
@@ -140,6 +148,59 @@ fn default_instance_id(extension_id: &ExtensionId) -> ExtensionInstanceId {
     ExtensionInstanceId::new(extension_id.as_str())
 }
 
+fn rollback_started_components(
+    extension: &mut ManagedExtension,
+    runtime_effects: &mut RuntimeEffectRegistry,
+    secrets: &SecretManager,
+    services: &ServiceRuntime,
+    ui: &UiRuntime,
+) -> Vec<ComponentStopFailure> {
+    let mut failures = Vec::new();
+    for component in extension.components.iter().rev() {
+        let identity = ComponentIdentity::new(
+            extension.manifest.id.clone(),
+            extension.instance_id.clone(),
+            extension.scope_id.clone(),
+            component.id().clone(),
+        );
+        let mut context =
+            EngineComponentContext::new(identity, runtime_effects, secrets, services, ui, false);
+        if let Err(error) = component.stop(&mut context) {
+            failures.push(ComponentStopFailure {
+                component_id: component.id().to_string(),
+                reason: error.to_string(),
+            });
+        }
+    }
+    failures
+}
+
+fn compare_component_refs(left: &ComponentRef, right: &ComponentRef) -> std::cmp::Ordering {
+    left.instance_id
+        .as_str()
+        .cmp(right.instance_id.as_str())
+        .then_with(|| left.component_id.as_str().cmp(right.component_id.as_str()))
+}
+
+fn is_transient_queued_ui_rejection(error: &EngineError) -> bool {
+    matches!(
+        error,
+        EngineError::Ui(
+            UiError::LayerNotOwner
+                | UiError::ScopeNotVisible
+                | UiError::InstanceNotRegistered(_)
+                | UiError::OwnerInactive
+                | UiError::SurfaceNotRegistered(_)
+                | UiError::SurfaceNotMounted(_)
+                | UiError::RevisionMismatch { .. }
+                | UiError::NodeNotFound(_)
+                | UiError::ActionNotBound { .. }
+                | UiError::ActionDisabled { .. }
+                | UiError::InvalidActionPayload { .. }
+        )
+    )
+}
+
 impl Default for ExtensionEngine {
     fn default() -> Self {
         let secrets = SecretManager::default();
@@ -148,11 +209,13 @@ impl Default for ExtensionEngine {
             extensions: HashMap::new(),
             active_contributions: HashSet::new(),
             runtime_effects: RuntimeEffectRegistry::default(),
+            runtime_permissions: RuntimePermissionManager::default(),
             secrets,
             services,
             ui: UiRuntime::new(),
             preferred_contract_providers: HashMap::new(),
             platform_contract_definitions: HashMap::new(),
+            execution_targets: ExecutionTargetRegistry::default(),
         }
     }
 }
@@ -173,12 +236,99 @@ impl ExtensionEngine {
             extensions: HashMap::new(),
             active_contributions: HashSet::new(),
             runtime_effects: RuntimeEffectRegistry::default(),
+            runtime_permissions: RuntimePermissionManager::default(),
             secrets,
             services,
             ui: UiRuntime::new(),
             preferred_contract_providers: HashMap::new(),
             platform_contract_definitions: HashMap::new(),
+            execution_targets: ExecutionTargetRegistry::default(),
         }
+    }
+
+    /// Registers one non-built-in component execution target owned by an active component.
+    ///
+    /// Execution-target identifiers are process-global ABI identities rather than
+    /// runtime-scope composition roles. The built-in WASM target is reserved and
+    /// cannot be replaced. The registration is automatically revoked when the
+    /// owning extension instance stops or unregisters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::ExtensionInstanceNotFound`] when the owner instance
+    /// is unknown, [`EngineError::ExecutionTargetOwnerInactive`] when the owner
+    /// component is absent or inactive, or a target validation/conflict error.
+    pub fn register_execution_target_host(
+        &self,
+        owner: &ComponentRef,
+        host: Arc<dyn RtwComponentHost>,
+    ) -> EngineResult<()> {
+        let extension = self
+            .extensions
+            .get(&owner.instance_id)
+            .ok_or_else(|| EngineError::ExtensionInstanceNotFound(owner.instance_id.to_string()))?;
+        let owner_is_active = extension.state == ExtensionState::Active
+            && extension
+                .components
+                .iter()
+                .any(|component| component.id() == &owner.component_id);
+        if !owner_is_active {
+            return Err(EngineError::ExecutionTargetOwnerInactive {
+                instance_id: owner.instance_id.to_string(),
+                component_id: owner.component_id.to_string(),
+            });
+        }
+        self.execution_targets.register(owner.clone(), host)
+    }
+
+    /// Returns the active component that owns a registered execution target.
+    pub fn execution_target_owner(&self, target: &str) -> Option<ComponentRef> {
+        self.execution_targets.owner(target)
+    }
+
+    pub(crate) fn resolve_component_host(
+        &self,
+        target: &str,
+    ) -> Option<crate::execution_targets::RegisteredExecutionTargetHost> {
+        self.execution_targets.resolve(target)
+    }
+
+    fn execution_target_dependents_of(
+        &self,
+        provider_instance_id: &ExtensionInstanceId,
+    ) -> Vec<ExtensionInstanceId> {
+        let mut dependents: Vec<_> = self
+            .extensions
+            .values()
+            .filter(|extension| &extension.instance_id != provider_instance_id)
+            .filter(|extension| {
+                extension
+                    .execution_target_dependencies
+                    .iter()
+                    .any(|dependency| &dependency.provider.instance_id == provider_instance_id)
+            })
+            .map(|extension| extension.instance_id.clone())
+            .collect();
+        dependents.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        dependents.dedup();
+        dependents
+    }
+
+    fn ensure_execution_target_provider_not_in_use(
+        &self,
+        provider_instance_id: &ExtensionInstanceId,
+    ) -> EngineResult<()> {
+        let dependents = self.execution_target_dependents_of(provider_instance_id);
+        if dependents.is_empty() {
+            return Ok(());
+        }
+        Err(EngineError::ExecutionTargetProviderInUse {
+            provider_instance_id: provider_instance_id.to_string(),
+            dependents: dependents
+                .into_iter()
+                .map(|instance| instance.to_string())
+                .collect(),
+        })
     }
 
     /// Returns the trusted host secret manager used by this engine.
@@ -204,6 +354,8 @@ impl ExtensionEngine {
             self.secrets.clone(),
             self.services.clone(),
             self.ui.clone(),
+            self.execution_targets.clone(),
+            self.runtime_permissions.clone(),
         )
     }
 
@@ -358,7 +510,24 @@ impl ExtensionEngine {
         instance_id: ExtensionInstanceId,
         scope_id: RuntimeScopeId,
         manifest: ExtensionManifest,
+        components: Vec<Box<dyn Component>>,
+    ) -> EngineResult<()> {
+        self.register_extension_instance_with_target_dependencies(
+            instance_id,
+            scope_id,
+            manifest,
+            components,
+            Vec::new(),
+        )
+    }
+
+    pub(crate) fn register_extension_instance_with_target_dependencies(
+        &mut self,
+        instance_id: ExtensionInstanceId,
+        scope_id: RuntimeScopeId,
+        manifest: ExtensionManifest,
         mut components: Vec<Box<dyn Component>>,
+        execution_target_dependencies: Vec<ExecutionTargetDependency>,
     ) -> EngineResult<()> {
         manifest.validate()?;
 
@@ -374,6 +543,7 @@ impl ExtensionEngine {
         let mut contract_providers = Vec::new();
         let mut contract_consumers = Vec::new();
         let mut ui_surfaces = Vec::new();
+        let mut ui_layers = Vec::new();
 
         for comp in &mut components {
             let first_contribution = registered_descriptors.len();
@@ -383,6 +553,7 @@ impl ExtensionEngine {
                 contract_providers: &mut contract_providers,
                 contract_consumers: &mut contract_consumers,
                 ui_surfaces: &mut ui_surfaces,
+                ui_layers: &mut ui_layers,
             };
             let identity = ComponentIdentity::new(
                 manifest.id.clone(),
@@ -440,10 +611,12 @@ impl ExtensionEngine {
             })
             .map_err(|()| EngineError::ServiceRuntimeUnavailable)?;
 
-        if let Err(error) =
-            self.ui
-                .register_instance(instance_id.clone(), scope_id.clone(), ui_surfaces.clone())
-        {
+        if let Err(error) = self.ui.register_instance(
+            instance_id.clone(),
+            scope_id.clone(),
+            ui_surfaces.clone(),
+            ui_layers.clone(),
+        ) {
             self.services.unregister_instance(&instance_id);
             return Err(error.into());
         }
@@ -463,6 +636,7 @@ impl ExtensionEngine {
             contract_definitions,
             contract_providers,
             contract_consumers,
+            execution_target_dependencies,
         };
 
         self.extensions.insert(instance_id, managed);
@@ -536,6 +710,72 @@ impl ExtensionEngine {
             pattern,
         )?;
         Ok(())
+    }
+
+    /// Approves one manifest-requested runtime permission for the default instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::grant_requested_runtime_permission_for_instance`].
+    pub fn grant_requested_runtime_permission(
+        &self,
+        extension_id: &ExtensionId,
+        component_id: &ComponentId,
+        permission: RuntimePermission,
+    ) -> EngineResult<()> {
+        let instance_id = default_instance_id(extension_id);
+        if !self.extensions.contains_key(&instance_id) {
+            return Err(EngineError::ExtensionNotFound(extension_id.to_string()));
+        }
+        self.grant_requested_runtime_permission_for_instance(&instance_id, component_id, permission)
+    }
+
+    /// Approves one exact runtime permission for a concrete component principal.
+    ///
+    /// A host cannot grant a capability that the component did not request in its
+    /// manifest. The grant survives stop/restart but is removed on unregister.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::ExtensionInstanceNotFound`] for an unknown instance,
+    /// [`EngineError::RuntimePermissionComponentNotFound`] for an undeclared component,
+    /// [`EngineError::RuntimePermissionNotRequested`] when policy would expand the
+    /// manifest request, or [`EngineError::RuntimePermissionUnavailable`] when the
+    /// internal policy store cannot be accessed.
+    pub fn grant_requested_runtime_permission_for_instance(
+        &self,
+        instance_id: &ExtensionInstanceId,
+        component_id: &ComponentId,
+        permission: RuntimePermission,
+    ) -> EngineResult<()> {
+        let extension = self
+            .extensions
+            .get(instance_id)
+            .ok_or_else(|| EngineError::ExtensionInstanceNotFound(instance_id.to_string()))?;
+        let Some(component) = extension
+            .manifest
+            .components
+            .iter()
+            .find(|component| &component.id == component_id)
+        else {
+            return Err(EngineError::RuntimePermissionComponentNotFound {
+                extension_id: extension.manifest.id.to_string(),
+                component_id: component_id.to_string(),
+            });
+        };
+        if !component.permissions.runtime.contains(&permission) {
+            return Err(EngineError::RuntimePermissionNotRequested {
+                extension_id: extension.manifest.id.to_string(),
+                component_id: component_id.to_string(),
+                permission: permission.to_string(),
+            });
+        }
+        self.runtime_permissions
+            .grant(
+                ComponentRef::new(instance_id.clone(), component_id.clone()),
+                permission,
+            )
+            .map_err(|()| EngineError::RuntimePermissionUnavailable)
     }
 
     /// Activates the default runtime instance of one logical extension.
@@ -677,8 +917,10 @@ impl ExtensionEngine {
                 }
 
                 runtime_effects.revoke_instance(&concrete_instance_id);
+                self.execution_targets
+                    .revoke_instance(&concrete_instance_id);
                 self.ui.set_instance_active(&concrete_instance_id, false)?;
-                self.services.set_active(&concrete_instance_id, false);
+                self.services.deactivate_instance(&concrete_instance_id);
 
                 if ext.state == ExtensionState::Stopped {
                     for contrib in &ext.contributions {
@@ -704,9 +946,49 @@ impl ExtensionEngine {
             }
         }
 
-        self.ui.set_instance_active(&concrete_instance_id, true)?;
+        let finalization_result: EngineResult<()> = (|| {
+            self.ui.set_instance_active(&concrete_instance_id, true)?;
+            self.services
+                .activate_instance(&concrete_instance_id)
+                .map_err(|()| EngineError::ServiceRuntimeUnavailable)?;
+            Ok(())
+        })();
+        if let Err(finalization_error) = finalization_result {
+            self.services.deactivate_instance(&concrete_instance_id);
+            let mut rollback_failures = rollback_started_components(
+                ext,
+                runtime_effects,
+                &self.secrets,
+                &self.services,
+                &self.ui,
+            );
+            if let Err(error) = self.ui.set_instance_active(&concrete_instance_id, false) {
+                rollback_failures.push(ComponentStopFailure {
+                    component_id: String::from("engine-ui"),
+                    reason: error.to_string(),
+                });
+            }
+            runtime_effects.revoke_instance(&concrete_instance_id);
+            self.execution_targets
+                .revoke_instance(&concrete_instance_id);
+            if ext.state == ExtensionState::Stopped {
+                for contrib in &ext.contributions {
+                    self.active_contributions
+                        .remove(&(scope_id.clone(), contrib.descriptor.id.clone()));
+                }
+            }
+            if rollback_failures.is_empty() {
+                return Err(finalization_error);
+            }
+            return Err(EngineError::StartupRollbackFailed {
+                extension_id: logical_id.to_string(),
+                component_id: String::from("engine"),
+                start_reason: finalization_error.to_string(),
+                rollback_failures,
+            });
+        }
+
         ext.state = ExtensionState::Active;
-        self.services.set_active(&concrete_instance_id, true);
         Ok(())
     }
 
@@ -737,21 +1019,27 @@ impl ExtensionEngine {
         &mut self,
         instance_id: &ExtensionInstanceId,
     ) -> EngineResult<()> {
+        let state = self
+            .extensions
+            .get(instance_id)
+            .map(|extension| extension.state)
+            .ok_or_else(|| EngineError::ExtensionInstanceNotFound(instance_id.to_string()))?;
+        if state == ExtensionState::Stopped {
+            return Ok(());
+        }
+        self.ensure_execution_target_provider_not_in_use(instance_id)?;
+
         let (extensions, runtime_effects) = (&mut self.extensions, &mut self.runtime_effects);
         let ext = extensions
             .get_mut(instance_id)
             .ok_or_else(|| EngineError::ExtensionInstanceNotFound(instance_id.to_string()))?;
-
-        if ext.state == ExtensionState::Stopped {
-            return Ok(());
-        }
 
         let logical_id = ext.manifest.id.clone();
         let scope_id = ext.scope_id.clone();
         let concrete_instance_id = ext.instance_id.clone();
 
         self.ui.set_instance_active(&concrete_instance_id, false)?;
-        self.services.set_active(&concrete_instance_id, false);
+        self.services.deactivate_instance(&concrete_instance_id);
 
         let mut stop_failures = Vec::new();
         for comp in ext.components.iter_mut().rev() {
@@ -784,6 +1072,8 @@ impl ExtensionEngine {
         }
 
         runtime_effects.revoke_instance(&concrete_instance_id);
+        self.execution_targets
+            .revoke_instance(&concrete_instance_id);
         ext.state = ExtensionState::Stopped;
 
         if stop_failures.is_empty() {
@@ -819,6 +1109,7 @@ impl ExtensionEngine {
         &mut self,
         instance_id: &ExtensionInstanceId,
     ) -> EngineResult<()> {
+        self.ensure_execution_target_provider_not_in_use(instance_id)?;
         if let Some(ext) = self.extensions.get(instance_id) {
             if ext.state == ExtensionState::Active {
                 self.stop_extension_instance(instance_id)?;
@@ -849,8 +1140,16 @@ impl ExtensionEngine {
                     component.id.clone(),
                 ));
             }
+            for component in &extension.manifest.components {
+                self.runtime_permissions
+                    .revoke_component(&ComponentRef::new(
+                        instance_id.clone(),
+                        component.id.clone(),
+                    ));
+            }
             self.services.unregister_instance(instance_id);
             self.ui.unregister_instance(instance_id);
+            self.execution_targets.revoke_instance(instance_id);
         }
         Ok(())
     }
@@ -933,6 +1232,98 @@ impl ExtensionEngine {
             }
         }
         self.services.clear_preferred_provider(scope_id, contract);
+    }
+
+    /// Executes one cooperative runtime pump across every active component.
+    ///
+    /// Components are visited in stable runtime-instance/component order. The
+    /// returned duration is the earliest requested next wake-up; `None` means no
+    /// active component currently has scheduled cooperative work.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::RuntimePollFailed`] when an active component cannot
+    /// execute its due runtime work.
+    pub fn poll_runtime(&mut self) -> EngineResult<Option<Duration>> {
+        let mut components = Vec::new();
+        for extension in self
+            .extensions
+            .values()
+            .filter(|extension| extension.state == ExtensionState::Active)
+        {
+            for component in &extension.components {
+                components.push((
+                    extension.manifest.id.clone(),
+                    extension.instance_id.clone(),
+                    extension.scope_id.clone(),
+                    component.id.clone(),
+                    component.handle.clone(),
+                ));
+            }
+        }
+        components.sort_by(|left, right| {
+            left.1
+                .as_str()
+                .cmp(right.1.as_str())
+                .then_with(|| left.3.as_str().cmp(right.3.as_str()))
+        });
+
+        let mut next_wake = None;
+        for (extension_id, instance_id, scope_id, component_id, handle) in components {
+            let identity = ComponentIdentity::new(
+                extension_id.clone(),
+                instance_id,
+                scope_id,
+                component_id.clone(),
+            );
+            let mut context = EngineComponentContext::new(
+                identity,
+                &mut self.runtime_effects,
+                &self.secrets,
+                &self.services,
+                &self.ui,
+                true,
+            );
+            let delay = {
+                let mut component = handle.lock().map_err(|_| EngineError::RuntimePollFailed {
+                    extension_id: extension_id.to_string(),
+                    component_id: component_id.to_string(),
+                    reason: String::from("component lock was poisoned"),
+                })?;
+                component.poll_runtime(&mut context).map_err(|error| {
+                    EngineError::RuntimePollFailed {
+                        extension_id: extension_id.to_string(),
+                        component_id: component_id.to_string(),
+                        reason: error.to_string(),
+                    }
+                })?
+            };
+            if let Some(delay) = delay {
+                next_wake = Some(next_wake.map_or(delay, |current: Duration| current.min(delay)));
+            }
+        }
+
+        for queued in self.ui.drain_queued_actions()? {
+            if let Err(error) = self.dispatch_ui_action(&queued.layer_owner, queued.event)
+                && !is_transient_queued_ui_rejection(&error)
+            {
+                return Err(error);
+            }
+        }
+
+        Ok(next_wake)
+    }
+
+    /// Attaches the statically registered descriptor for the selected UI Layer provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns a portable UI error when the component did not register a layer
+    /// descriptor, is inactive, conflicts with another attached layer, or cannot
+    /// render the currently mounted surfaces in its scope.
+    pub fn attach_registered_ui_layer(&self, owner: ComponentRef) -> EngineResult<()> {
+        self.ui.attach_registered_layer(owner)?;
+        Ok(())
     }
 
     /// Attaches the selected portable UI Layer for an active extension component.
@@ -1108,10 +1499,35 @@ impl ExtensionEngine {
         eligible_instances.extend(ordered_instances.iter().cloned());
 
         let mut composition = CompositionSnapshot::default();
+        let mut definition_dependencies = Vec::new();
         for scope_id in scopes {
             let scoped = self.resolve_composition_for_scope(&scope_id, |extension| {
                 eligible_instances.contains(&extension.instance_id)
             });
+            for binding in scoped.bindings.iter().filter(|binding| binding.required) {
+                let is_platform_owned = self
+                    .platform_contract_definitions
+                    .get(&scope_id)
+                    .is_some_and(|definitions| definitions.contains_key(&binding.contract));
+                if is_platform_owned {
+                    continue;
+                }
+                if let Some(owner) = self
+                    .extensions
+                    .values()
+                    .filter(|extension| {
+                        eligible_instances.contains(&extension.instance_id)
+                            && extension.scope_id == scope_id
+                    })
+                    .flat_map(|extension| extension.contract_definitions.iter())
+                    .filter(|owned| owned.definition.contract == binding.contract)
+                    .map(|owned| owned.owner.clone())
+                    .min_by(compare_component_refs)
+                {
+                    definition_dependencies
+                        .push((owner.instance_id, binding.consumer.instance_id.clone()));
+                }
+            }
             composition.bindings.extend(scoped.bindings);
             composition.unresolved.extend(scoped.unresolved);
         }
@@ -1120,6 +1536,7 @@ impl ExtensionEngine {
             &composition,
             ordered_instances,
             &active_instances,
+            &definition_dependencies,
         )?)
     }
 
@@ -1187,6 +1604,25 @@ impl ExtensionEngine {
             preferred,
             &self.secrets,
         )
+    }
+
+    /// Returns the extension-owned definition endpoint for one loaded scoped contract.
+    ///
+    /// Platform-owned definitions intentionally return `None` because they have no
+    /// extension lifecycle dependency. The lookup is lifecycle-agnostic and is meant
+    /// for bootstrap topology planning rather than runtime availability.
+    pub fn contract_definition_owner_in_scope(
+        &self,
+        scope_id: &RuntimeScopeId,
+        contract: &ContractKey,
+    ) -> Option<ComponentRef> {
+        self.extensions
+            .values()
+            .filter(|extension| &extension.scope_id == scope_id)
+            .flat_map(|extension| extension.contract_definitions.iter())
+            .filter(|owned| owned.definition.contract == *contract)
+            .map(|owned| owned.owner.clone())
+            .min_by(compare_component_refs)
     }
 
     /// Resolves the registered contract topology in the default runtime scope.
@@ -1333,5 +1769,60 @@ impl ExtensionEngine {
         instance_id: &ExtensionInstanceId,
     ) -> Option<ExtensionState> {
         self.extensions.get(instance_id).map(|ext| ext.state)
+    }
+}
+
+#[cfg(test)]
+mod queued_ui_tests {
+    use super::*;
+
+    #[test]
+    fn test_should_treat_stale_queued_ui_validation_as_transient() {
+        for error in [
+            UiError::LayerNotOwner,
+            UiError::ScopeNotVisible,
+            UiError::InstanceNotRegistered(String::from("feature")),
+            UiError::OwnerInactive,
+            UiError::SurfaceNotRegistered(String::from("example.main")),
+            UiError::SurfaceNotMounted(String::from("example.main")),
+            UiError::RevisionMismatch {
+                expected: 2,
+                actual: 1,
+            },
+            UiError::NodeNotFound(String::from("button")),
+            UiError::ActionNotBound {
+                surface: String::from("example.main"),
+                node: String::from("button"),
+                action: String::from("run"),
+            },
+            UiError::ActionDisabled {
+                node: String::from("button"),
+                action: String::from("run"),
+            },
+            UiError::InvalidActionPayload {
+                node: String::from("button"),
+                action: String::from("run"),
+            },
+        ] {
+            assert!(is_transient_queued_ui_rejection(&EngineError::Ui(error)));
+        }
+    }
+
+    #[test]
+    fn test_should_not_hide_ui_runtime_or_component_failures() {
+        assert!(!is_transient_queued_ui_rejection(&EngineError::Ui(
+            UiError::RuntimeUnavailable
+        )));
+        assert!(!is_transient_queued_ui_rejection(&EngineError::Ui(
+            UiError::SurfaceNotOwned(String::from("example.main"))
+        )));
+        assert!(!is_transient_queued_ui_rejection(
+            &EngineError::UiActionFailed {
+                extension_id: String::from("feature"),
+                component_id: String::from("ui"),
+                action_id: String::from("run"),
+                reason: String::from("failed"),
+            }
+        ));
     }
 }

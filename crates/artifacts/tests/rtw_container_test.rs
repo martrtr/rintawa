@@ -131,3 +131,44 @@ fn test_should_read_validated_entry_without_extracting_archive() -> Result<()> {
     assert_eq!(archive.read(&entry)?, b"portable\n");
     Ok(())
 }
+
+#[test]
+fn test_should_reject_caller_bounded_read_before_decompression() -> Result<()> {
+    let root = TempDir::new()?;
+    let source = write_source(&root)?;
+    let output = root.path().join("bounded-read.rtw");
+    pack_directory(&source, &output, RtwLimits::default())?;
+
+    let mut archive = RtwArchive::open(&output, RtwLimits::default())?;
+    let entry = ArtifactPath::parse("assets/data.txt")?;
+    let error = archive
+        .read_with_limit(&entry, 4)
+        .expect_err("declared entry above caller limit must be rejected");
+
+    assert!(matches!(
+        error,
+        RtwError::EntryTooLarge {
+            path,
+            actual,
+            maximum,
+        } if path == "assets/data.txt" && actual == 9 && maximum == 4
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_should_support_serial_reads_across_archive_fork() -> Result<()> {
+    let root = TempDir::new()?;
+    let source = write_source(&root)?;
+    let output = root.path().join("forked-read.rtw");
+    pack_directory(&source, &output, RtwLimits::default())?;
+
+    let mut original = RtwArchive::open(&output, RtwLimits::default())?;
+    let mut fork = original.fork()?;
+    let entry = ArtifactPath::parse("assets/data.txt")?;
+
+    assert_eq!(original.read(&entry)?, b"portable\n");
+    assert_eq!(fork.read(&entry)?, b"portable\n");
+    assert_eq!(original.read(&entry)?, b"portable\n");
+    Ok(())
+}

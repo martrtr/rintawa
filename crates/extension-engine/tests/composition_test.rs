@@ -242,6 +242,55 @@ fn test_should_order_required_provider_before_consumer_and_preserve_ties() -> an
 }
 
 #[test]
+fn test_should_order_separate_contract_definition_owner_before_consumer() -> anyhow::Result<()> {
+    let contract = contract("example.separate-definition");
+    let mut engine = ExtensionEngine::new();
+
+    engine.register_extension(
+        manifest("provider"),
+        vec![Box::new(
+            ContractComponent::new("runtime").providing(ContractProvider::new(contract.clone())),
+        )],
+    )?;
+    engine.register_extension(
+        manifest("consumer"),
+        vec![Box::new(
+            ContractComponent::new("runtime")
+                .consuming(ContractConsumer::new(contract.clone(), true)),
+        )],
+    )?;
+    engine.register_extension(
+        manifest("definition"),
+        vec![Box::new(ContractComponent::new("runtime").defining(
+            ContractDefinition::new(contract, ContractResolutionPolicy::Single),
+        ))],
+    )?;
+
+    let requested = vec![
+        ExtensionInstanceId::new("provider"),
+        ExtensionInstanceId::new("consumer"),
+        ExtensionInstanceId::new("definition"),
+    ];
+    let plan = engine.plan_extension_activation(&requested)?;
+    assert_eq!(
+        plan.ordered_instances(),
+        &[
+            ExtensionInstanceId::new("provider"),
+            ExtensionInstanceId::new("definition"),
+            ExtensionInstanceId::new("consumer"),
+        ]
+    );
+    for instance_id in plan.ordered_instances() {
+        engine.start_extension_instance(instance_id)?;
+    }
+    assert_eq!(
+        engine.extension_instance_state(&ExtensionInstanceId::new("consumer")),
+        Some(ExtensionState::Active)
+    );
+    Ok(())
+}
+
+#[test]
 fn test_should_reject_unresolved_required_consumer_activation() -> anyhow::Result<()> {
     let contract = contract("example.required-missing");
     let definition = ContractDefinition::new(contract.clone(), ContractResolutionPolicy::Single);
@@ -499,11 +548,12 @@ fn test_provider_grants_control_binding_eligibility() -> anyhow::Result<()> {
         components: vec![ComponentDescriptor {
             id: ComponentId::new("runtime"),
             kind: ComponentKind::Runtime,
-            target: ComponentTarget::new("native"),
+            target: ComponentTarget::new("example.runtime.native@1"),
             entry: None,
             required: true,
             permissions: ComponentPermissions {
                 secret_read: vec![secret_pattern.clone()],
+                runtime: Vec::new(),
             },
         }],
     };
@@ -614,11 +664,12 @@ fn test_consumer_grant_controls_binding_eligibility() -> anyhow::Result<()> {
         components: vec![ComponentDescriptor {
             id: ComponentId::new("runtime"),
             kind: ComponentKind::Runtime,
-            target: ComponentTarget::new("native"),
+            target: ComponentTarget::new("example.runtime.native@1"),
             entry: None,
             required: true,
             permissions: ComponentPermissions {
                 secret_read: vec![secret_pattern.clone()],
+                runtime: Vec::new(),
             },
         }],
     };
@@ -820,5 +871,60 @@ fn test_should_reject_platform_reservation_after_extension_definition() -> anyho
         error,
         EngineError::PlatformContractReservationConflict { .. }
     ));
+    Ok(())
+}
+
+#[test]
+fn test_should_choose_deterministic_owner_for_duplicate_identical_definitions() -> anyhow::Result<()>
+{
+    let contract = contract("example.duplicate-definition-owner");
+    let mut engine = ExtensionEngine::new();
+
+    engine.register_extension(
+        manifest("provider"),
+        vec![Box::new(
+            ContractComponent::new("runtime").providing(ContractProvider::new(contract.clone())),
+        )],
+    )?;
+    engine.register_extension(
+        manifest("consumer"),
+        vec![Box::new(
+            ContractComponent::new("runtime")
+                .consuming(ContractConsumer::new(contract.clone(), true)),
+        )],
+    )?;
+    for extension_id in ["definition-z", "definition-a"] {
+        engine.register_extension(
+            manifest(extension_id),
+            vec![Box::new(ContractComponent::new("runtime").defining(
+                ContractDefinition::new(contract.clone(), ContractResolutionPolicy::Single),
+            ))],
+        )?;
+    }
+
+    assert_eq!(
+        engine.contract_definition_owner_in_scope(&RuntimeScopeId::new("default"), &contract,),
+        Some(rintawa_sdk::contracts::ComponentRef::new(
+            ExtensionInstanceId::new("definition-a"),
+            ComponentId::new("runtime"),
+        ))
+    );
+
+    let requested = vec![
+        ExtensionInstanceId::new("provider"),
+        ExtensionInstanceId::new("consumer"),
+        ExtensionInstanceId::new("definition-z"),
+        ExtensionInstanceId::new("definition-a"),
+    ];
+    let plan = engine.plan_extension_activation(&requested)?;
+    assert_eq!(
+        plan.ordered_instances(),
+        &[
+            ExtensionInstanceId::new("provider"),
+            ExtensionInstanceId::new("definition-z"),
+            ExtensionInstanceId::new("definition-a"),
+            ExtensionInstanceId::new("consumer"),
+        ]
+    );
     Ok(())
 }

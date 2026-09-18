@@ -1,8 +1,16 @@
-use std::{env, path::PathBuf, sync::mpsc};
+use std::{
+    env,
+    path::PathBuf,
+    sync::mpsc::{self, RecvTimeoutError},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use rintawa_host::{HostHome, HostRuntime};
+use rintawa_host::{HOST_SCOPE, HostHome, HostRuntime};
+use rintawa_sdk::{
+    contracts::ComponentRef, runtime_permissions::RuntimePermission, types::RuntimeScopeId,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "rintawa", about = "Rintawa host and local RTW bootstrap")]
@@ -30,6 +38,30 @@ enum Commands {
     Enable { id: String },
     /// Disable one baseline activation by extension ID.
     Disable { id: String },
+    /// Approve one manifest-requested runtime capability for an exact component.
+    GrantRuntime {
+        /// Concrete baseline runtime instance.
+        instance: String,
+        /// Component within the runtime instance.
+        component: String,
+        /// Exact runtime capability to approve.
+        permission: RuntimePermission,
+        /// Runtime scope containing the component.
+        #[arg(long, default_value = HOST_SCOPE)]
+        scope: String,
+    },
+    /// Remove one persisted runtime capability approval.
+    RevokeRuntime {
+        /// Concrete baseline runtime instance.
+        instance: String,
+        /// Component within the runtime instance.
+        component: String,
+        /// Exact runtime capability to revoke.
+        permission: RuntimePermission,
+        /// Runtime scope containing the component.
+        #[arg(long, default_value = HOST_SCOPE)]
+        scope: String,
+    },
     /// Start the pre-world baseline composition from persisted exact digests.
     Run {
         /// Start the composition once, then shut down.
@@ -46,6 +78,18 @@ fn main() -> Result<()> {
         Commands::List => list(&home),
         Commands::Enable { id } => set_enabled(&home, id, true),
         Commands::Disable { id } => set_enabled(&home, id, false),
+        Commands::GrantRuntime {
+            instance,
+            component,
+            permission,
+            scope,
+        } => grant_runtime_permission(&home, instance, component, permission, scope),
+        Commands::RevokeRuntime {
+            instance,
+            component,
+            permission,
+            scope,
+        } => revoke_runtime_permission(&home, instance, component, permission, scope),
         Commands::Run { once } => run(&home, once),
     }
 }
@@ -97,15 +141,71 @@ fn set_enabled(home: &HostHome, id: String, enabled: bool) -> Result<()> {
     Ok(())
 }
 
-fn run(home: &HostHome, once: bool) -> Result<()> {
-    let runtime = HostRuntime::start(home)?;
-    if !once {
-        println!("running; press Ctrl+C to stop");
-        let receiver = interrupt_receiver()?;
-        let _ = receiver.recv();
-    }
-    runtime.shutdown()?;
+fn grant_runtime_permission(
+    home: &HostHome,
+    instance: String,
+    component: String,
+    permission: RuntimePermission,
+    scope: String,
+) -> Result<()> {
+    let scope_id = RuntimeScopeId::new(scope);
+    let owner = ComponentRef::new(instance, component);
+    home.grant_runtime_permission(scope_id, owner.clone(), permission)?;
+    println!(
+        "{} {} {}: granted",
+        owner.instance_id, owner.component_id, permission
+    );
     Ok(())
+}
+
+fn revoke_runtime_permission(
+    home: &HostHome,
+    instance: String,
+    component: String,
+    permission: RuntimePermission,
+    scope: String,
+) -> Result<()> {
+    let scope_id = RuntimeScopeId::new(scope);
+    let owner = ComponentRef::new(instance, component);
+    home.revoke_runtime_permission(&scope_id, &owner, permission)?;
+    println!(
+        "{} {} {}: revoked",
+        owner.instance_id, owner.component_id, permission
+    );
+    Ok(())
+}
+
+fn run(home: &HostHome, once: bool) -> Result<()> {
+    let mut runtime = HostRuntime::start(home)?;
+    let operation_result = if once {
+        Ok(())
+    } else {
+        run_until_interrupt(&mut runtime)
+    };
+    let shutdown_result = runtime.shutdown().map_err(anyhow::Error::from);
+
+    match (operation_result, shutdown_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(operation_error), Err(shutdown_error)) => {
+            Err(operation_error.context(format!("runtime shutdown also failed: {shutdown_error}")))
+        }
+    }
+}
+
+fn run_until_interrupt(runtime: &mut HostRuntime) -> Result<()> {
+    println!("running; press Ctrl+C to stop");
+    let receiver = interrupt_receiver()?;
+    let maximum_idle_wait = Duration::from_millis(250);
+    loop {
+        let wait = runtime
+            .poll_runtime()?
+            .map_or(maximum_idle_wait, |delay| delay.min(maximum_idle_wait));
+        match receiver.recv_timeout(wait) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
 }
 
 fn resolve_home(override_home: Option<PathBuf>) -> Result<PathBuf> {
@@ -131,4 +231,63 @@ fn interrupt_receiver() -> Result<mpsc::Receiver<()>> {
     })
     .context("failed to install Ctrl+C handler")?;
     Ok(receiver)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_parse_runtime_permission_commands() {
+        let grant = Cli::try_parse_from([
+            "rintawa",
+            "grant-runtime",
+            "example.runtime",
+            "runtime",
+            "background-task",
+        ])
+        .expect("grant-runtime command should parse");
+        assert!(matches!(
+            grant.command,
+            Commands::GrantRuntime {
+                instance,
+                component,
+                permission: RuntimePermission::BackgroundTask,
+                scope,
+            } if instance == "example.runtime" && component == "runtime" && scope == HOST_SCOPE
+        ));
+
+        let revoke = Cli::try_parse_from([
+            "rintawa",
+            "revoke-runtime",
+            "example.runtime",
+            "runtime",
+            "loopback-listen",
+            "--scope",
+            "world:test",
+        ])
+        .expect("revoke-runtime command should parse");
+        assert!(matches!(
+            revoke.command,
+            Commands::RevokeRuntime {
+                permission: RuntimePermission::LoopbackListen,
+                scope,
+                ..
+            } if scope == "world:test"
+        ));
+    }
+
+    #[test]
+    fn test_should_reject_unknown_runtime_permission() {
+        assert!(
+            Cli::try_parse_from([
+                "rintawa",
+                "grant-runtime",
+                "example.runtime",
+                "runtime",
+                "raw-network",
+            ])
+            .is_err()
+        );
+    }
 }

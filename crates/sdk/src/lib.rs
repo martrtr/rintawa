@@ -2,8 +2,8 @@
 //!
 //! Version 0.0.1 intentionally provides a small lifecycle and manifest
 //! contract. It does not implement the extension engine, runtime hosts, state,
-//! storage, AI, or UI rendering. It defines declarative secret-read requests;
-//! the Rintawa host alone evaluates and grants them.
+//! storage, AI, or UI rendering. It defines declarative secret-read and coarse
+//! runtime capability requests; the Rintawa host alone evaluates and grants them.
 //!
 //! A component's execution model is selected by its target. Core permanently
 //! provides the `rintawa.runtime.wasm-component@1` root target; additional targets
@@ -22,6 +22,7 @@
 //! - [`api`] — APIs available to extensions
 //! - [`errors`] — error types
 //! - [`secrets`] — validated secret paths and redacted secret values
+//! - [`runtime_permissions`] — explicitly requested host runtime capabilities
 //! - [`prelude`] — commonly used imports
 
 #![forbid(unsafe_code)]
@@ -34,6 +35,7 @@ pub mod contributions;
 pub mod errors;
 pub mod manifest;
 pub mod runtime_effects;
+pub mod runtime_permissions;
 pub mod secrets;
 pub mod services;
 pub mod traits;

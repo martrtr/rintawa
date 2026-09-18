@@ -1688,6 +1688,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "rintawa-host",
+ "rintawa-sdk",
 ]
 
 [[package]]
@@ -1770,6 +1771,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "rintawa-sdk",
+ "serde",
 ]
 
 [[package]]

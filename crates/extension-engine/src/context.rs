@@ -13,12 +13,15 @@ use rintawa_sdk::{
         ComponentId, ContributionId, ExtensionId, ExtensionInstanceId, RuntimeEffectId,
         RuntimeScopeId,
     },
-    ui::{UiPatchBatch, UiResult, UiSurfaceContribution, UiSurfaceId, UiSurfaceSnapshot},
+    ui::{
+        UiLayerDescriptor, UiPatchBatch, UiResult, UiSurfaceContribution, UiSurfaceId,
+        UiSurfaceSnapshot,
+    },
 };
 use std::collections::HashSet;
 use tracing::{debug, error, info, trace, warn};
 
-use rintawa_ui_runtime::{OwnedUiSurfaceContribution, UiRuntime};
+use rintawa_ui_runtime::{OwnedUiLayerDescriptor, OwnedUiSurfaceContribution, UiRuntime};
 
 use crate::{
     composition::{OwnedContractConsumer, OwnedContractDefinition, OwnedContractProvider},
@@ -96,6 +99,7 @@ pub(crate) struct RegistrationBuffers<'a> {
     pub(crate) contract_providers: &'a mut Vec<OwnedContractProvider>,
     pub(crate) contract_consumers: &'a mut Vec<OwnedContractConsumer>,
     pub(crate) ui_surfaces: &'a mut Vec<OwnedUiSurfaceContribution>,
+    pub(crate) ui_layers: &'a mut Vec<OwnedUiLayerDescriptor>,
 }
 
 /// Registration context provided to components during initialization.
@@ -224,6 +228,22 @@ impl<'a> RegistrationContext for EngineRegistrationContext<'a> {
             owner,
             contribution: surface,
         });
+        Ok(())
+    }
+
+    fn register_ui_layer(&mut self, descriptor: UiLayerDescriptor) -> ExtensionResult<()> {
+        let owner = self.identity.owner();
+        if self
+            .buffers
+            .ui_layers
+            .iter()
+            .any(|registered| registered.owner == owner)
+        {
+            return Err(ExtensionError::DuplicateUiLayerDescriptor);
+        }
+        self.buffers
+            .ui_layers
+            .push(OwnedUiLayerDescriptor { owner, descriptor });
         Ok(())
     }
 }

@@ -12,7 +12,10 @@ use crate::{
     secrets::{SecretPath, SecretValue},
     services::{ServiceCallError, ServiceCallResult},
     types::{ComponentId, ExtensionId, ExtensionInstanceId, RuntimeEffectId, RuntimeScopeId},
-    ui::{UiPatchBatch, UiResult, UiSurfaceContribution, UiSurfaceId, UiSurfaceSnapshot},
+    ui::{
+        UiLayerDescriptor, UiPatchBatch, UiResult, UiSurfaceContribution, UiSurfaceId,
+        UiSurfaceSnapshot,
+    },
 };
 
 /// The context available to a component during execution.
@@ -171,6 +174,19 @@ pub trait RegistrationContext: ComponentContext {
     ///
     /// Returns an error when the current host context cannot register UI metadata.
     fn register_ui_surface(&mut self, _surface: UiSurfaceContribution) -> ExtensionResult<()> {
+        Err(crate::errors::ExtensionError::UiRegistrationUnavailable)
+    }
+
+    /// Registers this component as a renderer for the portable UI protocol.
+    ///
+    /// The component must separately provide the platform `rintawa.ui.layer@1`
+    /// binding. The host selects one provider through normal composition policy
+    /// before attaching its descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current host context cannot register UI metadata.
+    fn register_ui_layer(&mut self, _descriptor: UiLayerDescriptor) -> ExtensionResult<()> {
         Err(crate::errors::ExtensionError::UiRegistrationUnavailable)
     }
 }

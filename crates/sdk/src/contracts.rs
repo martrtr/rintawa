@@ -72,6 +72,21 @@ pub fn host_shell_contract_key() -> ContractKey {
     ContractKey::new(HOST_SHELL_CONTRACT_ID, HOST_SHELL_CONTRACT_VERSION)
 }
 
+/// Stable identifier of the platform-owned portable UI Layer role.
+pub const UI_LAYER_CONTRACT_ID: &str = "rintawa.ui.layer";
+
+/// Major version of the platform-owned portable UI Layer role.
+pub const UI_LAYER_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1);
+
+/// Returns the versioned contract key used to select the active portable UI Layer.
+///
+/// The UI Layer is a composition role. Platform hosts define it as a
+/// single-provider binding while extensions provide renderer capabilities through
+/// a separately registered [`crate::ui::UiLayerDescriptor`].
+pub fn ui_layer_contract_key() -> ContractKey {
+    ContractKey::new(UI_LAYER_CONTRACT_ID, UI_LAYER_CONTRACT_VERSION)
+}
+
 /// Identifies one component within one concrete extension runtime instance.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ComponentRef {
