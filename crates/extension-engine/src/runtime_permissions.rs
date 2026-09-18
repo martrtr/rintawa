@@ -35,8 +35,48 @@ impl RuntimePermissionManager {
     }
 
     pub(crate) fn revoke_component(&self, owner: &ComponentRef) {
-        if let Ok(mut grants) = self.grants.write() {
-            grants.remove(owner);
-        }
+        let mut grants = match self.grants.write() {
+            Ok(grants) => grants,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        grants.remove(owner);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+
+    use rintawa_sdk::types::{ComponentId, ExtensionInstanceId};
+
+    use super::*;
+
+    #[test]
+    fn test_should_revoke_permission_after_policy_lock_is_poisoned() {
+        let manager = RuntimePermissionManager::default();
+        let owner = ComponentRef::new(
+            ExtensionInstanceId::new("example.runtime"),
+            ComponentId::new("runtime"),
+        );
+        manager
+            .grant(owner.clone(), RuntimePermission::BackgroundTask)
+            .expect("test grant should succeed");
+
+        let poisoner = manager.clone();
+        let _ = thread::spawn(move || {
+            let _grants = poisoner
+                .grants
+                .write()
+                .expect("test lock should start healthy");
+            panic!("poison runtime permission policy lock");
+        })
+        .join();
+
+        manager.revoke_component(&owner);
+        let grants = match manager.grants.read() {
+            Ok(grants) => grants,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(!grants.contains_key(&owner));
     }
 }

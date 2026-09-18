@@ -155,3 +155,20 @@ fn test_should_reject_caller_bounded_read_before_decompression() -> Result<()> {
     ));
     Ok(())
 }
+
+#[test]
+fn test_should_support_serial_reads_across_archive_fork() -> Result<()> {
+    let root = TempDir::new()?;
+    let source = write_source(&root)?;
+    let output = root.path().join("forked-read.rtw");
+    pack_directory(&source, &output, RtwLimits::default())?;
+
+    let mut original = RtwArchive::open(&output, RtwLimits::default())?;
+    let mut fork = original.fork()?;
+    let entry = ArtifactPath::parse("assets/data.txt")?;
+
+    assert_eq!(original.read(&entry)?, b"portable\n");
+    assert_eq!(fork.read(&entry)?, b"portable\n");
+    assert_eq!(original.read(&entry)?, b"portable\n");
+    Ok(())
+}

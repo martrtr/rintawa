@@ -12,8 +12,9 @@ use rintawa_sdk::{
 };
 
 use crate::{
-    BootstrapBlockedActivation, BootstrapDeferredActivation, BootstrapStall, HOST_SCOPE, HostError,
-    HostHome, HostResult,
+    BootstrapBlockedActivation, BootstrapDeferredActivation, BootstrapRollback, BootstrapStall,
+    HOST_SCOPE, HostCleanupFailure, HostCleanupOperation, HostError, HostHome, HostResult,
+    HostShutdownFailures,
 };
 
 /// Running baseline host composition loaded exclusively from exact local RTW digests.
@@ -273,13 +274,14 @@ impl HostRuntime {
         })();
 
         if let Err(error) = result {
-            for instance in started.iter().rev() {
-                let _ = engine.stop_extension_instance(instance);
+            let cleanup_failures = cleanup_instances(&mut engine, &started, &registered);
+            if cleanup_failures.is_empty() {
+                return Err(error);
             }
-            for instance in registered.iter().rev() {
-                let _ = engine.unregister_extension_instance(instance);
-            }
-            return Err(error);
+            return Err(HostError::BootstrapRollback(Box::new(BootstrapRollback {
+                primary: Box::new(error),
+                cleanup_failures,
+            })));
         }
 
         Ok(Self {
@@ -315,24 +317,66 @@ impl HostRuntime {
 
     /// Stops and unregisters every baseline runtime instance in reverse activation order.
     pub fn shutdown(mut self) -> HostResult<()> {
-        let mut first_error = None;
-        for instance in self.started_instances.iter().rev() {
-            if let Err(error) = self.engine.stop_extension_instance(instance)
-                && first_error.is_none()
-            {
-                first_error = Some(HostError::Engine(error));
-            }
-            if let Err(error) = self.engine.unregister_extension_instance(instance)
-                && first_error.is_none()
-            {
-                first_error = Some(HostError::Engine(error));
-            }
-        }
-        if let Some(error) = first_error {
-            Err(error)
-        } else {
+        let cleanup_failures = cleanup_instances(
+            &mut self.engine,
+            &self.started_instances,
+            &self.started_instances,
+        );
+        if cleanup_failures.is_empty() {
             Ok(())
+        } else {
+            Err(HostError::ShutdownFailed(Box::new(HostShutdownFailures {
+                cleanup_failures,
+            })))
         }
+    }
+}
+
+fn cleanup_instances(
+    engine: &mut ExtensionEngine,
+    started_instances: &[ExtensionInstanceId],
+    registered_instances: &[ExtensionInstanceId],
+) -> Vec<HostCleanupFailure> {
+    let started: HashSet<_> = started_instances.iter().cloned().collect();
+    let mut failures = Vec::new();
+
+    // Registered-but-never-started dependents can still hold execution-target
+    // dependencies that prevent their provider from stopping. Remove those first.
+    for instance_id in registered_instances
+        .iter()
+        .rev()
+        .filter(|instance_id| !started.contains(*instance_id))
+    {
+        record_unregister_failure(engine, instance_id, &mut failures);
+    }
+
+    // Started instances are recorded in provider-before-consumer order. Reverse
+    // that order and unregister each dependent immediately after stop so provider
+    // lifetime guards never observe a dangling registered dependent.
+    for instance_id in started_instances.iter().rev() {
+        if let Err(error) = engine.stop_extension_instance(instance_id) {
+            failures.push(HostCleanupFailure {
+                instance_id: instance_id.clone(),
+                operation: HostCleanupOperation::Stop,
+                error,
+            });
+        }
+        record_unregister_failure(engine, instance_id, &mut failures);
+    }
+    failures
+}
+
+fn record_unregister_failure(
+    engine: &mut ExtensionEngine,
+    instance_id: &ExtensionInstanceId,
+    failures: &mut Vec<HostCleanupFailure>,
+) {
+    if let Err(error) = engine.unregister_extension_instance(instance_id) {
+        failures.push(HostCleanupFailure {
+            instance_id: instance_id.clone(),
+            operation: HostCleanupOperation::Unregister,
+            error,
+        });
     }
 }
 
@@ -404,7 +448,7 @@ mod tests {
         contracts::{
             ContractConsumer, ContractDefinition, ContractKey, ContractProvider, ContractVersion,
         },
-        errors::ExtensionResult,
+        errors::{ExtensionError, ExtensionResult},
         manifest::ExtensionManifest,
         prelude::{Component, ComponentId, ContractResolutionPolicy, ExtensionId},
     };
@@ -527,6 +571,63 @@ mod tests {
         assert!(bootstrap.contains(&provider));
         assert!(bootstrap.contains(&definition));
         assert!(!bootstrap.contains(&unrelated));
+        Ok(())
+    }
+
+    struct FailingStopComponent {
+        id: ComponentId,
+    }
+
+    impl Component for FailingStopComponent {
+        fn id(&self) -> &ComponentId {
+            &self.id
+        }
+
+        fn stop(
+            &mut self,
+            _ctx: &mut dyn rintawa_sdk::context::ComponentContext,
+        ) -> ExtensionResult<()> {
+            Err(ExtensionError::Message(String::from("test stop failure")))
+        }
+    }
+
+    #[test]
+    fn test_should_aggregate_all_host_cleanup_failures() -> anyhow::Result<()> {
+        let scope = RuntimeScopeId::new("host");
+        let first = ExtensionInstanceId::new("first");
+        let second = ExtensionInstanceId::new("second");
+        let mut engine = ExtensionEngine::new();
+
+        engine.register_extension_instance(
+            first.clone(),
+            scope.clone(),
+            test_manifest("first"),
+            vec![Box::new(FailingStopComponent {
+                id: ComponentId::new("runtime"),
+            })],
+        )?;
+        engine.register_extension_instance(
+            second.clone(),
+            scope,
+            test_manifest("second"),
+            vec![Box::new(FailingStopComponent {
+                id: ComponentId::new("runtime"),
+            })],
+        )?;
+        engine.start_extension_instance(&first)?;
+        engine.start_extension_instance(&second)?;
+
+        let failures = cleanup_instances(
+            &mut engine,
+            &[first.clone(), second.clone()],
+            &[first.clone(), second.clone()],
+        );
+
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0].instance_id, second);
+        assert_eq!(failures[0].operation, HostCleanupOperation::Stop);
+        assert_eq!(failures[1].instance_id, first);
+        assert_eq!(failures[1].operation, HostCleanupOperation::Stop);
         Ok(())
     }
 }

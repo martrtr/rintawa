@@ -106,11 +106,13 @@ impl RtwArchive {
     pub fn manifest(&self) -> &RtwManifest {
         &self.manifest
     }
-    /// Creates an independently seekable, fully revalidated view of this artifact.
+    /// Creates a separately validated view of the same already-open artifact file.
     ///
-    /// The fork refers to the same already-open artifact file but owns an independent
-    /// file descriptor and ZIP cursor. Validation is repeated so callers never receive
-    /// a read view based on stale or partially trusted archive metadata.
+    /// Validation is repeated so callers never receive a read view based on stale or
+    /// partially trusted archive metadata. The cloned OS file handle may share its seek
+    /// position with the original handle, so original and forked views must be used
+    /// serially rather than read concurrently. This preserves exact-file identity
+    /// without reopening a mutable filesystem path.
     ///
     /// # Errors
     ///

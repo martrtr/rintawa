@@ -148,8 +148,52 @@ fn default_instance_id(extension_id: &ExtensionId) -> ExtensionInstanceId {
     ExtensionInstanceId::new(extension_id.as_str())
 }
 
+fn rollback_started_components(
+    extension: &mut ManagedExtension,
+    runtime_effects: &mut RuntimeEffectRegistry,
+    secrets: &SecretManager,
+    services: &ServiceRuntime,
+    ui: &UiRuntime,
+) -> Vec<ComponentStopFailure> {
+    let mut failures = Vec::new();
+    for component in extension.components.iter().rev() {
+        let identity = ComponentIdentity::new(
+            extension.manifest.id.clone(),
+            extension.instance_id.clone(),
+            extension.scope_id.clone(),
+            component.id().clone(),
+        );
+        let mut context =
+            EngineComponentContext::new(identity, runtime_effects, secrets, services, ui, false);
+        if let Err(error) = component.stop(&mut context) {
+            failures.push(ComponentStopFailure {
+                component_id: component.id().to_string(),
+                reason: error.to_string(),
+            });
+        }
+    }
+    failures
+}
+
+fn compare_component_refs(left: &ComponentRef, right: &ComponentRef) -> std::cmp::Ordering {
+    left.instance_id
+        .as_str()
+        .cmp(right.instance_id.as_str())
+        .then_with(|| left.component_id.as_str().cmp(right.component_id.as_str()))
+}
+
 fn is_transient_queued_ui_rejection(error: &EngineError) -> bool {
-    matches!(error, EngineError::Ui(ui_error) if !matches!(ui_error, UiError::RuntimeUnavailable))
+    matches!(
+        error,
+        EngineError::Ui(
+            UiError::SurfaceNotMounted(_)
+                | UiError::RevisionMismatch { .. }
+                | UiError::NodeNotFound(_)
+                | UiError::ActionNotBound { .. }
+                | UiError::ActionDisabled { .. }
+                | UiError::InvalidActionPayload { .. }
+        )
+    )
 }
 
 impl Default for ExtensionEngine {
@@ -871,7 +915,7 @@ impl ExtensionEngine {
                 self.execution_targets
                     .revoke_instance(&concrete_instance_id);
                 self.ui.set_instance_active(&concrete_instance_id, false)?;
-                self.services.set_active(&concrete_instance_id, false);
+                self.services.deactivate_instance(&concrete_instance_id);
 
                 if ext.state == ExtensionState::Stopped {
                     for contrib in &ext.contributions {
@@ -897,9 +941,49 @@ impl ExtensionEngine {
             }
         }
 
-        self.ui.set_instance_active(&concrete_instance_id, true)?;
+        let finalization_result: EngineResult<()> = (|| {
+            self.ui.set_instance_active(&concrete_instance_id, true)?;
+            self.services
+                .activate_instance(&concrete_instance_id)
+                .map_err(|()| EngineError::ServiceRuntimeUnavailable)?;
+            Ok(())
+        })();
+        if let Err(finalization_error) = finalization_result {
+            self.services.deactivate_instance(&concrete_instance_id);
+            let mut rollback_failures = rollback_started_components(
+                ext,
+                runtime_effects,
+                &self.secrets,
+                &self.services,
+                &self.ui,
+            );
+            if let Err(error) = self.ui.set_instance_active(&concrete_instance_id, false) {
+                rollback_failures.push(ComponentStopFailure {
+                    component_id: String::from("engine-ui"),
+                    reason: error.to_string(),
+                });
+            }
+            runtime_effects.revoke_instance(&concrete_instance_id);
+            self.execution_targets
+                .revoke_instance(&concrete_instance_id);
+            if ext.state == ExtensionState::Stopped {
+                for contrib in &ext.contributions {
+                    self.active_contributions
+                        .remove(&(scope_id.clone(), contrib.descriptor.id.clone()));
+                }
+            }
+            if rollback_failures.is_empty() {
+                return Err(finalization_error);
+            }
+            return Err(EngineError::StartupRollbackFailed {
+                extension_id: logical_id.to_string(),
+                component_id: String::from("engine"),
+                start_reason: finalization_error.to_string(),
+                rollback_failures,
+            });
+        }
+
         ext.state = ExtensionState::Active;
-        self.services.set_active(&concrete_instance_id, true);
         Ok(())
     }
 
@@ -950,7 +1034,7 @@ impl ExtensionEngine {
         let concrete_instance_id = ext.instance_id.clone();
 
         self.ui.set_instance_active(&concrete_instance_id, false)?;
-        self.services.set_active(&concrete_instance_id, false);
+        self.services.deactivate_instance(&concrete_instance_id);
 
         let mut stop_failures = Vec::new();
         for comp in ext.components.iter_mut().rev() {
@@ -1431,8 +1515,9 @@ impl ExtensionEngine {
                             && extension.scope_id == scope_id
                     })
                     .flat_map(|extension| extension.contract_definitions.iter())
-                    .find(|owned| owned.definition.contract == binding.contract)
+                    .filter(|owned| owned.definition.contract == binding.contract)
                     .map(|owned| owned.owner.clone())
+                    .min_by(compare_component_refs)
                 {
                     definition_dependencies
                         .push((owner.instance_id, binding.consumer.instance_id.clone()));
@@ -1530,8 +1615,9 @@ impl ExtensionEngine {
             .values()
             .filter(|extension| &extension.scope_id == scope_id)
             .flat_map(|extension| extension.contract_definitions.iter())
-            .find(|owned| owned.definition.contract == *contract)
+            .filter(|owned| owned.definition.contract == *contract)
             .map(|owned| owned.owner.clone())
+            .min_by(compare_component_refs)
     }
 
     /// Resolves the registered contract topology in the default runtime scope.
@@ -1698,6 +1784,12 @@ mod queued_ui_tests {
     fn test_should_not_hide_ui_runtime_or_component_failures() {
         assert!(!is_transient_queued_ui_rejection(&EngineError::Ui(
             UiError::RuntimeUnavailable
+        )));
+        assert!(!is_transient_queued_ui_rejection(&EngineError::Ui(
+            UiError::LayerNotOwner
+        )));
+        assert!(!is_transient_queued_ui_rejection(&EngineError::Ui(
+            UiError::SurfaceNotOwned(String::from("example.main"))
         )));
         assert!(!is_transient_queued_ui_rejection(
             &EngineError::UiActionFailed {

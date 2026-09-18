@@ -11,7 +11,7 @@ fn test_extension_loader_and_state_persistence() -> EngineResult<()> {
     let ext_dir = temp_dir.path().join("rintawa/extensions/chat-ext");
     fs::create_dir_all(&ext_dir)?;
 
-    // 1. Create a dummy manifest for a native component
+    // 1. Create a dummy manifest for an optional external component.
     let manifest_content = r#"
         id = "chat-ext"
         name = "Chat Extension"
@@ -22,6 +22,7 @@ fn test_extension_loader_and_state_persistence() -> EngineResult<()> {
         id = "chat-native"
         kind = "runtime"
         target = "example.runtime.native@1"
+        required = false
     "#;
     fs::write(ext_dir.join("manifest.toml"), manifest_content)?;
 
@@ -93,5 +94,41 @@ fn test_loader_rejects_duplicate_component_ids_before_artifact_loading() -> Engi
     assert!(matches!(error, EngineError::ManifestValidation(
         ManifestValidationError::DuplicateComponentId { extension_id, component_id }
     ) if extension_id.as_str() == "duplicate-extension" && component_id.as_str() == "runtime"));
+    Ok(())
+}
+
+#[test]
+fn test_loader_rejects_required_external_target_without_artifact_host() -> EngineResult<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let ext_dir = temp_dir.path().join("required-external");
+    fs::create_dir_all(&ext_dir)?;
+    fs::write(
+        ext_dir.join("manifest.toml"),
+        r#"
+        id = "required-external"
+        name = "Required External"
+        version = "0.0.1"
+        sdk = "^0.0"
+        [[components]]
+        id = "runtime"
+        kind = "runtime"
+        target = "example.runtime.external@1"
+        required = true
+    "#,
+    )?;
+
+    let mut engine = ExtensionEngine::new();
+    let loader = ExtensionLoader::new(engine.wasm_runtime_engine()?);
+    let error = loader
+        .load_single_extension(&mut engine, &ext_dir, &ExtensionsStateConfig::default())
+        .expect_err("required external target must not be silently ignored");
+
+    assert!(matches!(
+        error,
+        EngineError::UnsupportedRequiredComponentTarget {
+            component_id,
+            target,
+        } if component_id == "runtime" && target == "example.runtime.external@1"
+    ));
     Ok(())
 }

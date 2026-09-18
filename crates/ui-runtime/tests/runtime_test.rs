@@ -290,6 +290,34 @@ fn test_should_route_only_owned_bound_actions_from_active_layer() -> Result<()> 
 }
 
 #[test]
+fn test_should_bound_queued_renderer_actions() -> Result<()> {
+    let runtime = UiRuntime::new();
+    register_feature(&runtime, surface())?;
+    runtime.mount_surface(&owner("feature"), base_snapshot())?;
+    runtime.set_instance_active(&instance("feature"), true)?;
+    attach_layer(&runtime, compatible_layer())?;
+
+    let event = UiActionEvent {
+        owner_instance_id: instance("feature"),
+        surface_id: UiSurfaceId::new("example.main"),
+        node_id: "send".into(),
+        action_id: UiActionId::new("example.send"),
+        surface_revision: 1,
+        payload: UiActionPayload::None,
+    };
+
+    for _ in 0..64 {
+        runtime.queue_action(&owner("layer"), event.clone())?;
+    }
+    assert_eq!(
+        runtime.queue_action(&owner("layer"), event),
+        Err(UiError::ActionQueueFull)
+    );
+    assert_eq!(runtime.drain_queued_actions()?.len(), 64);
+    Ok(())
+}
+
+#[test]
 fn test_should_remove_surfaces_and_layer_on_extension_deactivation() -> Result<()> {
     let runtime = UiRuntime::new();
     register_feature(&runtime, surface())?;

@@ -873,3 +873,58 @@ fn test_should_reject_platform_reservation_after_extension_definition() -> anyho
     ));
     Ok(())
 }
+
+#[test]
+fn test_should_choose_deterministic_owner_for_duplicate_identical_definitions() -> anyhow::Result<()>
+{
+    let contract = contract("example.duplicate-definition-owner");
+    let mut engine = ExtensionEngine::new();
+
+    engine.register_extension(
+        manifest("provider"),
+        vec![Box::new(
+            ContractComponent::new("runtime").providing(ContractProvider::new(contract.clone())),
+        )],
+    )?;
+    engine.register_extension(
+        manifest("consumer"),
+        vec![Box::new(
+            ContractComponent::new("runtime")
+                .consuming(ContractConsumer::new(contract.clone(), true)),
+        )],
+    )?;
+    for extension_id in ["definition-z", "definition-a"] {
+        engine.register_extension(
+            manifest(extension_id),
+            vec![Box::new(ContractComponent::new("runtime").defining(
+                ContractDefinition::new(contract.clone(), ContractResolutionPolicy::Single),
+            ))],
+        )?;
+    }
+
+    assert_eq!(
+        engine.contract_definition_owner_in_scope(&RuntimeScopeId::new("default"), &contract,),
+        Some(rintawa_sdk::contracts::ComponentRef::new(
+            ExtensionInstanceId::new("definition-a"),
+            ComponentId::new("runtime"),
+        ))
+    );
+
+    let requested = vec![
+        ExtensionInstanceId::new("provider"),
+        ExtensionInstanceId::new("consumer"),
+        ExtensionInstanceId::new("definition-z"),
+        ExtensionInstanceId::new("definition-a"),
+    ];
+    let plan = engine.plan_extension_activation(&requested)?;
+    assert_eq!(
+        plan.ordered_instances(),
+        &[
+            ExtensionInstanceId::new("provider"),
+            ExtensionInstanceId::new("definition-z"),
+            ExtensionInstanceId::new("definition-a"),
+            ExtensionInstanceId::new("consumer"),
+        ]
+    );
+    Ok(())
+}

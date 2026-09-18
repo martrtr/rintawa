@@ -1175,15 +1175,14 @@ impl HostArtifactSource for WasmHostState {
     fn paths(
         &mut self,
         source: Resource<crate::artifact_host::OwnedRtwComponentSource>,
-    ) -> Vec<String> {
-        match self.resource_table.get(&source) {
-            Ok(source) => source
-                .paths()
-                .into_iter()
-                .map(|path| path.to_string())
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+    ) -> Result<Vec<String>, TargetArtifactError> {
+        let source = self
+            .resource_table
+            .get(&source)
+            .map_err(|_| TargetArtifactError::Unavailable)?;
+        source
+            .path_strings_with_limit(self.max_host_message_bytes)
+            .ok_or(TargetArtifactError::MessageTooLarge)
     }
 
     fn resolve_component_entry(
@@ -1355,11 +1354,12 @@ impl UiLayerHost for WasmHostState {
                     UiError::RuntimeUnavailable => UiLayerError::Unavailable,
                     _ => UiLayerError::Rejected,
                 })?;
-        let payload = serde_json::to_vec(&surfaces).map_err(|_| UiLayerError::Unavailable)?;
-        if payload.len() > self.max_host_message_bytes {
+        let mut counter = JsonSizeCounter::default();
+        serde_json::to_writer(&mut counter, &surfaces).map_err(|_| UiLayerError::Unavailable)?;
+        if counter.bytes > self.max_host_message_bytes {
             return Err(UiLayerError::MessageTooLarge);
         }
-        Ok(payload)
+        serde_json::to_vec(&surfaces).map_err(|_| UiLayerError::Unavailable)
     }
 
     fn dispatch_action(&mut self, action_json: Vec<u8>) -> Result<(), UiLayerError> {
@@ -2171,15 +2171,15 @@ impl WasmTargetProviderEndpoint {
             .store
             .data_mut()
             .begin_target_component_registration()?;
-        let result = instance
-            .target_provider
-            .as_ref()
-            .ok_or_else(|| {
-                ExtensionError::Message(String::from("target-provider export view is unavailable"))
-            })?
-            .rintawa_engine_target_provider()
-            .call_register_component(&mut instance.store, handle)
-            .map_err(|error| WasmComponent::execution_error("target register", error));
+        let result = match instance.target_provider.as_ref() {
+            Some(provider) => provider
+                .rintawa_engine_target_provider()
+                .call_register_component(&mut instance.store, handle)
+                .map_err(|error| WasmComponent::execution_error("target register", error)),
+            None => Err(ExtensionError::Message(String::from(
+                "target-provider export view is unavailable",
+            ))),
+        };
         match result {
             Ok(Ok(())) => instance.store.data_mut().finish_registration(),
             Ok(Err(error)) => {
@@ -2211,17 +2211,20 @@ impl WasmTargetProviderEndpoint {
             .store
             .data_mut()
             .begin_delegated_guest_execution(owner);
-        let result = instance
-            .target_provider
-            .as_ref()
-            .ok_or_else(|| {
-                ExtensionError::Message(String::from("target-provider export view is unavailable"))
-            })?
-            .rintawa_engine_target_provider()
-            .call_start_component(&mut instance.store, handle)
-            .map_err(|error| WasmComponent::execution_error("target start", error));
+        let result = match instance.target_provider.as_ref() {
+            Some(provider) => provider
+                .rintawa_engine_target_provider()
+                .call_start_component(&mut instance.store, handle)
+                .map_err(|error| WasmComponent::execution_error("target start", error)),
+            None => Err(ExtensionError::Message(String::from(
+                "target-provider export view is unavailable",
+            ))),
+        };
         match result {
-            Ok(Ok(())) => instance.store.data_mut().finish_guest_execution(ctx),
+            Ok(Ok(())) => match instance.store.data_mut().finish_guest_execution(ctx) {
+                Ok(()) => Ok(()),
+                Err(error) => Err(instance.store.data_mut().abort_guest_execution(ctx, error)),
+            },
             Ok(Err(error)) => {
                 let error = map_wit_target_host_error("start", error);
                 Err(instance.store.data_mut().abort_guest_execution(ctx, error))
@@ -2235,27 +2238,56 @@ impl WasmTargetProviderEndpoint {
             ctx.extension_instance_id().clone(),
             ctx.component_id().clone(),
         );
-        let mut runtime = self.runtime_for_callback()?;
-        let instance = Self::live_instance_for_callback(&mut runtime)?;
-        WasmComponent::set_callback_fuel(&mut instance.store, &self.budget, "target stop")?;
-        let result = instance
-            .target_provider
-            .as_ref()
-            .ok_or_else(|| {
-                ExtensionError::Message(String::from("target-provider export view is unavailable"))
-            })?
-            .rintawa_engine_target_provider()
-            .call_stop_component(&mut instance.store, handle)
-            .map_err(|error| WasmComponent::execution_error("target stop", error))?
-            .map_err(|error| map_wit_target_host_error("stop", error));
-        instance
-            .store
-            .data_mut()
-            .forget_effect_handles_for_owner(&owner);
-        instance
-            .store
-            .data_mut()
-            .revoke_runtime_resources_for_owner(&owner);
+        let (mut runtime, lock_failure) = match self.runtime.try_lock() {
+            Ok(runtime) => (runtime, None),
+            Err(TryLockError::WouldBlock) => {
+                return Err(ExtensionError::Message(String::from(
+                    "WASM target-provider runtime is busy",
+                )));
+            }
+            Err(TryLockError::Poisoned(poisoned)) => (
+                poisoned.into_inner(),
+                Some(ExtensionError::Message(String::from(
+                    "WASM target-provider runtime lock was poisoned",
+                ))),
+            ),
+        };
+        let result = if let Some(error) = lock_failure {
+            Err(error)
+        } else {
+            match Self::live_instance_for_callback(&mut runtime) {
+                Ok(instance) => match WasmComponent::set_callback_fuel(
+                    &mut instance.store,
+                    &self.budget,
+                    "target stop",
+                ) {
+                    Ok(()) => match instance.target_provider.as_ref() {
+                        Some(provider) => provider
+                            .rintawa_engine_target_provider()
+                            .call_stop_component(&mut instance.store, handle)
+                            .map_err(|error| WasmComponent::execution_error("target stop", error))
+                            .and_then(|result| {
+                                result.map_err(|error| map_wit_target_host_error("stop", error))
+                            }),
+                        None => Err(ExtensionError::Message(String::from(
+                            "target-provider export view is unavailable",
+                        ))),
+                    },
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            }
+        };
+        if let Some(instance) = runtime.instance.as_mut() {
+            instance
+                .store
+                .data_mut()
+                .forget_effect_handles_for_owner(&owner);
+            instance
+                .store
+                .data_mut()
+                .revoke_runtime_resources_for_owner(&owner);
+        }
         result
     }
 
@@ -2283,17 +2315,20 @@ impl WasmTargetProviderEndpoint {
             .store
             .data_mut()
             .begin_delegated_guest_execution(owner);
-        let result = instance
-            .target_provider
-            .as_ref()
-            .ok_or_else(|| {
-                ExtensionError::Message(String::from("target-provider export view is unavailable"))
-            })?
-            .rintawa_engine_target_provider()
-            .call_handle_ui_action(&mut instance.store, handle, payload)
-            .map_err(|error| WasmComponent::execution_error("target UI action", error));
+        let result = match instance.target_provider.as_ref() {
+            Some(provider) => provider
+                .rintawa_engine_target_provider()
+                .call_handle_ui_action(&mut instance.store, handle, payload)
+                .map_err(|error| WasmComponent::execution_error("target UI action", error)),
+            None => Err(ExtensionError::Message(String::from(
+                "target-provider export view is unavailable",
+            ))),
+        };
         match result {
-            Ok(Ok(())) => instance.store.data_mut().finish_guest_execution(ctx),
+            Ok(Ok(())) => match instance.store.data_mut().finish_guest_execution(ctx) {
+                Ok(()) => Ok(()),
+                Err(error) => Err(instance.store.data_mut().abort_guest_execution(ctx, error)),
+            },
             Ok(Err(error)) => {
                 let error = map_wit_target_host_error("UI action", error);
                 Err(instance.store.data_mut().abort_guest_execution(ctx, error))
@@ -2327,21 +2362,21 @@ impl WasmTargetProviderEndpoint {
             .store
             .data_mut()
             .begin_delegated_service_execution(owner);
-        let result = instance
-            .target_provider
-            .as_ref()
-            .ok_or_else(|| {
-                ExtensionError::Message(String::from("target-provider export view is unavailable"))
-            })?
-            .rintawa_engine_target_provider()
-            .call_handle_service(
-                &mut instance.store,
-                handle,
-                contract.id.as_str(),
-                contract.version.major(),
-                request,
-            )
-            .map_err(|error| WasmComponent::execution_error("target service", error));
+        let result = match instance.target_provider.as_ref() {
+            Some(provider) => provider
+                .rintawa_engine_target_provider()
+                .call_handle_service(
+                    &mut instance.store,
+                    handle,
+                    contract.id.as_str(),
+                    contract.version.major(),
+                    request,
+                )
+                .map_err(|error| WasmComponent::execution_error("target service", error)),
+            None => Err(ExtensionError::Message(String::from(
+                "target-provider export view is unavailable",
+            ))),
+        };
         instance.store.data_mut().finish_service_execution();
         let response = result?.map_err(|error| map_wit_target_host_error("service", error))?;
         if response.len() > self.budget.max_host_message_bytes {
@@ -2718,16 +2753,32 @@ impl Component for WasmComponent {
 
     fn stop(&mut self, _ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
         let budget = self.budget.clone();
-        let mut runtime = self.runtime()?;
+        let (mut runtime, lock_failure) = match self.runtime.try_lock() {
+            Ok(runtime) => (runtime, None),
+            Err(TryLockError::WouldBlock) => {
+                return Err(ExtensionError::Message(String::from(
+                    "WASM runtime state is busy",
+                )));
+            }
+            Err(TryLockError::Poisoned(poisoned)) => (
+                poisoned.into_inner(),
+                Some(ExtensionError::Message(String::from(
+                    "WASM runtime state lock was poisoned",
+                ))),
+            ),
+        };
         let stop_result = if let Some(instance) = runtime.instance.as_mut() {
-            let result =
+            let result = if let Some(error) = lock_failure {
+                Err(error)
+            } else {
                 Self::set_callback_fuel(&mut instance.store, &budget, "stop").and_then(|()| {
                     instance
                         .plugin
                         .rintawa_engine_guest()
                         .call_stop(&mut instance.store)
                         .map_err(|err| Self::execution_error("stop", err))
-                });
+                })
+            };
             let owner = instance.store.data().registered_owner();
             instance.store.data_mut().discard_guest_execution();
             instance.store.data_mut().effect_handles.clear();
@@ -2738,6 +2789,8 @@ impl Component for WasmComponent {
                     .revoke_runtime_resources_for_owner(&owner);
             }
             result
+        } else if let Some(error) = lock_failure {
+            Err(error)
         } else {
             return Ok(());
         };
@@ -2803,6 +2856,7 @@ impl Component for WasmComponent {
                     };
                     if let Err(error) = callback {
                         failure = Some(if is_root_owner {
+                            guest_failed = true;
                             instance.store.data_mut().abort_guest_execution(ctx, error)
                         } else {
                             instance.store.data_mut().discard_guest_execution();
@@ -2816,6 +2870,7 @@ impl Component for WasmComponent {
                     }
                     if is_root_owner {
                         if let Err(error) = instance.store.data_mut().finish_guest_execution(ctx) {
+                            guest_failed = true;
                             failure =
                                 Some(instance.store.data_mut().abort_guest_execution(ctx, error));
                             break;
@@ -2829,7 +2884,6 @@ impl Component for WasmComponent {
                         .reschedule_task(handle, Instant::now());
                 }
                 if let Some(error) = failure {
-                    guest_failed = true;
                     Err(error)
                 } else {
                     let now = Instant::now();
@@ -3700,6 +3754,112 @@ mod tests {
         };
         assert!(error.to_string().contains("runtime is busy"));
         drop(guard);
+    }
+
+    #[test]
+    fn test_should_drop_root_wasm_instance_after_poisoned_stop_cleanup() {
+        let runtime_engine = WasmRuntimeEngine::new().expect("test WASM runtime should initialize");
+        let mut component = runtime_engine
+            .load_component_from_bytes(
+                ComponentId::new("ordinary-component"),
+                include_str!("../../tests/fixtures/stateful_component.wat").as_bytes(),
+            )
+            .expect("ordinary test component should compile");
+        {
+            let mut runtime = component
+                .runtime()
+                .expect("test runtime lock should be available");
+            component
+                .ensure_instance(&mut runtime)
+                .expect("ordinary test component should instantiate");
+        }
+
+        let shared = component.runtime.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _runtime = shared
+                .lock()
+                .expect("test runtime lock should start healthy");
+            panic!("poison test WASM runtime lock");
+        }));
+
+        let mut context = TestRuntimeContext::new();
+        let error = component
+            .stop(&mut context)
+            .expect_err("poisoned stop must remain caller-visible");
+        assert!(error.to_string().contains("lock was poisoned"));
+
+        let runtime = match shared.lock() {
+            Ok(runtime) => runtime,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(runtime.instance.is_none());
+        assert_eq!(runtime.failed_lifecycle_callback, Some("stop"));
+    }
+
+    #[test]
+    fn test_should_revoke_delegated_resources_when_provider_lock_is_poisoned() {
+        let runtime_engine = WasmRuntimeEngine::new().expect("test WASM runtime should initialize");
+        let component = runtime_engine
+            .load_component_from_bytes(
+                ComponentId::new("ordinary-component"),
+                include_str!("../../tests/fixtures/stateful_component.wat").as_bytes(),
+            )
+            .expect("ordinary test component should compile");
+        let owner = rintawa_sdk::contracts::ComponentRef::new(
+            test_instance_id(),
+            ComponentId::new("chat-runtime"),
+        );
+        {
+            let mut runtime = component
+                .runtime()
+                .expect("test runtime lock should be available");
+            let instance = component
+                .ensure_instance(&mut runtime)
+                .expect("ordinary test component should instantiate");
+            instance.store.data_mut().active_tasks.insert(
+                7,
+                ActiveWasmTask {
+                    owner: owner.clone(),
+                    interval: Duration::from_millis(10),
+                    next_due: Instant::now(),
+                },
+            );
+        }
+
+        let shared = component.runtime.clone();
+        let endpoint = WasmTargetProviderEndpoint {
+            runtime: shared.clone(),
+            budget: WasmExecutionBudget::default(),
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _runtime = shared
+                .lock()
+                .expect("test runtime lock should start healthy");
+            panic!("poison test target-provider runtime lock");
+        }));
+
+        let mut context = TestRuntimeContext::new();
+        let error = endpoint
+            .stop_component(42, &mut context)
+            .expect_err("poisoned target stop must remain caller-visible");
+        assert!(error.to_string().contains("lock was poisoned"));
+
+        let runtime = match shared.lock() {
+            Ok(runtime) => runtime,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let instance = runtime
+            .instance
+            .as_ref()
+            .expect("provider store should remain available for host cleanup inspection");
+        assert!(
+            instance
+                .store
+                .data()
+                .active_tasks
+                .values()
+                .all(|task| task.owner != owner)
+        );
     }
 
     #[test]

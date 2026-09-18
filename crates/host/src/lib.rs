@@ -19,7 +19,7 @@ use rintawa_artifacts::{
     ArtifactDigest, ArtifactStore, ContentType, ImportDisposition, RtwArchive, RtwLimits,
 };
 use rintawa_extension_engine::{
-    ActivationPlanError, DeferredExecutionTarget, ExtensionEngine, RtwExtensionLoader,
+    ActivationPlanError, DeferredExecutionTarget, EngineError, ExtensionEngine, RtwExtensionLoader,
     UnresolvedContractReason,
 };
 use rintawa_sdk::{
@@ -102,6 +102,93 @@ impl fmt::Display for BootstrapStall {
             write!(formatter, "; batch activation plan: {error}")?;
         }
         Ok(())
+    }
+}
+
+/// Host lifecycle cleanup operation that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostCleanupOperation {
+    /// Stopping an active extension instance.
+    Stop,
+    /// Unregistering an extension instance.
+    Unregister,
+}
+
+impl fmt::Display for HostCleanupOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stop => formatter.write_str("stop"),
+            Self::Unregister => formatter.write_str("unregister"),
+        }
+    }
+}
+
+/// One caller-visible failure encountered while cleaning up host lifecycle state.
+#[derive(Debug)]
+pub struct HostCleanupFailure {
+    /// Runtime instance whose cleanup operation failed.
+    pub instance_id: ExtensionInstanceId,
+    /// Lifecycle operation that failed.
+    pub operation: HostCleanupOperation,
+    /// Exact Engine lifecycle error.
+    pub error: EngineError,
+}
+
+/// Bootstrap error plus every cleanup failure observed while rolling back partial startup.
+#[derive(Debug)]
+pub struct BootstrapRollback {
+    /// Original bootstrap failure that triggered rollback.
+    pub primary: Box<HostError>,
+    /// Stop/unregister failures observed while cleanup continued.
+    pub cleanup_failures: Vec<HostCleanupFailure>,
+}
+
+impl fmt::Display for BootstrapRollback {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "bootstrap failed: {}", self.primary)?;
+        for failure in &self.cleanup_failures {
+            write!(
+                formatter,
+                "; rollback {} for instance `{}` failed: {}",
+                failure.operation, failure.instance_id, failure.error
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for BootstrapRollback {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.primary.as_ref())
+    }
+}
+
+/// Aggregated failures observed while shutting down a running baseline composition.
+#[derive(Debug)]
+pub struct HostShutdownFailures {
+    /// Stop/unregister failures observed while shutdown continued.
+    pub cleanup_failures: Vec<HostCleanupFailure>,
+}
+
+impl fmt::Display for HostShutdownFailures {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("baseline shutdown cleanup failed")?;
+        for failure in &self.cleanup_failures {
+            write!(
+                formatter,
+                "; {} for instance `{}` failed: {}",
+                failure.operation, failure.instance_id, failure.error
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for HostShutdownFailures {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cleanup_failures
+            .first()
+            .map(|failure| &failure.error as &(dyn std::error::Error + 'static))
     }
 }
 
@@ -219,6 +306,12 @@ pub enum HostError {
     /// Baseline bootstrap reached a fixed point without satisfying every activation.
     #[error("{0}")]
     BootstrapStalled(Box<BootstrapStall>),
+    /// Baseline bootstrap failed and rollback also reported lifecycle failures.
+    #[error("{0}")]
+    BootstrapRollback(Box<BootstrapRollback>),
+    /// Running baseline shutdown reported one or more lifecycle cleanup failures.
+    #[error("{0}")]
+    ShutdownFailed(Box<HostShutdownFailures>),
     /// A persisted activation uses a content type for which this host has no handler.
     #[error("no activation handler is available for RTW content `{0}`")]
     UnsupportedContent(String),

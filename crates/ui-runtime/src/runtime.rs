@@ -5,6 +5,8 @@ use std::{
 
 use serde::Serialize;
 
+const MAX_QUEUED_ACTIONS: usize = 64;
+
 use rintawa_sdk::{
     contracts::ComponentRef,
     types::{ExtensionInstanceId, RuntimeScopeId},
@@ -188,28 +190,31 @@ impl UiRuntime {
 
     /// Removes one extension instance and all of its UI state.
     pub fn unregister_instance(&self, instance_id: &ExtensionInstanceId) {
-        if let Ok(mut state) = self.state.write()
-            && let Some(instance) = state.instances.remove(instance_id)
+        let mut state = match self.state.write() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(instance) = state.instances.remove(instance_id) else {
+            return;
+        };
+        for surface_id in instance.surfaces {
+            let key = UiSurfaceKey::new(instance_id.clone(), surface_id);
+            state.registered_surfaces.remove(&key);
+            state.mounted_surfaces.remove(&key);
+        }
+        state
+            .registered_layers
+            .retain(|owner, _| &owner.instance_id != instance_id);
+        state.queued_actions.retain(|queued| {
+            &queued.layer_owner.instance_id != instance_id
+                && &queued.event.owner_instance_id != instance_id
+        });
+        if state
+            .layers
+            .get(&instance.scope_id)
+            .is_some_and(|layer| &layer.owner.instance_id == instance_id)
         {
-            for surface_id in instance.surfaces {
-                let key = UiSurfaceKey::new(instance_id.clone(), surface_id);
-                state.registered_surfaces.remove(&key);
-                state.mounted_surfaces.remove(&key);
-            }
-            state
-                .registered_layers
-                .retain(|owner, _| &owner.instance_id != instance_id);
-            state.queued_actions.retain(|queued| {
-                &queued.layer_owner.instance_id != instance_id
-                    && &queued.event.owner_instance_id != instance_id
-            });
-            if state
-                .layers
-                .get(&instance.scope_id)
-                .is_some_and(|layer| &layer.owner.instance_id == instance_id)
-            {
-                state.layers.remove(&instance.scope_id);
-            }
+            state.layers.remove(&instance.scope_id);
         }
     }
 
@@ -223,10 +228,11 @@ impl UiRuntime {
         instance_id: &ExtensionInstanceId,
         is_active: bool,
     ) -> UiResult<()> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| UiError::RuntimeUnavailable)?;
+        let mut state = match self.state.write() {
+            Ok(state) => state,
+            Err(poisoned) if !is_active => poisoned.into_inner(),
+            Err(_) => return Err(UiError::RuntimeUnavailable),
+        };
         let (scope_id, surface_ids) = {
             let instance = state
                 .instances
@@ -546,17 +552,21 @@ impl UiRuntime {
     ///
     /// # Errors
     ///
-    /// Returns the same validation errors as [`Self::route_action`].
+    /// Returns the same validation errors as [`Self::route_action`] or
+    /// [`UiError::ActionQueueFull`] when the bounded host queue is saturated.
     pub fn queue_action(&self, layer_owner: &ComponentRef, event: UiActionEvent) -> UiResult<()> {
         self.route_action(layer_owner, event.clone())?;
-        self.state
+        let mut state = self
+            .state
             .write()
-            .map_err(|_| UiError::RuntimeUnavailable)?
-            .queued_actions
-            .push_back(QueuedUiAction {
-                layer_owner: layer_owner.clone(),
-                event,
-            });
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        if state.queued_actions.len() >= MAX_QUEUED_ACTIONS {
+            return Err(UiError::ActionQueueFull);
+        }
+        state.queued_actions.push_back(QueuedUiAction {
+            layer_owner: layer_owner.clone(),
+            event,
+        });
         Ok(())
     }
 
@@ -810,4 +820,42 @@ fn apply_patch_operations(snapshot: &mut UiSurfaceSnapshot, patches: &[UiPatch])
     rebuilt.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
     snapshot.nodes = rebuilt;
     Ok(())
+}
+
+#[cfg(test)]
+mod poison_cleanup_tests {
+    use std::thread;
+
+    use super::*;
+
+    #[test]
+    fn test_should_unregister_instance_after_ui_state_lock_is_poisoned() {
+        let runtime = UiRuntime::new();
+        let instance_id = ExtensionInstanceId::new("example.ui");
+        runtime
+            .register_instance(
+                instance_id.clone(),
+                RuntimeScopeId::new("host"),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("test UI instance should register");
+
+        let poisoner = runtime.clone();
+        let _ = thread::spawn(move || {
+            let _state = poisoner
+                .state
+                .write()
+                .expect("test UI state lock should start healthy");
+            panic!("poison UI runtime state lock");
+        })
+        .join();
+
+        runtime.unregister_instance(&instance_id);
+        let state = match runtime.state.read() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(!state.instances.contains_key(&instance_id));
+    }
 }

@@ -148,19 +148,34 @@ impl ServiceRuntime {
     }
 
     pub(crate) fn unregister_instance(&self, instance_id: &ExtensionInstanceId) {
-        if let Ok(mut state) = self.state.write()
-            && state.instances.remove(instance_id).is_some()
-        {
+        let mut state = match self.state.write() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.instances.remove(instance_id).is_some() {
             state.topology_changed();
         }
     }
 
-    pub(crate) fn set_active(&self, instance_id: &ExtensionInstanceId, is_active: bool) {
-        if let Ok(mut state) = self.state.write()
-            && let Some(instance) = state.instances.get_mut(instance_id)
-            && instance.is_active != is_active
+    pub(crate) fn activate_instance(&self, instance_id: &ExtensionInstanceId) -> Result<(), ()> {
+        let mut state = self.state.write().map_err(|_| ())?;
+        let instance = state.instances.get_mut(instance_id).ok_or(())?;
+        if !instance.is_active {
+            instance.is_active = true;
+            state.topology_changed();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn deactivate_instance(&self, instance_id: &ExtensionInstanceId) {
+        let mut state = match self.state.write() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(instance) = state.instances.get_mut(instance_id)
+            && instance.is_active
         {
-            instance.is_active = is_active;
+            instance.is_active = false;
             state.topology_changed();
         }
     }
@@ -516,5 +531,51 @@ impl ComponentContext for ServiceComponentContext {
     ) -> ServiceCallResult<Vec<u8>> {
         self.services
             .call_with_stack(&self.owner, contract, request, true, &self.call_stack)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+
+    use super::*;
+
+    fn registration(instance_id: ExtensionInstanceId) -> ServiceInstanceRegistration {
+        ServiceInstanceRegistration {
+            instance_id,
+            extension_id: ExtensionId::new("example.service"),
+            scope_id: RuntimeScopeId::new("host"),
+            definitions: Vec::new(),
+            providers: Vec::new(),
+            consumers: Vec::new(),
+            components: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_should_fail_activation_after_service_state_lock_is_poisoned() {
+        let runtime = ServiceRuntime::new(SecretManager::system());
+        let instance_id = ExtensionInstanceId::new("example.service");
+        runtime
+            .register_instance(registration(instance_id.clone()))
+            .expect("test service instance should register");
+
+        let poisoner = runtime.clone();
+        let _ = thread::spawn(move || {
+            let _state = poisoner
+                .state
+                .write()
+                .expect("test service state lock should start healthy");
+            panic!("poison service runtime state lock");
+        })
+        .join();
+
+        assert_eq!(runtime.activate_instance(&instance_id), Err(()));
+        runtime.deactivate_instance(&instance_id);
+        let state = match runtime.state.read() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(!state.instances[&instance_id].is_active);
     }
 }

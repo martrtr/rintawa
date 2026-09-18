@@ -102,12 +102,17 @@ pub fn validate_component_target(value: &str) -> Result<(), ComponentTargetValid
             ));
         }
     }
+    if major.is_empty() || !major.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid(
+            "major version must contain only ASCII decimal digits",
+        ));
+    }
     if major.len() > 1 && major.starts_with('0') {
         return Err(invalid("major version must use canonical decimal notation"));
     }
     major
         .parse::<u32>()
-        .map_err(|_| invalid("major version must be an unsigned integer"))?;
+        .map_err(|_| invalid("major version must fit in an unsigned 32-bit integer"))?;
     Ok(())
 }
 
@@ -419,6 +424,33 @@ mod tests {
                 ..
             }) if component_id == ComponentId::new("runtime")
                 && source.reason() == "expected `<namespace>.<name>@<major>`"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_noncanonical_component_target_major() -> Result<(), toml::de::Error> {
+        let manifest: ExtensionManifest = toml::from_str(
+            r#"
+            id = "invalid-target-major"
+            name = "Invalid Target Major"
+            version = "0.0.1"
+            sdk = "^0.0"
+            [[components]]
+            id = "runtime"
+            kind = "runtime"
+            target = "example.runtime.test@+1"
+        "#,
+        )?;
+
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestValidationError::InvalidComponentTarget {
+                component_id,
+                source,
+                ..
+            }) if component_id == ComponentId::new("runtime")
+                && source.reason() == "major version must contain only ASCII decimal digits"
         ));
         Ok(())
     }
