@@ -186,7 +186,12 @@ fn is_transient_queued_ui_rejection(error: &EngineError) -> bool {
     matches!(
         error,
         EngineError::Ui(
-            UiError::SurfaceNotMounted(_)
+            UiError::LayerNotOwner
+                | UiError::ScopeNotVisible
+                | UiError::InstanceNotRegistered(_)
+                | UiError::OwnerInactive
+                | UiError::SurfaceNotRegistered(_)
+                | UiError::SurfaceNotMounted(_)
                 | UiError::RevisionMismatch { .. }
                 | UiError::NodeNotFound(_)
                 | UiError::ActionNotBound { .. }
@@ -1773,20 +1778,40 @@ mod queued_ui_tests {
 
     #[test]
     fn test_should_treat_stale_queued_ui_validation_as_transient() {
-        let error = EngineError::Ui(UiError::RevisionMismatch {
-            expected: 2,
-            actual: 1,
-        });
-        assert!(is_transient_queued_ui_rejection(&error));
+        for error in [
+            UiError::LayerNotOwner,
+            UiError::ScopeNotVisible,
+            UiError::InstanceNotRegistered(String::from("feature")),
+            UiError::OwnerInactive,
+            UiError::SurfaceNotRegistered(String::from("example.main")),
+            UiError::SurfaceNotMounted(String::from("example.main")),
+            UiError::RevisionMismatch {
+                expected: 2,
+                actual: 1,
+            },
+            UiError::NodeNotFound(String::from("button")),
+            UiError::ActionNotBound {
+                surface: String::from("example.main"),
+                node: String::from("button"),
+                action: String::from("run"),
+            },
+            UiError::ActionDisabled {
+                node: String::from("button"),
+                action: String::from("run"),
+            },
+            UiError::InvalidActionPayload {
+                node: String::from("button"),
+                action: String::from("run"),
+            },
+        ] {
+            assert!(is_transient_queued_ui_rejection(&EngineError::Ui(error)));
+        }
     }
 
     #[test]
     fn test_should_not_hide_ui_runtime_or_component_failures() {
         assert!(!is_transient_queued_ui_rejection(&EngineError::Ui(
             UiError::RuntimeUnavailable
-        )));
-        assert!(!is_transient_queued_ui_rejection(&EngineError::Ui(
-            UiError::LayerNotOwner
         )));
         assert!(!is_transient_queued_ui_rejection(&EngineError::Ui(
             UiError::SurfaceNotOwned(String::from("example.main"))

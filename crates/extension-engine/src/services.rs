@@ -186,12 +186,14 @@ impl ServiceRuntime {
         contract: ContractKey,
         provider: ComponentRef,
     ) {
-        if let Ok(mut state) = self.state.write() {
-            let providers = state.preferred_providers.entry(scope_id).or_default();
-            if providers.get(&contract) != Some(&provider) {
-                providers.insert(contract, provider);
-                state.topology_changed();
-            }
+        let mut state = match self.state.write() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let providers = state.preferred_providers.entry(scope_id).or_default();
+        if providers.get(&contract) != Some(&provider) {
+            providers.insert(contract, provider);
+            state.topology_changed();
         }
     }
 
@@ -200,21 +202,23 @@ impl ServiceRuntime {
         scope_id: &RuntimeScopeId,
         contract: &ContractKey,
     ) {
-        if let Ok(mut state) = self.state.write() {
-            let removed = state
+        let mut state = match self.state.write() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let removed = state
+            .preferred_providers
+            .get_mut(scope_id)
+            .is_some_and(|providers| providers.remove(contract).is_some());
+        if removed {
+            if state
                 .preferred_providers
-                .get_mut(scope_id)
-                .is_some_and(|providers| providers.remove(contract).is_some());
-            if removed {
-                if state
-                    .preferred_providers
-                    .get(scope_id)
-                    .is_some_and(HashMap::is_empty)
-                {
-                    state.preferred_providers.remove(scope_id);
-                }
-                state.topology_changed();
+                .get(scope_id)
+                .is_some_and(HashMap::is_empty)
+            {
+                state.preferred_providers.remove(scope_id);
             }
+            state.topology_changed();
         }
     }
 
@@ -538,6 +542,8 @@ impl ComponentContext for ServiceComponentContext {
 mod tests {
     use std::thread;
 
+    use rintawa_sdk::contracts::ContractVersion;
+
     use super::*;
 
     fn registration(instance_id: ExtensionInstanceId) -> ServiceInstanceRegistration {
@@ -550,6 +556,51 @@ mod tests {
             consumers: Vec::new(),
             components: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn test_should_apply_preferred_provider_policy_after_service_state_lock_is_poisoned() {
+        let runtime = ServiceRuntime::new(SecretManager::system());
+        let scope_id = RuntimeScopeId::new("host");
+        let contract = ContractKey::new("example.policy", ContractVersion::new(1));
+        let provider = ComponentRef::new("example.provider", "runtime");
+
+        let poisoner = runtime.clone();
+        let _ = thread::spawn(move || {
+            let _state = poisoner
+                .state
+                .write()
+                .expect("test service state lock should start healthy");
+            panic!("poison service runtime state lock");
+        })
+        .join();
+
+        runtime.set_preferred_provider(scope_id.clone(), contract.clone(), provider.clone());
+        {
+            let state = match runtime.state.read() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            assert_eq!(
+                state
+                    .preferred_providers
+                    .get(&scope_id)
+                    .and_then(|providers| providers.get(&contract)),
+                Some(&provider)
+            );
+        }
+
+        runtime.clear_preferred_provider(&scope_id, &contract);
+        let state = match runtime.state.read() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(
+            state
+                .preferred_providers
+                .get(&scope_id)
+                .is_none_or(HashMap::is_empty)
+        );
     }
 
     #[test]
