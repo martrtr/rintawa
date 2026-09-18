@@ -27,7 +27,7 @@ use rintawa_sdk::{
     traits::Component,
     types::{ComponentId, ExtensionId, ExtensionInstanceId, RuntimeEffectId, RuntimeScopeId},
     ui::{
-        UiActionEvent, UiCapabilityId, UiError, UiPatchBatch, UiPlacementHint,
+        UiActionEvent, UiCapabilityId, UiError, UiLayerDescriptor, UiPatchBatch, UiPlacementHint,
         UiSurfaceContribution, UiSurfaceId, UiSurfaceSnapshot,
     },
 };
@@ -198,6 +198,7 @@ use bindings::rintawa::engine::{
     runtime_tasks::{Error as RuntimeTaskError, Host as RuntimeTasksHost},
     secrets::{Error as SecretError, Host as SecretsHost},
     services::{Error as ServiceTransportError, Host as ServicesHost},
+    ui_layer::{Error as UiLayerError, Host as UiLayerHost},
 };
 use target_provider_bindings::TargetProviderPlugin;
 use target_provider_bindings::exports::rintawa::engine::target_provider::{
@@ -258,6 +259,7 @@ struct WasmRegistrationScope {
     consumer_keys: HashSet<ContractKey>,
     ui_surfaces: Vec<UiSurfaceContribution>,
     ui_surface_ids: HashSet<UiSurfaceId>,
+    ui_layer: Option<UiLayerDescriptor>,
 }
 
 struct WasmRegistrations {
@@ -266,6 +268,7 @@ struct WasmRegistrations {
     providers: Vec<ContractProvider>,
     consumers: Vec<ContractConsumer>,
     ui_surfaces: Vec<UiSurfaceContribution>,
+    ui_layer: Option<UiLayerDescriptor>,
 }
 
 /// A guest request that is committed through the Engine-owned effect registry.
@@ -424,6 +427,7 @@ impl WasmHostState {
             consumer_keys: HashSet::new(),
             ui_surfaces: Vec::new(),
             ui_surface_ids: HashSet::new(),
+            ui_layer: None,
         });
         self.extension_id = Some(extension_id);
         self.instance_id = Some(instance_id);
@@ -456,6 +460,7 @@ impl WasmHostState {
             consumer_keys: HashSet::new(),
             ui_surfaces: Vec::new(),
             ui_surface_ids: HashSet::new(),
+            ui_layer: None,
         });
         Ok(())
     }
@@ -475,6 +480,7 @@ impl WasmHostState {
             providers: scope.providers,
             consumers: scope.consumers,
             ui_surfaces: scope.ui_surfaces,
+            ui_layer: scope.ui_layer,
         })
     }
 
@@ -719,12 +725,30 @@ impl WasmHostState {
     fn begin_delegated_guest_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
         self.execution_owner = Some(owner);
         self.runtime_effects_active = true;
-        self.task_access_active = false;
-        self.network_access_active = false;
+        self.task_access_active = true;
+        self.network_access_active = true;
         self.secret_access_active = true;
         self.service_access_active = true;
         self.ui_access_active = true;
         self.execution_target_registration_active = false;
+    }
+
+    fn begin_delegated_task_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
+        self.execution_owner = Some(owner);
+        // Runtime effects require an Engine ComponentContext for the exact owner.
+        // The cooperative provider pump currently has only the provider context,
+        // so delegated task callbacks cannot create or revoke runtime effects.
+        self.runtime_effects_active = false;
+        self.task_access_active = true;
+        self.network_access_active = true;
+        self.secret_access_active = true;
+        self.service_access_active = true;
+        self.ui_access_active = true;
+        self.execution_target_registration_active = false;
+    }
+
+    fn finish_delegated_task_execution(&mut self) {
+        self.discard_guest_execution();
     }
 
     fn begin_start_execution(&mut self) {
@@ -903,18 +927,13 @@ impl WasmHostState {
             .retain(|handle| self.effect_handles.contains_key(handle));
     }
 
-    fn root_runtime_owner(&self) -> Option<rintawa_sdk::contracts::ComponentRef> {
-        let current = self.current_execution_owner()?;
-        let registered = self.registered_owner()?;
-        (current == &registered).then_some(registered)
-    }
-
     fn runtime_permission_owner(
         &self,
         permission: RuntimePermission,
     ) -> Result<rintawa_sdk::contracts::ComponentRef, RuntimePermissionCheck> {
         let owner = self
-            .root_runtime_owner()
+            .current_execution_owner()
+            .cloned()
             .ok_or(RuntimePermissionCheck::Denied)?;
         match self.runtime_permissions.has_grant(&owner, permission) {
             Ok(true) => Ok(owner),
@@ -952,31 +971,34 @@ impl WasmHostState {
             .retain(|_, resource| &resource.owner != owner);
     }
 
-    fn next_task_due_in(
-        &self,
-        owner: &rintawa_sdk::contracts::ComponentRef,
-        now: Instant,
-    ) -> Option<Duration> {
+    fn next_task_due_in(&self, now: Instant) -> Option<Duration> {
         self.active_tasks
             .values()
-            .filter(|task| &task.owner == owner)
             .map(|task| task.next_due.saturating_duration_since(now))
             .min()
     }
 
-    fn due_task_handles(
-        &self,
-        owner: &rintawa_sdk::contracts::ComponentRef,
-        now: Instant,
-    ) -> Vec<u64> {
-        let mut handles: Vec<_> = self
+    fn due_tasks(&self, now: Instant) -> Vec<(rintawa_sdk::contracts::ComponentRef, u64)> {
+        let mut tasks: Vec<_> = self
             .active_tasks
             .iter()
-            .filter(|(_, task)| &task.owner == owner && task.next_due <= now)
-            .map(|(handle, _)| *handle)
+            .filter(|(_, task)| task.next_due <= now)
+            .map(|(handle, task)| (task.owner.clone(), *handle))
             .collect();
-        handles.sort_unstable();
-        handles
+        tasks.sort_by(|left, right| {
+            left.0
+                .instance_id
+                .as_str()
+                .cmp(right.0.instance_id.as_str())
+                .then_with(|| {
+                    left.0
+                        .component_id
+                        .as_str()
+                        .cmp(right.0.component_id.as_str())
+                })
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        tasks
     }
 
     fn reschedule_task(&mut self, handle: u64, now: Instant) {
@@ -1024,6 +1046,28 @@ impl WasmHostState {
                 .into_iter()
                 .map(UiCapabilityId::new)
                 .collect(),
+        });
+        Ok(())
+    }
+
+    fn queue_ui_layer(
+        &mut self,
+        protocol_major: u32,
+        capabilities: Vec<String>,
+    ) -> Result<(), PortableUiError> {
+        let mut counter = JsonSizeCounter::default();
+        serde_json::to_writer(&mut counter, &(protocol_major, &capabilities))
+            .map_err(|_| PortableUiError::InvalidPayload)?;
+        self.validate_ui_message_size(counter.bytes)?;
+        let Some(scope) = self.registration_scope.as_mut() else {
+            return Err(PortableUiError::RegistrationNotActive);
+        };
+        if scope.ui_layer.is_some() {
+            return Err(PortableUiError::DuplicateLayer);
+        }
+        scope.ui_layer = Some(UiLayerDescriptor {
+            protocol_major,
+            capabilities: capabilities.into_iter().map(UiCapabilityId::new).collect(),
         });
         Ok(())
     }
@@ -1233,6 +1277,14 @@ impl PortableUiHost for WasmHostState {
         )
     }
 
+    fn register_layer(
+        &mut self,
+        protocol_major: u32,
+        capabilities: Vec<String>,
+    ) -> Result<(), PortableUiError> {
+        self.queue_ui_layer(protocol_major, capabilities)
+    }
+
     fn mount_surface(&mut self, snapshot_json: Vec<u8>) -> Result<(), PortableUiError> {
         if !self.ui_access_active {
             return Err(PortableUiError::Unavailable);
@@ -1281,6 +1333,57 @@ impl PortableUiHost for WasmHostState {
         self.ui
             .unmount_surface(&owner, &UiSurfaceId::new(surface_id))
             .map_err(Self::map_ui_error)
+    }
+}
+
+impl UiLayerHost for WasmHostState {
+    fn presentation_surfaces(&mut self) -> Result<Vec<u8>, UiLayerError> {
+        if !self.ui_access_active {
+            return Err(UiLayerError::AccessNotActive);
+        }
+        let owner = self
+            .current_execution_owner()
+            .cloned()
+            .ok_or(UiLayerError::AccessNotActive)?;
+        let surfaces =
+            self.ui
+                .presentation_surfaces_for_layer(&owner)
+                .map_err(|error| match error {
+                    UiError::LayerNotOwner | UiError::LayerNotRegistered => {
+                        UiLayerError::NotActiveLayer
+                    }
+                    UiError::RuntimeUnavailable => UiLayerError::Unavailable,
+                    _ => UiLayerError::Rejected,
+                })?;
+        let payload = serde_json::to_vec(&surfaces).map_err(|_| UiLayerError::Unavailable)?;
+        if payload.len() > self.max_host_message_bytes {
+            return Err(UiLayerError::MessageTooLarge);
+        }
+        Ok(payload)
+    }
+
+    fn dispatch_action(&mut self, action_json: Vec<u8>) -> Result<(), UiLayerError> {
+        if !self.ui_access_active {
+            return Err(UiLayerError::AccessNotActive);
+        }
+        if action_json.len() > self.max_host_message_bytes {
+            return Err(UiLayerError::MessageTooLarge);
+        }
+        let event: UiActionEvent =
+            serde_json::from_slice(&action_json).map_err(|_| UiLayerError::InvalidPayload)?;
+        let owner = self
+            .current_execution_owner()
+            .cloned()
+            .ok_or(UiLayerError::AccessNotActive)?;
+        self.ui
+            .queue_action(&owner, event)
+            .map_err(|error| match error {
+                UiError::LayerNotOwner | UiError::LayerNotRegistered => {
+                    UiLayerError::NotActiveLayer
+                }
+                UiError::RuntimeUnavailable => UiLayerError::Unavailable,
+                _ => UiLayerError::Rejected,
+            })
     }
 }
 
@@ -1436,7 +1539,8 @@ impl NetworkHost for WasmHostState {
             return Err(NetworkError::AccessNotActive);
         }
         let owner = self
-            .root_runtime_owner()
+            .current_execution_owner()
+            .cloned()
             .ok_or(NetworkError::PermissionDenied)?;
         if self
             .network_handles
@@ -1478,7 +1582,8 @@ impl NetworkHost for WasmHostState {
             return Err(NetworkError::AccessNotActive);
         }
         let owner = self
-            .root_runtime_owner()
+            .current_execution_owner()
+            .cloned()
             .ok_or(NetworkError::PermissionDenied)?;
         let requested = usize::try_from(max_bytes).map_err(|_| NetworkError::MessageTooLarge)?;
         if requested > self.max_network_io_bytes {
@@ -1519,7 +1624,8 @@ impl NetworkHost for WasmHostState {
             return Err(NetworkError::AccessNotActive);
         }
         let owner = self
-            .root_runtime_owner()
+            .current_execution_owner()
+            .cloned()
             .ok_or(NetworkError::PermissionDenied)?;
         if data.len() > self.max_network_io_bytes {
             return Err(NetworkError::MessageTooLarge);
@@ -1545,7 +1651,8 @@ impl NetworkHost for WasmHostState {
             return Err(NetworkError::AccessNotActive);
         }
         let owner = self
-            .root_runtime_owner()
+            .current_execution_owner()
+            .cloned()
             .ok_or(NetworkError::PermissionDenied)?;
         let Some(resource) = self.network_handles.get(&handle) else {
             return Err(NetworkError::UnknownHandle);
@@ -2356,6 +2463,9 @@ fn apply_wasm_registrations(
     for surface in registrations.ui_surfaces {
         ctx.register_ui_surface(surface)?;
     }
+    if let Some(layer) = registrations.ui_layer {
+        ctx.register_ui_layer(layer)?;
+    }
     Ok(())
 }
 
@@ -2645,7 +2755,7 @@ impl Component for WasmComponent {
         &mut self,
         ctx: &mut dyn ComponentContext,
     ) -> ExtensionResult<Option<Duration>> {
-        let owner = rintawa_sdk::contracts::ComponentRef::new(
+        let root_owner = rintawa_sdk::contracts::ComponentRef::new(
             ctx.extension_instance_id().clone(),
             ctx.component_id().clone(),
         );
@@ -2656,18 +2766,32 @@ impl Component for WasmComponent {
             let instance = self.ensure_instance(&mut runtime)?;
             instance.store.data().validate_execution_owner(ctx)?;
             let now = Instant::now();
-            let due = instance.store.data().due_task_handles(&owner, now);
+            let due = instance.store.data().due_tasks(now);
             if due.is_empty() {
-                Ok(instance.store.data().next_task_due_in(&owner, now))
+                Ok(instance.store.data().next_task_due_in(now))
             } else {
                 Self::ensure_task_handler(instance)?;
                 let mut failure = None;
-                for handle in due {
-                    if !instance.store.data().active_tasks.contains_key(&handle) {
+                for (task_owner, handle) in due {
+                    if !instance
+                        .store
+                        .data()
+                        .active_tasks
+                        .get(&handle)
+                        .is_some_and(|task| task.owner == task_owner)
+                    {
                         continue;
                     }
                     Self::set_callback_fuel(&mut instance.store, &budget, "runtime task")?;
-                    instance.store.data_mut().begin_guest_execution();
+                    let is_root_owner = task_owner == root_owner;
+                    if is_root_owner {
+                        instance.store.data_mut().begin_guest_execution();
+                    } else {
+                        instance
+                            .store
+                            .data_mut()
+                            .begin_delegated_task_execution(task_owner.clone());
+                    }
                     let callback = match instance.task_handler.as_ref() {
                         Some(handler) => handler
                             .rintawa_engine_task_handler()
@@ -2678,12 +2802,26 @@ impl Component for WasmComponent {
                         ))),
                     };
                     if let Err(error) = callback {
-                        failure = Some(instance.store.data_mut().abort_guest_execution(ctx, error));
+                        failure = Some(if is_root_owner {
+                            instance.store.data_mut().abort_guest_execution(ctx, error)
+                        } else {
+                            instance.store.data_mut().discard_guest_execution();
+                            instance
+                                .store
+                                .data_mut()
+                                .revoke_runtime_resources_for_owner(&task_owner);
+                            error
+                        });
                         break;
                     }
-                    if let Err(error) = instance.store.data_mut().finish_guest_execution(ctx) {
-                        failure = Some(instance.store.data_mut().abort_guest_execution(ctx, error));
-                        break;
+                    if is_root_owner {
+                        if let Err(error) = instance.store.data_mut().finish_guest_execution(ctx) {
+                            failure =
+                                Some(instance.store.data_mut().abort_guest_execution(ctx, error));
+                            break;
+                        }
+                    } else {
+                        instance.store.data_mut().finish_delegated_task_execution();
                     }
                     instance
                         .store
@@ -2695,7 +2833,7 @@ impl Component for WasmComponent {
                     Err(error)
                 } else {
                     let now = Instant::now();
-                    Ok(instance.store.data().next_task_due_in(&owner, now))
+                    Ok(instance.store.data().next_task_due_in(now))
                 }
             }
         };
@@ -3112,6 +3250,7 @@ mod tests {
                     owner: owner.clone(),
                     contribution: registrations.ui_surfaces[0].clone(),
                 }],
+                Vec::new(),
             )
             .unwrap();
 
@@ -3403,7 +3542,7 @@ mod tests {
     }
 
     #[test]
-    fn test_should_not_expose_task_or_network_capabilities_to_delegated_principal() {
+    fn test_should_require_delegated_principal_own_runtime_permissions() {
         let mut state = WasmHostState::new(ComponentId::new("provider-runtime"));
         begin_test_registration(&mut state, ExtensionId::new("runtime.provider"));
         state.finish_registration().unwrap();
@@ -3418,20 +3557,39 @@ mod tests {
             .grant(root_owner, RuntimePermission::LoopbackListen)
             .unwrap();
 
-        state.task_access_active = true;
-        state.network_access_active = true;
-        state.begin_delegated_guest_execution(rintawa_sdk::contracts::ComponentRef::new(
-            "dependent-instance",
-            "hosted-component",
-        ));
+        let dependent_owner =
+            rintawa_sdk::contracts::ComponentRef::new("dependent-instance", "hosted-component");
+        state.begin_delegated_guest_execution(dependent_owner.clone());
         assert!(matches!(
             RuntimeTasksHost::spawn_periodic(&mut state, 10),
-            Err(RuntimeTaskError::RuntimeNotActive)
+            Err(RuntimeTaskError::PermissionDenied)
         ));
         assert!(matches!(
             NetworkHost::listen_loopback(&mut state, 0),
-            Err(NetworkError::AccessNotActive)
+            Err(NetworkError::PermissionDenied)
         ));
+
+        state
+            .runtime_permissions
+            .grant(dependent_owner.clone(), RuntimePermission::BackgroundTask)
+            .unwrap();
+        state
+            .runtime_permissions
+            .grant(dependent_owner.clone(), RuntimePermission::LoopbackListen)
+            .unwrap();
+        let task = RuntimeTasksHost::spawn_periodic(&mut state, 10).unwrap();
+        let listener = NetworkHost::listen_loopback(&mut state, 0).unwrap();
+        assert_eq!(
+            state.active_tasks.get(&task).map(|active| &active.owner),
+            Some(&dependent_owner)
+        );
+        assert_eq!(
+            state
+                .network_handles
+                .get(&listener.handle)
+                .map(|resource| &resource.owner),
+            Some(&dependent_owner)
+        );
     }
 
     #[test]

@@ -6,4 +6,7 @@
 mod runtime;
 mod validation;
 
-pub use runtime::{OwnedUiSurfaceContribution, UiActionDispatch, UiPresentationSurface, UiRuntime};
+pub use runtime::{
+    OwnedUiLayerDescriptor, OwnedUiSurfaceContribution, QueuedUiAction, UiActionDispatch,
+    UiPresentationSurface, UiRuntime,
+};

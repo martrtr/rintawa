@@ -12,7 +12,7 @@ use rintawa_sdk::{
         ComponentId, ContributionId, ExtensionId, ExtensionInstanceId, RuntimeEffectId,
         RuntimeScopeId,
     },
-    ui::{UiActionEvent, UiLayerDescriptor},
+    ui::{UiActionEvent, UiError, UiLayerDescriptor},
 };
 use rintawa_ui_runtime::{UiPresentationSurface, UiRuntime};
 
@@ -146,6 +146,10 @@ fn default_scope_id() -> RuntimeScopeId {
 
 fn default_instance_id(extension_id: &ExtensionId) -> ExtensionInstanceId {
     ExtensionInstanceId::new(extension_id.as_str())
+}
+
+fn is_transient_queued_ui_rejection(error: &EngineError) -> bool {
+    matches!(error, EngineError::Ui(ui_error) if !matches!(ui_error, UiError::RuntimeUnavailable))
 }
 
 impl Default for ExtensionEngine {
@@ -490,6 +494,7 @@ impl ExtensionEngine {
         let mut contract_providers = Vec::new();
         let mut contract_consumers = Vec::new();
         let mut ui_surfaces = Vec::new();
+        let mut ui_layers = Vec::new();
 
         for comp in &mut components {
             let first_contribution = registered_descriptors.len();
@@ -499,6 +504,7 @@ impl ExtensionEngine {
                 contract_providers: &mut contract_providers,
                 contract_consumers: &mut contract_consumers,
                 ui_surfaces: &mut ui_surfaces,
+                ui_layers: &mut ui_layers,
             };
             let identity = ComponentIdentity::new(
                 manifest.id.clone(),
@@ -556,10 +562,12 @@ impl ExtensionEngine {
             })
             .map_err(|()| EngineError::ServiceRuntimeUnavailable)?;
 
-        if let Err(error) =
-            self.ui
-                .register_instance(instance_id.clone(), scope_id.clone(), ui_surfaces.clone())
-        {
+        if let Err(error) = self.ui.register_instance(
+            instance_id.clone(),
+            scope_id.clone(),
+            ui_surfaces.clone(),
+            ui_layers.clone(),
+        ) {
             self.services.unregister_instance(&instance_id);
             return Err(error.into());
         }
@@ -1205,7 +1213,28 @@ impl ExtensionEngine {
                 next_wake = Some(next_wake.map_or(delay, |current: Duration| current.min(delay)));
             }
         }
+
+        for queued in self.ui.drain_queued_actions()? {
+            if let Err(error) = self.dispatch_ui_action(&queued.layer_owner, queued.event)
+                && !is_transient_queued_ui_rejection(&error)
+            {
+                return Err(error);
+            }
+        }
+
         Ok(next_wake)
+    }
+
+    /// Attaches the statically registered descriptor for the selected UI Layer provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns a portable UI error when the component did not register a layer
+    /// descriptor, is inactive, conflicts with another attached layer, or cannot
+    /// render the currently mounted surfaces in its scope.
+    pub fn attach_registered_ui_layer(&self, owner: ComponentRef) -> EngineResult<()> {
+        self.ui.attach_registered_layer(owner)?;
+        Ok(())
     }
 
     /// Attaches the selected portable UI Layer for an active extension component.
@@ -1649,5 +1678,34 @@ impl ExtensionEngine {
         instance_id: &ExtensionInstanceId,
     ) -> Option<ExtensionState> {
         self.extensions.get(instance_id).map(|ext| ext.state)
+    }
+}
+
+#[cfg(test)]
+mod queued_ui_tests {
+    use super::*;
+
+    #[test]
+    fn test_should_treat_stale_queued_ui_validation_as_transient() {
+        let error = EngineError::Ui(UiError::RevisionMismatch {
+            expected: 2,
+            actual: 1,
+        });
+        assert!(is_transient_queued_ui_rejection(&error));
+    }
+
+    #[test]
+    fn test_should_not_hide_ui_runtime_or_component_failures() {
+        assert!(!is_transient_queued_ui_rejection(&EngineError::Ui(
+            UiError::RuntimeUnavailable
+        )));
+        assert!(!is_transient_queued_ui_rejection(
+            &EngineError::UiActionFailed {
+                extension_id: String::from("feature"),
+                component_id: String::from("ui"),
+                action_id: String::from("run"),
+                reason: String::from("failed"),
+            }
+        ));
     }
 }

@@ -274,6 +274,7 @@ interface portable-ui {
         unavailable,
         registration-not-active,
         duplicate-surface,
+        duplicate-layer,
         invalid-payload,
         message-too-large,
         unsupported-capability(string),
@@ -289,6 +290,15 @@ interface portable-ui {
         required-capabilities: list<string>,
     ) -> result<_, error>;
 
+    /// Registers this component's renderer capabilities during guest `register`.
+    ///
+    /// Selection remains host-owned composition policy. Registering a descriptor
+    /// does not make this component the active UI Layer.
+    register-layer: func(
+        protocol-major: u32,
+        capabilities: list<string>,
+    ) -> result<_, error>;
+
     /// Mounts a serialized `UiSurfaceSnapshot` during active guest execution.
     mount-surface: func(snapshot-json: list<u8>) -> result<_, error>;
 
@@ -297,6 +307,25 @@ interface portable-ui {
 
     /// Unmounts one owned surface during active guest execution.
     unmount-surface: func(surface-id: string) -> result<_, error>;
+}
+
+/// Renderer-facing operations available to the selected active UI Layer.
+interface ui-layer {
+    /// Failure while reading presentation state or submitting semantic input.
+    variant error {
+        access-not-active,
+        not-active-layer,
+        invalid-payload,
+        message-too-large,
+        unavailable,
+        rejected,
+    }
+
+    /// Returns the current visible presentation as serialized JSON.
+    presentation-surfaces: func() -> result<list<u8>, error>;
+
+    /// Queues one serialized `UiActionEvent` for Engine validation and dispatch.
+    dispatch-action: func(action-json: list<u8>) -> result<_, error>;
 }
 
 /// Optional callback surface for components that schedule background tasks.
@@ -400,6 +429,7 @@ world plugin {
     import secrets;
     import services;
     import portable-ui;
+    import ui-layer;
     export guest;
 }
 
@@ -425,6 +455,7 @@ world task-runtime-plugin {
     import secrets;
     import services;
     import portable-ui;
+    import ui-layer;
     export guest;
     export task-handler;
 }
@@ -440,6 +471,7 @@ world runtime-provider-plugin {
     import secrets;
     import services;
     import portable-ui;
+    import ui-layer;
     export guest;
     export target-provider;
 }
@@ -455,6 +487,7 @@ world runtime-provider-task-plugin {
     import secrets;
     import services;
     import portable-ui;
+    import ui-layer;
     export guest;
     export target-provider;
     export task-handler;

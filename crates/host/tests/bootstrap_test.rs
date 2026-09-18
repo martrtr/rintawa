@@ -4,7 +4,7 @@ use rintawa_artifacts::{ImportDisposition, RtwLimits, pack_directory};
 use rintawa_extension_engine::UnresolvedContractReason;
 use rintawa_host::{HOST_SCOPE, HostError, HostHome, HostRuntime};
 use rintawa_sdk::{
-    contracts::{ComponentRef, host_shell_contract_key},
+    contracts::{ComponentRef, host_shell_contract_key, ui_layer_contract_key},
     runtime_permissions::RuntimePermission,
     types::RuntimeScopeId,
 };
@@ -154,6 +154,7 @@ fn local_install_enable_disable_and_restart_are_persistent() -> anyhow::Result<(
     assert!(restarted.list_activations()?[0].enabled);
     let runtime = HostRuntime::start(&restarted)?;
     assert_eq!(runtime.host_shell_provider(), None);
+    assert_eq!(runtime.ui_layer_provider(), None);
     runtime.shutdown()?;
     Ok(())
 }
@@ -475,6 +476,35 @@ fn test_should_report_fixed_point_when_required_execution_target_never_appears()
                 && stall.deferred[0].missing_required_targets.len() == 1
                 && stall.deferred[0].missing_required_targets[0].component_id.as_str() == "hosted"
                 && stall.deferred[0].missing_required_targets[0].target.as_str() == "test.wasm-target@1"
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_should_fail_explicit_unavailable_ui_layer_without_fallback() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let artifact = build_extension(root.path(), "0.0.1", "Bootstrap")?;
+    let home = HostHome::open(root.path().join("home"))?;
+    home.install_local_rtw(&artifact, None)?;
+    home.set_preferred_provider(
+        RuntimeScopeId::new(HOST_SCOPE),
+        ui_layer_contract_key(),
+        ComponentRef::new("example.bootstrap", "missing-layer"),
+    )?;
+
+    let error = match HostRuntime::start(&home) {
+        Ok(runtime) => {
+            runtime.shutdown()?;
+            anyhow::bail!("explicit unavailable UI Layer selection should fail startup");
+        }
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        HostError::ContractRoleUnavailable {
+            reason: UnresolvedContractReason::PreferredProviderUnavailable,
+            ..
+        }
     ));
     Ok(())
 }

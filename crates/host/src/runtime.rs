@@ -5,7 +5,9 @@ use rintawa_extension_engine::{
     UnresolvedContractReason,
 };
 use rintawa_sdk::{
-    contracts::{ComponentRef, ContractResolutionPolicy, host_shell_contract_key},
+    contracts::{
+        ComponentRef, ContractResolutionPolicy, host_shell_contract_key, ui_layer_contract_key,
+    },
     types::{ExtensionInstanceId, RuntimeScopeId},
 };
 
@@ -19,6 +21,7 @@ pub struct HostRuntime {
     engine: ExtensionEngine,
     started_instances: Vec<ExtensionInstanceId>,
     host_shell_provider: Option<ComponentRef>,
+    ui_layer_provider: Option<ComponentRef>,
 }
 
 impl HostRuntime {
@@ -35,9 +38,15 @@ impl HostRuntime {
         let mut engine = ExtensionEngine::new();
         let host_scope = RuntimeScopeId::new(HOST_SCOPE);
         let host_shell_contract = host_shell_contract_key();
+        let ui_layer_contract = ui_layer_contract_key();
         engine.define_platform_binding_contract_in_scope(
             host_scope.clone(),
             host_shell_contract.clone(),
+            ContractResolutionPolicy::Single,
+        )?;
+        engine.define_platform_binding_contract_in_scope(
+            host_scope.clone(),
+            ui_layer_contract.clone(),
             ContractResolutionPolicy::Single,
         )?;
 
@@ -45,6 +54,7 @@ impl HostRuntime {
         let mut registered = Vec::new();
         let mut started = Vec::new();
         let mut host_shell_provider = None;
+        let mut ui_layer_provider = None;
 
         let result: HostResult<()> = (|| {
             let activations: Vec<_> = profile
@@ -236,6 +246,29 @@ impl HostRuntime {
                     });
                 }
             };
+
+            let has_explicit_ui_layer_selection =
+                profile.preferred_providers.iter().any(|selection| {
+                    selection.scope_id == host_scope && selection.contract() == ui_layer_contract
+                });
+            ui_layer_provider = match engine
+                .resolve_active_contract_providers_in_scope(&host_scope, &ui_layer_contract)
+            {
+                Ok(providers) => providers.into_iter().next(),
+                Err(UnresolvedContractReason::NoProvider) if !has_explicit_ui_layer_selection => {
+                    None
+                }
+                Err(reason) => {
+                    return Err(HostError::ContractRoleUnavailable {
+                        scope_id: host_scope.to_string(),
+                        contract: ui_layer_contract.to_string(),
+                        reason,
+                    });
+                }
+            };
+            if let Some(provider) = ui_layer_provider.clone() {
+                engine.attach_registered_ui_layer(provider)?;
+            }
             Ok(())
         })();
 
@@ -253,6 +286,7 @@ impl HostRuntime {
             engine,
             started_instances: started,
             host_shell_provider,
+            ui_layer_provider,
         })
     }
 
@@ -261,6 +295,14 @@ impl HostRuntime {
     /// `None` is a valid headless composition with no eligible Host Shell provider.
     pub fn host_shell_provider(&self) -> Option<&ComponentRef> {
         self.host_shell_provider.as_ref()
+    }
+
+    /// Returns the selected active provider of the portable UI Layer role.
+    ///
+    /// `None` is valid for a headless composition or a shell that does not use
+    /// the portable UI presentation protocol.
+    pub fn ui_layer_provider(&self) -> Option<&ComponentRef> {
+        self.ui_layer_provider.as_ref()
     }
 
     /// Executes one cooperative runtime pump for active baseline components.

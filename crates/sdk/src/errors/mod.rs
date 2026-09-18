@@ -93,6 +93,10 @@ pub enum ExtensionError {
     #[error("duplicate UI surface `{0}`")]
     DuplicateUiSurface(String),
 
+    /// The component registered more than one portable UI Layer descriptor.
+    #[error("duplicate UI Layer descriptor")]
+    DuplicateUiLayerDescriptor,
+
     /// The host cannot register portable UI metadata in the current context.
     #[error("UI registration is unavailable in this component context")]
     UiRegistrationUnavailable,

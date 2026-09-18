@@ -1,7 +1,9 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, RwLock},
 };
+
+use serde::Serialize;
 
 use rintawa_sdk::{
     contracts::ComponentRef,
@@ -25,8 +27,17 @@ pub struct OwnedUiSurfaceContribution {
     pub contribution: UiSurfaceContribution,
 }
 
-/// Mounted presentation exposed to an eligible UI Layer.
+/// Static portable UI Layer descriptor associated with its owning component.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedUiLayerDescriptor {
+    /// Component that registered the layer descriptor.
+    pub owner: ComponentRef,
+    /// Renderer capabilities offered by the component.
+    pub descriptor: UiLayerDescriptor,
+}
+
+/// Mounted presentation exposed to an eligible UI Layer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UiPresentationSurface {
     /// Component that owns and updates the surface.
     pub owner: ComponentRef,
@@ -42,6 +53,15 @@ pub struct UiActionDispatch {
     /// Component allowed to receive this action.
     pub owner: ComponentRef,
     /// Validated semantic action.
+    pub event: UiActionEvent,
+}
+
+/// Renderer action queued by an active UI Layer for Engine dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedUiAction {
+    /// Active layer that submitted the event.
+    pub layer_owner: ComponentRef,
+    /// Semantic action to validate again immediately before dispatch.
     pub event: UiActionEvent,
 }
 
@@ -78,8 +98,10 @@ struct ActiveUiLayer {
 struct UiRuntimeState {
     instances: HashMap<ExtensionInstanceId, UiExtensionInstance>,
     registered_surfaces: HashMap<UiSurfaceKey, OwnedUiSurfaceContribution>,
+    registered_layers: HashMap<ComponentRef, UiLayerDescriptor>,
     mounted_surfaces: HashMap<UiSurfaceKey, UiSurfaceSnapshot>,
     layers: HashMap<RuntimeScopeId, ActiveUiLayer>,
+    queued_actions: VecDeque<QueuedUiAction>,
 }
 
 /// Shared renderer-neutral runtime for portable surfaces and semantic actions.
@@ -112,6 +134,7 @@ impl UiRuntime {
         instance_id: ExtensionInstanceId,
         scope_id: RuntimeScopeId,
         surfaces: Vec<OwnedUiSurfaceContribution>,
+        layers: Vec<OwnedUiLayerDescriptor>,
     ) -> UiResult<()> {
         let mut state = self
             .state
@@ -133,9 +156,24 @@ impl UiRuntime {
             }
         }
 
+        let mut layer_owners = HashSet::new();
+        for layer in &layers {
+            if layer.owner.instance_id != instance_id {
+                return Err(UiError::LayerNotOwner);
+            }
+            if !layer_owners.insert(layer.owner.clone()) {
+                return Err(UiError::LayerAlreadyRegistered);
+            }
+        }
+
         for owned in surfaces {
             let key = UiSurfaceKey::new(instance_id.clone(), owned.contribution.id.clone());
             state.registered_surfaces.insert(key, owned);
+        }
+        for layer in layers {
+            state
+                .registered_layers
+                .insert(layer.owner, layer.descriptor);
         }
         state.instances.insert(
             instance_id,
@@ -158,6 +196,13 @@ impl UiRuntime {
                 state.registered_surfaces.remove(&key);
                 state.mounted_surfaces.remove(&key);
             }
+            state
+                .registered_layers
+                .retain(|owner, _| &owner.instance_id != instance_id);
+            state.queued_actions.retain(|queued| {
+                &queued.layer_owner.instance_id != instance_id
+                    && &queued.event.owner_instance_id != instance_id
+            });
             if state
                 .layers
                 .get(&instance.scope_id)
@@ -197,6 +242,10 @@ impl UiRuntime {
                     .mounted_surfaces
                     .remove(&UiSurfaceKey::new(instance_id.clone(), surface_id));
             }
+            state.queued_actions.retain(|queued| {
+                &queued.layer_owner.instance_id != instance_id
+                    && &queued.event.owner_instance_id != instance_id
+            });
             if state
                 .layers
                 .get(&scope_id)
@@ -206,6 +255,33 @@ impl UiRuntime {
             }
         }
         Ok(())
+    }
+
+    /// Returns the statically registered descriptor for one UI Layer candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError::LayerNotRegistered`] when the component did not register a
+    /// layer descriptor.
+    pub fn registered_layer_descriptor(&self, owner: &ComponentRef) -> UiResult<UiLayerDescriptor> {
+        self.state
+            .read()
+            .map_err(|_| UiError::RuntimeUnavailable)?
+            .registered_layers
+            .get(owner)
+            .cloned()
+            .ok_or(UiError::LayerNotRegistered)
+    }
+
+    /// Attaches the statically registered descriptor for a selected layer provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::attach_layer`] or
+    /// [`UiError::LayerNotRegistered`] when no descriptor was registered.
+    pub fn attach_registered_layer(&self, owner: ComponentRef) -> UiResult<()> {
+        let descriptor = self.registered_layer_descriptor(&owner)?;
+        self.attach_layer(owner, descriptor)
     }
 
     /// Attaches or refreshes the selected UI Layer for its runtime scope.
@@ -461,6 +537,40 @@ impl UiRuntime {
             .find_map(|(scope_id, layer)| (&layer.owner == layer_owner).then_some(scope_id.clone()))
             .ok_or(UiError::LayerNotOwner)?;
         Ok(collect_presentations(&state, Some(&scope_id)))
+    }
+
+    /// Validates and queues one renderer action for later Engine dispatch.
+    ///
+    /// The Engine validates the event again immediately before invoking the target
+    /// component so queued work cannot bypass lifecycle or revision changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::route_action`].
+    pub fn queue_action(&self, layer_owner: &ComponentRef, event: UiActionEvent) -> UiResult<()> {
+        self.route_action(layer_owner, event.clone())?;
+        self.state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?
+            .queued_actions
+            .push_back(QueuedUiAction {
+                layer_owner: layer_owner.clone(),
+                event,
+            });
+        Ok(())
+    }
+
+    /// Drains renderer actions queued since the previous Engine pump.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError::RuntimeUnavailable`] when shared UI state cannot be accessed.
+    pub fn drain_queued_actions(&self) -> UiResult<Vec<QueuedUiAction>> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        Ok(state.queued_actions.drain(..).collect())
     }
 
     /// Validates an input event from an active UI Layer and resolves its owner.

@@ -17,6 +17,12 @@ pub enum UiError {
     /// No UI Layer is currently attached.
     #[error("UI Layer is unavailable")]
     LayerUnavailable,
+    /// A component registered more than one UI Layer descriptor.
+    #[error("UI Layer descriptor is already registered for this component")]
+    LayerAlreadyRegistered,
+    /// The selected component did not register a UI Layer descriptor.
+    #[error("component did not register a UI Layer descriptor")]
+    LayerNotRegistered,
     /// Another UI Layer is already attached.
     #[error("a different UI Layer is already attached")]
     LayerAlreadyAttached,

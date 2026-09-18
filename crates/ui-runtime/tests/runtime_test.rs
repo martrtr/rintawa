@@ -10,7 +10,7 @@ use rintawa_sdk::{
         UiTextNode,
     },
 };
-use rintawa_ui_runtime::{OwnedUiSurfaceContribution, UiRuntime};
+use rintawa_ui_runtime::{OwnedUiLayerDescriptor, OwnedUiSurfaceContribution, UiRuntime};
 
 fn instance(id: &str) -> ExtensionInstanceId {
     ExtensionInstanceId::new(id)
@@ -85,14 +85,23 @@ fn register_feature(runtime: &UiRuntime, contribution: UiSurfaceContribution) ->
             owner: owner("feature"),
             contribution,
         }],
+        Vec::new(),
     )?;
     Ok(())
 }
 
 fn attach_layer(runtime: &UiRuntime, descriptor: UiLayerDescriptor) -> Result<()> {
-    runtime.register_instance(instance("layer"), scope(), Vec::new())?;
+    runtime.register_instance(
+        instance("layer"),
+        scope(),
+        Vec::new(),
+        vec![OwnedUiLayerDescriptor {
+            owner: owner("layer"),
+            descriptor,
+        }],
+    )?;
     runtime.set_instance_active(&instance("layer"), true)?;
-    runtime.attach_layer(owner("layer"), descriptor)?;
+    runtime.attach_registered_layer(owner("layer"))?;
     Ok(())
 }
 
@@ -124,11 +133,19 @@ fn test_should_reject_layer_missing_required_capability() -> Result<()> {
     )?;
     runtime.mount_surface(&owner("feature"), base_snapshot())?;
     runtime.set_instance_active(&instance("feature"), true)?;
-    runtime.register_instance(instance("layer"), scope(), Vec::new())?;
+    runtime.register_instance(
+        instance("layer"),
+        scope(),
+        Vec::new(),
+        vec![OwnedUiLayerDescriptor {
+            owner: owner("layer"),
+            descriptor: compatible_layer(),
+        }],
+    )?;
     runtime.set_instance_active(&instance("layer"), true)?;
 
     assert_eq!(
-        runtime.attach_layer(owner("layer"), compatible_layer()),
+        runtime.attach_registered_layer(owner("layer")),
         Err(UiError::UnsupportedCapability(String::from(
             "example.canvas@1"
         )))
