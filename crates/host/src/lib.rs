@@ -312,6 +312,26 @@ pub enum HostError {
     /// Running baseline shutdown reported one or more lifecycle cleanup failures.
     #[error("{0}")]
     ShutdownFailed(Box<HostShutdownFailures>),
+    /// A persisted preference record duplicates the same owner/key pair.
+    #[error(
+        "duplicate preference `{key}` for component `{component_id}` in instance `{instance_id}` scope `{scope_id}`"
+    )]
+    DuplicatePreference {
+        /// Runtime scope owning the preference.
+        scope_id: String,
+        /// Runtime instance owning the preference.
+        instance_id: String,
+        /// Component owning the preference.
+        component_id: String,
+        /// Duplicate preference key.
+        key: String,
+    },
+    /// A preference key/value violates host bounds.
+    #[error("invalid extension preference: {0}")]
+    InvalidPreference(String),
+    /// A component exceeded its bounded persistent preference quota.
+    #[error("extension preference quota exceeded")]
+    PreferenceQuotaExceeded,
     /// A persisted activation uses a content type for which this host has no handler.
     #[error("no activation handler is available for RTW content `{0}`")]
     UnsupportedContent(String),
@@ -408,11 +428,39 @@ impl HostHome {
         drop(archive);
 
         let imported = self.store.import(source)?;
-        let digest = imported.digest().clone();
+        let activation = self.select_stored_rtw(imported.digest(), enabled)?;
+        Ok(InstallResult {
+            disposition: imported.disposition(),
+            activation,
+        })
+    }
+
+    /// Imports validated RTW bytes into the immutable CAS without selecting them.
+    ///
+    /// This primitive is source-agnostic: repository URLs, update policy, and version
+    /// selection stay outside the host.
+    pub fn import_rtw_bytes(&self, bytes: &[u8]) -> HostResult<rintawa_artifacts::ArtifactImport> {
+        Ok(self.store.import_bytes(bytes)?)
+    }
+
+    /// Selects one already-stored exact RTW artifact in the baseline profile.
+    ///
+    /// Existing selections preserve their enabled state unless `enabled` overrides it.
+    pub fn select_stored_rtw(
+        &self,
+        digest: &ArtifactDigest,
+        enabled: Option<bool>,
+    ) -> HostResult<InstalledActivation> {
+        let archive = self.store.open_artifact(digest)?;
+        let content = archive.manifest().content.clone();
+        if content.to_string() != EXTENSION_CONTENT_V1 {
+            return Err(HostError::UnsupportedContent(content.to_string()));
+        }
+        drop(archive);
+
         let engine = ExtensionEngine::new();
         let manifest =
-            RtwExtensionLoader::new().read_stored_manifest(&engine, &self.store, &digest)?;
-
+            RtwExtensionLoader::new().read_stored_manifest(&engine, &self.store, digest)?;
         let mut profile = self.load_profile()?;
         let subject = manifest.id.to_string();
         let scope_id = RuntimeScopeId::new(HOST_SCOPE);
@@ -430,18 +478,15 @@ impl HostHome {
         );
         profile.save(&self.profile_path)?;
 
-        Ok(InstallResult {
-            disposition: imported.disposition(),
-            activation: InstalledActivation {
-                subject,
-                content,
-                name: manifest.name,
-                version: Some(manifest.version),
-                digest,
-                instance_id,
-                scope_id,
-                enabled,
-            },
+        Ok(InstalledActivation {
+            subject,
+            content,
+            name: manifest.name,
+            version: Some(manifest.version),
+            digest: digest.clone(),
+            instance_id,
+            scope_id,
+            enabled,
         })
     }
 
@@ -449,6 +494,50 @@ impl HostHome {
     pub fn set_enabled(&self, subject: &str, enabled: bool) -> HostResult<()> {
         let mut profile = self.load_profile()?;
         profile.set_enabled(subject, enabled)?;
+        profile.save(&self.profile_path)
+    }
+
+    /// Removes one baseline activation and policy entries that reference its instance.
+    ///
+    /// Stored CAS bytes remain immutable and may still be referenced by another scope later.
+    pub fn remove_activation(&self, subject: &str) -> HostResult<()> {
+        let mut profile = self.load_profile()?;
+        profile.remove_activation(subject)?;
+        profile.save(&self.profile_path)
+    }
+
+    /// Reads one owner-scoped non-authoritative extension preference.
+    pub fn get_preference(
+        &self,
+        scope_id: &RuntimeScopeId,
+        owner: &ComponentRef,
+        key: &str,
+    ) -> HostResult<Option<String>> {
+        self.load_profile()?.get_preference(scope_id, owner, key)
+    }
+
+    /// Persists one owner-scoped non-authoritative extension preference.
+    pub fn set_preference(
+        &self,
+        scope_id: RuntimeScopeId,
+        owner: ComponentRef,
+        key: String,
+        value: String,
+    ) -> HostResult<()> {
+        let mut profile = self.load_profile()?;
+        profile.set_preference(scope_id, owner, key, value)?;
+        profile.save(&self.profile_path)
+    }
+
+    /// Deletes one owner-scoped non-authoritative extension preference.
+    pub fn delete_preference(
+        &self,
+        scope_id: &RuntimeScopeId,
+        owner: &ComponentRef,
+        key: &str,
+    ) -> HostResult<()> {
+        let mut profile = self.load_profile()?;
+        profile.delete_preference(scope_id, owner, key)?;
         profile.save(&self.profile_path)
     }
 

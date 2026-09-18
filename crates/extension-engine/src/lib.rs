@@ -17,6 +17,7 @@ pub mod context;
 pub mod engine;
 pub mod errors;
 mod execution_targets;
+pub mod host_access;
 pub mod loader;
 pub mod runtime;
 pub mod secrets;
@@ -40,6 +41,10 @@ pub use composition::{
 };
 pub use engine::{ExtensionEngine, ExtensionState};
 pub use errors::{ComponentStopFailure, EngineError, EngineResult};
+pub use host_access::{
+    ArtifactStoreAccess, CompositionAccess, CompositionActivation, HostAccessError,
+    HostAccessResult, ImportedArtifact, PreferenceAccess,
+};
 pub use loader::ExtensionLoader;
 pub use runtime::{WasmComponent, WasmExecutionBudget, WasmRuntimeEngine};
 pub use secrets::SecretManager;

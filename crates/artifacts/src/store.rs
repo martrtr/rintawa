@@ -2,7 +2,7 @@
 
 use std::{
     fs::{self, File},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Cursor, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -101,6 +101,35 @@ impl ArtifactStore {
         let mut temporary = NamedTempFile::new_in(&self.temporary_directory)?;
         let digest = copy_and_hash(
             &mut source_file,
+            temporary.as_file_mut(),
+            self.limits.max_archive_bytes,
+        )?;
+        temporary.as_file_mut().sync_all()?;
+
+        let validated = RtwArchive::open(temporary.path(), self.limits)?;
+        drop(validated);
+
+        let destination = self.path_for(&digest);
+        let disposition = self.publish_temporary(&temporary, &destination, &digest)?;
+        File::open(&destination)?.sync_all()?;
+        sync_directory(&self.sha256_directory)?;
+
+        Ok(ArtifactImport {
+            digest,
+            disposition,
+        })
+    }
+
+    /// Imports in-memory RTW bytes through the same validation and CAS publication path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an RTW validation, size-limit, I/O, or store-integrity error.
+    pub fn import_bytes(&self, bytes: &[u8]) -> RtwResult<ArtifactImport> {
+        let mut source = Cursor::new(bytes);
+        let mut temporary = NamedTempFile::new_in(&self.temporary_directory)?;
+        let digest = copy_and_hash(
+            &mut source,
             temporary.as_file_mut(),
             self.limits.max_archive_bytes,
         )?;
@@ -239,7 +268,7 @@ fn ensure_regular_store_file(path: &Path, digest: &ArtifactDigest) -> RtwResult<
     Ok(())
 }
 fn copy_and_hash(
-    source: &mut File,
+    source: &mut impl Read,
     destination: &mut File,
     maximum_bytes: u64,
 ) -> RtwResult<ArtifactDigest> {

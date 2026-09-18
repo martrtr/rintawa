@@ -34,6 +34,7 @@ use crate::{
     },
     errors::{ComponentStopFailure, EngineError, EngineResult},
     execution_targets::{ExecutionTargetDependency, ExecutionTargetRegistry},
+    host_access::{ArtifactStoreAccess, CompositionAccess, HostAccessServices, PreferenceAccess},
     runtime::WasmRuntimeEngine,
     runtime_effects::RuntimeEffectRegistry,
     runtime_permissions::RuntimePermissionManager,
@@ -135,6 +136,7 @@ pub struct ExtensionEngine {
     platform_contract_definitions:
         HashMap<RuntimeScopeId, HashMap<ContractKey, ContractDefinition>>,
     execution_targets: ExecutionTargetRegistry,
+    host_access: HostAccessServices,
 }
 
 /// Runtime scope used by legacy convenience APIs that do not specify one.
@@ -216,6 +218,7 @@ impl Default for ExtensionEngine {
             preferred_contract_providers: HashMap::new(),
             platform_contract_definitions: HashMap::new(),
             execution_targets: ExecutionTargetRegistry::default(),
+            host_access: HostAccessServices::unavailable(),
         }
     }
 }
@@ -224,6 +227,24 @@ impl ExtensionEngine {
     /// Creates a new, empty [`ExtensionEngine`].
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates an engine with generic host artifact/composition capabilities attached.
+    ///
+    /// Guest access remains separately permission-gated per concrete component principal.
+    pub fn with_host_access(
+        artifact_store_access: Arc<dyn ArtifactStoreAccess>,
+        composition_access: Arc<dyn CompositionAccess>,
+        preference_access: Arc<dyn PreferenceAccess>,
+    ) -> Self {
+        Self {
+            host_access: HostAccessServices::new(
+                artifact_store_access,
+                composition_access,
+                preference_access,
+            ),
+            ..Self::default()
+        }
     }
 
     /// Creates an engine using a host-configured secret manager.
@@ -243,6 +264,7 @@ impl ExtensionEngine {
             preferred_contract_providers: HashMap::new(),
             platform_contract_definitions: HashMap::new(),
             execution_targets: ExecutionTargetRegistry::default(),
+            host_access: HostAccessServices::unavailable(),
         }
     }
 
@@ -356,6 +378,7 @@ impl ExtensionEngine {
             self.ui.clone(),
             self.execution_targets.clone(),
             self.runtime_permissions.clone(),
+            self.host_access.clone(),
         )
     }
 

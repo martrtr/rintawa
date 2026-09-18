@@ -178,6 +178,121 @@ interface network {
     close: func(handle: handle) -> result<_, error>;
 }
 
+/// Bounded outbound HTTPS reads available only with an explicit host grant.
+interface http-fetch {
+    /// One completed response after safe redirect handling.
+    record response {
+        status: u16,
+        final-url: string,
+        content-type: option<string>,
+        body: list<u8>,
+    }
+
+    /// Failure while performing one bounded HTTPS fetch.
+    variant error {
+        access-not-active,
+        permission-denied,
+        invalid-url,
+        forbidden-destination,
+        too-many-redirects,
+        response-too-large,
+        timeout,
+        unavailable,
+    }
+
+    /// Performs an HTTPS GET. The host validates every redirect destination and
+    /// bounds the response body before returning it to the guest.
+    get: func(url: string, max-bytes: u32) -> result<response, error>;
+}
+
+/// Generic access to the local immutable RTW artifact store.
+interface artifact-store {
+    /// Identity returned after validated RTW bytes enter the CAS.
+    record imported-artifact {
+        digest: string,
+        content: string,
+    }
+
+    /// Failure while importing an RTW artifact.
+    variant error {
+        access-not-active,
+        permission-denied,
+        message-too-large,
+        invalid-artifact,
+        rejected,
+        unavailable,
+    }
+
+    /// Validates and imports RTW bytes without selecting them for activation.
+    import-rtw: func(bytes: list<u8>) -> result<imported-artifact, error>;
+}
+
+
+/// Owner-scoped non-authoritative persistent preferences.
+interface preferences {
+    /// Failure while accessing one bounded preference value.
+    variant error {
+        access-not-active,
+        invalid-preference,
+        message-too-large,
+        quota-exceeded,
+        unavailable,
+        rejected,
+    }
+
+    /// Reads one UTF-8 value owned by the current component principal.
+    get: func(key: string) -> result<option<string>, error>;
+
+    /// Persists one UTF-8 value owned by the current component principal.
+    set: func(key: string, value: string) -> result<_, error>;
+
+    /// Deletes one preference owned by the current component principal.
+    delete: func(key: string) -> result<_, error>;
+}
+
+/// Generic mutation/read boundary for the host baseline composition.
+interface composition {
+    /// One exact activation selected in the host profile.
+    record activation {
+        subject: string,
+        content: string,
+        name: string,
+        version: option<string>,
+        digest: string,
+        instance-id: string,
+        scope-id: string,
+        enabled: bool,
+    }
+
+    /// Failure while reading or mutating profile selection.
+    variant error {
+        access-not-active,
+        permission-denied,
+        invalid-digest,
+        not-found,
+        unsupported-content,
+        rejected,
+        unavailable,
+    }
+
+    /// Lists exact baseline selections. Requires composition-read.
+    list-activations: func() -> result<list<activation>, error>;
+
+    /// Selects one already-imported exact artifact in the baseline profile.
+    /// An absent enabled override preserves existing state and enables new selections.
+    select-artifact: func(
+        digest: string,
+        enabled: option<bool>,
+    ) -> result<activation, error>;
+
+    /// Changes persisted enabled state. Changes take effect on a later bootstrap.
+    set-enabled: func(subject: string, enabled: bool) -> result<_, error>;
+
+    /// Removes a persisted baseline selection and related policy references.
+    /// Running instances are not torn down implicitly.
+    remove-activation: func(subject: string) -> result<_, error>;
+}
+
 /// Dynamic execution targets published by an active runtime-provider component.
 interface execution-targets {
     /// A host-owned, read-only view of one validated RTW artifact.
@@ -428,6 +543,10 @@ world plugin {
     import runtime-effects;
     import runtime-tasks;
     import network;
+    import http-fetch;
+    import artifact-store;
+    import preferences;
+    import composition;
     import execution-targets;
     import secrets;
     import services;
@@ -454,6 +573,10 @@ world task-runtime-plugin {
     import runtime-effects;
     import runtime-tasks;
     import network;
+    import http-fetch;
+    import artifact-store;
+    import preferences;
+    import composition;
     import execution-targets;
     import secrets;
     import services;
@@ -470,6 +593,10 @@ world runtime-provider-plugin {
     import runtime-effects;
     import runtime-tasks;
     import network;
+    import http-fetch;
+    import artifact-store;
+    import preferences;
+    import composition;
     import execution-targets;
     import secrets;
     import services;
@@ -486,6 +613,10 @@ world runtime-provider-task-plugin {
     import runtime-effects;
     import runtime-tasks;
     import network;
+    import http-fetch;
+    import artifact-store;
+    import preferences;
+    import composition;
     import execution-targets;
     import secrets;
     import services;

@@ -6,7 +6,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     io::{ErrorKind, Read, Write},
-    net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs},
     path::Path,
     sync::{Arc, Mutex, MutexGuard, TryLockError},
     time::{Duration, Instant},
@@ -32,7 +32,14 @@ use rintawa_sdk::{
     },
 };
 
+use reqwest::{
+    StatusCode,
+    blocking::Client as HttpClient,
+    header::{CONTENT_TYPE, LOCATION},
+    redirect::Policy as RedirectPolicy,
+};
 use tracing::{debug, error, info, trace, warn};
+use url::{Host as UrlHost, Url};
 use wasmtime::{
     Engine, Store, StoreLimits, StoreLimitsBuilder, Trap,
     component::{Component as WasmtimeComponent, Instance, Linker, Resource, ResourceTable},
@@ -44,6 +51,7 @@ use crate::{
     },
     errors::{EngineError, EngineResult},
     execution_targets::ExecutionTargetRegistry,
+    host_access::{HostAccessError, HostAccessServices},
     runtime_permissions::RuntimePermissionManager,
     secrets::SecretManager,
     services::ServiceRuntime,
@@ -96,6 +104,8 @@ pub struct WasmExecutionBudget {
     pub max_host_message_bytes: usize,
     /// Maximum bytes returned by one bounded target-artifact resource read.
     pub max_artifact_read_bytes: usize,
+    /// Maximum RTW bytes accepted by one generic artifact import call.
+    pub max_artifact_import_bytes: usize,
     /// Maximum cooperative background tasks owned by one WASM component.
     pub max_background_tasks: usize,
     /// Smallest periodic task interval accepted from a guest.
@@ -106,6 +116,12 @@ pub struct WasmExecutionBudget {
     pub max_network_io_bytes: usize,
     /// Maximum time a loopback connect host call may block.
     pub loopback_connect_timeout_ms: u64,
+    /// Maximum payload returned by one bounded outbound HTTPS request.
+    pub max_http_fetch_bytes: usize,
+    /// Maximum total duration of one outbound HTTPS request.
+    pub http_fetch_timeout_ms: u64,
+    /// Maximum number of manually validated HTTPS redirects.
+    pub max_http_redirects: usize,
 }
 
 impl Default for WasmExecutionBudget {
@@ -120,11 +136,15 @@ impl Default for WasmExecutionBudget {
             fuel_per_callback: 10_000_000,
             max_host_message_bytes: 1024 * 1024,
             max_artifact_read_bytes: 8 * 1024 * 1024,
+            max_artifact_import_bytes: 32 * 1024 * 1024,
             max_background_tasks: 8,
             min_background_task_interval_ms: 10,
             max_network_handles: 64,
             max_network_io_bytes: 64 * 1024,
             loopback_connect_timeout_ms: 250,
+            max_http_fetch_bytes: 32 * 1024 * 1024,
+            http_fetch_timeout_ms: 15_000,
+            max_http_redirects: 5,
         }
     }
 }
@@ -178,11 +198,19 @@ mod task_bindings {
 
 use bindings::Plugin;
 use bindings::rintawa::engine::{
+    artifact_store::{
+        Error as ArtifactStoreError, Host as ArtifactStoreHost,
+        ImportedArtifact as WitImportedArtifact,
+    },
+    composition::{
+        Activation as WitCompositionActivation, Error as CompositionError, Host as CompositionHost,
+    },
     execution_targets::{
         ArtifactError as TargetArtifactError, Host as ExecutionTargetsHost, HostArtifactSource,
         RegistrationError as TargetRegistrationError,
     },
     host::{Host as HostOperations, LogLevel, PublishError},
+    http_fetch::{Error as HttpFetchError, Host as HttpFetchHost, Response as WitHttpResponse},
     network::{
         Error as NetworkError, Host as NetworkHost, Listener as WitNetworkListener,
         ReadResult as WitNetworkReadResult,
@@ -190,6 +218,7 @@ use bindings::rintawa::engine::{
     portable_ui::{
         Error as PortableUiError, Host as PortableUiHost, PlacementHint as WitPlacementHint,
     },
+    preferences::{Error as PreferenceError, Host as PreferencesHost},
     registration::{
         ContractProtocol as WitContractProtocol, Error as RegistrationError,
         Host as RegistrationHost, ResolutionPolicy as WitResolutionPolicy,
@@ -225,6 +254,7 @@ pub struct WasmHostState {
     next_task_handle: u64,
     active_tasks: HashMap<u64, ActiveWasmTask>,
     network_access_active: bool,
+    host_access_active: bool,
     next_network_handle: u64,
     network_handles: HashMap<u64, OwnedNetworkHandle>,
     max_background_tasks: usize,
@@ -232,14 +262,19 @@ pub struct WasmHostState {
     max_network_handles: usize,
     max_network_io_bytes: usize,
     loopback_connect_timeout_ms: u64,
+    max_http_fetch_bytes: usize,
+    http_fetch_timeout_ms: u64,
+    max_http_redirects: usize,
     secrets: SecretManager,
     services: ServiceRuntime,
     ui: UiRuntime,
+    host_access: HostAccessServices,
     secret_access_active: bool,
     service_access_active: bool,
     ui_access_active: bool,
     max_host_message_bytes: usize,
     max_artifact_read_bytes: usize,
+    max_artifact_import_bytes: usize,
     execution_target_registration_active: bool,
     pending_execution_targets: Vec<String>,
     resource_limits: StoreLimits,
@@ -314,17 +349,33 @@ enum RuntimePermissionCheck {
     Unavailable,
 }
 
+#[derive(Clone)]
+struct WasmHostServices {
+    secrets: SecretManager,
+    services: ServiceRuntime,
+    ui: UiRuntime,
+    runtime_permissions: RuntimePermissionManager,
+    host_access: HostAccessServices,
+}
+
+impl WasmHostServices {
+    fn standalone(secrets: SecretManager) -> Self {
+        Self {
+            services: ServiceRuntime::new(secrets.clone()),
+            secrets,
+            ui: UiRuntime::new(),
+            runtime_permissions: RuntimePermissionManager::default(),
+            host_access: HostAccessServices::unavailable(),
+        }
+    }
+}
+
 impl WasmHostState {
     /// Creates a new host state instance.
     pub fn new(component_id: ComponentId) -> Self {
-        let secrets = SecretManager::system();
-        let services = ServiceRuntime::new(secrets.clone());
         Self::with_host_services_and_budget(
             component_id,
-            secrets,
-            services,
-            UiRuntime::new(),
-            RuntimePermissionManager::default(),
+            WasmHostServices::standalone(SecretManager::system()),
             false,
             &WasmExecutionBudget::default(),
         )
@@ -332,13 +383,9 @@ impl WasmHostState {
 
     /// Creates host state with the Rintawa secret manager shared by the runtime.
     pub fn with_secret_manager(component_id: ComponentId, secrets: SecretManager) -> Self {
-        let services = ServiceRuntime::new(secrets.clone());
         Self::with_host_services_and_budget(
             component_id,
-            secrets,
-            services,
-            UiRuntime::new(),
-            RuntimePermissionManager::default(),
+            WasmHostServices::standalone(secrets),
             false,
             &WasmExecutionBudget::default(),
         )
@@ -346,13 +393,17 @@ impl WasmHostState {
 
     fn with_host_services_and_budget(
         component_id: ComponentId,
-        secrets: SecretManager,
-        services: ServiceRuntime,
-        ui: UiRuntime,
-        runtime_permissions: RuntimePermissionManager,
+        host_services: WasmHostServices,
         task_handler_available: bool,
         budget: &WasmExecutionBudget,
     ) -> Self {
+        let WasmHostServices {
+            secrets,
+            services,
+            ui,
+            runtime_permissions,
+            host_access,
+        } = host_services;
         Self {
             component_id,
             extension_id: None,
@@ -371,6 +422,7 @@ impl WasmHostState {
             next_task_handle: 0,
             active_tasks: HashMap::new(),
             network_access_active: false,
+            host_access_active: false,
             next_network_handle: 0,
             network_handles: HashMap::new(),
             max_background_tasks: budget.max_background_tasks,
@@ -378,14 +430,19 @@ impl WasmHostState {
             max_network_handles: budget.max_network_handles,
             max_network_io_bytes: budget.max_network_io_bytes,
             loopback_connect_timeout_ms: budget.loopback_connect_timeout_ms,
+            max_http_fetch_bytes: budget.max_http_fetch_bytes,
+            http_fetch_timeout_ms: budget.http_fetch_timeout_ms,
+            max_http_redirects: budget.max_http_redirects,
             secrets,
             services,
             ui,
+            host_access,
             secret_access_active: false,
             service_access_active: false,
             ui_access_active: false,
             max_host_message_bytes: budget.max_host_message_bytes,
             max_artifact_read_bytes: budget.max_artifact_read_bytes,
+            max_artifact_import_bytes: budget.max_artifact_import_bytes,
             execution_target_registration_active: false,
             pending_execution_targets: Vec::new(),
             resource_limits: budget.store_limits(),
@@ -440,6 +497,7 @@ impl WasmHostState {
         self.runtime_effects_active = false;
         self.task_access_active = false;
         self.network_access_active = false;
+        self.host_access_active = false;
         self.secret_access_active = false;
         self.service_access_active = false;
         self.ui_access_active = false;
@@ -532,6 +590,7 @@ impl WasmHostState {
         self.runtime_effects_active = false;
         self.task_access_active = false;
         self.network_access_active = false;
+        self.host_access_active = false;
         self.pending_effects.clear();
         self.pending_revocations.clear();
         self.secret_access_active = false;
@@ -716,6 +775,7 @@ impl WasmHostState {
         self.runtime_effects_active = true;
         self.task_access_active = true;
         self.network_access_active = true;
+        self.host_access_active = true;
         self.secret_access_active = true;
         self.service_access_active = true;
         self.ui_access_active = true;
@@ -727,6 +787,7 @@ impl WasmHostState {
         self.runtime_effects_active = true;
         self.task_access_active = true;
         self.network_access_active = true;
+        self.host_access_active = true;
         self.secret_access_active = true;
         self.service_access_active = true;
         self.ui_access_active = true;
@@ -741,6 +802,7 @@ impl WasmHostState {
         self.runtime_effects_active = false;
         self.task_access_active = true;
         self.network_access_active = true;
+        self.host_access_active = true;
         self.secret_access_active = true;
         self.service_access_active = true;
         self.ui_access_active = true;
@@ -766,6 +828,7 @@ impl WasmHostState {
         self.runtime_effects_active = false;
         self.task_access_active = false;
         self.network_access_active = false;
+        self.host_access_active = false;
         self.secret_access_active = true;
         self.service_access_active = true;
         self.ui_access_active = true;
@@ -776,6 +839,7 @@ impl WasmHostState {
         self.runtime_effects_active = false;
         self.task_access_active = false;
         self.network_access_active = false;
+        self.host_access_active = false;
         self.secret_access_active = true;
         self.service_access_active = true;
         self.ui_access_active = true;
@@ -785,6 +849,7 @@ impl WasmHostState {
         self.execution_owner = None;
         self.task_access_active = false;
         self.network_access_active = false;
+        self.host_access_active = false;
         self.secret_access_active = false;
         self.service_access_active = false;
         self.ui_access_active = false;
@@ -796,6 +861,7 @@ impl WasmHostState {
         self.runtime_effects_active = false;
         self.task_access_active = false;
         self.network_access_active = false;
+        self.host_access_active = false;
         self.secret_access_active = false;
         self.service_access_active = false;
         self.ui_access_active = false;
@@ -1665,6 +1731,444 @@ impl NetworkHost for WasmHostState {
     }
 }
 
+impl HttpFetchHost for WasmHostState {
+    fn get(&mut self, url: String, max_bytes: u32) -> Result<WitHttpResponse, HttpFetchError> {
+        if !self.host_access_active {
+            return Err(HttpFetchError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::HttpFetch)
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => HttpFetchError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => HttpFetchError::Unavailable,
+            })?;
+
+        let requested_limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+        let response_limit = requested_limit.min(self.max_http_fetch_bytes);
+        let timeout = Duration::from_millis(self.http_fetch_timeout_ms);
+        let mut current = Url::parse(&url).map_err(|_| HttpFetchError::InvalidUrl)?;
+
+        for redirect_count in 0..=self.max_http_redirects {
+            let client = build_bounded_https_client(&current, timeout)?;
+            let response = client
+                .get(current.clone())
+                .header(reqwest::header::USER_AGENT, "Rintawa/0.0.1")
+                .send()
+                .map_err(map_http_request_error)?;
+
+            let status = response.status();
+            if is_followed_redirect(status) {
+                if redirect_count >= self.max_http_redirects {
+                    return Err(HttpFetchError::TooManyRedirects);
+                }
+                let location = response
+                    .headers()
+                    .get(LOCATION)
+                    .ok_or(HttpFetchError::InvalidUrl)?
+                    .to_str()
+                    .map_err(|_| HttpFetchError::InvalidUrl)?;
+                current = current
+                    .join(location)
+                    .map_err(|_| HttpFetchError::InvalidUrl)?;
+                continue;
+            }
+
+            if response
+                .content_length()
+                .is_some_and(|length| length > u64::try_from(response_limit).unwrap_or(u64::MAX))
+            {
+                return Err(HttpFetchError::ResponseTooLarge);
+            }
+
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let final_url = current.to_string();
+            let mut body = Vec::with_capacity(
+                response_limit
+                    .min(response.content_length().unwrap_or(0) as usize)
+                    .min(1024 * 1024),
+            );
+            let read_limit = u64::try_from(response_limit)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1);
+            response
+                .take(read_limit)
+                .read_to_end(&mut body)
+                .map_err(|_| HttpFetchError::Unavailable)?;
+            if body.len() > response_limit {
+                return Err(HttpFetchError::ResponseTooLarge);
+            }
+
+            return Ok(WitHttpResponse {
+                status: status.as_u16(),
+                final_url,
+                content_type,
+                body,
+            });
+        }
+
+        Err(HttpFetchError::TooManyRedirects)
+    }
+}
+
+fn build_bounded_https_client(url: &Url, timeout: Duration) -> Result<HttpClient, HttpFetchError> {
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return Err(HttpFetchError::InvalidUrl);
+    }
+    let host = url.host().ok_or(HttpFetchError::InvalidUrl)?;
+    let port = url
+        .port_or_known_default()
+        .ok_or(HttpFetchError::InvalidUrl)?;
+
+    let mut builder = HttpClient::builder()
+        .redirect(RedirectPolicy::none())
+        .timeout(timeout)
+        .connect_timeout(timeout.min(Duration::from_secs(5)));
+
+    match host {
+        UrlHost::Domain(domain) => {
+            let addresses = (domain, port)
+                .to_socket_addrs()
+                .map_err(|_| HttpFetchError::Unavailable)?;
+            let public = addresses
+                .into_iter()
+                .find(|address| is_allowed_public_ip(address.ip()))
+                .ok_or(HttpFetchError::ForbiddenDestination)?;
+            builder = builder.resolve(domain, public);
+        }
+        UrlHost::Ipv4(address) => {
+            if !is_allowed_public_ip(IpAddr::V4(address)) {
+                return Err(HttpFetchError::ForbiddenDestination);
+            }
+        }
+        UrlHost::Ipv6(address) => {
+            if !is_allowed_public_ip(IpAddr::V6(address)) {
+                return Err(HttpFetchError::ForbiddenDestination);
+            }
+        }
+    }
+
+    builder.build().map_err(|_| HttpFetchError::Unavailable)
+}
+
+fn is_followed_redirect(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    )
+}
+
+fn map_http_request_error(error: reqwest::Error) -> HttpFetchError {
+    if error.is_timeout() {
+        HttpFetchError::Timeout
+    } else {
+        HttpFetchError::Unavailable
+    }
+}
+
+fn is_allowed_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(address) => is_allowed_public_ipv4(address),
+        IpAddr::V6(address) => is_allowed_public_ipv6(address),
+    }
+}
+
+fn is_allowed_public_ipv4(address: Ipv4Addr) -> bool {
+    let [a, b, c, _d] = address.octets();
+
+    if a == 0
+        || a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 168)
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224
+    {
+        return false;
+    }
+
+    true
+}
+
+fn is_allowed_public_ipv6(address: Ipv6Addr) -> bool {
+    if address.is_unspecified() || address.is_loopback() || address.is_multicast() {
+        return false;
+    }
+
+    let segments = address.segments();
+    if (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] & 0xffc0) == 0xfec0
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+    {
+        return false;
+    }
+
+    if segments[..5] == [0, 0, 0, 0, 0] && segments[5] == 0xffff {
+        let octets = address.octets();
+        return is_allowed_public_ipv4(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+
+    true
+}
+
+impl ArtifactStoreHost for WasmHostState {
+    fn import_rtw(&mut self, bytes: Vec<u8>) -> Result<WitImportedArtifact, ArtifactStoreError> {
+        if !self.host_access_active {
+            return Err(ArtifactStoreError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::ArtifactImport)
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => ArtifactStoreError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => ArtifactStoreError::Unavailable,
+            })?;
+        if bytes.len() > self.max_artifact_import_bytes {
+            return Err(ArtifactStoreError::MessageTooLarge);
+        }
+
+        let imported = self
+            .host_access
+            .artifact_store
+            .import_rtw(&bytes)
+            .map_err(map_artifact_store_access_error)?;
+        Ok(WitImportedArtifact {
+            digest: imported.digest,
+            content: imported.content,
+        })
+    }
+}
+
+impl PreferencesHost for WasmHostState {
+    fn get(&mut self, key: String) -> Result<Option<String>, PreferenceError> {
+        let (scope_id, owner) = self.preference_owner()?;
+        if key.len() > self.max_host_message_bytes {
+            return Err(PreferenceError::MessageTooLarge);
+        }
+        self.host_access
+            .preferences
+            .get(
+                scope_id.as_str(),
+                owner.instance_id.as_str(),
+                owner.component_id.as_str(),
+                &key,
+            )
+            .map_err(map_preference_access_error)
+    }
+
+    fn set(&mut self, key: String, value: String) -> Result<(), PreferenceError> {
+        let (scope_id, owner) = self.preference_owner()?;
+        if key.len().saturating_add(value.len()) > self.max_host_message_bytes {
+            return Err(PreferenceError::MessageTooLarge);
+        }
+        self.host_access
+            .preferences
+            .set(
+                scope_id.as_str(),
+                owner.instance_id.as_str(),
+                owner.component_id.as_str(),
+                &key,
+                &value,
+            )
+            .map_err(map_preference_access_error)
+    }
+
+    fn delete(&mut self, key: String) -> Result<(), PreferenceError> {
+        let (scope_id, owner) = self.preference_owner()?;
+        if key.len() > self.max_host_message_bytes {
+            return Err(PreferenceError::MessageTooLarge);
+        }
+        self.host_access
+            .preferences
+            .delete(
+                scope_id.as_str(),
+                owner.instance_id.as_str(),
+                owner.component_id.as_str(),
+                &key,
+            )
+            .map_err(map_preference_access_error)
+    }
+}
+
+impl WasmHostState {
+    fn preference_owner(
+        &self,
+    ) -> Result<(RuntimeScopeId, rintawa_sdk::contracts::ComponentRef), PreferenceError> {
+        if !self.host_access_active {
+            return Err(PreferenceError::AccessNotActive);
+        }
+        let scope_id = self
+            .scope_id
+            .clone()
+            .ok_or(PreferenceError::AccessNotActive)?;
+        let owner = self
+            .current_execution_owner()
+            .cloned()
+            .ok_or(PreferenceError::AccessNotActive)?;
+        Ok((scope_id, owner))
+    }
+}
+
+impl CompositionHost for WasmHostState {
+    fn list_activations(&mut self) -> Result<Vec<WitCompositionActivation>, CompositionError> {
+        if !self.host_access_active {
+            return Err(CompositionError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::CompositionRead)
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => CompositionError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => CompositionError::Unavailable,
+            })?;
+
+        let activations = self
+            .host_access
+            .composition
+            .list_activations()
+            .map_err(map_composition_access_error)?;
+        let message_bytes = activations.iter().fold(0_usize, |total, activation| {
+            total
+                .saturating_add(activation.subject.len())
+                .saturating_add(activation.content.len())
+                .saturating_add(activation.name.len())
+                .saturating_add(activation.version.as_ref().map_or(0, String::len))
+                .saturating_add(activation.digest.len())
+                .saturating_add(activation.instance_id.len())
+                .saturating_add(activation.scope_id.len())
+                .saturating_add(1)
+        });
+        if message_bytes > self.max_host_message_bytes {
+            return Err(CompositionError::Rejected);
+        }
+
+        Ok(activations
+            .into_iter()
+            .map(to_wit_composition_activation)
+            .collect())
+    }
+
+    fn select_artifact(
+        &mut self,
+        digest: String,
+        enabled: Option<bool>,
+    ) -> Result<WitCompositionActivation, CompositionError> {
+        self.require_composition_write()?;
+        if digest.len() > self.max_host_message_bytes {
+            return Err(CompositionError::InvalidDigest);
+        }
+
+        self.host_access
+            .composition
+            .select_artifact(&digest, enabled)
+            .map(to_wit_composition_activation)
+            .map_err(map_composition_access_error)
+    }
+
+    fn set_enabled(&mut self, subject: String, enabled: bool) -> Result<(), CompositionError> {
+        self.require_composition_write()?;
+        if subject.len() > self.max_host_message_bytes {
+            return Err(CompositionError::Rejected);
+        }
+        self.host_access
+            .composition
+            .set_enabled(&subject, enabled)
+            .map_err(map_composition_access_error)
+    }
+
+    fn remove_activation(&mut self, subject: String) -> Result<(), CompositionError> {
+        self.require_composition_write()?;
+        if subject.len() > self.max_host_message_bytes {
+            return Err(CompositionError::Rejected);
+        }
+        self.host_access
+            .composition
+            .remove_activation(&subject)
+            .map_err(map_composition_access_error)
+    }
+}
+
+impl WasmHostState {
+    fn require_composition_write(&self) -> Result<(), CompositionError> {
+        if !self.host_access_active {
+            return Err(CompositionError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::CompositionWrite)
+            .map(|_| ())
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => CompositionError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => CompositionError::Unavailable,
+            })
+    }
+}
+
+fn to_wit_composition_activation(
+    activation: crate::host_access::CompositionActivation,
+) -> WitCompositionActivation {
+    WitCompositionActivation {
+        subject: activation.subject,
+        content: activation.content,
+        name: activation.name,
+        version: activation.version,
+        digest: activation.digest,
+        instance_id: activation.instance_id,
+        scope_id: activation.scope_id,
+        enabled: activation.enabled,
+    }
+}
+
+fn map_artifact_store_access_error(error: HostAccessError) -> ArtifactStoreError {
+    match error {
+        HostAccessError::InvalidArtifact | HostAccessError::InvalidDigest => {
+            ArtifactStoreError::InvalidArtifact
+        }
+        HostAccessError::Unavailable => ArtifactStoreError::Unavailable,
+        HostAccessError::NotFound
+        | HostAccessError::UnsupportedContent
+        | HostAccessError::InvalidPreference
+        | HostAccessError::PreferenceQuotaExceeded
+        | HostAccessError::Rejected => ArtifactStoreError::Rejected,
+    }
+}
+
+fn map_preference_access_error(error: HostAccessError) -> PreferenceError {
+    match error {
+        HostAccessError::InvalidPreference => PreferenceError::InvalidPreference,
+        HostAccessError::PreferenceQuotaExceeded => PreferenceError::QuotaExceeded,
+        HostAccessError::Unavailable => PreferenceError::Unavailable,
+        HostAccessError::InvalidArtifact
+        | HostAccessError::InvalidDigest
+        | HostAccessError::NotFound
+        | HostAccessError::UnsupportedContent
+        | HostAccessError::Rejected => PreferenceError::Rejected,
+    }
+}
+
+fn map_composition_access_error(error: HostAccessError) -> CompositionError {
+    match error {
+        HostAccessError::InvalidDigest | HostAccessError::InvalidArtifact => {
+            CompositionError::InvalidDigest
+        }
+        HostAccessError::NotFound => CompositionError::NotFound,
+        HostAccessError::UnsupportedContent => CompositionError::UnsupportedContent,
+        HostAccessError::InvalidPreference
+        | HostAccessError::PreferenceQuotaExceeded
+        | HostAccessError::Rejected => CompositionError::Rejected,
+        HostAccessError::Unavailable => CompositionError::Unavailable,
+    }
+}
+
 impl SecretsHost for WasmHostState {
     fn read(&mut self, path: String) -> Result<String, SecretError> {
         self.read_secret(path)
@@ -1780,11 +2284,8 @@ impl ServicesHost for WasmHostState {
 #[derive(Clone)]
 pub struct WasmRuntimeEngine {
     engine: Engine,
-    secrets: SecretManager,
-    services: ServiceRuntime,
-    ui: UiRuntime,
+    host_services: WasmHostServices,
     execution_targets: ExecutionTargetRegistry,
-    runtime_permissions: RuntimePermissionManager,
     budget: WasmExecutionBudget,
 }
 
@@ -1832,13 +2333,9 @@ impl WasmRuntimeEngine {
         secrets: SecretManager,
         budget: WasmExecutionBudget,
     ) -> EngineResult<Self> {
-        let services = ServiceRuntime::new(secrets.clone());
         Self::with_host_services_and_budget(
-            secrets,
-            services,
-            UiRuntime::new(),
+            WasmHostServices::standalone(secrets),
             ExecutionTargetRegistry::default(),
-            RuntimePermissionManager::default(),
             budget,
         )
     }
@@ -1849,23 +2346,24 @@ impl WasmRuntimeEngine {
         ui: UiRuntime,
         execution_targets: ExecutionTargetRegistry,
         runtime_permissions: RuntimePermissionManager,
+        host_access: HostAccessServices,
     ) -> EngineResult<Self> {
         Self::with_host_services_and_budget(
-            secrets,
-            services,
-            ui,
+            WasmHostServices {
+                secrets,
+                services,
+                ui,
+                runtime_permissions,
+                host_access,
+            },
             execution_targets,
-            runtime_permissions,
             WasmExecutionBudget::default(),
         )
     }
 
     fn with_host_services_and_budget(
-        secrets: SecretManager,
-        services: ServiceRuntime,
-        ui: UiRuntime,
+        host_services: WasmHostServices,
         execution_targets: ExecutionTargetRegistry,
-        runtime_permissions: RuntimePermissionManager,
         budget: WasmExecutionBudget,
     ) -> EngineResult<Self> {
         let mut config = wasmtime::Config::new();
@@ -1877,11 +2375,8 @@ impl WasmRuntimeEngine {
 
         Ok(Self {
             engine,
-            secrets,
-            services,
-            ui,
+            host_services,
             execution_targets,
-            runtime_permissions,
             budget,
         })
     }
@@ -1913,11 +2408,8 @@ impl WasmRuntimeEngine {
             engine: self.engine.clone(),
             component,
             linker: Arc::new(linker),
-            secrets: self.secrets.clone(),
-            services: self.services.clone(),
-            ui: self.ui.clone(),
+            host_services: self.host_services.clone(),
             execution_targets: self.execution_targets.clone(),
-            runtime_permissions: self.runtime_permissions.clone(),
             task_handler_available,
             budget: self.budget.clone(),
             runtime: Arc::new(Mutex::new(WasmSharedRuntime {
@@ -1974,11 +2466,8 @@ pub struct WasmComponent {
     engine: Engine,
     component: WasmtimeComponent,
     linker: Arc<Linker<WasmHostState>>,
-    secrets: SecretManager,
-    services: ServiceRuntime,
-    ui: UiRuntime,
+    host_services: WasmHostServices,
     execution_targets: ExecutionTargetRegistry,
-    runtime_permissions: RuntimePermissionManager,
     task_handler_available: bool,
     budget: WasmExecutionBudget,
     runtime: Arc<Mutex<WasmSharedRuntime>>,
@@ -2536,10 +3025,7 @@ impl WasmComponent {
         if runtime.instance.is_none() {
             let host_state = WasmHostState::with_host_services_and_budget(
                 self.id.clone(),
-                self.secrets.clone(),
-                self.services.clone(),
-                self.ui.clone(),
-                self.runtime_permissions.clone(),
+                self.host_services.clone(),
                 self.task_handler_available,
                 &self.budget,
             );
@@ -2997,6 +3483,43 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn test_should_reject_non_public_http_fetch_destinations() {
+        for url in [
+            "http://example.com/index.json",
+            "https://127.0.0.1/index.json",
+            "https://10.0.0.1/index.json",
+            "https://169.254.169.254/latest/meta-data",
+            "https://[::1]/index.json",
+            "https://[fc00::1]/index.json",
+            "https://[fe80::1]/index.json",
+            "https://[fec0::1]/index.json",
+        ] {
+            let parsed = Url::parse(url).unwrap();
+            assert!(matches!(
+                build_bounded_https_client(&parsed, Duration::from_millis(50)),
+                Err(HttpFetchError::InvalidUrl | HttpFetchError::ForbiddenDestination)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_should_classify_public_and_special_ip_ranges() {
+        assert!(is_allowed_public_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+        assert!(is_allowed_public_ip(IpAddr::V6(
+            "2606:4700:4700::1111".parse().unwrap()
+        )));
+
+        for address in [
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+            IpAddr::V6("2001:db8::1".parse().unwrap()),
+        ] {
+            assert!(!is_allowed_public_ip(address));
+        }
+    }
+
     struct TestLogger;
 
     impl LoggerApi for TestLogger {
@@ -3127,13 +3650,9 @@ mod tests {
             ..WasmExecutionBudget::default()
         };
         let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
-        let services = ServiceRuntime::new(secrets.clone());
         let mut state = WasmHostState::with_host_services_and_budget(
             ComponentId::new("runtime"),
-            secrets,
-            services,
-            UiRuntime::new(),
-            RuntimePermissionManager::default(),
+            WasmHostServices::standalone(secrets),
             false,
             &budget,
         );
@@ -3166,13 +3685,9 @@ mod tests {
             ..WasmExecutionBudget::default()
         };
         let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
-        let services = ServiceRuntime::new(secrets.clone());
         let mut state = WasmHostState::with_host_services_and_budget(
             ComponentId::new("runtime"),
-            secrets,
-            services,
-            UiRuntime::new(),
-            RuntimePermissionManager::default(),
+            WasmHostServices::standalone(secrets),
             false,
             &budget,
         );

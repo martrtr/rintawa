@@ -54,6 +54,40 @@ fn test_should_import_valid_rtw_under_its_sha256_digest() -> Result<()> {
 }
 
 #[test]
+fn test_should_import_identical_in_memory_rtw_bytes_into_same_cas_object() -> Result<()> {
+    let root = TempDir::new()?;
+    let artifact = build_artifact(&root, "memory")?;
+    let bytes = fs::read(&artifact)?;
+    let store = ArtifactStore::open(root.path().join("store"), RtwLimits::default())?;
+
+    let imported = store.import_bytes(&bytes)?;
+    assert_eq!(
+        imported.digest(),
+        &rintawa_artifacts::ArtifactDigest::sha256(&bytes)
+    );
+    assert_eq!(imported.disposition(), ImportDisposition::Imported);
+    assert_eq!(
+        store
+            .open_artifact(imported.digest())?
+            .manifest()
+            .content
+            .to_string(),
+        "rintawa.extension@1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_invalid_in_memory_rtw_without_publishing() -> Result<()> {
+    let root = TempDir::new()?;
+    let store = ArtifactStore::open(root.path().join("store"), RtwLimits::default())?;
+
+    assert!(store.import_bytes(b"not an rtw").is_err());
+    assert_eq!(fs::read_dir(store.root().join("sha256"))?.count(), 0);
+    Ok(())
+}
+
+#[test]
 fn test_should_deduplicate_repeated_imports_without_rewriting() -> Result<()> {
     let root = TempDir::new()?;
     let artifact = build_artifact(&root, "same")?;

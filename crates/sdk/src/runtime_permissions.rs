@@ -17,6 +17,14 @@ pub enum RuntimePermission {
     LoopbackListen,
     /// Allows opening a TCP connection only to the local loopback interface.
     LoopbackConnect,
+    /// Allows bounded outbound HTTPS GET requests through the host HTTP client.
+    HttpFetch,
+    /// Allows importing validated RTW bytes into the local immutable artifact store.
+    ArtifactImport,
+    /// Allows reading the selected host composition without mutating it.
+    CompositionRead,
+    /// Allows changing exact artifact selections and enabled state in host composition.
+    CompositionWrite,
 }
 
 impl fmt::Display for RuntimePermission {
@@ -25,6 +33,10 @@ impl fmt::Display for RuntimePermission {
             Self::BackgroundTask => formatter.write_str("background-task"),
             Self::LoopbackListen => formatter.write_str("loopback-listen"),
             Self::LoopbackConnect => formatter.write_str("loopback-connect"),
+            Self::HttpFetch => formatter.write_str("http-fetch"),
+            Self::ArtifactImport => formatter.write_str("artifact-import"),
+            Self::CompositionRead => formatter.write_str("composition-read"),
+            Self::CompositionWrite => formatter.write_str("composition-write"),
         }
     }
 }
@@ -49,6 +61,10 @@ impl FromStr for RuntimePermission {
             "background-task" => Ok(Self::BackgroundTask),
             "loopback-listen" => Ok(Self::LoopbackListen),
             "loopback-connect" => Ok(Self::LoopbackConnect),
+            "http-fetch" => Ok(Self::HttpFetch),
+            "artifact-import" => Ok(Self::ArtifactImport),
+            "composition-read" => Ok(Self::CompositionRead),
+            "composition-write" => Ok(Self::CompositionWrite),
             _ => Err(RuntimePermissionParseError(value.to_string())),
         }
     }

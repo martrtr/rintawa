@@ -183,6 +183,46 @@ fn manual_update_repoints_activation_and_preserves_enabled_state() -> anyhow::Re
 }
 
 #[test]
+fn generic_import_does_not_activate_until_exact_digest_is_selected() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let artifact = build_extension(root.path(), "0.0.1", "Bootstrap")?;
+    let bytes = fs::read(&artifact)?;
+    let home = HostHome::open(root.path().join("home"))?;
+
+    let imported = home.import_rtw_bytes(&bytes)?;
+    assert!(home.list_activations()?.is_empty());
+
+    let selected = home.select_stored_rtw(imported.digest(), Some(false))?;
+    assert_eq!(selected.subject, "example.bootstrap");
+    assert_eq!(selected.version.as_deref(), Some("0.0.1"));
+    assert!(!selected.enabled);
+    assert_eq!(home.list_activations()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn removing_activation_cleans_profile_policy_but_keeps_cas_bytes() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let artifact = build_task_runtime(root.path(), true)?;
+    let home = HostHome::open(root.path().join("home"))?;
+    let installed = home.install_local_rtw(&artifact, None)?;
+    let scope = RuntimeScopeId::new(HOST_SCOPE);
+    let owner = ComponentRef::new("bootstrap.task-runtime", "runtime");
+    home.grant_runtime_permission(scope, owner, RuntimePermission::BackgroundTask)?;
+
+    home.remove_activation("bootstrap.task-runtime")?;
+    let profile = home.load_profile()?;
+    assert!(profile.activations.is_empty());
+    assert!(profile.runtime_permissions.is_empty());
+    assert!(
+        home.artifact_store()
+            .open_artifact(&installed.activation.digest)
+            .is_ok()
+    );
+    Ok(())
+}
+
+#[test]
 fn importing_identical_bytes_reuses_cas_object() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let artifact = build_extension(root.path(), "0.0.1", "Bootstrap")?;
@@ -201,7 +241,7 @@ fn importing_identical_bytes_reuses_cas_object() -> anyhow::Result<()> {
 
 #[test]
 fn test_should_read_legacy_profile_schemas_without_runtime_permissions() -> anyhow::Result<()> {
-    for schema in [1, 2] {
+    for schema in [1, 2, 3] {
         let root = tempfile::tempdir()?;
         let home_path = root.path().join(format!("home-{schema}"));
         let profile_dir = home_path.join("profiles");
@@ -218,6 +258,66 @@ fn test_should_read_legacy_profile_schemas_without_runtime_permissions() -> anyh
         assert!(profile.preferred_providers.is_empty());
         assert!(profile.runtime_permissions.is_empty());
     }
+    Ok(())
+}
+
+#[test]
+fn test_preferences_are_owner_scoped_persistent_and_bounded() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let home_path = root.path().join("home");
+    let home = HostHome::open(&home_path)?;
+    let scope = RuntimeScopeId::new(HOST_SCOPE);
+    let owner = ComponentRef::new("example.manager", "runtime");
+    let other = ComponentRef::new("example.other", "runtime");
+
+    assert_eq!(home.get_preference(&scope, &owner, "repositories")?, None);
+
+    home.set_preference(
+        scope.clone(),
+        owner.clone(),
+        "repositories".to_string(),
+        "[\"https://example.invalid/index.json\"]".to_string(),
+    )?;
+
+    assert_eq!(
+        home.get_preference(&scope, &owner, "repositories")?
+            .as_deref(),
+        Some("[\"https://example.invalid/index.json\"]")
+    );
+    assert_eq!(home.get_preference(&scope, &other, "repositories")?, None);
+
+    let reopened = HostHome::open(&home_path)?;
+    assert_eq!(
+        reopened
+            .get_preference(&scope, &owner, "repositories")?
+            .as_deref(),
+        Some("[\"https://example.invalid/index.json\"]")
+    );
+
+    assert!(matches!(
+        reopened.set_preference(
+            scope.clone(),
+            owner.clone(),
+            String::new(),
+            "value".to_string(),
+        ),
+        Err(HostError::InvalidPreference(_))
+    ));
+    assert!(matches!(
+        reopened.set_preference(
+            scope.clone(),
+            owner.clone(),
+            "oversized".to_string(),
+            "x".repeat(64 * 1024 + 1),
+        ),
+        Err(HostError::InvalidPreference(_))
+    ));
+
+    reopened.delete_preference(&scope, &owner, "repositories")?;
+    assert_eq!(
+        reopened.get_preference(&scope, &owner, "repositories")?,
+        None
+    );
     Ok(())
 }
 
@@ -252,7 +352,7 @@ fn test_should_persist_runtime_permission_and_apply_it_during_bootstrap() -> any
             .join("profiles")
             .join(rintawa_host::BASELINE_PROFILE_FILE),
     )?;
-    assert!(profile_source.contains("schema = 3"));
+    assert!(profile_source.contains("schema = 4"));
     assert!(profile_source.contains("[[runtime_permissions]]"));
     assert!(profile_source.contains("permission = \"background-task\""));
 

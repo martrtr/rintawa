@@ -1,8 +1,14 @@
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use rintawa_extension_engine::{
-    ActivationPlanError, EngineError, ExtensionEngine, RtwExtensionLoadOutcome, RtwExtensionLoader,
-    UnresolvedContractReason,
+    ActivationPlanError, ArtifactStoreAccess, CompositionAccess, CompositionActivation,
+    EngineError, ExtensionEngine, HostAccessError, HostAccessResult, ImportedArtifact,
+    PreferenceAccess, RtwExtensionLoadOutcome, RtwExtensionLoader, UnresolvedContractReason,
 };
 use rintawa_sdk::{
     contracts::{
@@ -16,6 +22,171 @@ use crate::{
     HOST_SCOPE, HostCleanupFailure, HostCleanupOperation, HostError, HostHome, HostResult,
     HostShutdownFailures,
 };
+
+struct BaselineHostAccess {
+    home_root: PathBuf,
+}
+
+impl BaselineHostAccess {
+    fn new(home_root: &Path) -> Self {
+        Self {
+            home_root: home_root.to_path_buf(),
+        }
+    }
+
+    fn home(&self) -> HostAccessResult<HostHome> {
+        HostHome::open(&self.home_root).map_err(map_host_access_error)
+    }
+}
+
+impl ArtifactStoreAccess for BaselineHostAccess {
+    fn import_rtw(&self, bytes: &[u8]) -> HostAccessResult<ImportedArtifact> {
+        let home = self.home()?;
+        let imported = home
+            .import_rtw_bytes(bytes)
+            .map_err(map_artifact_import_error)?;
+        let archive = home
+            .artifact_store()
+            .open_artifact(imported.digest())
+            .map_err(|_| HostAccessError::InvalidArtifact)?;
+        Ok(ImportedArtifact {
+            digest: imported.digest().to_string(),
+            content: archive.manifest().content.to_string(),
+        })
+    }
+}
+
+impl PreferenceAccess for BaselineHostAccess {
+    fn get(
+        &self,
+        scope_id: &str,
+        instance_id: &str,
+        component_id: &str,
+        key: &str,
+    ) -> HostAccessResult<Option<String>> {
+        self.home()?
+            .get_preference(
+                &RuntimeScopeId::new(scope_id),
+                &ComponentRef::new(instance_id, component_id),
+                key,
+            )
+            .map_err(map_host_access_error)
+    }
+
+    fn set(
+        &self,
+        scope_id: &str,
+        instance_id: &str,
+        component_id: &str,
+        key: &str,
+        value: &str,
+    ) -> HostAccessResult<()> {
+        self.home()?
+            .set_preference(
+                RuntimeScopeId::new(scope_id),
+                ComponentRef::new(instance_id, component_id),
+                key.to_string(),
+                value.to_string(),
+            )
+            .map_err(map_host_access_error)
+    }
+
+    fn delete(
+        &self,
+        scope_id: &str,
+        instance_id: &str,
+        component_id: &str,
+        key: &str,
+    ) -> HostAccessResult<()> {
+        self.home()?
+            .delete_preference(
+                &RuntimeScopeId::new(scope_id),
+                &ComponentRef::new(instance_id, component_id),
+                key,
+            )
+            .map_err(map_host_access_error)
+    }
+}
+
+impl CompositionAccess for BaselineHostAccess {
+    fn list_activations(&self) -> HostAccessResult<Vec<CompositionActivation>> {
+        self.home()?
+            .list_activations()
+            .map(|activations| {
+                activations
+                    .into_iter()
+                    .map(to_composition_activation)
+                    .collect()
+            })
+            .map_err(map_host_access_error)
+    }
+
+    fn select_artifact(
+        &self,
+        digest: &str,
+        enabled: Option<bool>,
+    ) -> HostAccessResult<CompositionActivation> {
+        let digest: rintawa_artifacts::ArtifactDigest =
+            digest.parse().map_err(|_| HostAccessError::InvalidDigest)?;
+        self.home()?
+            .select_stored_rtw(&digest, enabled)
+            .map(to_composition_activation)
+            .map_err(map_host_access_error)
+    }
+
+    fn set_enabled(&self, subject: &str, enabled: bool) -> HostAccessResult<()> {
+        self.home()?
+            .set_enabled(subject, enabled)
+            .map_err(map_host_access_error)
+    }
+
+    fn remove_activation(&self, subject: &str) -> HostAccessResult<()> {
+        self.home()?
+            .remove_activation(subject)
+            .map_err(map_host_access_error)
+    }
+}
+
+fn to_composition_activation(activation: crate::InstalledActivation) -> CompositionActivation {
+    CompositionActivation {
+        subject: activation.subject,
+        content: activation.content.to_string(),
+        name: activation.name,
+        version: activation.version,
+        digest: activation.digest.to_string(),
+        instance_id: activation.instance_id.to_string(),
+        scope_id: activation.scope_id.to_string(),
+        enabled: activation.enabled,
+    }
+}
+
+fn map_artifact_import_error(error: HostError) -> HostAccessError {
+    match error {
+        HostError::Artifact(_) | HostError::UnsupportedContent(_) => {
+            HostAccessError::InvalidArtifact
+        }
+        HostError::Io(_)
+        | HostError::ProfileDecode(_)
+        | HostError::ProfileEncode(_)
+        | HostError::UnsupportedProfileSchema(_) => HostAccessError::Unavailable,
+        _ => HostAccessError::Rejected,
+    }
+}
+
+fn map_host_access_error(error: HostError) -> HostAccessError {
+    match error {
+        HostError::ActivationNotFound(_) => HostAccessError::NotFound,
+        HostError::UnsupportedContent(_) => HostAccessError::UnsupportedContent,
+        HostError::Io(_)
+        | HostError::ProfileDecode(_)
+        | HostError::ProfileEncode(_)
+        | HostError::UnsupportedProfileSchema(_) => HostAccessError::Unavailable,
+        HostError::InvalidPreference(_) => HostAccessError::InvalidPreference,
+        HostError::PreferenceQuotaExceeded => HostAccessError::PreferenceQuotaExceeded,
+        HostError::Artifact(_) => HostAccessError::Rejected,
+        _ => HostAccessError::Rejected,
+    }
+}
 
 /// Running baseline host composition loaded exclusively from exact local RTW digests.
 pub struct HostRuntime {
@@ -36,7 +207,15 @@ impl HostRuntime {
     /// deterministic full-topology activation plan.
     pub fn start(home: &HostHome) -> HostResult<Self> {
         let profile = home.load_profile()?;
-        let mut engine = ExtensionEngine::new();
+        let access = Arc::new(BaselineHostAccess::new(home.root()));
+        let artifact_store_access: Arc<dyn ArtifactStoreAccess> = access.clone();
+        let composition_access: Arc<dyn CompositionAccess> = access.clone();
+        let preference_access: Arc<dyn PreferenceAccess> = access;
+        let mut engine = ExtensionEngine::with_host_access(
+            artifact_store_access,
+            composition_access,
+            preference_access,
+        );
         let host_scope = RuntimeScopeId::new(HOST_SCOPE);
         let host_shell_contract = host_shell_contract_key();
         let ui_layer_contract = ui_layer_contract_key();
