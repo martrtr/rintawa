@@ -293,6 +293,67 @@ interface composition {
     remove-activation: func(subject: string) -> result<_, error>;
 }
 
+
+/// Administrative runtime permission policy for exact baseline components.
+interface runtime-policy {
+    /// Runtime permissions requested by one component in an exact artifact.
+    record component-request {
+        component-id: string,
+        requested: list<string>,
+    }
+
+    /// Read-only runtime policy metadata for one exact imported artifact.
+    record artifact-policy {
+        subject: string,
+        name: string,
+        version: string,
+        components: list<component-request>,
+    }
+
+    /// Requested and granted permissions for one exact component principal.
+    record component-policy {
+        scope-id: string,
+        instance-id: string,
+        component-id: string,
+        requested: list<string>,
+        granted: list<string>,
+    }
+
+    /// Failure while reading or mutating runtime permission policy.
+    variant error {
+        access-not-active,
+        permission-denied,
+        invalid-permission,
+        not-found,
+        message-too-large,
+        rejected,
+        unavailable,
+    }
+
+    /// Inspects one imported exact artifact before composition mutation.
+    /// Requires runtime-policy-read.
+    inspect-artifact: func(digest: string) -> result<artifact-policy, error>;
+
+    /// Lists baseline component permission policy. Requires runtime-policy-read.
+    list-components: func() -> result<list<component-policy>, error>;
+
+    /// Grants one manifest-requested permission. Requires runtime-policy-write.
+    grant: func(
+        scope-id: string,
+        instance-id: string,
+        component-id: string,
+        permission: string,
+    ) -> result<_, error>;
+
+    /// Revokes one persisted permission. Requires runtime-policy-write.
+    revoke: func(
+        scope-id: string,
+        instance-id: string,
+        component-id: string,
+        permission: string,
+    ) -> result<_, error>;
+}
+
 /// Dynamic execution targets published by an active runtime-provider component.
 interface execution-targets {
     /// A host-owned, read-only view of one validated RTW artifact.
@@ -399,12 +460,21 @@ interface portable-ui {
         rejected,
     }
 
+    /// Renderer-neutral shell activity metadata associated with one or more surfaces.
+    record activity {
+        id: string,
+        label: string,
+        icon-slot: option<string>,
+    }
+
     /// Registers one static portable UI surface during guest `register`.
     register-surface: func(
         id: string,
         placement: placement-hint,
         semantic-contract: option<string>,
         semantic-version: option<u32>,
+        activity: option<activity>,
+        traits: list<string>,
         required-capabilities: list<string>,
     ) -> result<_, error>;
 
@@ -547,6 +617,7 @@ world plugin {
     import artifact-store;
     import preferences;
     import composition;
+    import runtime-policy;
     import execution-targets;
     import secrets;
     import services;
@@ -577,6 +648,7 @@ world task-runtime-plugin {
     import artifact-store;
     import preferences;
     import composition;
+    import runtime-policy;
     import execution-targets;
     import secrets;
     import services;
@@ -597,6 +669,7 @@ world runtime-provider-plugin {
     import artifact-store;
     import preferences;
     import composition;
+    import runtime-policy;
     import execution-targets;
     import secrets;
     import services;
@@ -617,6 +690,7 @@ world runtime-provider-task-plugin {
     import artifact-store;
     import preferences;
     import composition;
+    import runtime-policy;
     import execution-targets;
     import secrets;
     import services;

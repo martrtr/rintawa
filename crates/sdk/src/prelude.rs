@@ -45,8 +45,11 @@ pub use crate::types::{
 };
 
 pub use crate::ui::{
-    PORTABLE_UI_PROTOCOL_MAJOR, UiActionEvent, UiActionId, UiActionPayload, UiButtonNode,
-    UiCapabilityId, UiContainerNode, UiError, UiLayerDescriptor, UiMarkdownNode, UiNode, UiNodeId,
-    UiNodeKind, UiPatch, UiPatchBatch, UiPlacementHint, UiResult, UiSurfaceContribution,
-    UiSurfaceId, UiSurfaceSnapshot, UiTextAreaNode, UiTextInputNode, UiTextNode,
+    PORTABLE_UI_PROTOCOL_MAJOR, UiActionEvent, UiActionId, UiActionPayload, UiActivityContribution,
+    UiActivityId, UiButtonAppearance, UiButtonNode, UiCapabilityId, UiCheckboxNode,
+    UiContainerNode, UiDataGridColumn, UiDataGridNode, UiDataGridSortDirection, UiError,
+    UiIconNode, UiIconSlotId, UiImageNode, UiLayerDescriptor, UiMarkdownNode, UiNode, UiNodeId,
+    UiNodeKind, UiNodeSemanticTraitId, UiPatch, UiPatchBatch, UiPlacementHint, UiResult,
+    UiSelectNode, UiSelectOption, UiSplitAxis, UiSplitNode, UiSurfaceContribution, UiSurfaceId,
+    UiSurfaceSnapshot, UiSurfaceTraitId, UiTextAreaNode, UiTextInputNode, UiTextNode,
 };

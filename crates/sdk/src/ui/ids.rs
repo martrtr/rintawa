@@ -45,8 +45,21 @@ macro_rules! ui_string_id {
 
 ui_string_id!(UiSurfaceId, "Identifies one portable UI surface.");
 ui_string_id!(
+    UiActivityId,
+    "Identifies one renderer-neutral activity entry point."
+);
+ui_string_id!(UiIconSlotId, "Identifies one semantic interface icon slot.");
+ui_string_id!(
+    UiSurfaceTraitId,
+    "Identifies one semantic presentation trait."
+);
+ui_string_id!(
     UiNodeId,
     "Identifies one node within a portable UI surface."
+);
+ui_string_id!(
+    UiNodeSemanticTraitId,
+    "Identifies one semantic presentation trait attached to a portable UI node."
 );
 ui_string_id!(
     UiActionId,
@@ -66,13 +79,25 @@ pub const UI_CAPABILITY_TEXT: &str = "rintawa.ui.text@1";
 pub const UI_CAPABILITY_MARKDOWN: &str = "rintawa.ui.markdown@1";
 /// Capability required for buttons.
 pub const UI_CAPABILITY_BUTTON: &str = "rintawa.ui.button@1";
+/// Capability required for semantic interface icons.
+pub const UI_CAPABILITY_ICON: &str = "rintawa.ui.icon@1";
+/// Capability required for verified raster images.
+pub const UI_CAPABILITY_IMAGE: &str = "rintawa.ui.image@1";
+/// Capability required for checkbox controls.
+pub const UI_CAPABILITY_CHECKBOX: &str = "rintawa.ui.input.checkbox@1";
+/// Capability required for select controls.
+pub const UI_CAPABILITY_SELECT: &str = "rintawa.ui.input.select@1";
 /// Capability required for single-line text input.
 pub const UI_CAPABILITY_TEXT_INPUT: &str = "rintawa.ui.input.text@1";
 /// Capability required for multiline text input.
 pub const UI_CAPABILITY_TEXT_AREA: &str = "rintawa.ui.input.text-area@1";
+/// Capability required for weighted split containers.
+pub const UI_CAPABILITY_SPLIT: &str = "rintawa.ui.layout.split@1";
 /// Capability required for horizontal containers.
 pub const UI_CAPABILITY_ROW: &str = "rintawa.ui.layout.row@1";
 /// Capability required for vertical containers.
 pub const UI_CAPABILITY_COLUMN: &str = "rintawa.ui.layout.column@1";
 /// Capability required for list containers.
 pub const UI_CAPABILITY_LIST: &str = "rintawa.ui.list@1";
+/// Capability required for renderer-neutral data grids.
+pub const UI_CAPABILITY_DATA_GRID: &str = "rintawa.ui.data-grid@1";

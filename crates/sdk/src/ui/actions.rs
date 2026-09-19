@@ -14,6 +14,8 @@ pub enum UiActionPayload {
     None,
     /// Text supplied by an input control.
     Text(String),
+    /// Boolean supplied by a toggle control.
+    Boolean(bool),
 }
 
 /// One semantic action emitted by the active UI Layer.

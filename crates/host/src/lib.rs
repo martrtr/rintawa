@@ -25,7 +25,7 @@ use rintawa_extension_engine::{
 use rintawa_sdk::{
     contracts::{ComponentRef, ContractKey},
     runtime_permissions::RuntimePermission,
-    types::{ExtensionInstanceId, RuntimeScopeId},
+    types::{ComponentId, ExtensionInstanceId, RuntimeScopeId},
 };
 use thiserror::Error;
 
@@ -361,6 +361,21 @@ pub struct InstalledActivation {
     pub enabled: bool,
 }
 
+/// Requested and granted runtime permissions for one exact baseline component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePermissionPolicyEntry {
+    /// Runtime scope containing the component.
+    pub scope_id: RuntimeScopeId,
+    /// Concrete runtime instance identity.
+    pub instance_id: ExtensionInstanceId,
+    /// Component within the runtime instance.
+    pub component_id: ComponentId,
+    /// Permissions requested by the exact selected artifact manifest.
+    pub requested: Vec<RuntimePermission>,
+    /// Host-approved permissions persisted for the exact component principal.
+    pub granted: Vec<RuntimePermission>,
+}
+
 /// Result of importing and selecting a local RTW activation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallResult {
@@ -476,6 +491,15 @@ impl HostHome {
             },
             enabled,
         );
+        profile.runtime_permissions.retain(|grant| {
+            if grant.scope_id != scope_id || grant.instance_id != instance_id {
+                return true;
+            }
+            manifest.components.iter().any(|component| {
+                component.id == grant.component_id
+                    && component.permissions.runtime.contains(&grant.permission)
+            })
+        });
         profile.save(&self.profile_path)?;
 
         Ok(InstalledActivation {
@@ -539,6 +563,53 @@ impl HostHome {
         let mut profile = self.load_profile()?;
         profile.delete_preference(scope_id, owner, key)?;
         profile.save(&self.profile_path)
+    }
+
+    /// Lists requested and granted runtime permissions for every exact baseline component.
+    pub fn list_runtime_permission_policy(&self) -> HostResult<Vec<RuntimePermissionPolicyEntry>> {
+        let profile = self.load_profile()?;
+        let engine = ExtensionEngine::new();
+        let loader = RtwExtensionLoader::new();
+        let mut entries = Vec::new();
+
+        for activation in &profile.activations {
+            if activation.content.to_string() != EXTENSION_CONTENT_V1 {
+                return Err(HostError::UnsupportedContent(
+                    activation.content.to_string(),
+                ));
+            }
+            let manifest =
+                loader.read_stored_manifest(&engine, &self.store, &activation.artifact)?;
+            for component in manifest.components {
+                let owner = ComponentRef::new(activation.instance_id.clone(), component.id.clone());
+                let granted = profile
+                    .runtime_permissions
+                    .iter()
+                    .filter(|grant| {
+                        grant.scope_id == activation.scope_id
+                            && grant.instance_id == owner.instance_id
+                            && grant.component_id == owner.component_id
+                    })
+                    .map(|grant| grant.permission)
+                    .collect();
+                entries.push(RuntimePermissionPolicyEntry {
+                    scope_id: activation.scope_id.clone(),
+                    instance_id: activation.instance_id.clone(),
+                    component_id: component.id,
+                    requested: component.permissions.runtime,
+                    granted,
+                });
+            }
+        }
+
+        entries.sort_by(|left, right| {
+            left.scope_id
+                .as_str()
+                .cmp(right.scope_id.as_str())
+                .then_with(|| left.instance_id.as_str().cmp(right.instance_id.as_str()))
+                .then_with(|| left.component_id.as_str().cmp(right.component_id.as_str()))
+        });
+        Ok(entries)
     }
 
     /// Persists one explicit runtime capability approval for an exact baseline component.

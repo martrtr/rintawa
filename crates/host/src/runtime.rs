@@ -1,3 +1,5 @@
+//! Runtime orchestration for exact artifact activations in a local Rintawa host.
+
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
@@ -5,15 +7,18 @@ use std::{
     time::Duration,
 };
 
+use rintawa_artifacts::ArtifactDigest;
 use rintawa_extension_engine::{
     ActivationPlanError, ArtifactStoreAccess, CompositionAccess, CompositionActivation,
     EngineError, ExtensionEngine, HostAccessError, HostAccessResult, ImportedArtifact,
-    PreferenceAccess, RtwExtensionLoadOutcome, RtwExtensionLoader, UnresolvedContractReason,
+    PreferenceAccess, RtwExtensionLoadOutcome, RtwExtensionLoader, RuntimeArtifactPolicy,
+    RuntimePolicyAccess, RuntimePolicyComponent, RuntimePolicyRequest, UnresolvedContractReason,
 };
 use rintawa_sdk::{
     contracts::{
         ComponentRef, ContractResolutionPolicy, host_shell_contract_key, ui_layer_contract_key,
     },
+    runtime_permissions::RuntimePermission,
     types::{ExtensionInstanceId, RuntimeScopeId},
 };
 
@@ -103,6 +108,107 @@ impl PreferenceAccess for BaselineHostAccess {
                 &RuntimeScopeId::new(scope_id),
                 &ComponentRef::new(instance_id, component_id),
                 key,
+            )
+            .map_err(map_host_access_error)
+    }
+}
+
+fn inspect_runtime_artifact(
+    access: &BaselineHostAccess,
+    digest: &str,
+) -> HostAccessResult<RuntimeArtifactPolicy> {
+    let digest: ArtifactDigest = digest.parse().map_err(|_| HostAccessError::InvalidDigest)?;
+    let home = access.home()?;
+    let engine = ExtensionEngine::new();
+    let manifest = RtwExtensionLoader::new()
+        .read_stored_manifest(&engine, home.artifact_store(), &digest)
+        .map_err(|_| HostAccessError::InvalidArtifact)?;
+    let components = manifest
+        .components
+        .into_iter()
+        .map(|component| RuntimePolicyRequest {
+            component_id: component.id.to_string(),
+            requested: component
+                .permissions
+                .runtime
+                .into_iter()
+                .map(|permission| permission.to_string())
+                .collect(),
+        })
+        .collect();
+    Ok(RuntimeArtifactPolicy {
+        subject: manifest.id.to_string(),
+        name: manifest.name,
+        version: manifest.version,
+        components,
+    })
+}
+
+impl RuntimePolicyAccess for BaselineHostAccess {
+    fn inspect_artifact(&self, digest: &str) -> HostAccessResult<RuntimeArtifactPolicy> {
+        inspect_runtime_artifact(self, digest)
+    }
+
+    fn list_components(&self) -> HostAccessResult<Vec<RuntimePolicyComponent>> {
+        self.home()?
+            .list_runtime_permission_policy()
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| RuntimePolicyComponent {
+                        scope_id: entry.scope_id.to_string(),
+                        instance_id: entry.instance_id.to_string(),
+                        component_id: entry.component_id.to_string(),
+                        requested: entry
+                            .requested
+                            .into_iter()
+                            .map(|permission| permission.to_string())
+                            .collect(),
+                        granted: entry
+                            .granted
+                            .into_iter()
+                            .map(|permission| permission.to_string())
+                            .collect(),
+                    })
+                    .collect()
+            })
+            .map_err(map_host_access_error)
+    }
+
+    fn grant(
+        &self,
+        scope_id: &str,
+        instance_id: &str,
+        component_id: &str,
+        permission: &str,
+    ) -> HostAccessResult<()> {
+        let permission: RuntimePermission = permission
+            .parse()
+            .map_err(|_| HostAccessError::InvalidPermission)?;
+        self.home()?
+            .grant_runtime_permission(
+                RuntimeScopeId::new(scope_id),
+                ComponentRef::new(instance_id, component_id),
+                permission,
+            )
+            .map_err(map_host_access_error)
+    }
+
+    fn revoke(
+        &self,
+        scope_id: &str,
+        instance_id: &str,
+        component_id: &str,
+        permission: &str,
+    ) -> HostAccessResult<()> {
+        let permission: RuntimePermission = permission
+            .parse()
+            .map_err(|_| HostAccessError::InvalidPermission)?;
+        self.home()?
+            .revoke_runtime_permission(
+                &RuntimeScopeId::new(scope_id),
+                &ComponentRef::new(instance_id, component_id),
+                permission,
             )
             .map_err(map_host_access_error)
     }
@@ -210,11 +316,13 @@ impl HostRuntime {
         let access = Arc::new(BaselineHostAccess::new(home.root()));
         let artifact_store_access: Arc<dyn ArtifactStoreAccess> = access.clone();
         let composition_access: Arc<dyn CompositionAccess> = access.clone();
-        let preference_access: Arc<dyn PreferenceAccess> = access;
+        let preference_access: Arc<dyn PreferenceAccess> = access.clone();
+        let runtime_policy_access: Arc<dyn RuntimePolicyAccess> = access;
         let mut engine = ExtensionEngine::with_host_access(
             artifact_store_access,
             composition_access,
             preference_access,
+            runtime_policy_access,
         );
         let host_scope = RuntimeScopeId::new(HOST_SCOPE);
         let host_shell_contract = host_shell_contract_key();

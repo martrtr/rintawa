@@ -133,6 +133,9 @@ pub enum UiError {
     /// The UI tree contains a cycle.
     #[error("UI tree contains a cycle at node `{0}`")]
     CycleDetected(String),
+    /// A layout node contains structurally invalid metadata.
+    #[error("invalid UI layout: {0}")]
+    InvalidLayout(String),
     /// The layer emitted an action not bound to the source node.
     #[error("UI action `{action}` is not bound to node `{node}` on surface `{surface}`")]
     ActionNotBound {

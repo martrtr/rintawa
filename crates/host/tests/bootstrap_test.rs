@@ -1,3 +1,5 @@
+//! Integration tests for host bootstrap, activation persistence, and runtime policy.
+
 use std::{fs, time::Duration};
 
 use rintawa_artifacts::{ImportDisposition, RtwLimits, pack_directory};
@@ -133,7 +135,7 @@ fn build_extension(
 }
 
 #[test]
-fn local_install_enable_disable_and_restart_are_persistent() -> anyhow::Result<()> {
+fn test_should_persist_local_install_enable_disable_and_restart() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let artifact = build_extension(root.path(), "0.0.1", "Bootstrap")?;
     let home_path = root.path().join("home");
@@ -160,7 +162,8 @@ fn local_install_enable_disable_and_restart_are_persistent() -> anyhow::Result<(
 }
 
 #[test]
-fn manual_update_repoints_activation_and_preserves_enabled_state() -> anyhow::Result<()> {
+fn test_should_repoint_activation_on_manual_update_and_preserve_enabled_state() -> anyhow::Result<()>
+{
     let root = tempfile::tempdir()?;
     let first = build_extension(root.path(), "0.0.1", "First")?;
     let second = build_extension(root.path(), "0.0.2", "Second")?;
@@ -183,7 +186,7 @@ fn manual_update_repoints_activation_and_preserves_enabled_state() -> anyhow::Re
 }
 
 #[test]
-fn generic_import_does_not_activate_until_exact_digest_is_selected() -> anyhow::Result<()> {
+fn test_should_keep_generic_import_inactive_until_exact_digest_is_selected() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let artifact = build_extension(root.path(), "0.0.1", "Bootstrap")?;
     let bytes = fs::read(&artifact)?;
@@ -201,7 +204,7 @@ fn generic_import_does_not_activate_until_exact_digest_is_selected() -> anyhow::
 }
 
 #[test]
-fn removing_activation_cleans_profile_policy_but_keeps_cas_bytes() -> anyhow::Result<()> {
+fn test_should_clean_profile_policy_on_removal_and_keep_cas_bytes() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let artifact = build_task_runtime(root.path(), true)?;
     let home = HostHome::open(root.path().join("home"))?;
@@ -223,7 +226,7 @@ fn removing_activation_cleans_profile_policy_but_keeps_cas_bytes() -> anyhow::Re
 }
 
 #[test]
-fn importing_identical_bytes_reuses_cas_object() -> anyhow::Result<()> {
+fn test_should_reuse_cas_object_for_identical_bytes() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let artifact = build_extension(root.path(), "0.0.1", "Bootstrap")?;
     let home = HostHome::open(root.path().join("home"))?;
@@ -262,7 +265,7 @@ fn test_should_read_legacy_profile_schemas_without_runtime_permissions() -> anyh
 }
 
 #[test]
-fn test_preferences_are_owner_scoped_persistent_and_bounded() -> anyhow::Result<()> {
+fn test_should_scope_persist_and_bound_preferences() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let home_path = root.path().join("home");
     let home = HostHome::open(&home_path)?;
@@ -318,6 +321,53 @@ fn test_preferences_are_owner_scoped_persistent_and_bounded() -> anyhow::Result<
         reopened.get_preference(&scope, &owner, "repositories")?,
         None
     );
+    Ok(())
+}
+
+#[test]
+fn test_should_list_requested_and_granted_runtime_policy_separately() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let artifact = build_task_runtime(root.path(), true)?;
+    let home = HostHome::open(root.path().join("home"))?;
+    home.install_local_rtw(&artifact, None)?;
+    let scope = RuntimeScopeId::new(HOST_SCOPE);
+    let owner = ComponentRef::new("bootstrap.task-runtime", "runtime");
+
+    let before = home.list_runtime_permission_policy()?;
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].requested, vec![RuntimePermission::BackgroundTask]);
+    assert!(before[0].granted.is_empty());
+
+    home.grant_runtime_permission(scope, owner, RuntimePermission::BackgroundTask)?;
+
+    let after = home.list_runtime_permission_policy()?;
+    assert_eq!(after[0].requested, vec![RuntimePermission::BackgroundTask]);
+    assert_eq!(after[0].granted, vec![RuntimePermission::BackgroundTask]);
+    Ok(())
+}
+
+#[test]
+fn test_should_prune_unrequested_permissions_when_selecting_updated_artifact() -> anyhow::Result<()>
+{
+    let root = tempfile::tempdir()?;
+    let requested = build_task_runtime(root.path(), true)?;
+    let unrequested = build_task_runtime(root.path(), false)?;
+    let home = HostHome::open(root.path().join("home"))?;
+
+    home.install_local_rtw(&requested, None)?;
+    home.grant_runtime_permission(
+        RuntimeScopeId::new(HOST_SCOPE),
+        ComponentRef::new("bootstrap.task-runtime", "runtime"),
+        RuntimePermission::BackgroundTask,
+    )?;
+
+    home.install_local_rtw(&unrequested, None)?;
+
+    let profile = home.load_profile()?;
+    assert!(profile.runtime_permissions.is_empty());
+    let policy = home.list_runtime_permission_policy()?;
+    assert!(policy[0].requested.is_empty());
+    assert!(policy[0].granted.is_empty());
     Ok(())
 }
 

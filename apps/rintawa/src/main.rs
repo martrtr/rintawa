@@ -1,3 +1,5 @@
+//! Command-line entry point for running and managing a local Rintawa host.
+
 use std::{
     env,
     path::PathBuf,
@@ -71,6 +73,7 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
+    init_tracing();
     let cli = Cli::parse();
     let home = HostHome::open(resolve_home(cli.home)?)?;
     match cli.command {
@@ -92,6 +95,15 @@ fn main() -> Result<()> {
         } => revoke_runtime_permission(&home, instance, component, permission, scope),
         Commands::Run { once } => run(&home, once),
     }
+}
+
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .try_init();
 }
 
 fn install(home: &HostHome, path: PathBuf, disabled: bool) -> Result<()> {
@@ -215,6 +227,11 @@ fn resolve_home(override_home: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = env::var_os("RINTAWA_HOME") {
         return Ok(PathBuf::from(path));
     }
+    #[cfg(windows)]
+    if let Some(path) = env::var_os("LOCALAPPDATA") {
+        return Ok(PathBuf::from(path).join("Rintawa"));
+    }
+    #[cfg(not(windows))]
     if let Some(path) = env::var_os("XDG_DATA_HOME") {
         return Ok(PathBuf::from(path).join("rintawa"));
     }

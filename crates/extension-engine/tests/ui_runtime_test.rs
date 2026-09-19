@@ -1,3 +1,5 @@
+//! Integration coverage for Extension Engine portable UI lifecycle and dispatch.
+
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -38,6 +40,7 @@ impl FeatureComponent {
                         label: String::from("Run"),
                         action: UiActionId::new("example.run"),
                         is_enabled: true,
+                        appearance: UiButtonAppearance::Default,
                     }),
                 ),
             ],
@@ -112,7 +115,7 @@ fn layer_descriptor() -> UiLayerDescriptor {
 }
 
 #[test]
-fn test_portable_ui_lifecycle_and_action_dispatch() -> Result<()> {
+fn test_should_dispatch_portable_ui_actions_across_component_lifecycle() -> Result<()> {
     let actions = Arc::new(Mutex::new(Vec::new()));
     let stop_ui_denied = Arc::new(Mutex::new(false));
     let mut engine = ExtensionEngine::new();

@@ -1,13 +1,15 @@
+//! Integration tests for portable UI lifecycle, patching, actions, and teardown.
+
 use anyhow::Result;
 use rintawa_sdk::{
     contracts::ComponentRef,
     types::{ExtensionInstanceId, RuntimeScopeId},
     ui::{
         UI_CAPABILITY_BUTTON, UI_CAPABILITY_COLUMN, UI_CAPABILITY_TEXT, UI_CAPABILITY_TEXT_INPUT,
-        UiActionEvent, UiActionId, UiActionPayload, UiButtonNode, UiCapabilityId, UiContainerNode,
-        UiError, UiLayerDescriptor, UiNode, UiNodeId, UiNodeKind, UiPatch, UiPatchBatch,
-        UiPlacementHint, UiSurfaceContribution, UiSurfaceId, UiSurfaceSnapshot, UiTextInputNode,
-        UiTextNode,
+        UiActionEvent, UiActionId, UiActionPayload, UiButtonAppearance, UiButtonNode,
+        UiCapabilityId, UiContainerNode, UiError, UiLayerDescriptor, UiNode, UiNodeId, UiNodeKind,
+        UiPatch, UiPatchBatch, UiPlacementHint, UiSurfaceContribution, UiSurfaceId,
+        UiSurfaceSnapshot, UiTextInputNode, UiTextNode,
     },
 };
 use rintawa_ui_runtime::{OwnedUiLayerDescriptor, OwnedUiSurfaceContribution, UiRuntime};
@@ -52,6 +54,7 @@ fn base_snapshot() -> UiSurfaceSnapshot {
                     label: String::from("Send"),
                     action: UiActionId::new("example.send"),
                     is_enabled: true,
+                    appearance: UiButtonAppearance::Default,
                 }),
             ),
             UiNode::new(

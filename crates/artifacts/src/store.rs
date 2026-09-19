@@ -106,12 +106,12 @@ impl ArtifactStore {
         )?;
         temporary.as_file_mut().sync_all()?;
 
-        let validated = RtwArchive::open(temporary.path(), self.limits)?;
+        let validated = RtwArchive::from_file(temporary.as_file().try_clone()?, self.limits)?;
         drop(validated);
 
         let destination = self.path_for(&digest);
         let disposition = self.publish_temporary(&temporary, &destination, &digest)?;
-        File::open(&destination)?.sync_all()?;
+        sync_published_file(&destination)?;
         sync_directory(&self.sha256_directory)?;
 
         Ok(ArtifactImport {
@@ -135,12 +135,12 @@ impl ArtifactStore {
         )?;
         temporary.as_file_mut().sync_all()?;
 
-        let validated = RtwArchive::open(temporary.path(), self.limits)?;
+        let validated = RtwArchive::from_file(temporary.as_file().try_clone()?, self.limits)?;
         drop(validated);
 
         let destination = self.path_for(&digest);
         let disposition = self.publish_temporary(&temporary, &destination, &digest)?;
-        File::open(&destination)?.sync_all()?;
+        sync_published_file(&destination)?;
         sync_directory(&self.sha256_directory)?;
 
         Ok(ArtifactImport {
@@ -325,6 +325,18 @@ fn hash_open_file(file: &mut File, maximum_bytes: u64) -> RtwResult<ArtifactDige
 
     let digest: [u8; 32] = hasher.finalize().into();
     Ok(ArtifactDigest::from_sha256_bytes(digest))
+}
+
+#[cfg(windows)]
+fn sync_published_file(path: &Path) -> RtwResult<()> {
+    File::options().write(true).open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn sync_published_file(path: &Path) -> RtwResult<()> {
+    File::open(path)?.sync_all()?;
+    Ok(())
 }
 
 #[cfg(unix)]

@@ -12,6 +12,7 @@ publish = false
 anyhow.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 rintawa-host = { path = "../../crates/host" }
 rintawa-sdk = { path = "../../crates/sdk" }

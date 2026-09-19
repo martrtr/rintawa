@@ -47,6 +47,8 @@ pub enum HostAccessError {
     NotFound,
     /// The host has no content handler for the selected RTW content type.
     UnsupportedContent,
+    /// A textual runtime permission identity is not recognized.
+    InvalidPermission,
     /// An owner-scoped preference key/value violates host bounds.
     InvalidPreference,
     /// The owner exceeded its bounded preference quota.
@@ -97,6 +99,70 @@ pub trait PreferenceAccess: Send + Sync {
         instance_id: &str,
         component_id: &str,
         key: &str,
+    ) -> HostAccessResult<()>;
+}
+
+/// Requested runtime permissions for one component in an exact artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePolicyRequest {
+    /// Component identifier declared by the artifact manifest.
+    pub component_id: String,
+    /// Runtime permissions requested by that component.
+    pub requested: Vec<String>,
+}
+
+/// Read-only runtime policy metadata from one exact imported artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeArtifactPolicy {
+    /// Logical extension identity declared by the artifact.
+    pub subject: String,
+    /// Human-readable extension name.
+    pub name: String,
+    /// Extension version declared by the artifact.
+    pub version: String,
+    /// Component-scoped runtime permission requests.
+    pub components: Vec<RuntimePolicyRequest>,
+}
+
+/// Runtime permission policy for one exact baseline component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePolicyComponent {
+    /// Runtime scope containing the component principal.
+    pub scope_id: String,
+    /// Concrete runtime instance identity.
+    pub instance_id: String,
+    /// Component within the runtime instance.
+    pub component_id: String,
+    /// Permissions requested by the exact selected artifact manifest.
+    pub requested: Vec<String>,
+    /// Host-approved permissions currently persisted for this exact principal.
+    pub granted: Vec<String>,
+}
+
+/// Generic administrative access to runtime permission policy.
+pub trait RuntimePolicyAccess: Send + Sync {
+    /// Inspects requested runtime permissions in one exact imported artifact.
+    fn inspect_artifact(&self, digest: &str) -> HostAccessResult<RuntimeArtifactPolicy>;
+
+    /// Lists requested and granted runtime permissions for baseline components.
+    fn list_components(&self) -> HostAccessResult<Vec<RuntimePolicyComponent>>;
+
+    /// Grants one permission to an exact component principal.
+    fn grant(
+        &self,
+        scope_id: &str,
+        instance_id: &str,
+        component_id: &str,
+        permission: &str,
+    ) -> HostAccessResult<()>;
+
+    /// Revokes one permission from an exact component principal.
+    fn revoke(
+        &self,
+        scope_id: &str,
+        instance_id: &str,
+        component_id: &str,
+        permission: &str,
     ) -> HostAccessResult<()>;
 }
 
@@ -165,6 +231,39 @@ impl PreferenceAccess for UnavailablePreferenceAccess {
 }
 
 #[derive(Default)]
+struct UnavailableRuntimePolicyAccess;
+
+impl RuntimePolicyAccess for UnavailableRuntimePolicyAccess {
+    fn inspect_artifact(&self, _digest: &str) -> HostAccessResult<RuntimeArtifactPolicy> {
+        Err(HostAccessError::Unavailable)
+    }
+
+    fn list_components(&self) -> HostAccessResult<Vec<RuntimePolicyComponent>> {
+        Err(HostAccessError::Unavailable)
+    }
+
+    fn grant(
+        &self,
+        _scope_id: &str,
+        _instance_id: &str,
+        _component_id: &str,
+        _permission: &str,
+    ) -> HostAccessResult<()> {
+        Err(HostAccessError::Unavailable)
+    }
+
+    fn revoke(
+        &self,
+        _scope_id: &str,
+        _instance_id: &str,
+        _component_id: &str,
+        _permission: &str,
+    ) -> HostAccessResult<()> {
+        Err(HostAccessError::Unavailable)
+    }
+}
+
+#[derive(Default)]
 struct UnavailableCompositionAccess;
 
 impl CompositionAccess for UnavailableCompositionAccess {
@@ -194,6 +293,7 @@ pub(crate) struct HostAccessServices {
     pub(crate) artifact_store: Arc<dyn ArtifactStoreAccess>,
     pub(crate) composition: Arc<dyn CompositionAccess>,
     pub(crate) preferences: Arc<dyn PreferenceAccess>,
+    pub(crate) runtime_policy: Arc<dyn RuntimePolicyAccess>,
 }
 
 impl HostAccessServices {
@@ -201,11 +301,13 @@ impl HostAccessServices {
         artifact_store: Arc<dyn ArtifactStoreAccess>,
         composition: Arc<dyn CompositionAccess>,
         preferences: Arc<dyn PreferenceAccess>,
+        runtime_policy: Arc<dyn RuntimePolicyAccess>,
     ) -> Self {
         Self {
             artifact_store,
             composition,
             preferences,
+            runtime_policy,
         }
     }
 
@@ -214,6 +316,7 @@ impl HostAccessServices {
             artifact_store: Arc::new(UnavailableArtifactStoreAccess),
             composition: Arc::new(UnavailableCompositionAccess),
             preferences: Arc::new(UnavailablePreferenceAccess),
+            runtime_policy: Arc::new(UnavailableRuntimePolicyAccess),
         }
     }
 }

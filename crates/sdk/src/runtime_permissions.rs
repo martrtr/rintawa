@@ -25,6 +25,10 @@ pub enum RuntimePermission {
     CompositionRead,
     /// Allows changing exact artifact selections and enabled state in host composition.
     CompositionWrite,
+    /// Allows inspecting requested/granted runtime permission policy for baseline components.
+    RuntimePolicyRead,
+    /// Allows granting/revoking requested runtime permissions for exact baseline components.
+    RuntimePolicyWrite,
 }
 
 impl fmt::Display for RuntimePermission {
@@ -37,6 +41,8 @@ impl fmt::Display for RuntimePermission {
             Self::ArtifactImport => formatter.write_str("artifact-import"),
             Self::CompositionRead => formatter.write_str("composition-read"),
             Self::CompositionWrite => formatter.write_str("composition-write"),
+            Self::RuntimePolicyRead => formatter.write_str("runtime-policy-read"),
+            Self::RuntimePolicyWrite => formatter.write_str("runtime-policy-write"),
         }
     }
 }
@@ -65,6 +71,8 @@ impl FromStr for RuntimePermission {
             "artifact-import" => Ok(Self::ArtifactImport),
             "composition-read" => Ok(Self::CompositionRead),
             "composition-write" => Ok(Self::CompositionWrite),
+            "runtime-policy-read" => Ok(Self::RuntimePolicyRead),
+            "runtime-policy-write" => Ok(Self::RuntimePolicyWrite),
             _ => Err(RuntimePermissionParseError(value.to_string())),
         }
     }

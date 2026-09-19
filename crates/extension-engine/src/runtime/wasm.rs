@@ -6,7 +6,10 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     io::{ErrorKind, Read, Write},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs},
+    net::{
+        IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream,
+        ToSocketAddrs, UdpSocket,
+    },
     path::Path,
     sync::{Arc, Mutex, MutexGuard, TryLockError},
     time::{Duration, Instant},
@@ -27,8 +30,9 @@ use rintawa_sdk::{
     traits::Component,
     types::{ComponentId, ExtensionId, ExtensionInstanceId, RuntimeEffectId, RuntimeScopeId},
     ui::{
-        UiActionEvent, UiCapabilityId, UiError, UiLayerDescriptor, UiPatchBatch, UiPlacementHint,
-        UiSurfaceContribution, UiSurfaceId, UiSurfaceSnapshot,
+        UiActionEvent, UiActivityContribution, UiActivityId, UiCapabilityId, UiError, UiIconSlotId,
+        UiLayerDescriptor, UiPatchBatch, UiPlacementHint, UiSurfaceContribution, UiSurfaceId,
+        UiSurfaceSnapshot, UiSurfaceTraitId,
     },
 };
 
@@ -60,6 +64,17 @@ use rintawa_ui_runtime::UiRuntime;
 
 const TARGET_PROVIDER_EXPORT_NAME: &str = "rintawa:engine/target-provider@0.0.1";
 const TASK_HANDLER_EXPORT_NAME: &str = "rintawa:engine/task-handler@0.0.1";
+
+#[derive(Debug)]
+struct UiSurfaceRegistrationRequest {
+    id: String,
+    placement: WitPlacementHint,
+    semantic_contract: Option<String>,
+    semantic_version: Option<u32>,
+    activity: Option<WitActivity>,
+    traits: Vec<String>,
+    required_capabilities: Vec<String>,
+}
 
 #[derive(Default)]
 struct JsonSizeCounter {
@@ -216,7 +231,8 @@ use bindings::rintawa::engine::{
         ReadResult as WitNetworkReadResult,
     },
     portable_ui::{
-        Error as PortableUiError, Host as PortableUiHost, PlacementHint as WitPlacementHint,
+        Activity as WitActivity, Error as PortableUiError, Host as PortableUiHost,
+        PlacementHint as WitPlacementHint,
     },
     preferences::{Error as PreferenceError, Host as PreferencesHost},
     registration::{
@@ -224,6 +240,11 @@ use bindings::rintawa::engine::{
         Host as RegistrationHost, ResolutionPolicy as WitResolutionPolicy,
     },
     runtime_effects::{Error as RuntimeEffectError, Host as RuntimeEffectsHost},
+    runtime_policy::{
+        ArtifactPolicy as WitRuntimeArtifactPolicy, ComponentPolicy as WitRuntimePolicyComponent,
+        ComponentRequest as WitRuntimePolicyRequest, Error as RuntimePolicyError,
+        Host as RuntimePolicyHost,
+    },
     runtime_tasks::{Error as RuntimeTaskError, Host as RuntimeTasksHost},
     secrets::{Error as SecretError, Host as SecretsHost},
     services::{Error as ServiceTransportError, Host as ServicesHost},
@@ -1075,12 +1096,17 @@ impl WasmHostState {
 
     fn queue_ui_surface(
         &mut self,
-        id: String,
-        placement: WitPlacementHint,
-        semantic_contract: Option<String>,
-        semantic_version: Option<u32>,
-        required_capabilities: Vec<String>,
+        request: UiSurfaceRegistrationRequest,
     ) -> Result<(), PortableUiError> {
+        let UiSurfaceRegistrationRequest {
+            id,
+            placement,
+            semantic_contract,
+            semantic_version,
+            activity,
+            traits,
+            required_capabilities,
+        } = request;
         let semantic = match (semantic_contract, semantic_version) {
             (Some(contract), Some(version)) => {
                 Some(ContractKey::new(contract, ContractVersion::new(version)))
@@ -1088,6 +1114,28 @@ impl WasmHostState {
             (None, None) => None,
             _ => return Err(PortableUiError::InvalidPayload),
         };
+        let activity = match activity {
+            Some(activity) => {
+                if activity.id.trim().is_empty()
+                    || activity.label.trim().is_empty()
+                    || activity
+                        .icon_slot
+                        .as_deref()
+                        .is_some_and(|slot| slot.trim().is_empty())
+                {
+                    return Err(PortableUiError::InvalidPayload);
+                }
+                Some(UiActivityContribution {
+                    id: UiActivityId::new(activity.id),
+                    label: activity.label,
+                    icon_slot: activity.icon_slot.map(UiIconSlotId::new),
+                })
+            }
+            None => None,
+        };
+        if traits.iter().any(|trait_id| trait_id.trim().is_empty()) {
+            return Err(PortableUiError::InvalidPayload);
+        }
         let Some(scope) = self.registration_scope.as_mut() else {
             return Err(PortableUiError::RegistrationNotActive);
         };
@@ -1108,6 +1156,8 @@ impl WasmHostState {
             id,
             placement,
             semantic,
+            activity,
+            traits: traits.into_iter().map(UiSurfaceTraitId::new).collect(),
             required_capabilities: required_capabilities
                 .into_iter()
                 .map(UiCapabilityId::new)
@@ -1153,13 +1203,9 @@ impl WasmHostState {
 
     fn validate_ui_registration_size(
         &self,
-        id: &str,
-        placement: WitPlacementHint,
-        semantic_contract: Option<&str>,
-        semantic_version: Option<u32>,
-        required_capabilities: &[String],
+        request: &UiSurfaceRegistrationRequest,
     ) -> Result<(), PortableUiError> {
-        let placement = match placement {
+        let placement = match request.placement {
             WitPlacementHint::Primary => "primary",
             WitPlacementHint::Secondary => "secondary",
             WitPlacementHint::Sidebar => "sidebar",
@@ -1168,15 +1214,24 @@ impl WasmHostState {
             WitPlacementHint::Status => "status",
             WitPlacementHint::Overlay => "overlay",
         };
+        let activity_size = request.activity.as_ref().map(|activity| {
+            (
+                activity.id.as_str(),
+                activity.label.as_str(),
+                activity.icon_slot.as_deref(),
+            )
+        });
         let mut counter = JsonSizeCounter::default();
         serde_json::to_writer(
             &mut counter,
             &(
-                id,
+                request.id.as_str(),
                 placement,
-                semantic_contract,
-                semantic_version,
-                required_capabilities,
+                request.semantic_contract.as_deref(),
+                request.semantic_version,
+                activity_size,
+                &request.traits,
+                &request.required_capabilities,
             ),
         )
         .map_err(|_| PortableUiError::InvalidPayload)?;
@@ -1324,22 +1379,21 @@ impl PortableUiHost for WasmHostState {
         placement: WitPlacementHint,
         semantic_contract: Option<String>,
         semantic_version: Option<u32>,
+        activity: Option<WitActivity>,
+        traits: Vec<String>,
         required_capabilities: Vec<String>,
     ) -> Result<(), PortableUiError> {
-        self.validate_ui_registration_size(
-            &id,
-            placement,
-            semantic_contract.as_deref(),
-            semantic_version,
-            &required_capabilities,
-        )?;
-        self.queue_ui_surface(
+        let request = UiSurfaceRegistrationRequest {
             id,
             placement,
             semantic_contract,
             semantic_version,
+            activity,
+            traits,
             required_capabilities,
-        )
+        };
+        self.validate_ui_registration_size(&request)?;
+        self.queue_ui_surface(request)
     }
 
     fn register_layer(
@@ -1560,13 +1614,20 @@ impl NetworkHost for WasmHostState {
                 RuntimePermissionCheck::Unavailable => NetworkError::Unavailable,
             })?;
         let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
-        let listener = TcpListener::bind(address).map_err(|_| NetworkError::Unavailable)?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|_| NetworkError::Unavailable)?;
+        let listener = TcpListener::bind(address).map_err(|error| {
+            warn!(%address, %error, "Failed to bind WASM loopback listener");
+            NetworkError::Unavailable
+        })?;
+        listener.set_nonblocking(true).map_err(|error| {
+            warn!(%address, %error, "Failed to make WASM loopback listener nonblocking");
+            NetworkError::Unavailable
+        })?;
         let bound_port = listener
             .local_addr()
-            .map_err(|_| NetworkError::Unavailable)?
+            .map_err(|error| {
+                warn!(%address, %error, "Failed to inspect WASM loopback listener address");
+                NetworkError::Unavailable
+            })?
             .port();
         let handle = self.allocate_network_handle(owner, NetworkHandleKind::Listener(listener))?;
         Ok(WitNetworkListener {
@@ -1832,11 +1893,11 @@ fn build_bounded_https_client(url: &Url, timeout: Duration) -> Result<HttpClient
             let addresses = (domain, port)
                 .to_socket_addrs()
                 .map_err(|_| HttpFetchError::Unavailable)?;
-            let public = addresses
+            let allowed = addresses
                 .into_iter()
-                .find(|address| is_allowed_public_ip(address.ip()))
+                .find(|address| is_allowed_domain_destination(*address))
                 .ok_or(HttpFetchError::ForbiddenDestination)?;
-            builder = builder.resolve(domain, public);
+            builder = builder.resolve(domain, allowed);
         }
         UrlHost::Ipv4(address) => {
             if !is_allowed_public_ip(IpAddr::V4(address)) {
@@ -1851,6 +1912,47 @@ fn build_bounded_https_client(url: &Url, timeout: Duration) -> Result<HttpClient
     }
 
     builder.build().map_err(|_| HttpFetchError::Unavailable)
+}
+
+fn is_allowed_domain_destination(address: SocketAddr) -> bool {
+    let destination = address.ip();
+    let routed_source = if matches!(destination, IpAddr::V4(address) if is_benchmarking_ipv4(address))
+    {
+        routed_source_ip(address)
+    } else {
+        None
+    };
+    is_allowed_domain_destination_with_source(destination, routed_source)
+}
+
+fn is_allowed_domain_destination_with_source(
+    destination: IpAddr,
+    routed_source: Option<IpAddr>,
+) -> bool {
+    if is_allowed_public_ip(destination) {
+        return true;
+    }
+
+    matches!(
+        (destination, routed_source),
+        (IpAddr::V4(destination), Some(IpAddr::V4(source)))
+            if is_benchmarking_ipv4(destination) && is_benchmarking_ipv4(source)
+    )
+}
+
+fn routed_source_ip(destination: SocketAddr) -> Option<IpAddr> {
+    let bind_address = match destination {
+        SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+    };
+    let socket = UdpSocket::bind(bind_address).ok()?;
+    socket.connect(destination).ok()?;
+    socket.local_addr().ok().map(|address| address.ip())
+}
+
+fn is_benchmarking_ipv4(address: Ipv4Addr) -> bool {
+    let [a, b, _c, _d] = address.octets();
+    a == 198 && (b == 18 || b == 19)
 }
 
 fn is_followed_redirect(status: StatusCode) -> bool {
@@ -2022,6 +2124,157 @@ impl WasmHostState {
     }
 }
 
+impl RuntimePolicyHost for WasmHostState {
+    fn inspect_artifact(
+        &mut self,
+        digest: String,
+    ) -> Result<WitRuntimeArtifactPolicy, RuntimePolicyError> {
+        if !self.host_access_active {
+            return Err(RuntimePolicyError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::RuntimePolicyRead)
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => RuntimePolicyError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => RuntimePolicyError::Unavailable,
+            })?;
+        if digest.len() > self.max_host_message_bytes {
+            return Err(RuntimePolicyError::MessageTooLarge);
+        }
+
+        let policy = self
+            .host_access
+            .runtime_policy
+            .inspect_artifact(&digest)
+            .map_err(map_runtime_policy_access_error)?;
+        let message_bytes = policy
+            .subject
+            .len()
+            .saturating_add(policy.name.len())
+            .saturating_add(policy.version.len())
+            .saturating_add(policy.components.iter().fold(0_usize, |total, component| {
+                total
+                    .saturating_add(component.component_id.len())
+                    .saturating_add(component.requested.iter().map(String::len).sum::<usize>())
+            }));
+        if message_bytes > self.max_host_message_bytes {
+            return Err(RuntimePolicyError::MessageTooLarge);
+        }
+
+        Ok(WitRuntimeArtifactPolicy {
+            subject: policy.subject,
+            name: policy.name,
+            version: policy.version,
+            components: policy
+                .components
+                .into_iter()
+                .map(|component| WitRuntimePolicyRequest {
+                    component_id: component.component_id,
+                    requested: component.requested,
+                })
+                .collect(),
+        })
+    }
+
+    fn list_components(&mut self) -> Result<Vec<WitRuntimePolicyComponent>, RuntimePolicyError> {
+        if !self.host_access_active {
+            return Err(RuntimePolicyError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::RuntimePolicyRead)
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => RuntimePolicyError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => RuntimePolicyError::Unavailable,
+            })?;
+
+        let components = self
+            .host_access
+            .runtime_policy
+            .list_components()
+            .map_err(map_runtime_policy_access_error)?;
+        let message_bytes = components.iter().fold(0_usize, |total, component| {
+            total
+                .saturating_add(component.scope_id.len())
+                .saturating_add(component.instance_id.len())
+                .saturating_add(component.component_id.len())
+                .saturating_add(component.requested.iter().map(String::len).sum::<usize>())
+                .saturating_add(component.granted.iter().map(String::len).sum::<usize>())
+        });
+        if message_bytes > self.max_host_message_bytes {
+            return Err(RuntimePolicyError::MessageTooLarge);
+        }
+
+        Ok(components
+            .into_iter()
+            .map(|component| WitRuntimePolicyComponent {
+                scope_id: component.scope_id,
+                instance_id: component.instance_id,
+                component_id: component.component_id,
+                requested: component.requested,
+                granted: component.granted,
+            })
+            .collect())
+    }
+
+    fn grant(
+        &mut self,
+        scope_id: String,
+        instance_id: String,
+        component_id: String,
+        permission: String,
+    ) -> Result<(), RuntimePolicyError> {
+        self.require_runtime_policy_write()?;
+        if scope_id
+            .len()
+            .saturating_add(instance_id.len())
+            .saturating_add(component_id.len())
+            .saturating_add(permission.len())
+            > self.max_host_message_bytes
+        {
+            return Err(RuntimePolicyError::MessageTooLarge);
+        }
+        self.host_access
+            .runtime_policy
+            .grant(&scope_id, &instance_id, &component_id, &permission)
+            .map_err(map_runtime_policy_access_error)
+    }
+
+    fn revoke(
+        &mut self,
+        scope_id: String,
+        instance_id: String,
+        component_id: String,
+        permission: String,
+    ) -> Result<(), RuntimePolicyError> {
+        self.require_runtime_policy_write()?;
+        if scope_id
+            .len()
+            .saturating_add(instance_id.len())
+            .saturating_add(component_id.len())
+            .saturating_add(permission.len())
+            > self.max_host_message_bytes
+        {
+            return Err(RuntimePolicyError::MessageTooLarge);
+        }
+        self.host_access
+            .runtime_policy
+            .revoke(&scope_id, &instance_id, &component_id, &permission)
+            .map_err(map_runtime_policy_access_error)
+    }
+}
+
+impl WasmHostState {
+    fn require_runtime_policy_write(&self) -> Result<(), RuntimePolicyError> {
+        if !self.host_access_active {
+            return Err(RuntimePolicyError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::RuntimePolicyWrite)
+            .map(|_| ())
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => RuntimePolicyError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => RuntimePolicyError::Unavailable,
+            })
+    }
+}
+
 impl CompositionHost for WasmHostState {
     fn list_activations(&mut self) -> Result<Vec<WitCompositionActivation>, CompositionError> {
         if !self.host_access_active {
@@ -2136,6 +2389,7 @@ fn map_artifact_store_access_error(error: HostAccessError) -> ArtifactStoreError
         HostAccessError::Unavailable => ArtifactStoreError::Unavailable,
         HostAccessError::NotFound
         | HostAccessError::UnsupportedContent
+        | HostAccessError::InvalidPermission
         | HostAccessError::InvalidPreference
         | HostAccessError::PreferenceQuotaExceeded
         | HostAccessError::Rejected => ArtifactStoreError::Rejected,
@@ -2151,7 +2405,22 @@ fn map_preference_access_error(error: HostAccessError) -> PreferenceError {
         | HostAccessError::InvalidDigest
         | HostAccessError::NotFound
         | HostAccessError::UnsupportedContent
+        | HostAccessError::InvalidPermission
         | HostAccessError::Rejected => PreferenceError::Rejected,
+    }
+}
+
+fn map_runtime_policy_access_error(error: HostAccessError) -> RuntimePolicyError {
+    match error {
+        HostAccessError::InvalidPermission => RuntimePolicyError::InvalidPermission,
+        HostAccessError::NotFound => RuntimePolicyError::NotFound,
+        HostAccessError::Unavailable => RuntimePolicyError::Unavailable,
+        HostAccessError::InvalidArtifact
+        | HostAccessError::InvalidDigest
+        | HostAccessError::UnsupportedContent
+        | HostAccessError::InvalidPreference
+        | HostAccessError::PreferenceQuotaExceeded
+        | HostAccessError::Rejected => RuntimePolicyError::Rejected,
     }
 }
 
@@ -2162,7 +2431,8 @@ fn map_composition_access_error(error: HostAccessError) -> CompositionError {
         }
         HostAccessError::NotFound => CompositionError::NotFound,
         HostAccessError::UnsupportedContent => CompositionError::UnsupportedContent,
-        HostAccessError::InvalidPreference
+        HostAccessError::InvalidPermission
+        | HostAccessError::InvalidPreference
         | HostAccessError::PreferenceQuotaExceeded
         | HostAccessError::Rejected => CompositionError::Rejected,
         HostAccessError::Unavailable => CompositionError::Unavailable,
@@ -3490,6 +3760,7 @@ mod tests {
             "https://127.0.0.1/index.json",
             "https://10.0.0.1/index.json",
             "https://169.254.169.254/latest/meta-data",
+            "https://198.18.0.58/index.json",
             "https://[::1]/index.json",
             "https://[fc00::1]/index.json",
             "https://[fe80::1]/index.json",
@@ -3501,6 +3772,27 @@ mod tests {
                 Err(HttpFetchError::InvalidUrl | HttpFetchError::ForbiddenDestination)
             ));
         }
+    }
+
+    #[test]
+    fn test_should_allow_benchmarking_fake_ip_only_for_domain_tunnel_resolution() {
+        let synthetic = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 58));
+        let tunnel_source = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1));
+        let ordinary_source = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+
+        assert!(!is_allowed_public_ip(synthetic));
+        assert!(is_allowed_domain_destination_with_source(
+            synthetic,
+            Some(tunnel_source)
+        ));
+        assert!(!is_allowed_domain_destination_with_source(
+            synthetic,
+            Some(ordinary_source)
+        ));
+        assert!(!is_allowed_domain_destination_with_source(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            Some(tunnel_source)
+        ));
     }
 
     #[test]
@@ -3665,6 +3957,8 @@ mod tests {
                 WitPlacementHint::Primary,
                 None,
                 None,
+                None,
+                Vec::new(),
                 Vec::new(),
             ),
             Err(PortableUiError::MessageTooLarge)
@@ -3700,6 +3994,8 @@ mod tests {
                 WitPlacementHint::Primary,
                 None,
                 None,
+                None,
+                Vec::new(),
                 vec![String::new(); 32],
             ),
             Err(PortableUiError::MessageTooLarge)
@@ -3799,6 +4095,8 @@ mod tests {
             WitPlacementHint::Primary,
             None,
             None,
+            None,
+            Vec::new(),
             vec![String::from(rintawa_sdk::ui::UI_CAPABILITY_TEXT)],
         )
         .unwrap();
@@ -4058,6 +4356,72 @@ mod tests {
 
         state.discard_guest_execution();
         assert!(state.pending_execution_targets.is_empty());
+    }
+
+    #[test]
+    fn test_should_require_explicit_runtime_policy_permissions() {
+        let mut state = WasmHostState::new(ComponentId::new("runtime"));
+        begin_test_registration(&mut state, ExtensionId::new("admin.ui"));
+        state.finish_registration().unwrap();
+        state.begin_guest_execution();
+
+        assert!(matches!(
+            RuntimePolicyHost::list_components(&mut state),
+            Err(RuntimePolicyError::PermissionDenied)
+        ));
+        assert!(matches!(
+            RuntimePolicyHost::inspect_artifact(&mut state, String::from("sha256:deadbeef")),
+            Err(RuntimePolicyError::PermissionDenied)
+        ));
+        assert!(matches!(
+            RuntimePolicyHost::grant(
+                &mut state,
+                String::from("host"),
+                String::from("target"),
+                String::from("runtime"),
+                String::from("background-task"),
+            ),
+            Err(RuntimePolicyError::PermissionDenied)
+        ));
+
+        let owner = state.registered_owner().unwrap();
+        state
+            .runtime_permissions
+            .grant(owner.clone(), RuntimePermission::RuntimePolicyRead)
+            .unwrap();
+        assert!(matches!(
+            RuntimePolicyHost::list_components(&mut state),
+            Err(RuntimePolicyError::Unavailable)
+        ));
+        assert!(matches!(
+            RuntimePolicyHost::inspect_artifact(&mut state, String::from("sha256:deadbeef")),
+            Err(RuntimePolicyError::Unavailable)
+        ));
+
+        state
+            .runtime_permissions
+            .grant(owner, RuntimePermission::RuntimePolicyWrite)
+            .unwrap();
+        assert!(matches!(
+            RuntimePolicyHost::grant(
+                &mut state,
+                String::from("host"),
+                String::from("target"),
+                String::from("runtime"),
+                String::from("background-task"),
+            ),
+            Err(RuntimePolicyError::Unavailable)
+        ));
+        assert!(matches!(
+            RuntimePolicyHost::revoke(
+                &mut state,
+                String::from("host"),
+                String::from("target"),
+                String::from("runtime"),
+                String::from("background-task"),
+            ),
+            Err(RuntimePolicyError::Unavailable)
+        ));
     }
 
     #[test]

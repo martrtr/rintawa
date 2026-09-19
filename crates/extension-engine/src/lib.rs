@@ -43,7 +43,8 @@ pub use engine::{ExtensionEngine, ExtensionState};
 pub use errors::{ComponentStopFailure, EngineError, EngineResult};
 pub use host_access::{
     ArtifactStoreAccess, CompositionAccess, CompositionActivation, HostAccessError,
-    HostAccessResult, ImportedArtifact, PreferenceAccess,
+    HostAccessResult, ImportedArtifact, PreferenceAccess, RuntimeArtifactPolicy,
+    RuntimePolicyAccess, RuntimePolicyComponent, RuntimePolicyRequest,
 };
 pub use loader::ExtensionLoader;
 pub use runtime::{WasmComponent, WasmExecutionBudget, WasmRuntimeEngine};
@@ -223,7 +224,8 @@ mod tests {
     }
 
     #[test]
-    fn test_full_extension_lifecycle_with_restart_and_unregister() -> EngineResult<()> {
+    fn test_should_complete_full_extension_lifecycle_with_restart_and_unregister()
+    -> EngineResult<()> {
         let mut engine = ExtensionEngine::new();
 
         let manifest_toml = r#"
@@ -279,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn test_loader_and_state_config_integration() -> EngineResult<()> {
+    fn test_should_integrate_loader_and_state_config() -> EngineResult<()> {
         let dir = tempdir().map_err(EngineError::Io)?;
         let ext_dir = dir.path().join("chat-ext");
         fs::create_dir_all(&ext_dir).map_err(EngineError::Io)?;
@@ -319,8 +321,8 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_effects_are_owner_scoped_and_cleaned_on_stop_and_failed_start()
-    -> EngineResult<()> {
+    fn test_should_scope_runtime_effects_and_cleanup_on_stop_and_failed_start() -> EngineResult<()>
+    {
         let manifest_toml = r#"
             id = "runtime-effects"
             name = "Runtime Effects"
@@ -373,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stop_failures_are_returned_after_host_cleanup() -> EngineResult<()> {
+    fn test_should_return_stop_failures_after_host_cleanup() -> EngineResult<()> {
         let mut engine = ExtensionEngine::new();
         let manifest = engine.parse_manifest(
             r#"
@@ -440,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unregister_propagates_stop_failure_after_host_cleanup() -> EngineResult<()> {
+    fn test_should_propagate_stop_failure_after_host_cleanup_on_unregister() -> EngineResult<()> {
         let mut engine = ExtensionEngine::new();
         let manifest = engine.parse_manifest(
             r#"
@@ -480,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn test_startup_rollback_failures_are_aggregated_and_effects_revoked() -> EngineResult<()> {
+    fn test_should_aggregate_startup_rollback_failures_and_revoke_effects() -> EngineResult<()> {
         let mut engine = ExtensionEngine::new();
         let manifest = engine.parse_manifest(
             r#"

@@ -34,7 +34,10 @@ use crate::{
     },
     errors::{ComponentStopFailure, EngineError, EngineResult},
     execution_targets::{ExecutionTargetDependency, ExecutionTargetRegistry},
-    host_access::{ArtifactStoreAccess, CompositionAccess, HostAccessServices, PreferenceAccess},
+    host_access::{
+        ArtifactStoreAccess, CompositionAccess, HostAccessServices, PreferenceAccess,
+        RuntimePolicyAccess,
+    },
     runtime::WasmRuntimeEngine,
     runtime_effects::RuntimeEffectRegistry,
     runtime_permissions::RuntimePermissionManager,
@@ -236,12 +239,14 @@ impl ExtensionEngine {
         artifact_store_access: Arc<dyn ArtifactStoreAccess>,
         composition_access: Arc<dyn CompositionAccess>,
         preference_access: Arc<dyn PreferenceAccess>,
+        runtime_policy_access: Arc<dyn RuntimePolicyAccess>,
     ) -> Self {
         Self {
             host_access: HostAccessServices::new(
                 artifact_store_access,
                 composition_access,
                 preference_access,
+                runtime_policy_access,
             ),
             ..Self::default()
         }

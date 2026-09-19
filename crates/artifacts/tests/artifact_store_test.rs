@@ -1,3 +1,5 @@
+//! Integration tests for validated content-addressed RTW artifact storage.
+
 use std::{
     fs,
     path::PathBuf,

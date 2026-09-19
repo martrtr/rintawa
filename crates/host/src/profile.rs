@@ -1,3 +1,5 @@
+//! Persistent host profile schema, validation, and atomic storage.
+
 use std::{collections::HashSet, io::Write, path::Path};
 
 use rintawa_artifacts::{ArtifactDigest, ContentType};
