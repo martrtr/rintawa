@@ -2596,6 +2596,7 @@ impl WasmRuntimeEngine {
             execution_targets: self.execution_targets.clone(),
             task_handler_available,
             budget: self.budget.clone(),
+            active: false,
             runtime: Arc::new(Mutex::new(WasmSharedRuntime {
                 instance: None,
                 failed_lifecycle_callback: None,
@@ -2654,6 +2655,7 @@ pub struct WasmComponent {
     execution_targets: ExecutionTargetRegistry,
     task_handler_available: bool,
     budget: WasmExecutionBudget,
+    active: bool,
     runtime: Arc<Mutex<WasmSharedRuntime>>,
 }
 
@@ -2663,6 +2665,16 @@ impl WasmComponent {
             .component_type()
             .get_export(&self.engine, TARGET_PROVIDER_EXPORT_NAME)
             .is_some()
+    }
+
+    fn ensure_active(&self, operation: &'static str) -> ExtensionResult<()> {
+        if self.active {
+            Ok(())
+        } else {
+            Err(ExtensionError::Message(format!(
+                "WASM component is not active during {operation}"
+            )))
+        }
     }
 
     fn ensure_task_handler(instance: &mut WasmInstance) -> ExtensionResult<()> {
@@ -3301,6 +3313,7 @@ impl WasmComponent {
         topic: &str,
         payload: &[u8],
     ) -> ExtensionResult<()> {
+        self.ensure_active("event dispatch")?;
         self.validate_inbound_message("event topic", topic.len())?;
         self.validate_inbound_message("event payload", payload.len())?;
         let budget = self.budget.clone();
@@ -3368,6 +3381,7 @@ impl Component for WasmComponent {
     }
 
     fn start(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
+        self.active = false;
         let budget = self.budget.clone();
         let mut guest_failed = false;
         let mut pending_targets = Vec::new();
@@ -3411,6 +3425,7 @@ impl Component for WasmComponent {
         result?;
 
         if pending_targets.is_empty() {
+            self.active = true;
             return Ok(());
         }
 
@@ -3434,10 +3449,12 @@ impl Component for WasmComponent {
                 )));
             }
         }
+        self.active = true;
         Ok(())
     }
 
     fn stop(&mut self, _ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
+        self.active = false;
         let budget = self.budget.clone();
         let (mut runtime, lock_failure) = match self.runtime.try_lock() {
             Ok(runtime) => (runtime, None),

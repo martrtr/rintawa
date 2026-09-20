@@ -329,6 +329,38 @@ fn test_should_preserve_guest_state_across_component_lifecycle() -> EngineResult
 }
 
 #[test]
+fn test_should_dispatch_events_only_while_component_is_active() -> EngineResult<()> {
+    let runtime = WasmRuntimeEngine::new()?;
+    let mut component = runtime.load_component_from_bytes(
+        ComponentId::new("stateful-component"),
+        STATEFUL_WASM_COMPONENT.as_bytes(),
+    )?;
+    let mut context = TestComponentContext::new();
+
+    component.register(&mut context)?;
+    assert!(matches!(
+        component.dispatch_event(&mut context, "chat.message", b"before-start"),
+        Err(ExtensionError::Message(message))
+            if message.contains("not active during event dispatch")
+    ));
+
+    component.start(&mut context)?;
+    component.dispatch_event(&mut context, "chat.message", b"active")?;
+    component.stop(&mut context)?;
+
+    assert!(matches!(
+        component.dispatch_event(&mut context, "chat.message", b"after-stop"),
+        Err(ExtensionError::Message(message))
+            if message.contains("not active during event dispatch")
+    ));
+
+    component.start(&mut context)?;
+    component.dispatch_event(&mut context, "chat.message", b"after-restart")?;
+
+    Ok(())
+}
+
+#[test]
 fn test_should_reject_component_artifacts_above_the_host_budget() {
     let budget = WasmExecutionBudget {
         max_component_bytes: 8,
