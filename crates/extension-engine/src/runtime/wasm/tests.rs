@@ -7,7 +7,11 @@ use rintawa_sdk::{
     secrets::{SecretPath, SecretPathPattern, SecretValue},
     types::ExtensionId,
 };
-use std::sync::{Arc, Mutex};
+use std::{
+    net::{IpAddr, Ipv4Addr},
+    sync::{Arc, Mutex},
+};
+use url::Url;
 
 fn test_instance_id() -> ExtensionInstanceId {
     ExtensionInstanceId::new("test-instance")
