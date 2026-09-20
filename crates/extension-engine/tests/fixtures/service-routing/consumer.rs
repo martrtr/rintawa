@@ -9,6 +9,13 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
     fn register() {
         rintawa::engine::registration::consume_contract("example.echo", 1, true, &[])
             .expect("fixture consumer should register");
+        rintawa::engine::registration::consume_contract(
+            "example.secure-echo",
+            1,
+            false,
+            &[],
+        )
+        .expect("optional secure fixture consumer should register");
     }
 
     fn start() {

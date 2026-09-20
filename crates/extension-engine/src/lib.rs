@@ -697,6 +697,93 @@ mod tests {
     }
 
     #[test]
+    fn test_should_scope_secret_reads_inside_wasm_service_callbacks() -> EngineResult<()> {
+        const PROVIDER_WASM: &[u8] =
+            include_bytes!("../tests/fixtures/service-routing/provider.wasm");
+        const CONSUMER_WASM: &[u8] =
+            include_bytes!("../tests/fixtures/service-routing/consumer.wasm");
+
+        let secret_manager = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
+        let secret_path = SecretPath::parse("service.credentials.fixture").unwrap();
+        let secret_pattern = SecretPathPattern::parse("service.credentials.fixture").unwrap();
+        secret_manager.store(&secret_path, &SecretValue::new("fixture-key"))?;
+
+        let mut engine = ExtensionEngine::with_secret_manager(secret_manager);
+        let provider_id = ExtensionId::new("secure-service-provider");
+        let consumer_id = ExtensionId::new("secure-service-consumer");
+        let component_id = ComponentId::new("runtime");
+        let provider_manifest = ExtensionManifest {
+            id: provider_id.clone(),
+            name: String::from("Secure Service Provider"),
+            version: String::from("0.0.1"),
+            sdk: String::from("^0.0"),
+            components: vec![ComponentDescriptor {
+                id: component_id.clone(),
+                kind: ComponentKind::Runtime,
+                target: ComponentTarget::new(WASM_COMPONENT_TARGET_V1),
+                entry: None,
+                required: true,
+                permissions: ComponentPermissions {
+                    secret_read: vec![secret_pattern.clone()],
+                    runtime: Vec::new(),
+                },
+            }],
+        };
+        let consumer_manifest = ExtensionManifest {
+            id: consumer_id.clone(),
+            name: String::from("Secure Service Consumer"),
+            version: String::from("0.0.1"),
+            sdk: String::from("^0.0"),
+            components: vec![ComponentDescriptor {
+                id: component_id.clone(),
+                kind: ComponentKind::Runtime,
+                target: ComponentTarget::new(WASM_COMPONENT_TARGET_V1),
+                entry: None,
+                required: true,
+                permissions: ComponentPermissions::default(),
+            }],
+        };
+        let provider = engine
+            .wasm_runtime_engine()?
+            .load_component_from_bytes(component_id.clone(), PROVIDER_WASM)?;
+        let consumer = engine
+            .wasm_runtime_engine()?
+            .load_component_from_bytes(component_id.clone(), CONSUMER_WASM)?;
+
+        engine.register_extension(provider_manifest, vec![Box::new(provider)])?;
+        engine.register_extension(consumer_manifest, vec![Box::new(consumer)])?;
+        engine.start_extension(&provider_id)?;
+        engine.start_extension(&consumer_id)?;
+
+        let caller =
+            rintawa_sdk::contracts::ComponentRef::new(consumer_id.as_str(), component_id.as_str());
+        let contract = ContractKey::new("example.secure-echo", ContractVersion::new(1));
+        assert_eq!(
+            engine.call_service(&caller, &contract, b"ping"),
+            Err(ServiceCallError::Unavailable)
+        );
+
+        engine.grant_requested_secret_read(&provider_id, &component_id, secret_pattern)?;
+        assert_eq!(
+            engine.call_service(&caller, &contract, b"ping"),
+            Ok(b"secure-pong".to_vec())
+        );
+
+        engine
+            .secret_manager()
+            .revoke_component(&rintawa_sdk::contracts::ComponentRef::new(
+                provider_id.as_str(),
+                component_id.as_str(),
+            ));
+        assert_eq!(
+            engine.call_service(&caller, &contract, b"ping"),
+            Err(ServiceCallError::Unavailable)
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_should_revoke_secret_grants_for_manifest_only_components() -> EngineResult<()> {
         let secret_manager = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
         let secret_path = SecretPath::parse("ai.api_keys.openai").unwrap();
