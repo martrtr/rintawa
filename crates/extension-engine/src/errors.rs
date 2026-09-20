@@ -1,11 +1,12 @@
 //! Error types for the Rintawa Extension Engine.
 
+use std::io;
+
 use rintawa_artifacts::RtwError;
 use rintawa_sdk::{
     errors::ExtensionError, manifest::ManifestValidationError, secrets::SecretAccessError,
     ui::UiError,
 };
-use std::io;
 use thiserror::Error;
 
 use crate::{activation::ActivationPlanError, artifact_host::RtwComponentHostError};
@@ -29,6 +30,15 @@ pub enum EngineError {
     /// The specified directory for extensions is invalid.
     #[error("invalid extensions directory: `{0}`")]
     InvalidDirectory(String),
+
+    /// A manifest or component path resolves outside its extension directory.
+    #[error("extension path `{path}` escapes extension root `{root}`")]
+    ExtensionPathEscapesRoot {
+        /// Requested or resolved extension-owned path.
+        path: String,
+        /// Canonical extension directory that must contain the path.
+        root: String,
+    },
 
     /// An RTW artifact could not be validated or read.
     #[error("RTW artifact error: {0}")]

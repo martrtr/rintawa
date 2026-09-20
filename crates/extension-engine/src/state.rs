@@ -1,9 +1,13 @@
 //! Global state persistence for installed extensions.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::{
+    collections::HashMap,
+    io::{self, Write},
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
 
 use crate::errors::EngineResult;
 
@@ -39,6 +43,27 @@ pub struct ExtensionsStateConfig {
     pub extensions: HashMap<String, ExtensionStateRecord>,
 }
 
+fn persistence_parent(path: &Path) -> PathBuf {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf()
+}
+
+fn persist_atomically_with(
+    path: &Path,
+    content: &str,
+    commit: impl FnOnce(NamedTempFile, &Path) -> io::Result<()>,
+) -> EngineResult<()> {
+    let parent = persistence_parent(path);
+    std::fs::create_dir_all(&parent)?;
+    let mut temporary = NamedTempFile::new_in(&parent)?;
+    temporary.write_all(content.as_bytes())?;
+    temporary.as_file_mut().sync_all()?;
+    commit(temporary, path)?;
+    Ok(())
+}
+
 impl ExtensionsStateConfig {
     /// Loads state configuration from a file, returning a default empty config if missing.
     pub fn load_from_file(path: &Path) -> EngineResult<Self> {
@@ -50,14 +75,23 @@ impl ExtensionsStateConfig {
         Ok(config)
     }
 
-    /// Saves state configuration back to a file.
+    /// Saves state configuration atomically.
+    ///
+    /// The replacement file is fully written and synced before it becomes
+    /// visible at `path`, so an interrupted write cannot leave a truncated
+    /// `state.toml`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O or serialization error when the state cannot be persisted.
     pub fn save_to_file(&self, path: &Path) -> EngineResult<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(path, content)?;
-        Ok(())
+        persist_atomically_with(path, &content, |temporary, destination| {
+            temporary
+                .persist(destination)
+                .map_err(|error| error.error)?;
+            Ok(())
+        })
     }
 
     /// Returns `true` if an extension is enabled or untracked.
@@ -77,5 +111,46 @@ impl ExtensionsStateConfig {
                 updated_by: actor.to_string(),
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_atomic_state_write_replaces_complete_document() -> EngineResult<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join(STATE_FILE_NAME);
+        let mut state = ExtensionsStateConfig::default();
+        state.set_enabled("alpha", false, "tester", "2026-09-20T00:00:00Z");
+
+        state.save_to_file(&path)?;
+
+        assert_eq!(ExtensionsStateConfig::load_from_file(&path)?, state);
+        Ok(())
+    }
+
+    #[test]
+    fn test_interrupted_atomic_state_write_preserves_previous_document() -> EngineResult<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join(STATE_FILE_NAME);
+        let mut original = ExtensionsStateConfig::default();
+        original.set_enabled("alpha", true, "tester", "2026-09-20T00:00:00Z");
+        original.save_to_file(&path)?;
+
+        let mut replacement = original.clone();
+        replacement.set_enabled("alpha", false, "tester", "2026-09-20T00:01:00Z");
+        let replacement_content = toml::to_string_pretty(&replacement)?;
+        let error = persist_atomically_with(&path, &replacement_content, |_temporary, _path| {
+            Err(io::Error::other(
+                "simulated interruption before atomic commit",
+            ))
+        })
+        .expect_err("simulated interruption must fail");
+
+        assert!(matches!(error, crate::EngineError::Io(_)));
+        assert_eq!(ExtensionsStateConfig::load_from_file(&path)?, original);
+        Ok(())
     }
 }

@@ -1,6 +1,6 @@
 //! Directory scanner and loader for Rintawa extensions.
 
-use std::path::{Component as PathComponent, Path};
+use std::path::{Component as PathComponent, Path, PathBuf};
 
 use rintawa_sdk::{manifest::WASM_COMPONENT_TARGET_V1, traits::Component, types::ExtensionId};
 use tracing::{info, warn};
@@ -15,6 +15,21 @@ use crate::{
 /// Service responsible for discovering and loading extensions from disk.
 pub struct ExtensionLoader {
     wasm_engine: WasmRuntimeEngine,
+}
+
+fn path_escape_error(root: &Path, path: &Path) -> EngineError {
+    EngineError::ExtensionPathEscapesRoot {
+        path: path.to_string_lossy().into_owned(),
+        root: root.to_string_lossy().into_owned(),
+    }
+}
+
+fn canonicalize_owned_path(root: &Path, path: &Path) -> EngineResult<PathBuf> {
+    let canonical = path.canonicalize()?;
+    if !canonical.starts_with(root) {
+        return Err(path_escape_error(root, &canonical));
+    }
+    Ok(canonical)
 }
 
 impl ExtensionLoader {
@@ -35,33 +50,43 @@ impl ExtensionLoader {
             ));
         }
 
+        let root = dir_path.canonicalize()?;
         let state_path = dir_path.join(STATE_FILE_NAME);
         let state_config = ExtensionsStateConfig::load_from_file(&state_path)?;
 
         let mut loaded_extensions = Vec::new();
-        let entries = std::fs::read_dir(dir_path)?;
-
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
+        let mut entries = std::fs::read_dir(dir_path)?
+            .filter_map(|entry| match entry {
+                Ok(entry) => Some(entry),
                 Err(err) => {
                     warn!(
                         "Failed to read directory entry in {}: {err}",
                         dir_path.display()
                     );
-                    continue;
+                    None
                 }
-            };
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+
+        for entry in entries {
             let path = entry.path();
 
             if path.is_dir() {
-                let manifest_path = path.join("manifest.toml");
+                let canonical_path = match canonicalize_owned_path(&root, &path) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        warn!(path = %path.display(), "Skipping extension directory: {err}");
+                        continue;
+                    }
+                };
+                let manifest_path = canonical_path.join("manifest.toml");
                 if manifest_path.exists() {
-                    match self.load_single_extension(engine, &path, &state_config) {
+                    match self.load_single_extension(engine, &canonical_path, &state_config) {
                         Ok(Some(id)) => loaded_extensions.push(id),
                         Ok(None) => {}
                         Err(err) => {
-                            warn!(path = %path.display(), "Failed to load extension: {err}");
+                            warn!(path = %canonical_path.display(), "Failed to load extension: {err}");
                         }
                     }
                 }
@@ -78,7 +103,8 @@ impl ExtensionLoader {
         ext_dir: &Path,
         state_config: &ExtensionsStateConfig,
     ) -> EngineResult<Option<ExtensionId>> {
-        let manifest_path = ext_dir.join("manifest.toml");
+        let root = ext_dir.canonicalize()?;
+        let manifest_path = canonicalize_owned_path(&root, &root.join("manifest.toml"))?;
         let raw_manifest = std::fs::read_to_string(&manifest_path)?;
         let manifest = engine.parse_manifest(&raw_manifest)?;
 
@@ -96,18 +122,15 @@ impl ExtensionLoader {
                 let wasm_rel_str = comp_desc.entry.as_deref().unwrap_or("runtime.wasm");
                 let wasm_rel_path = Path::new(wasm_rel_str);
 
-                // Path traversal protection: forbid absolute paths and parent directory components ('..')
                 if wasm_rel_path.is_absolute()
                     || wasm_rel_path
                         .components()
-                        .any(|c| c == PathComponent::ParentDir)
+                        .any(|component| component == PathComponent::ParentDir)
                 {
-                    return Err(EngineError::InvalidDirectory(format!(
-                        "Path traversal attempt detected in component entry path: {wasm_rel_str}"
-                    )));
+                    return Err(path_escape_error(&root, wasm_rel_path));
                 }
 
-                let wasm_path = ext_dir.join(wasm_rel_path);
+                let wasm_path = canonicalize_owned_path(&root, &root.join(wasm_rel_path))?;
                 let wasm_component = self
                     .wasm_engine
                     .load_component_from_file(comp_desc.id.clone(), &wasm_path)?;
