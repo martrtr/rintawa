@@ -3,9 +3,9 @@
 //! This module provides the error types used throughout the SDK
 //! for error handling and propagation.
 
-use crate::secrets::SecretAccessError;
-
 use thiserror::Error;
+
+use crate::secrets::SecretAccessError;
 
 /// The error type for Rintawa extension operations.
 ///
@@ -45,6 +45,15 @@ pub enum ExtensionError {
         operation: String,
         /// The error that prevented owner-effect cleanup.
         cleanup: String,
+    },
+
+    /// A runtime adapter discarded the component instance after a fatal callback failure.
+    #[error("component runtime was invalidated during `{operation}`: {reason}")]
+    ComponentRuntimeInvalidated {
+        /// Callback after which the component runtime can no longer execute.
+        operation: &'static str,
+        /// Original failure that caused the runtime to be discarded.
+        reason: String,
     },
 
     /// An execution budget enforced by the host was exhausted.

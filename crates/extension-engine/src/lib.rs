@@ -12,16 +12,16 @@
 mod activation;
 mod artifact_host;
 mod artifact_loader;
-pub mod composition;
-pub mod context;
-pub mod engine;
-pub mod errors;
+mod composition;
+mod context;
+mod engine;
+mod errors;
 mod execution_targets;
-pub mod host_access;
-pub mod loader;
-pub mod runtime;
-pub mod secrets;
-pub mod state;
+mod host_access;
+mod loader;
+mod runtime;
+mod secrets;
+mod state;
 
 mod services;
 

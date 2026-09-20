@@ -5,6 +5,13 @@
 .vscode/
 .idea/
 
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
 # OS
 .DS_Store
 Thumbs.db

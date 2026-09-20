@@ -1,12 +1,21 @@
 //! Main Extension Engine implementation managing lifecycle and contributions.
 
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
 use rintawa_sdk::{
+    context::ComponentContext,
     contracts::{ComponentRef, ContractDefinition, ContractKey, ContractResolutionPolicy},
     contributions::ContributionDescriptor,
+    errors::{ExtensionError, ExtensionResult},
     manifest::ExtensionManifest,
     runtime_effects::RuntimeEffect,
     runtime_permissions::RuntimePermission,
     secrets::SecretPathPattern,
+    services::ServiceCallResult,
     traits::Component,
     types::{
         ComponentId, ContributionId, ExtensionId, ExtensionInstanceId, RuntimeEffectId,
@@ -15,12 +24,7 @@ use rintawa_sdk::{
     ui::{UiActionEvent, UiError, UiLayerDescriptor},
 };
 use rintawa_ui_runtime::{UiPresentationSurface, UiRuntime};
-
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use tracing::warn;
 
 use crate::{
     activation::{ActivationPlan, build_activation_plan},
@@ -82,40 +86,31 @@ impl ManagedComponent {
         &self.id
     }
 
-    fn start(
-        &self,
-        context: &mut dyn rintawa_sdk::context::ComponentContext,
-    ) -> rintawa_sdk::errors::ExtensionResult<()> {
-        let mut component = self.handle.lock().map_err(|_| {
-            rintawa_sdk::errors::ExtensionError::Message(String::from(
-                "component lock was poisoned",
-            ))
-        })?;
+    fn start(&self, context: &mut dyn ComponentContext) -> ExtensionResult<()> {
+        let mut component = self
+            .handle
+            .lock()
+            .map_err(|_| ExtensionError::Message(String::from("component lock was poisoned")))?;
         component.start(context)
     }
 
-    fn stop(
-        &self,
-        context: &mut dyn rintawa_sdk::context::ComponentContext,
-    ) -> rintawa_sdk::errors::ExtensionResult<()> {
-        let mut component = self.handle.lock().map_err(|_| {
-            rintawa_sdk::errors::ExtensionError::Message(String::from(
-                "component lock was poisoned",
-            ))
-        })?;
+    fn stop(&self, context: &mut dyn ComponentContext) -> ExtensionResult<()> {
+        let mut component = self
+            .handle
+            .lock()
+            .map_err(|_| ExtensionError::Message(String::from("component lock was poisoned")))?;
         component.stop(context)
     }
 
     fn handle_ui_action(
         &self,
-        context: &mut dyn rintawa_sdk::context::ComponentContext,
+        context: &mut dyn ComponentContext,
         event: &UiActionEvent,
-    ) -> rintawa_sdk::errors::ExtensionResult<()> {
-        let mut component = self.handle.lock().map_err(|_| {
-            rintawa_sdk::errors::ExtensionError::Message(String::from(
-                "component lock was poisoned",
-            ))
-        })?;
+    ) -> ExtensionResult<()> {
+        let mut component = self
+            .handle
+            .lock()
+            .map_err(|_| ExtensionError::Message(String::from("component lock was poisoned")))?;
         component.handle_ui_action(context, event)
     }
 }
@@ -204,6 +199,10 @@ fn is_transient_queued_ui_rejection(error: &EngineError) -> bool {
                 | UiError::InvalidActionPayload { .. }
         )
     )
+}
+
+fn should_contain_queued_ui_error(error: &EngineError) -> bool {
+    matches!(error, EngineError::UiActionFailed { .. }) || is_transient_queued_ui_rejection(error)
 }
 
 impl Default for ExtensionEngine {
@@ -1047,6 +1046,58 @@ impl ExtensionEngine {
         &mut self,
         instance_id: &ExtensionInstanceId,
     ) -> EngineResult<()> {
+        self.stop_extension_instance_inner(instance_id, true)
+    }
+
+    fn quarantine_extension_instance(
+        &mut self,
+        instance_id: &ExtensionInstanceId,
+    ) -> EngineResult<()> {
+        let mut visited = HashSet::new();
+        self.quarantine_extension_instance_recursive(instance_id, &mut visited)
+    }
+
+    fn quarantine_extension_instance_recursive(
+        &mut self,
+        instance_id: &ExtensionInstanceId,
+        visited: &mut HashSet<ExtensionInstanceId>,
+    ) -> EngineResult<()> {
+        if !visited.insert(instance_id.clone()) {
+            return Ok(());
+        }
+
+        let active_dependents = self
+            .execution_target_dependents_of(instance_id)
+            .into_iter()
+            .filter(|dependent| {
+                self.extensions
+                    .get(dependent)
+                    .is_some_and(|extension| extension.state == ExtensionState::Active)
+            })
+            .collect::<Vec<_>>();
+        for dependent in active_dependents {
+            self.quarantine_extension_instance_recursive(&dependent, visited)?;
+        }
+
+        match self.stop_extension_instance_inner(instance_id, false) {
+            Ok(()) => Ok(()),
+            Err(error @ EngineError::StopFailed { .. }) => {
+                warn!(
+                    instance_id = %instance_id,
+                    error = %error,
+                    "failed component runtime was quarantined with component cleanup errors"
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn stop_extension_instance_inner(
+        &mut self,
+        instance_id: &ExtensionInstanceId,
+        enforce_provider_guard: bool,
+    ) -> EngineResult<()> {
         let state = self
             .extensions
             .get(instance_id)
@@ -1055,7 +1106,9 @@ impl ExtensionEngine {
         if state == ExtensionState::Stopped {
             return Ok(());
         }
-        self.ensure_execution_target_provider_not_in_use(instance_id)?;
+        if enforce_provider_guard {
+            self.ensure_execution_target_provider_not_in_use(instance_id)?;
+        }
 
         let (extensions, runtime_effects) = (&mut self.extensions, &mut self.runtime_effects);
         let ext = extensions
@@ -1266,12 +1319,14 @@ impl ExtensionEngine {
     ///
     /// Components are visited in stable runtime-instance/component order. The
     /// returned duration is the earliest requested next wake-up; `None` means no
-    /// active component currently has scheduled cooperative work.
+    /// active component currently has scheduled cooperative work. A component
+    /// callback failure is contained by quarantining its extension instance
+    /// instead of terminating the host runtime.
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::RuntimePollFailed`] when an active component cannot
-    /// execute its due runtime work.
+    /// Returns an error only when host-owned runtime infrastructure cannot be
+    /// pumped safely. Extension callback failures are logged and contained.
     pub fn poll_runtime(&mut self) -> EngineResult<Option<Duration>> {
         let mut components = Vec::new();
         for extension in self
@@ -1298,44 +1353,64 @@ impl ExtensionEngine {
 
         let mut next_wake = None;
         for (extension_id, instance_id, scope_id, component_id, handle) in components {
-            let identity = ComponentIdentity::new(
-                extension_id.clone(),
-                instance_id,
-                scope_id,
-                component_id.clone(),
-            );
-            let mut context = EngineComponentContext::new(
-                identity,
-                &mut self.runtime_effects,
-                &self.secrets,
-                &self.services,
-                &self.ui,
-                true,
-            );
-            let delay = {
-                let mut component = handle.lock().map_err(|_| EngineError::RuntimePollFailed {
-                    extension_id: extension_id.to_string(),
-                    component_id: component_id.to_string(),
-                    reason: String::from("component lock was poisoned"),
-                })?;
-                component.poll_runtime(&mut context).map_err(|error| {
-                    EngineError::RuntimePollFailed {
-                        extension_id: extension_id.to_string(),
-                        component_id: component_id.to_string(),
-                        reason: error.to_string(),
-                    }
-                })?
+            if !self
+                .extensions
+                .get(&instance_id)
+                .is_some_and(|extension| extension.state == ExtensionState::Active)
+            {
+                continue;
+            }
+
+            let poll_result = {
+                let identity = ComponentIdentity::new(
+                    extension_id.clone(),
+                    instance_id.clone(),
+                    scope_id,
+                    component_id.clone(),
+                );
+                let mut context = EngineComponentContext::new(
+                    identity,
+                    &mut self.runtime_effects,
+                    &self.secrets,
+                    &self.services,
+                    &self.ui,
+                    true,
+                );
+                match handle.lock() {
+                    Ok(mut component) => component
+                        .poll_runtime(&mut context)
+                        .map_err(|error| error.to_string()),
+                    Err(_) => Err(String::from("component lock was poisoned")),
+                }
             };
-            if let Some(delay) = delay {
-                next_wake = Some(next_wake.map_or(delay, |current: Duration| current.min(delay)));
+
+            match poll_result {
+                Ok(Some(delay)) => {
+                    next_wake =
+                        Some(next_wake.map_or(delay, |current: Duration| current.min(delay)));
+                }
+                Ok(None) => {}
+                Err(reason) => {
+                    warn!(
+                        extension_id = %extension_id,
+                        instance_id = %instance_id,
+                        component_id = %component_id,
+                        reason = %reason,
+                        "extension runtime callback failed; quarantining extension instance"
+                    );
+                    self.quarantine_extension_instance(&instance_id)?;
+                }
             }
         }
 
         for queued in self.ui.drain_queued_actions()? {
-            if let Err(error) = self.dispatch_ui_action(&queued.layer_owner, queued.event)
-                && !is_transient_queued_ui_rejection(&error)
-            {
-                return Err(error);
+            if let Err(error) = self.dispatch_ui_action(&queued.layer_owner, queued.event) {
+                if matches!(error, EngineError::UiActionFailed { .. }) {
+                    warn!(error = %error, "Portable UI action failed; runtime pump continues");
+                }
+                if !should_contain_queued_ui_error(&error) {
+                    return Err(error);
+                }
             }
         }
 
@@ -1445,32 +1520,54 @@ impl ExtensionEngine {
 
         let owner = dispatch.owner.clone();
         let action_id = dispatch.event.action_id.to_string();
-        let identity = ComponentIdentity::new(
-            logical_id.clone(),
-            owner.instance_id.clone(),
-            scope_id,
-            owner.component_id.clone(),
-        );
-        let mut context = EngineComponentContext::new(
-            identity,
-            &mut self.runtime_effects,
-            &self.secrets,
-            &self.services,
-            &self.ui,
-            true,
-        );
-        let managed = ManagedComponent {
-            id: owner.component_id.clone(),
-            handle: component_handle,
+        let action_result = {
+            let identity = ComponentIdentity::new(
+                logical_id.clone(),
+                owner.instance_id.clone(),
+                scope_id,
+                owner.component_id.clone(),
+            );
+            let mut context = EngineComponentContext::new(
+                identity,
+                &mut self.runtime_effects,
+                &self.secrets,
+                &self.services,
+                &self.ui,
+                true,
+            );
+            let managed = ManagedComponent {
+                id: owner.component_id.clone(),
+                handle: component_handle,
+            };
+            managed.handle_ui_action(&mut context, &dispatch.event)
         };
-        managed
-            .handle_ui_action(&mut context, &dispatch.event)
-            .map_err(|error| EngineError::UiActionFailed {
+
+        match action_result {
+            Ok(()) => Ok(()),
+            Err(ExtensionError::ComponentRuntimeInvalidated { reason, .. }) => {
+                warn!(
+                    extension_id = %logical_id,
+                    instance_id = %owner.instance_id,
+                    component_id = %owner.component_id,
+                    action_id = %action_id,
+                    reason = %reason,
+                    "Portable UI action invalidated its component runtime; quarantining extension instance"
+                );
+                self.quarantine_extension_instance(&owner.instance_id)?;
+                Err(EngineError::UiActionFailed {
+                    extension_id: logical_id.to_string(),
+                    component_id: owner.component_id.to_string(),
+                    action_id,
+                    reason,
+                })
+            }
+            Err(other) => Err(EngineError::UiActionFailed {
                 extension_id: logical_id.to_string(),
                 component_id: owner.component_id.to_string(),
                 action_id,
-                reason: error.to_string(),
-            })
+                reason: other.to_string(),
+            }),
+        }
     }
 
     /// Calls a unary service on behalf of an active consumer component.
@@ -1484,7 +1581,7 @@ impl ExtensionEngine {
         consumer: &ComponentRef,
         contract: &ContractKey,
         request: &[u8],
-    ) -> rintawa_sdk::services::ServiceCallResult<Vec<u8>> {
+    ) -> ServiceCallResult<Vec<u8>> {
         self.services.call(consumer, contract, request)
     }
 
@@ -1801,56 +1898,4 @@ impl ExtensionEngine {
 }
 
 #[cfg(test)]
-mod queued_ui_tests {
-    use super::*;
-
-    #[test]
-    fn test_should_treat_stale_queued_ui_validation_as_transient() {
-        for error in [
-            UiError::LayerNotOwner,
-            UiError::ScopeNotVisible,
-            UiError::InstanceNotRegistered(String::from("feature")),
-            UiError::OwnerInactive,
-            UiError::SurfaceNotRegistered(String::from("example.main")),
-            UiError::SurfaceNotMounted(String::from("example.main")),
-            UiError::RevisionMismatch {
-                expected: 2,
-                actual: 1,
-            },
-            UiError::NodeNotFound(String::from("button")),
-            UiError::ActionNotBound {
-                surface: String::from("example.main"),
-                node: String::from("button"),
-                action: String::from("run"),
-            },
-            UiError::ActionDisabled {
-                node: String::from("button"),
-                action: String::from("run"),
-            },
-            UiError::InvalidActionPayload {
-                node: String::from("button"),
-                action: String::from("run"),
-            },
-        ] {
-            assert!(is_transient_queued_ui_rejection(&EngineError::Ui(error)));
-        }
-    }
-
-    #[test]
-    fn test_should_not_hide_ui_runtime_or_component_failures() {
-        assert!(!is_transient_queued_ui_rejection(&EngineError::Ui(
-            UiError::RuntimeUnavailable
-        )));
-        assert!(!is_transient_queued_ui_rejection(&EngineError::Ui(
-            UiError::SurfaceNotOwned(String::from("example.main"))
-        )));
-        assert!(!is_transient_queued_ui_rejection(
-            &EngineError::UiActionFailed {
-                extension_id: String::from("feature"),
-                component_id: String::from("ui"),
-                action_id: String::from("run"),
-                reason: String::from("failed"),
-            }
-        ));
-    }
-}
+mod queued_ui_tests;

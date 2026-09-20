@@ -1,3 +1,5 @@
+//! Integration tests for WASM component execution, budgets, and host boundaries.
+
 use rintawa_extension_engine::{
     EngineResult, ExtensionEngine, WasmExecutionBudget, WasmRuntimeEngine,
 };
@@ -76,7 +78,7 @@ const STATEFUL_WASM_COMPONENT: &str = include_str!("fixtures/stateful_component.
 const TASK_WASM_COMPONENT: &[u8] = include_bytes!("fixtures/task-runtime/component.wasm");
 
 #[test]
-fn test_wasm_runtime_engine_initialization() -> EngineResult<()> {
+fn test_should_initialize_wasm_runtime_engine() -> EngineResult<()> {
     let runtime = WasmRuntimeEngine::new()?;
     let id = ComponentId::new("test-wasm-component");
 
@@ -243,6 +245,66 @@ fn test_should_dispatch_validated_ui_action_to_wasm_guest() -> EngineResult<()> 
             payload: UiActionPayload::None,
         },
     )?;
+
+    Ok(())
+}
+
+#[test]
+fn test_should_use_dedicated_fuel_budget_for_ui_actions() -> EngineResult<()> {
+    let expensive_ui_component = STATEFUL_WASM_COMPONENT.replace(
+        r#"(func (export "handle-ui-action") (param i32 i32))"#,
+        r#"(func (export "handle-ui-action") (param i32 i32)
+                (local $remaining i32)
+                (loop $work
+                    (local.set $remaining
+                        (i32.add (local.get $remaining) (i32.const 1)))
+                    (br_if $work
+                        (i32.lt_u (local.get $remaining) (i32.const 8000)))))"#,
+    );
+    let event = UiActionEvent {
+        owner_instance_id: ExtensionInstanceId::new("test-extension"),
+        surface_id: UiSurfaceId::new("example.main"),
+        node_id: UiNodeId::new("send"),
+        action_id: UiActionId::new("example.send"),
+        surface_revision: 1,
+        payload: UiActionPayload::None,
+    };
+
+    let low_ui_budget = WasmExecutionBudget {
+        fuel_per_callback: 10_000,
+        fuel_per_ui_action: 1_000,
+        ..WasmExecutionBudget::default()
+    };
+    let runtime = WasmRuntimeEngine::with_execution_budget(low_ui_budget)?;
+    let mut component = runtime.load_component_from_bytes(
+        ComponentId::new("stateful-component"),
+        expensive_ui_component.as_bytes(),
+    )?;
+    let mut context = TestComponentContext::new();
+    component.register(&mut context)?;
+    component.start(&mut context)?;
+    assert!(matches!(
+        component.handle_ui_action(&mut context, &event),
+        Err(ExtensionError::ComponentRuntimeInvalidated {
+            operation: "UI action",
+            reason,
+        }) if reason.contains("execution budget for `fuel` was exhausted during `UI action`")
+    ));
+
+    let larger_ui_budget = WasmExecutionBudget {
+        fuel_per_callback: 10_000,
+        fuel_per_ui_action: 100_000,
+        ..WasmExecutionBudget::default()
+    };
+    let runtime = WasmRuntimeEngine::with_execution_budget(larger_ui_budget)?;
+    let mut component = runtime.load_component_from_bytes(
+        ComponentId::new("stateful-component"),
+        expensive_ui_component.as_bytes(),
+    )?;
+    let mut context = TestComponentContext::new();
+    component.register(&mut context)?;
+    component.start(&mut context)?;
+    component.handle_ui_action(&mut context, &event)?;
 
     Ok(())
 }

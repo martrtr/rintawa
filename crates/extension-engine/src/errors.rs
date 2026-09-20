@@ -191,19 +191,6 @@ pub enum EngineError {
     #[error("WASM runtime error: {0}")]
     WasmRuntime(#[from] wasmtime::Error),
 
-    /// An active component failed while executing cooperative runtime work.
-    #[error(
-        "component `{component_id}` in extension `{extension_id}` failed runtime polling: {reason}"
-    )]
-    RuntimePollFailed {
-        /// Logical extension owning the component.
-        extension_id: String,
-        /// Component that failed during the runtime pump.
-        component_id: String,
-        /// Component-reported execution failure.
-        reason: String,
-    },
-
     /// Portable UI registration, lifecycle, patching, or action validation failed.
     #[error("portable UI error: {0}")]
     Ui(#[from] UiError),
