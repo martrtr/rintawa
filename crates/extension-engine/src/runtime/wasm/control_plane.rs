@@ -4,13 +4,14 @@ use rintawa_sdk::{
     contracts::ComponentRef, runtime_permissions::RuntimePermission, types::RuntimeScopeId,
 };
 
-use crate::host_access::{CompositionActivation, HostAccessError};
-
-use super::{
-    ArtifactStoreError, ArtifactStoreHost, CompositionError, CompositionHost, PreferenceError,
-    PreferencesHost, RuntimePermissionCheck, RuntimePolicyError, RuntimePolicyHost, WasmHostState,
-    WitCompositionActivation, WitImportedArtifact, WitRuntimeArtifactPolicy,
-    WitRuntimePolicyComponent, WitRuntimePolicyRequest,
+use crate::{
+    host_access::{CompositionActivation, HostAccessError},
+    runtime::wasm::{
+        ArtifactStoreError, ArtifactStoreHost, CompositionError, CompositionHost, PreferenceError,
+        PreferencesHost, RuntimePermissionCheck, RuntimePolicyError, RuntimePolicyHost,
+        WasmHostState, WitCompositionActivation, WitImportedArtifact, WitRuntimeArtifactPolicy,
+        WitRuntimePolicyComponent, WitRuntimePolicyRequest,
+    },
 };
 
 impl ArtifactStoreHost for WasmHostState {

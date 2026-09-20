@@ -19,7 +19,7 @@ use rintawa_sdk::{contracts::ComponentRef, runtime_permissions::RuntimePermissio
 use tracing::warn;
 use url::{Host as UrlHost, Url};
 
-use super::{
+use crate::runtime::wasm::{
     HttpFetchError, HttpFetchHost, NetworkError, NetworkHost, RuntimePermissionCheck,
     WasmHostState, WitHttpResponse, WitNetworkListener, WitNetworkReadResult,
 };

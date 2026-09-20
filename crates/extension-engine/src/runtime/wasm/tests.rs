@@ -6,6 +6,7 @@ use rintawa_sdk::{
     api::{LogLevel, LoggerApi},
     secrets::{SecretPath, SecretPathPattern, SecretValue},
     types::ExtensionId,
+    ui::{UiPatchBatch, UiSurfaceSnapshot},
 };
 use std::{
     net::{IpAddr, Ipv4Addr},
