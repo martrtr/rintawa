@@ -306,10 +306,27 @@ fn test_state_transaction() {
 
 ---
 
+## Secrets and Credentials
+
+- Never commit real API keys, tokens, private keys, or provider credentials.
+- Local credentials belong in ignored local configuration or the Core secret capability,
+  never in package metadata, fixtures, logs, or RTW artifacts.
+- `scripts/check.sh` runs pinned Gitleaks 8.30.1 before Rust validation. The bootstrap
+  script verifies the official release archive against a repository-pinned SHA-256.
+- Secret scanning covers complete Git history plus unstaged tracked changes and the
+  staged pre-commit diff. CI must therefore use a full-history checkout.
+- Do not add a baseline or allowlist for a real credential. If a real secret ever
+  reaches Git history, rotate/revoke it first; deleting the current file is insufficient.
+- A scanner exception is acceptable only for a verified false positive and must be
+  narrowly scoped, documented, and reviewed.
+
+---
+
 ## Code Organization Checklist
 
 Before committing:
 
+- [ ] `bash scripts/scan-secrets.sh` passes
 - [ ] `cargo fmt --all` has been run
 - [ ] `cargo clippy` passes with no warnings
 - [ ] All public items have doc comments
