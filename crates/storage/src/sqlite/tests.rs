@@ -1,9 +1,15 @@
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Barrier},
+};
 
 use anyhow::Result;
 use rintawa_sdk::{
     types::ExtensionId,
-    world::{CommandId, CorrelationId, EntityId, PrincipalId, RelationId, SchemaKey, WorldId},
+    world::{
+        CommandId, CorrelationId, EffectJobId, EntityId, PrincipalId, RelationId, SchemaKey,
+        UnixTimeMillis, WorldId,
+    },
 };
 use rintawa_world::{
     ActorRef, CommitDisposition, CommitReceipt, ControlGrant, ControlScope, EffectJobDraft,
@@ -217,6 +223,24 @@ fn commit_entity(
     });
     commit_current(storage, &command, &transaction)?;
     Ok(entity_id)
+}
+
+fn enqueue_effect(
+    storage: &SqliteWorldStorage,
+    schemas: &TestSchemas,
+    principal: PrincipalId,
+    input: &str,
+) -> Result<EffectJobId> {
+    let command = direct_command(&schemas.command, principal, "enqueue-effect");
+    let effect = EffectJobDraft::new(
+        schemas.effect.clone(),
+        serde_json::json!({ "input": input }),
+    );
+    let effect_id = effect.id();
+    let mut transaction = WorldTransaction::new();
+    transaction.push_effect(effect);
+    commit_current(storage, &command, &transaction)?;
+    Ok(effect_id)
 }
 
 #[test]
@@ -843,6 +867,300 @@ fn test_should_reject_mismatched_direct_principal_actor() -> Result<()> {
         StorageError::World(WorldError::ActorUnauthorized { .. })
     ));
     assert_eq!(storage.load_session()?.commit_position(), 0);
+    Ok(())
+}
+
+#[test]
+fn test_should_reclaim_expired_effect_with_fencing_token() -> Result<()> {
+    let (_root, storage) = create_storage()?;
+    let schemas = register_test_schemas(&storage)?;
+    let effect_id = enqueue_effect(&storage, &schemas, PrincipalId::new(), "lease")?;
+
+    assert!(matches!(
+        storage.claim_next_effect(UnixTimeMillis::new(100), UnixTimeMillis::new(100)),
+        Err(StorageError::InvalidEffectLease)
+    ));
+
+    let first = storage
+        .claim_next_effect(UnixTimeMillis::new(100), UnixTimeMillis::new(200))?
+        .expect("pending effect must be claimable");
+    assert_eq!(first.job().id, effect_id);
+    assert_eq!(first.attempt(), 1);
+    assert_eq!(first.lease_expires_at(), UnixTimeMillis::new(200));
+    assert!(
+        storage
+            .claim_next_effect(UnixTimeMillis::new(199), UnixTimeMillis::new(300))?
+            .is_none()
+    );
+
+    let second = storage
+        .claim_next_effect(UnixTimeMillis::new(200), UnixTimeMillis::new(300))?
+        .expect("expired lease must be reclaimable");
+    assert_eq!(second.job().id, effect_id);
+    assert_eq!(second.attempt(), 2);
+
+    assert!(matches!(
+        storage.complete_effect(effect_id, first.attempt()),
+        Err(StorageError::EffectJobClaimLost(id)) if id == effect_id
+    ));
+    storage.complete_effect(effect_id, second.attempt())?;
+    assert!(
+        storage
+            .claim_next_effect(UnixTimeMillis::new(400), UnixTimeMillis::new(500))?
+            .is_none()
+    );
+    assert!(matches!(
+        storage.cancel_effect(effect_id),
+        Err(StorageError::EffectJobTerminal(id)) if id == effect_id
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_effect_attempt_counter_overflow() -> Result<()> {
+    let (_root, storage) = create_storage()?;
+    let schemas = register_test_schemas(&storage)?;
+    let effect_id = enqueue_effect(&storage, &schemas, PrincipalId::new(), "overflow")?;
+
+    {
+        let connection = storage.writer()?;
+        connection.execute(
+            "UPDATE effect_jobs SET attempt_count = ?1 WHERE job_id = ?2",
+            params![i64::from(u32::MAX), effect_id.into_bytes().as_slice()],
+        )?;
+    }
+
+    assert!(matches!(
+        storage.claim_next_effect(UnixTimeMillis::new(1), UnixTimeMillis::new(2)),
+        Err(StorageError::EffectAttemptOverflow(id)) if id == effect_id
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_should_claim_effect_once_across_independent_storage_handles() -> Result<()> {
+    let (root, first_storage) = create_storage()?;
+    let schemas = register_test_schemas(&first_storage)?;
+    let effect_id = enqueue_effect(
+        &first_storage,
+        &schemas,
+        PrincipalId::new(),
+        "concurrent-claim",
+    )?;
+    let second_storage = SqliteWorldStorage::open(root.path().join("world.sqlite"))?;
+    let barrier = Arc::new(Barrier::new(2));
+
+    let first_barrier = Arc::clone(&barrier);
+    let first = std::thread::spawn(move || {
+        first_barrier.wait();
+        first_storage.claim_next_effect(UnixTimeMillis::new(100), UnixTimeMillis::new(200))
+    });
+    let second_barrier = Arc::clone(&barrier);
+    let second = std::thread::spawn(move || {
+        second_barrier.wait();
+        second_storage.claim_next_effect(UnixTimeMillis::new(100), UnixTimeMillis::new(200))
+    });
+
+    let first = first.join().expect("first claim thread must not panic")?;
+    let second = second.join().expect("second claim thread must not panic")?;
+    let claims = [first, second].into_iter().flatten().collect::<Vec<_>>();
+
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].job().id, effect_id);
+    assert_eq!(claims[0].attempt(), 1);
+    Ok(())
+}
+
+#[test]
+fn test_should_retry_effect_at_due_time_and_cancel_running_claim() -> Result<()> {
+    let (_root, storage) = create_storage()?;
+    let schemas = register_test_schemas(&storage)?;
+    let effect_id = enqueue_effect(&storage, &schemas, PrincipalId::new(), "retry")?;
+
+    let first = storage
+        .claim_next_effect(UnixTimeMillis::new(10), UnixTimeMillis::new(20))?
+        .expect("effect must be claimable");
+    storage.retry_effect(
+        effect_id,
+        first.attempt(),
+        UnixTimeMillis::new(50),
+        "temporary provider failure",
+    )?;
+
+    assert!(
+        storage
+            .claim_next_effect(UnixTimeMillis::new(49), UnixTimeMillis::new(60))?
+            .is_none()
+    );
+    let second = storage
+        .claim_next_effect(UnixTimeMillis::new(50), UnixTimeMillis::new(60))?
+        .expect("retry must become claimable at available_at");
+    assert_eq!(second.attempt(), 2);
+
+    assert!(storage.cancel_effect(effect_id)?);
+    assert!(!storage.cancel_effect(effect_id)?);
+    assert!(matches!(
+        storage.complete_effect(effect_id, second.attempt()),
+        Err(StorageError::EffectJobClaimLost(id)) if id == effect_id
+    ));
+    assert!(
+        storage
+            .claim_next_effect(UnixTimeMillis::new(100), UnixTimeMillis::new(110))?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_preserve_retry_schedule_and_attempt_across_restart() -> Result<()> {
+    let (root, storage) = create_storage()?;
+    let path = root.path().join("world.sqlite");
+    let schemas = register_test_schemas(&storage)?;
+    let effect_id = enqueue_effect(&storage, &schemas, PrincipalId::new(), "restart-retry")?;
+
+    let first = storage
+        .claim_next_effect(UnixTimeMillis::new(10), UnixTimeMillis::new(20))?
+        .expect("effect must be claimable");
+    storage.retry_effect(
+        effect_id,
+        first.attempt(),
+        UnixTimeMillis::new(50),
+        "sanitized transient failure",
+    )?;
+    drop(storage);
+
+    let reopened = SqliteWorldStorage::open(&path)?;
+    assert!(
+        reopened
+            .claim_next_effect(UnixTimeMillis::new(49), UnixTimeMillis::new(60))?
+            .is_none()
+    );
+    let second = reopened
+        .claim_next_effect(UnixTimeMillis::new(50), UnixTimeMillis::new(60))?
+        .expect("persisted retry must become due after restart");
+    assert_eq!(second.job().id, effect_id);
+    assert_eq!(second.attempt(), 2);
+    reopened.complete_effect(effect_id, second.attempt())?;
+    drop(reopened);
+
+    let reopened = SqliteWorldStorage::open(&path)?;
+    assert!(
+        reopened
+            .claim_next_effect(UnixTimeMillis::new(100), UnixTimeMillis::new(110))?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_keep_claim_authoritative_when_retry_error_is_rejected() -> Result<()> {
+    let (_root, storage) = create_storage()?;
+    let schemas = register_test_schemas(&storage)?;
+    let effect_id = enqueue_effect(&storage, &schemas, PrincipalId::new(), "bounded-error")?;
+    let claim = storage
+        .claim_next_effect(UnixTimeMillis::new(1), UnixTimeMillis::new(10))?
+        .expect("effect must be claimable");
+
+    let error = "x".repeat(8 * 1024 + 1);
+    assert!(matches!(
+        storage.retry_effect(effect_id, claim.attempt(), UnixTimeMillis::new(20), &error),
+        Err(StorageError::EffectErrorTooLarge { .. })
+    ));
+
+    storage.complete_effect(effect_id, claim.attempt())?;
+    Ok(())
+}
+
+#[test]
+fn test_should_migrate_v2_running_effect_back_to_claimable_pending_state() -> Result<()> {
+    let root = TempDir::new()?;
+    let path = root.path().join("world.sqlite");
+    let world_id = WorldId::new();
+    let command_id = CommandId::new();
+    let principal = PrincipalId::new();
+    let correlation_id = CorrelationId::new();
+    let effect_id = EffectJobId::new();
+
+    let mut connection = Connection::open(&path)?;
+    configure_connection(&connection)?;
+    migration::migrate_to_v1(&mut connection)?;
+    connection.execute(
+        "INSERT INTO world_metadata (
+            singleton, world_id, world_format_version, commit_position
+         ) VALUES (1, ?1, ?2, 1)",
+        params![
+            world_id.into_bytes().as_slice(),
+            i64::from(WORLD_FORMAT_VERSION)
+        ],
+    )?;
+    migration::migrate_to_v2(&mut connection)?;
+    connection.execute(
+        "INSERT INTO world_schemas (
+            schema_id, schema_version, kind, owner_extension_id, definition_json
+         ) VALUES
+            ('rintawa.test.command', 1, 4, 'rintawa.test', '{}'),
+            ('rintawa.test.effect', 1, 6, 'rintawa.test', '{}')",
+        [],
+    )?;
+    connection.execute(
+        "INSERT INTO world_commits (
+            commit_position, command_id, command_schema_id, command_schema_version,
+            principal_id, actor_kind, actor_id, causation_kind, causation_id,
+            correlation_id, expected_position, effective_at_ms, recorded_at_ms,
+            command_payload_json, command_digest
+         ) VALUES (
+            1, ?1, 'rintawa.test.command', 1,
+            ?2, 1, ?2, NULL, NULL,
+            ?3, NULL, NULL, 123, '{}', ?4
+         )",
+        params![
+            command_id.into_bytes().as_slice(),
+            principal.into_bytes().as_slice(),
+            correlation_id.into_bytes().as_slice(),
+            [7_u8; 32].as_slice(),
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO effect_jobs (
+            job_id, commit_position, job_index,
+            schema_id, schema_version, payload_json,
+            status, attempt_count, last_error
+         ) VALUES (?1, 1, 0, 'rintawa.test.effect', 1, '{}', 1, 4, 'legacy-running')",
+        [effect_id.into_bytes().as_slice()],
+    )?;
+    drop(connection);
+
+    let storage = SqliteWorldStorage::open(&path)?;
+    let reader = storage.reader()?;
+    assert_eq!(
+        migration::storage_version(&reader)?,
+        migration::STORAGE_SCHEMA_VERSION
+    );
+    let migrated: (i64, i64, i64, Option<i64>, Option<String>) = reader.query_row(
+        "SELECT status, attempt_count, available_at_ms, lease_expires_at_ms, last_error
+         FROM effect_jobs WHERE job_id = ?1",
+        [effect_id.into_bytes().as_slice()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    assert_eq!(
+        migrated,
+        (0, 4, 0, None, Some(String::from("legacy-running")))
+    );
+    drop(reader);
+
+    let claim = storage
+        .claim_next_effect(UnixTimeMillis::new(1), UnixTimeMillis::new(10))?
+        .expect("legacy running job must be safely reclaimable after migration");
+    assert_eq!(claim.job().id, effect_id);
+    assert_eq!(claim.attempt(), 5);
     Ok(())
 }
 

@@ -7,7 +7,9 @@
 #![warn(missing_docs, rustdoc::broken_intra_doc_links)]
 
 mod error;
+mod outbox;
 mod sqlite;
 
 pub use error::{StorageError, StorageResult};
+pub use outbox::ClaimedEffectJob;
 pub use sqlite::{SqliteWorldSnapshot, SqliteWorldStorage};

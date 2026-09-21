@@ -6,7 +6,7 @@ use rusqlite::{Connection, params};
 
 use crate::{StorageError, StorageResult};
 
-pub(super) const STORAGE_SCHEMA_VERSION: u32 = 2;
+pub(super) const STORAGE_SCHEMA_VERSION: u32 = 3;
 
 pub(super) fn initialize_new(connection: &mut Connection, world_id: WorldId) -> StorageResult<()> {
     let found = storage_version(connection)?;
@@ -28,6 +28,7 @@ pub(super) fn initialize_new(connection: &mut Connection, world_id: WorldId) -> 
         ],
     )?;
     migrate_to_v2(connection)?;
+    migrate_to_v3(connection)?;
     Ok(())
 }
 
@@ -56,6 +57,11 @@ pub(super) fn migrate_existing(connection: &mut Connection) -> StorageResult<()>
         }
         migrate_to_v2(connection)?;
         found = 2;
+    }
+
+    if found == 2 {
+        migrate_to_v3(connection)?;
+        found = 3;
     }
 
     if found != STORAGE_SCHEMA_VERSION {
@@ -95,7 +101,7 @@ pub(super) fn migrate_to_v1(connection: &mut Connection) -> StorageResult<()> {
     Ok(())
 }
 
-fn migrate_to_v2(connection: &mut Connection) -> StorageResult<()> {
+pub(super) fn migrate_to_v2(connection: &mut Connection) -> StorageResult<()> {
     let transaction = connection.transaction()?;
     transaction.execute_batch(
         "CREATE TABLE world_commits (
@@ -296,6 +302,61 @@ fn migrate_to_v2(connection: &mut Connection) -> StorageResult<()> {
 
         CREATE INDEX effect_jobs_pending_idx
             ON effect_jobs(status, commit_position, job_index);",
+    )?;
+    transaction.pragma_update(None, "user_version", 2_u32)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_to_v3(connection: &mut Connection) -> StorageResult<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "DROP INDEX effect_jobs_pending_idx;
+
+        CREATE TABLE effect_jobs_v3 (
+            job_id BLOB PRIMARY KEY CHECK (length(job_id) = 16),
+            commit_position INTEGER NOT NULL,
+            job_index INTEGER NOT NULL CHECK (job_index >= 0),
+            schema_id TEXT NOT NULL,
+            schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+            payload_json TEXT NOT NULL,
+            status INTEGER NOT NULL DEFAULT 0 CHECK (status IN (0, 1, 2, 3)),
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+            available_at_ms INTEGER NOT NULL DEFAULT 0,
+            lease_expires_at_ms INTEGER,
+            last_error TEXT,
+            UNIQUE (commit_position, job_index),
+            FOREIGN KEY (commit_position)
+                REFERENCES world_commits(commit_position)
+                ON UPDATE RESTRICT ON DELETE RESTRICT,
+            FOREIGN KEY (schema_id, schema_version)
+                REFERENCES world_schemas(schema_id, schema_version)
+                ON UPDATE RESTRICT ON DELETE RESTRICT,
+            CHECK (
+                (status = 1 AND lease_expires_at_ms IS NOT NULL)
+                OR (status != 1 AND lease_expires_at_ms IS NULL)
+            )
+        );
+
+        INSERT INTO effect_jobs_v3 (
+            job_id, commit_position, job_index,
+            schema_id, schema_version, payload_json,
+            status, attempt_count, available_at_ms, lease_expires_at_ms, last_error
+        )
+        SELECT
+            job_id, commit_position, job_index,
+            schema_id, schema_version, payload_json,
+            CASE status WHEN 1 THEN 0 ELSE status END,
+            attempt_count, 0, NULL, last_error
+        FROM effect_jobs;
+
+        DROP TABLE effect_jobs;
+        ALTER TABLE effect_jobs_v3 RENAME TO effect_jobs;
+
+        CREATE INDEX effect_jobs_pending_idx
+            ON effect_jobs(status, available_at_ms, commit_position, job_index);
+        CREATE INDEX effect_jobs_lease_idx
+            ON effect_jobs(status, lease_expires_at_ms, commit_position, job_index);",
     )?;
     transaction.pragma_update(None, "user_version", STORAGE_SCHEMA_VERSION)?;
     transaction.commit()?;

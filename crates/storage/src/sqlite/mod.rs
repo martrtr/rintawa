@@ -3,6 +3,7 @@
 mod codec;
 mod commit;
 mod migration;
+mod outbox;
 mod query;
 mod snapshot;
 
@@ -16,7 +17,7 @@ use std::{
     time::Duration,
 };
 
-use rintawa_sdk::world::{EntityId, RelationId, SchemaKey, WorldId};
+use rintawa_sdk::world::{EffectJobId, EntityId, RelationId, SchemaKey, UnixTimeMillis, WorldId};
 use rintawa_world::{
     CommitReceipt, EntityRecord, FacetRecord, FacetTarget, RelationRecord, SchemaDefinition,
     SchemaRegistration, SchemaRegistry, StoredEffectJob, StoredWorldEvent, StoredWorldMutation,
@@ -24,7 +25,7 @@ use rintawa_world::{
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
-use crate::{StorageError, StorageResult};
+use crate::{ClaimedEffectJob, StorageError, StorageResult};
 
 use self::codec::{load_schema, load_schema_registry, schema_kind_code, world_id_from_blob};
 
@@ -330,6 +331,8 @@ impl SqliteWorldStorage {
 
     /// Reads pending durable external effect jobs in deterministic enqueue order.
     ///
+    /// Delayed retries remain pending and can appear here before their next
+    /// `available_at`; workers should use `claim_next_effect` for due-job selection.
     /// The requested batch is bounded internally to protect host memory.
     ///
     /// # Errors
@@ -338,6 +341,73 @@ impl SqliteWorldStorage {
     pub fn pending_effects(&self, limit: usize) -> StorageResult<Vec<StoredEffectJob>> {
         let connection = self.reader()?;
         query::pending_effects(&connection, self.world_id, limit)
+    }
+
+    /// Atomically leases the oldest due or expired durable effect job.
+    ///
+    /// A reclaimed expired job receives a new attempt number. The returned
+    /// attempt is a fencing token: completion/retry from any older claim is
+    /// rejected after reclaim. External execution must use the stable job ID as
+    /// its idempotency key because an expired worker may still resume outside
+    /// the database transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-lease, attempt-overflow, corruption, or SQLite error.
+    pub fn claim_next_effect(
+        &self,
+        now: UnixTimeMillis,
+        lease_expires_at: UnixTimeMillis,
+    ) -> StorageResult<Option<ClaimedEffectJob>> {
+        let mut connection = self.writer()?;
+        outbox::claim_next(&mut connection, self.world_id, now, lease_expires_at)
+    }
+
+    /// Marks one currently leased effect job complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns EffectJobClaimLost when the attempt no longer owns the lease, or
+    /// EffectJobNotFound when the durable job identity is unknown.
+    pub fn complete_effect(&self, job_id: EffectJobId, attempt: u32) -> StorageResult<()> {
+        let connection = self.writer()?;
+        outbox::complete(&connection, job_id, attempt)
+    }
+
+    /// Returns one currently leased effect job to the pending queue.
+    ///
+    /// `available_at` controls the earliest future claim and therefore lets the
+    /// worker implement backoff without sleeping while holding a lease. `diagnostic`
+    /// is durable and must already be a sanitized, non-secret summary; storage
+    /// bounds it but cannot infer provider-specific secret formats.
+    ///
+    /// # Errors
+    ///
+    /// Returns EffectJobClaimLost for stale attempts, a bounded-error failure,
+    /// EffectJobNotFound, or another storage error.
+    pub fn retry_effect(
+        &self,
+        job_id: EffectJobId,
+        attempt: u32,
+        available_at: UnixTimeMillis,
+        diagnostic: &str,
+    ) -> StorageResult<()> {
+        let connection = self.writer()?;
+        outbox::retry(&connection, job_id, attempt, available_at, diagnostic)
+    }
+
+    /// Cancels a pending or running durable effect job.
+    ///
+    /// Cancellation is idempotent. Cancelling a running job invalidates its
+    /// fencing token so a late completion cannot resurrect the job.
+    ///
+    /// # Errors
+    ///
+    /// Returns EffectJobNotFound for an unknown job or EffectJobTerminal when a
+    /// completed job can no longer be cancelled.
+    pub fn cancel_effect(&self, job_id: EffectJobId) -> StorageResult<bool> {
+        let connection = self.writer()?;
+        outbox::cancel(&connection, job_id)
     }
 
     fn writer(&self) -> StorageResult<MutexGuard<'_, Connection>> {

@@ -84,6 +84,31 @@ pub enum StorageError {
     #[error("effect job {0} does not exist")]
     EffectJobNotFound(EffectJobId),
 
+    /// An effect worker requested a lease that does not extend beyond the claim time.
+    #[error("effect job lease must expire after the claim time")]
+    InvalidEffectLease,
+
+    /// A previous effect claim lost authority because the job was reclaimed or cancelled.
+    #[error("effect job claim for {0} is no longer authoritative")]
+    EffectJobClaimLost(EffectJobId),
+
+    /// The effect job attempt counter cannot be incremented further.
+    #[error("effect job {0} attempt counter overflowed")]
+    EffectAttemptOverflow(EffectJobId),
+
+    /// A completed effect job cannot transition back to a worker-controlled state.
+    #[error("effect job {0} is already terminal")]
+    EffectJobTerminal(EffectJobId),
+
+    /// Worker diagnostic text exceeds the bounded durable error field.
+    #[error("effect job error is {actual_bytes} bytes, exceeding the {maximum_bytes}-byte limit")]
+    EffectErrorTooLarge {
+        /// Supplied UTF-8 byte length.
+        actual_bytes: usize,
+        /// Maximum persisted error size.
+        maximum_bytes: usize,
+    },
+
     /// The storage mutex became poisoned after an internal panic.
     #[error("world storage connection is unavailable")]
     ConnectionUnavailable,

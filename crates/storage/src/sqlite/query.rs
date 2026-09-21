@@ -1,6 +1,6 @@
 //! Read-side SQLite projections for current state, events, and outbox jobs.
 
-use rintawa_sdk::world::{EntityId, RelationId, SchemaKey, UnixTimeMillis, WorldId};
+use rintawa_sdk::world::{EffectJobId, EntityId, RelationId, SchemaKey, UnixTimeMillis, WorldId};
 use rintawa_world::{
     ActorRef, CausationRef, CommandProvenance, EntityRecord, FacetRecord, FacetTarget,
     RelationRecord, StoredEffectJob, StoredWorldEvent, StoredWorldMutation,
@@ -275,6 +275,65 @@ pub(super) fn events_after(
         })
     })
     .collect()
+}
+
+pub(super) fn effect_job_by_id(
+    connection: &Connection,
+    world_id: WorldId,
+    job_id: EffectJobId,
+) -> StorageResult<Option<StoredEffectJob>> {
+    let row = connection
+        .query_row(
+            "SELECT
+                j.job_id, j.commit_position, j.job_index,
+                j.schema_id, j.schema_version, j.payload_json, j.attempt_count,
+                c.command_id, c.command_schema_id, c.command_schema_version,
+                c.principal_id, c.actor_kind, c.actor_id,
+                c.causation_kind, c.causation_id, c.correlation_id,
+                c.effective_at_ms, c.recorded_at_ms
+             FROM effect_jobs j
+             JOIN world_commits c ON c.commit_position = j.commit_position
+             WHERE j.job_id = ?1",
+            [job_id.into_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    provenance_sql_from_row(row, 7)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    row.map(
+        |(
+            id,
+            commit_position,
+            job_index,
+            schema_id,
+            schema_version,
+            payload,
+            attempt_count,
+            provenance,
+        )| {
+            Ok(StoredEffectJob {
+                world_id,
+                id: effect_job_id_from_blob(id)?,
+                commit_position: position_from_sql(commit_position)?,
+                job_index: index_from_sql(job_index, "job_index")?,
+                provenance: decode_provenance(provenance)?,
+                schema: decode_schema_key(schema_id, schema_version)?,
+                payload: serde_json::from_str(&payload)?,
+                attempt_count: index_from_sql(attempt_count, "attempt_count")?,
+            })
+        },
+    )
+    .transpose()
 }
 
 pub(super) fn pending_effects(
