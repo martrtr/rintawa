@@ -21,6 +21,7 @@ rintawa-extension-engine = { path = "../extension-engine" }
 rintawa-sdk = { path = "../sdk" }
 rintawa-storage = { path = "../storage" }
 rintawa-world = { path = "../world" }
+rintawa-world-runtime = { path = "../world-runtime" }
 
 [dev-dependencies]
 anyhow.workspace = true

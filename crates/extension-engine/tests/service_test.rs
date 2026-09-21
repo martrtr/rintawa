@@ -196,6 +196,171 @@ fn test_unary_service_route_tracks_provider_lifecycle() -> Result<()> {
 }
 
 #[test]
+fn test_platform_caller_only_invokes_platform_owned_service_contracts() -> Result<()> {
+    let scope = RuntimeScopeId::new("world:platform");
+    let platform_service = contract("rintawa.test.platform-system");
+    let platform_binding = contract("rintawa.test.platform-binding");
+    let extension_service = contract("example.extension-service");
+    let provider_instance = ExtensionInstanceId::new("provider-instance");
+    let mut engine = ExtensionEngine::new();
+
+    engine.define_platform_service_contract_in_scope(
+        scope.clone(),
+        platform_service.clone(),
+        ContractResolutionPolicy::Single,
+    )?;
+    engine.define_platform_binding_contract_in_scope(
+        scope.clone(),
+        platform_binding.clone(),
+        ContractResolutionPolicy::Single,
+    )?;
+    engine.register_extension_instance(
+        provider_instance.clone(),
+        scope.clone(),
+        manifest("provider"),
+        vec![Box::new(
+            ServiceComponent::new("runtime")
+                .defining(ContractDefinition::service(
+                    extension_service.clone(),
+                    ContractResolutionPolicy::Single,
+                ))
+                .providing(ContractProvider::new(platform_service.clone()))
+                .providing(ContractProvider::new(platform_binding.clone()))
+                .providing(ContractProvider::new(extension_service.clone()))
+                .responding(b"platform-pong".to_vec()),
+        )],
+    )?;
+    engine.start_extension_instance(&provider_instance)?;
+
+    let caller = engine.platform_service_caller(scope.clone());
+    assert_eq!(caller.scope_id(), &scope);
+    assert_eq!(caller.call(&platform_service, b"ping")?, b"platform-pong");
+    assert_eq!(
+        caller.call(&platform_binding, b"ping"),
+        Err(ServiceCallError::NotServiceContract)
+    );
+    assert_eq!(
+        caller.call(&extension_service, b"ping"),
+        Err(ServiceCallError::Unavailable)
+    );
+
+    engine.stop_extension_instance(&provider_instance)?;
+    assert_eq!(
+        caller.call(&platform_service, b"ping"),
+        Err(ServiceCallError::Unavailable)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_platform_caller_can_pin_provider_extension_owner() -> Result<()> {
+    let contract = contract("rintawa.test.owner-pinned-platform-service");
+    let scope = RuntimeScopeId::new("world:owner-pinned");
+    let hijacker_instance = ExtensionInstanceId::new("a-hijacker");
+    let owner_instance = ExtensionInstanceId::new("z-owner");
+    let mut engine = ExtensionEngine::new();
+
+    engine.define_platform_service_contract_in_scope(
+        scope.clone(),
+        contract.clone(),
+        ContractResolutionPolicy::Single,
+    )?;
+    engine.register_extension_instance(
+        hijacker_instance.clone(),
+        scope.clone(),
+        manifest("hijacker"),
+        vec![Box::new(
+            ServiceComponent::new("runtime")
+                .providing(ContractProvider::new(contract.clone()))
+                .responding(b"hijacked".to_vec()),
+        )],
+    )?;
+    engine.register_extension_instance(
+        owner_instance.clone(),
+        scope.clone(),
+        manifest("schema-owner"),
+        vec![Box::new(
+            ServiceComponent::new("runtime")
+                .providing(ContractProvider::new(contract.clone()))
+                .responding(b"owner".to_vec()),
+        )],
+    )?;
+    engine.start_extension_instance(&hijacker_instance)?;
+    engine.start_extension_instance(&owner_instance)?;
+
+    assert_eq!(
+        engine
+            .platform_service_caller(scope.clone())
+            .call(&contract, b"ping")?,
+        b"hijacked"
+    );
+
+    let caller = engine
+        .platform_service_caller_for_extension(scope.clone(), ExtensionId::new("schema-owner"));
+    assert_eq!(
+        caller.provider_extension_id(),
+        Some(&ExtensionId::new("schema-owner"))
+    );
+    assert_eq!(caller.call(&contract, b"ping")?, b"owner");
+
+    let missing =
+        engine.platform_service_caller_for_extension(scope, ExtensionId::new("missing-owner"));
+    assert_eq!(
+        missing.call(&contract, b"ping"),
+        Err(ServiceCallError::Unavailable)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_platform_caller_isolates_identical_contracts_by_scope() -> Result<()> {
+    let contract = contract("rintawa.test.scoped-platform-service");
+    let scope_a = RuntimeScopeId::new("world:a");
+    let scope_b = RuntimeScopeId::new("world:b");
+    let instance_a = ExtensionInstanceId::new("provider-a");
+    let instance_b = ExtensionInstanceId::new("provider-b");
+    let mut engine = ExtensionEngine::new();
+
+    for scope in [&scope_a, &scope_b] {
+        engine.define_platform_service_contract_in_scope(
+            scope.clone(),
+            contract.clone(),
+            ContractResolutionPolicy::Single,
+        )?;
+    }
+    for (instance, scope, response) in [
+        (&instance_a, &scope_a, b"a".to_vec()),
+        (&instance_b, &scope_b, b"b".to_vec()),
+    ] {
+        engine.register_extension_instance(
+            instance.clone(),
+            scope.clone(),
+            manifest(instance.as_str()),
+            vec![Box::new(
+                ServiceComponent::new("runtime")
+                    .providing(ContractProvider::new(contract.clone()))
+                    .responding(response),
+            )],
+        )?;
+        engine.start_extension_instance(instance)?;
+    }
+
+    assert_eq!(
+        engine
+            .platform_service_caller(scope_a)
+            .call(&contract, b"ping")?,
+        b"a"
+    );
+    assert_eq!(
+        engine
+            .platform_service_caller(scope_b)
+            .call(&contract, b"ping")?,
+        b"b"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_bound_caller_uses_platform_service_contract_and_tracks_lifecycle() -> Result<()> {
     let scope = RuntimeScopeId::new("world:test");
     let contract = contract("rintawa.test.platform-service");

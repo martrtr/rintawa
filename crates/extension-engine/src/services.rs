@@ -19,7 +19,8 @@ use tracing::warn;
 
 use crate::{
     composition::{
-        OwnedContractConsumer, OwnedContractDefinition, OwnedContractProvider, resolve_contracts,
+        OwnedContractConsumer, OwnedContractDefinition, OwnedContractProvider,
+        resolve_contract_providers, resolve_contracts,
     },
     context::{ComponentIdentity, EngineLogger},
     secrets::SecretManager,
@@ -126,6 +127,14 @@ pub struct BoundServiceCaller {
     consumer: ComponentRef,
 }
 
+/// Cloneable host caller restricted to platform-owned services in one exact scope.
+#[derive(Clone)]
+pub struct PlatformServiceCaller {
+    services: ServiceRuntime,
+    scope_id: RuntimeScopeId,
+    provider_extension_id: Option<ExtensionId>,
+}
+
 impl BoundServiceCaller {
     pub(crate) fn new(services: ServiceRuntime, consumer: ComponentRef) -> Self {
         Self { services, consumer }
@@ -139,6 +148,50 @@ impl BoundServiceCaller {
     /// Returns the immutable component principal represented by this handle.
     pub const fn consumer(&self) -> &ComponentRef {
         &self.consumer
+    }
+}
+
+impl PlatformServiceCaller {
+    pub(crate) fn new(services: ServiceRuntime, scope_id: RuntimeScopeId) -> Self {
+        Self {
+            services,
+            scope_id,
+            provider_extension_id: None,
+        }
+    }
+
+    pub(crate) fn for_extension(
+        services: ServiceRuntime,
+        scope_id: RuntimeScopeId,
+        provider_extension_id: ExtensionId,
+    ) -> Self {
+        Self {
+            services,
+            scope_id,
+            provider_extension_id: Some(provider_extension_id),
+        }
+    }
+
+    /// Calls one platform-owned unary service in the bound runtime scope.
+    ///
+    /// Extension-defined contracts are rejected even if they share an active provider.
+    pub fn call(&self, contract: &ContractKey, request: &[u8]) -> ServiceCallResult<Vec<u8>> {
+        self.services.call_platform(
+            &self.scope_id,
+            self.provider_extension_id.as_ref(),
+            contract,
+            request,
+        )
+    }
+
+    /// Returns the exact composition scope represented by this handle.
+    pub const fn scope_id(&self) -> &RuntimeScopeId {
+        &self.scope_id
+    }
+
+    /// Returns the required provider extension when this caller is owner-pinned.
+    pub const fn provider_extension_id(&self) -> Option<&ExtensionId> {
+        self.provider_extension_id.as_ref()
     }
 }
 
@@ -286,6 +339,28 @@ impl ServiceRuntime {
         self.call_with_stack(caller, contract, request, true, &[])
     }
 
+    pub(crate) fn call_platform(
+        &self,
+        scope_id: &RuntimeScopeId,
+        provider_extension_id: Option<&ExtensionId>,
+        contract: &ContractKey,
+        request: &[u8],
+    ) -> ServiceCallResult<Vec<u8>> {
+        if request.len() > self.max_message_bytes {
+            return Err(ServiceCallError::RequestTooLarge);
+        }
+        let (provider, component, provider_identity) =
+            self.resolve_platform_provider(scope_id, provider_extension_id, contract)?;
+        self.invoke_provider(
+            provider,
+            component,
+            provider_identity,
+            contract,
+            request,
+            &[],
+        )
+    }
+
     fn call_with_stack(
         &self,
         caller: &ComponentRef,
@@ -300,6 +375,25 @@ impl ServiceRuntime {
 
         let (provider, component, provider_identity) =
             self.resolve_provider(caller, contract, allow_inactive_caller)?;
+        self.invoke_provider(
+            provider,
+            component,
+            provider_identity,
+            contract,
+            request,
+            call_stack,
+        )
+    }
+
+    fn invoke_provider(
+        &self,
+        provider: ComponentRef,
+        component: ComponentHandle,
+        provider_identity: ComponentIdentity,
+        contract: &ContractKey,
+        request: &[u8],
+        call_stack: &[ComponentRef],
+    ) -> ServiceCallResult<Vec<u8>> {
         if call_stack.contains(&provider) {
             return Err(ServiceCallError::CyclicCall);
         }
@@ -354,6 +448,68 @@ impl ServiceRuntime {
             return Err(ServiceCallError::ResponseTooLarge);
         }
         Ok(response)
+    }
+
+    fn resolve_platform_provider(
+        &self,
+        scope_id: &RuntimeScopeId,
+        provider_extension_id: Option<&ExtensionId>,
+        contract: &ContractKey,
+    ) -> ServiceCallResult<(ComponentRef, ComponentHandle, ComponentIdentity)> {
+        loop {
+            let policy_revision = self.secrets.policy_revision();
+            let state = self
+                .state
+                .read()
+                .map_err(|_| ServiceCallError::Unavailable)?;
+            let definition = state
+                .platform_definitions
+                .get(scope_id)
+                .and_then(|definitions| definitions.get(contract))
+                .ok_or(ServiceCallError::Unavailable)?;
+            if definition.protocol != ContractProtocol::Service {
+                return Err(ServiceCallError::NotServiceContract);
+            }
+
+            let providers = state
+                .instances
+                .values()
+                .filter(|instance| {
+                    instance.is_active
+                        && &instance.scope_id == scope_id
+                        && provider_extension_id
+                            .is_none_or(|expected| &instance.extension_id == expected)
+                })
+                .flat_map(|instance| instance.providers.iter().cloned())
+                .collect::<Vec<_>>();
+            let preferred = state
+                .preferred_providers
+                .get(scope_id)
+                .and_then(|providers| providers.get(contract));
+            let resolved = resolve_contract_providers(
+                contract,
+                definition.resolution,
+                &providers,
+                preferred,
+                &self.secrets,
+            )
+            .map_err(|_| ServiceCallError::Unavailable)?;
+            if self.secrets.policy_revision() != policy_revision {
+                drop(state);
+                continue;
+            }
+            if resolved.len() != 1 {
+                return Err(ServiceCallError::UnsupportedResolution);
+            }
+            let provider = resolved[0].clone();
+            let component = state
+                .component(&provider)
+                .ok_or(ServiceCallError::Unavailable)?;
+            let identity = state
+                .component_identity(&provider)
+                .ok_or(ServiceCallError::Unavailable)?;
+            return Ok((provider, component, identity));
+        }
     }
 
     fn resolve_provider(

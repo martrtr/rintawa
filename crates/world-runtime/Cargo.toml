@@ -10,6 +10,8 @@ rust-version.workspace = true
 description = "Single-writer authoritative world command runtime for Rintawa"
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 rintawa-sdk = { path = "../sdk" }

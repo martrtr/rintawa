@@ -16,12 +16,15 @@ use rintawa_extension_engine::{
 };
 use rintawa_sdk::{
     contracts::{
-        ComponentRef, ContractResolutionPolicy, host_shell_contract_key, ui_layer_contract_key,
+        ComponentRef, ContractKey, ContractResolutionPolicy, host_shell_contract_key,
+        ui_layer_contract_key,
     },
     runtime_permissions::RuntimePermission,
-    types::{ExtensionInstanceId, RuntimeScopeId},
+    types::{ExtensionId, ExtensionInstanceId, RuntimeScopeId},
+    world::SchemaKey,
 };
 use rintawa_world::StoredWorldEvent;
+use rintawa_world_runtime::{ServiceWorldSystem, world_system_service_contract_key};
 
 use crate::{
     BootstrapBlockedActivation, BootstrapDeferredActivation, BootstrapRollback, BootstrapStall,
@@ -595,6 +598,42 @@ impl HostRuntime {
         self.ui_layer_provider.as_ref()
     }
 
+    /// Binds one exact command schema to an extension-provided World System service.
+    ///
+    /// The service contract is platform-owned and scoped to the authoritative world.
+    /// Provider resolution is pinned to the extension that owns the command schema,
+    /// so another package in the same world scope cannot hijack the System role.
+    /// The returned System still evaluates through the ordinary World Runtime, so
+    /// transaction validation, authority checks, optimistic position checks, and
+    /// commit ordering remain authoritative host responsibilities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an Extension Engine contract-definition error when the same key was
+    /// already reserved incompatibly or defined by an extension.
+    pub fn bind_world_system(
+        &mut self,
+        world_id: rintawa_sdk::world::WorldId,
+        command_schema: SchemaKey,
+        schema_owner: ExtensionId,
+    ) -> HostResult<ServiceWorldSystem> {
+        let scope_id = world_runtime_scope_id(world_id);
+        let contract = world_system_service_contract_key(&command_schema);
+        self.engine.define_platform_service_contract_in_scope(
+            scope_id.clone(),
+            contract,
+            ContractResolutionPolicy::Single,
+        )?;
+        let caller = self
+            .engine
+            .platform_service_caller_for_extension(scope_id, schema_owner);
+        Ok(ServiceWorldSystem::new(
+            world_id,
+            command_schema,
+            move |contract: &ContractKey, request: &[u8]| caller.call(contract, request),
+        ))
+    }
+
     /// Delivers committed durable world events to one active runtime scope.
     ///
     /// Routing uses each event's exact versioned schema as the runtime topic.
@@ -775,9 +814,19 @@ mod tests {
         manifest::ExtensionManifest,
         prelude::{Component, ComponentId, ContractResolutionPolicy, ExtensionId},
         runtime_effects::RuntimeEffect,
-        world::{CommandId, CorrelationId, PrincipalId, UnixTimeMillis, WorldEventId, WorldId},
+        world::{
+            CommandId, CorrelationId, PrincipalId, SchemaKey, UnixTimeMillis, WorldEventId, WorldId,
+        },
     };
-    use rintawa_world::{ActorRef, CommandProvenance};
+    use rintawa_storage::SqliteWorldStorage;
+    use rintawa_world::{
+        ActorRef, CommandProvenance, SchemaDefinition, SchemaKind, WorldCommand, WorldEventDraft,
+        WorldTransaction,
+    };
+    use rintawa_world_runtime::{
+        WorldRuntimeBuilder, WorldSystemServiceRequest, WorldSystemServiceResponse,
+        world_system_service_contract_key,
+    };
     use std::sync::{Arc, Mutex};
 
     struct ContractComponent {
@@ -827,6 +876,76 @@ mod tests {
         }
     }
 
+    struct WorldSystemProvider {
+        id: ComponentId,
+        contract: ContractKey,
+        event_schema: SchemaKey,
+    }
+
+    impl Component for WorldSystemProvider {
+        fn id(&self) -> &ComponentId {
+            &self.id
+        }
+
+        fn register(&mut self, ctx: &mut dyn RegistrationContext) -> ExtensionResult<()> {
+            ctx.provide_contract(ContractProvider::new(self.contract.clone()))
+        }
+
+        fn handle_service(
+            &mut self,
+            _ctx: &mut dyn ComponentContext,
+            contract: &ContractKey,
+            request: &[u8],
+        ) -> ExtensionResult<Vec<u8>> {
+            if contract != &self.contract {
+                return Err(ExtensionError::ServiceHandlerUnavailable(
+                    contract.to_string(),
+                ));
+            }
+            let request: WorldSystemServiceRequest = serde_json::from_slice(request)
+                .map_err(|error| ExtensionError::Message(error.to_string()))?;
+            let mut transaction = WorldTransaction::new();
+            transaction.push_event(WorldEventDraft::new(
+                self.event_schema.clone(),
+                request.command().payload().clone(),
+            ));
+            serde_json::to_vec(&WorldSystemServiceResponse::Transaction { transaction })
+                .map_err(|error| ExtensionError::Message(error.to_string()))
+        }
+    }
+
+    struct RejectingWorldSystemProvider {
+        id: ComponentId,
+        contract: ContractKey,
+    }
+
+    impl Component for RejectingWorldSystemProvider {
+        fn id(&self) -> &ComponentId {
+            &self.id
+        }
+
+        fn register(&mut self, ctx: &mut dyn RegistrationContext) -> ExtensionResult<()> {
+            ctx.provide_contract(ContractProvider::new(self.contract.clone()))
+        }
+
+        fn handle_service(
+            &mut self,
+            _ctx: &mut dyn ComponentContext,
+            contract: &ContractKey,
+            _request: &[u8],
+        ) -> ExtensionResult<Vec<u8>> {
+            if contract != &self.contract {
+                return Err(ExtensionError::ServiceHandlerUnavailable(
+                    contract.to_string(),
+                ));
+            }
+            serde_json::to_vec(&WorldSystemServiceResponse::Rejected {
+                reason: String::from("hijacker selected"),
+            })
+            .map_err(|error| ExtensionError::Message(error.to_string()))
+        }
+    }
+
     struct WorldEventSubscriber {
         id: ComponentId,
         topic: String,
@@ -857,6 +976,90 @@ mod tests {
                 .push((topic.to_string(), event));
             Ok(())
         }
+    }
+
+    #[test]
+    fn test_should_execute_extension_world_system_through_platform_service() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let world_id = WorldId::new();
+        let storage = SqliteWorldStorage::create(root.path().join("world.sqlite"), world_id)?;
+        let command_schema: SchemaKey = "rintawa.test.service-command@1".parse()?;
+        let event_schema: SchemaKey = "rintawa.test.service-event@1".parse()?;
+        let owner = ExtensionId::new("rintawa.test-system");
+        storage.register_schema(&SchemaDefinition::new(
+            command_schema.clone(),
+            SchemaKind::Command,
+            owner.clone(),
+            serde_json::json!({ "type": "object" }),
+        ))?;
+        storage.register_schema(&SchemaDefinition::new(
+            event_schema.clone(),
+            SchemaKind::Event,
+            owner.clone(),
+            serde_json::json!({ "type": "object" }),
+        ))?;
+
+        let mut host = HostRuntime {
+            engine: ExtensionEngine::new(),
+            started_instances: Vec::new(),
+            host_shell_provider: None,
+            ui_layer_provider: None,
+        };
+        let system = host.bind_world_system(world_id, command_schema.clone(), owner)?;
+        let contract = world_system_service_contract_key(&command_schema);
+        let scope = world_runtime_scope_id(world_id);
+
+        let hijacker_instance = ExtensionInstanceId::new("a-hijacker");
+        host.engine.register_extension_instance(
+            hijacker_instance.clone(),
+            scope.clone(),
+            test_manifest("rintawa.hijacker"),
+            vec![Box::new(RejectingWorldSystemProvider {
+                id: ComponentId::new("runtime"),
+                contract: contract.clone(),
+            })],
+        )?;
+        host.engine.start_extension_instance(&hijacker_instance)?;
+        host.started_instances.push(hijacker_instance);
+
+        let provider_instance = ExtensionInstanceId::new("z-world-system-provider");
+        host.engine.register_extension_instance(
+            provider_instance.clone(),
+            scope,
+            test_manifest("rintawa.test-system"),
+            vec![Box::new(WorldSystemProvider {
+                id: ComponentId::new("runtime"),
+                contract,
+                event_schema: event_schema.clone(),
+            })],
+        )?;
+        host.engine.start_extension_instance(&provider_instance)?;
+        host.started_instances.push(provider_instance);
+
+        let mut builder = WorldRuntimeBuilder::new(storage);
+        builder.register_system(system)?;
+        let world_runtime = builder.start()?;
+        let principal = PrincipalId::new();
+        let outcome = world_runtime
+            .submit(WorldCommand::new(
+                command_schema,
+                principal,
+                ActorRef::Principal(principal),
+                serde_json::json!({ "kind": "extension-system" }),
+            ))?
+            .wait_outcome()?;
+
+        assert_eq!(outcome.receipt().position(), 1);
+        assert_eq!(outcome.committed_events().len(), 1);
+        assert_eq!(outcome.committed_events()[0].schema, event_schema);
+        assert_eq!(
+            outcome.committed_events()[0].payload,
+            serde_json::json!({ "kind": "extension-system" })
+        );
+
+        world_runtime.shutdown()?;
+        host.shutdown()?;
+        Ok(())
     }
 
     #[test]

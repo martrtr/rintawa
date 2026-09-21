@@ -46,7 +46,10 @@ use crate::{
     runtime_effects::RuntimeEffectRegistry,
     runtime_permissions::RuntimePermissionManager,
     secrets::SecretManager,
-    services::{BoundServiceCaller, ComponentHandle, ServiceInstanceRegistration, ServiceRuntime},
+    services::{
+        BoundServiceCaller, ComponentHandle, PlatformServiceCaller, ServiceInstanceRegistration,
+        ServiceRuntime,
+    },
 };
 
 /// Represents the active lifecycle state of an extension in the engine.
@@ -1732,6 +1735,26 @@ impl ExtensionEngine {
     /// scope/grant/provider policy.
     pub fn bound_service_caller(&self, consumer: ComponentRef) -> BoundServiceCaller {
         BoundServiceCaller::new(self.services.clone(), consumer)
+    }
+
+    /// Returns a cloneable host caller for platform-owned services in one scope.
+    ///
+    /// The handle cannot invoke extension-defined contracts and does not impersonate
+    /// an extension component principal.
+    pub fn platform_service_caller(&self, scope_id: RuntimeScopeId) -> PlatformServiceCaller {
+        PlatformServiceCaller::new(self.services.clone(), scope_id)
+    }
+
+    /// Returns a host caller restricted to one provider extension in one scope.
+    ///
+    /// This is useful when a platform-owned service contract represents authority
+    /// delegated to the owner of another versioned resource, such as a world schema.
+    pub fn platform_service_caller_for_extension(
+        &self,
+        scope_id: RuntimeScopeId,
+        provider_extension_id: ExtensionId,
+    ) -> PlatformServiceCaller {
+        PlatformServiceCaller::for_extension(self.services.clone(), scope_id, provider_extension_id)
     }
 
     /// Calls a unary service on behalf of an active consumer component.
