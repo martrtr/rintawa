@@ -8,7 +8,7 @@ use std::{
 use rintawa_sdk::{
     api::LoggerApi,
     context::ComponentContext,
-    contracts::{ComponentRef, ContractKey, ContractProtocol},
+    contracts::{ComponentRef, ContractDefinition, ContractKey, ContractProtocol},
     errors::{ExtensionError, ExtensionResult},
     secrets::{SecretPath, SecretValue},
     services::{ServiceCallError, ServiceCallResult},
@@ -68,6 +68,7 @@ struct CachedRoute {
 #[derive(Default)]
 struct ServiceRuntimeState {
     instances: HashMap<ExtensionInstanceId, ServiceExtensionInstance>,
+    platform_definitions: HashMap<RuntimeScopeId, HashMap<ContractKey, ContractDefinition>>,
     preferred_providers: HashMap<RuntimeScopeId, HashMap<ContractKey, ComponentRef>>,
     topology_revision: u64,
     route_cache: HashMap<RouteKey, CachedRoute>,
@@ -114,6 +115,33 @@ pub(crate) struct ServiceRuntime {
     max_message_bytes: usize,
 }
 
+/// Cloneable service caller permanently bound to one component principal.
+///
+/// Creating this handle grants no service capability by itself. Every call still
+/// resolves through the ordinary service runtime and therefore requires the bound
+/// component to be an active declared consumer in the exact runtime scope.
+#[derive(Clone)]
+pub struct BoundServiceCaller {
+    services: ServiceRuntime,
+    consumer: ComponentRef,
+}
+
+impl BoundServiceCaller {
+    pub(crate) fn new(services: ServiceRuntime, consumer: ComponentRef) -> Self {
+        Self { services, consumer }
+    }
+
+    /// Calls one versioned unary service as the bound component principal.
+    pub fn call(&self, contract: &ContractKey, request: &[u8]) -> ServiceCallResult<Vec<u8>> {
+        self.services.call(&self.consumer, contract, request)
+    }
+
+    /// Returns the immutable component principal represented by this handle.
+    pub const fn consumer(&self) -> &ComponentRef {
+        &self.consumer
+    }
+}
+
 impl ServiceRuntime {
     pub(crate) fn new(secrets: SecretManager) -> Self {
         Self {
@@ -121,6 +149,24 @@ impl ServiceRuntime {
             secrets,
             max_message_bytes: DEFAULT_MAX_SERVICE_MESSAGE_BYTES,
         }
+    }
+
+    pub(crate) fn define_platform_contract(
+        &self,
+        scope_id: RuntimeScopeId,
+        definition: ContractDefinition,
+    ) -> Result<(), ()> {
+        let mut state = self.state.write().map_err(|_| ())?;
+        let definitions = state.platform_definitions.entry(scope_id).or_default();
+        if let Some(existing) = definitions.get(&definition.contract) {
+            if existing != &definition {
+                return Err(());
+            }
+            return Ok(());
+        }
+        definitions.insert(definition.contract.clone(), definition);
+        state.topology_changed();
+        Ok(())
     }
 
     pub(crate) fn register_instance(
@@ -400,7 +446,12 @@ impl ServiceRuntime {
             .ok_or(ServiceCallError::Unavailable)?;
         let caller_scope = &caller_instance.scope_id;
 
-        let mut definitions = Vec::new();
+        let mut definitions = state
+            .platform_definitions
+            .get(caller_scope)
+            .into_iter()
+            .flat_map(|definitions| definitions.values().cloned())
+            .collect::<Vec<_>>();
         let mut providers = Vec::new();
         let mut consumers = Vec::new();
 

@@ -49,6 +49,7 @@ pub use host_access::{
 pub use loader::ExtensionLoader;
 pub use runtime::{WasmComponent, WasmExecutionBudget, WasmRuntimeEngine};
 pub use secrets::SecretManager;
+pub use services::BoundServiceCaller;
 pub use state::{ExtensionStateRecord, ExtensionsStateConfig, STATE_FILE_NAME};
 
 #[cfg(test)]

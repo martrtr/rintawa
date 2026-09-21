@@ -46,7 +46,7 @@ use crate::{
     runtime_effects::RuntimeEffectRegistry,
     runtime_permissions::RuntimePermissionManager,
     secrets::SecretManager,
-    services::{ComponentHandle, ServiceInstanceRegistration, ServiceRuntime},
+    services::{BoundServiceCaller, ComponentHandle, ServiceInstanceRegistration, ServiceRuntime},
 };
 
 /// Represents the active lifecycle state of an extension in the engine.
@@ -472,13 +472,46 @@ impl ExtensionEngine {
     /// Returns [`EngineError::PlatformContractReservationConflict`] if an extension
     /// already defined the contract in this scope, or
     /// [`EngineError::ContractDefinitionConflict`] if the platform already defined
-    /// the same contract with another resolution policy.
+    /// the same contract with another protocol or resolution policy.
     pub fn define_platform_binding_contract_in_scope(
         &mut self,
         scope_id: RuntimeScopeId,
         contract: ContractKey,
         resolution: ContractResolutionPolicy,
     ) -> EngineResult<()> {
+        self.define_platform_contract_in_scope(
+            scope_id,
+            ContractDefinition::new(contract, resolution),
+        )
+    }
+
+    /// Defines one platform-owned unary service contract inside an exact runtime scope.
+    ///
+    /// Extensions may provide or consume the contract but cannot redefine its
+    /// protocol or resolution policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same reservation/conflict errors as
+    /// [`Self::define_platform_binding_contract_in_scope`].
+    pub fn define_platform_service_contract_in_scope(
+        &mut self,
+        scope_id: RuntimeScopeId,
+        contract: ContractKey,
+        resolution: ContractResolutionPolicy,
+    ) -> EngineResult<()> {
+        self.define_platform_contract_in_scope(
+            scope_id,
+            ContractDefinition::service(contract, resolution),
+        )
+    }
+
+    fn define_platform_contract_in_scope(
+        &mut self,
+        scope_id: RuntimeScopeId,
+        definition: ContractDefinition,
+    ) -> EngineResult<()> {
+        let contract = definition.contract.clone();
         let has_extension_definition = self.extensions.values().any(|extension| {
             extension.scope_id == scope_id
                 && extension
@@ -493,12 +526,11 @@ impl ExtensionEngine {
             });
         }
 
-        let definition = ContractDefinition::new(contract.clone(), resolution);
-        let definitions = self
+        if let Some(existing) = self
             .platform_contract_definitions
-            .entry(scope_id)
-            .or_default();
-        if let Some(existing) = definitions.get(&contract) {
+            .get(&scope_id)
+            .and_then(|definitions| definitions.get(&contract))
+        {
             if existing != &definition {
                 return Err(EngineError::ContractDefinitionConflict {
                     contract: contract.to_string(),
@@ -506,9 +538,19 @@ impl ExtensionEngine {
                     incoming: format!("{}/{}", definition.protocol, definition.resolution),
                 });
             }
+            self.services
+                .define_platform_contract(scope_id, definition)
+                .map_err(|()| EngineError::ServiceRuntimeUnavailable)?;
             return Ok(());
         }
-        definitions.insert(contract, definition);
+
+        self.services
+            .define_platform_contract(scope_id.clone(), definition.clone())
+            .map_err(|()| EngineError::ServiceRuntimeUnavailable)?;
+        self.platform_contract_definitions
+            .entry(scope_id)
+            .or_default()
+            .insert(contract, definition);
         Ok(())
     }
 
@@ -1681,6 +1723,15 @@ impl ExtensionEngine {
                 reason: other.to_string(),
             }),
         }
+    }
+
+    /// Returns a cloneable service caller bound to one component principal.
+    ///
+    /// Constructing the handle grants no rights. Calls still require the bound
+    /// component to be an active declared consumer and resolve through normal
+    /// scope/grant/provider policy.
+    pub fn bound_service_caller(&self, consumer: ComponentRef) -> BoundServiceCaller {
+        BoundServiceCaller::new(self.services.clone(), consumer)
     }
 
     /// Calls a unary service on behalf of an active consumer component.

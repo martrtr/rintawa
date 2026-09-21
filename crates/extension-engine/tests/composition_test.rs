@@ -819,6 +819,32 @@ fn test_should_resolve_platform_owned_binding_provider_with_persisted_policy_sem
 }
 
 #[test]
+fn test_should_reject_platform_contract_protocol_change() -> anyhow::Result<()> {
+    let scope = RuntimeScopeId::new("host");
+    let contract = contract("rintawa.test.platform-role");
+    let mut engine = ExtensionEngine::new();
+
+    engine.define_platform_binding_contract_in_scope(
+        scope.clone(),
+        contract.clone(),
+        ContractResolutionPolicy::Single,
+    )?;
+    let error = engine
+        .define_platform_service_contract_in_scope(
+            scope,
+            contract,
+            ContractResolutionPolicy::Single,
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        EngineError::ContractDefinitionConflict { .. }
+    ));
+    Ok(())
+}
+
+#[test]
 fn test_should_reject_extension_definition_of_platform_owned_contract() -> anyhow::Result<()> {
     let scope = RuntimeScopeId::new("host");
     let contract = host_shell_contract_key();

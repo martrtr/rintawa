@@ -196,6 +196,70 @@ fn test_unary_service_route_tracks_provider_lifecycle() -> Result<()> {
 }
 
 #[test]
+fn test_bound_caller_uses_platform_service_contract_and_tracks_lifecycle() -> Result<()> {
+    let scope = RuntimeScopeId::new("world:test");
+    let contract = contract("rintawa.test.platform-service");
+    let provider_instance = ExtensionInstanceId::new("provider-instance");
+    let consumer_instance = ExtensionInstanceId::new("consumer-instance");
+    let mut engine = ExtensionEngine::new();
+
+    engine.define_platform_service_contract_in_scope(
+        scope.clone(),
+        contract.clone(),
+        ContractResolutionPolicy::Single,
+    )?;
+    engine.register_extension_instance(
+        provider_instance.clone(),
+        scope.clone(),
+        manifest("provider"),
+        vec![Box::new(
+            ServiceComponent::new("runtime")
+                .providing(ContractProvider::new(contract.clone()))
+                .responding(b"pong".to_vec()),
+        )],
+    )?;
+    engine.register_extension_instance(
+        consumer_instance.clone(),
+        scope,
+        manifest("consumer"),
+        vec![Box::new(
+            ServiceComponent::new("runtime")
+                .consuming(ContractConsumer::new(contract.clone(), true)),
+        )],
+    )?;
+    engine.start_extension_instance(&provider_instance)?;
+    engine.start_extension_instance(&consumer_instance)?;
+
+    let caller =
+        engine.bound_service_caller(ComponentRef::new(consumer_instance.clone(), "runtime"));
+    assert_eq!(
+        caller.consumer(),
+        &ComponentRef::new(consumer_instance, "runtime")
+    );
+    let threaded_caller = caller.clone();
+    let threaded_contract = contract.clone();
+    let threaded_response =
+        std::thread::spawn(move || threaded_caller.call(&threaded_contract, b"ping"))
+            .join()
+            .expect("bound service caller thread must not panic")?;
+    assert_eq!(threaded_response, b"pong");
+
+    let undeclared =
+        engine.bound_service_caller(ComponentRef::new(provider_instance.clone(), "runtime"));
+    assert_eq!(
+        undeclared.call(&contract, b"ping"),
+        Err(ServiceCallError::NotConsumer)
+    );
+
+    engine.stop_extension_instance(&provider_instance)?;
+    assert_eq!(
+        caller.call(&contract, b"ping"),
+        Err(ServiceCallError::Unavailable)
+    );
+    Ok(())
+}
+
+#[test]
 fn test_preferred_provider_invalidates_cached_route() -> Result<()> {
     let contract = contract("example.choice");
     let definition =
