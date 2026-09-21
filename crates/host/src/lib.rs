@@ -40,6 +40,14 @@ pub use runtime::HostRuntime;
 
 /// Stable runtime scope used by the pre-world/bootstrap composition.
 pub const HOST_SCOPE: &str = "host";
+/// Prefix used for host-owned per-world runtime composition scopes.
+pub const WORLD_SCOPE_PREFIX: &str = "world:";
+
+/// Returns the canonical runtime scope owned by one authoritative world.
+pub fn world_runtime_scope_id(world_id: WorldId) -> RuntimeScopeId {
+    RuntimeScopeId::new(format!("{WORLD_SCOPE_PREFIX}{world_id}"))
+}
+
 /// File name of the current baseline host profile.
 pub const BASELINE_PROFILE_FILE: &str = "baseline.toml";
 const EXTENSION_CONTENT_V1: &str = "rintawa.extension@1";
@@ -242,6 +250,12 @@ pub enum HostError {
         /// Filesystem cleanup failure.
         cleanup: String,
     },
+    /// A runtime event envelope could not be serialized for extension delivery.
+    #[error("failed to encode runtime event envelope: {0}")]
+    EventEnvelopeEncode(#[from] serde_json::Error),
+    /// One delivery batch mixed events owned by different authoritative worlds.
+    #[error("world event delivery batch contains multiple WorldIds")]
+    MixedWorldEventBatch,
     /// Persisted host state could not be decoded.
     #[error("invalid host profile: {0}")]
     ProfileDecode(#[from] toml::de::Error),

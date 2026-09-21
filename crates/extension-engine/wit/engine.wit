@@ -14,16 +14,18 @@ interface host {
     /// Logs a message to the host's tracing system.
     log: func(level: log-level, message: string);
 
-    /// An explicit event-publication failure.
+    /// An explicit extension-originated event-publication failure.
     variant publish-error {
-        /// Event publication is unavailable until the Event Runtime exists.
+        /// Guest publication is unavailable under the current host policy.
         unavailable,
     }
 
-    /// Requests host event publication.
+    /// Requests extension-originated runtime event publication.
     ///
-    /// MVP 0.0.1 has no Event Runtime, so the host returns `unavailable`
-    /// instead of accepting and silently discarding the event.
+    /// Host-to-subscriber Event Runtime delivery exists, but arbitrary guest
+    /// publication remains fail-closed until publisher/topic authorization and
+    /// guest-to-host quotas are part of the contract. The host therefore returns
+    /// `unavailable` instead of accepting an event it cannot authorize safely.
     publish-event: func(topic: string, payload: list<u8>) -> result<_, publish-error>;
 
 }
@@ -562,6 +564,13 @@ interface target-provider {
 
     /// Permanently releases provider-local state after the proxy is unloaded.
     drop-component: func(handle: component-handle) -> result<_, error>;
+
+    /// Handles one subscribed runtime event for the dependent component.
+    handle-event: func(
+        handle: component-handle,
+        topic: string,
+        payload: list<u8>,
+    ) -> result<_, error>;
 
     /// Handles one validated portable UI action for the dependent component.
     handle-ui-action: func(handle: component-handle, action-json: list<u8>) -> result<_, error>;

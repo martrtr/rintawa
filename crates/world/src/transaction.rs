@@ -282,7 +282,7 @@ pub struct StoredWorldMutation {
 }
 
 /// Immutable command provenance attached to committed events and effects.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandProvenance {
     /// Stable command identity.
     pub command_id: CommandId,
@@ -303,7 +303,7 @@ pub struct CommandProvenance {
 }
 
 /// One persisted durable world-event envelope.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredWorldEvent {
     /// Authoritative world that owns the event.
     pub world_id: WorldId,

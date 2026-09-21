@@ -21,11 +21,12 @@ use rintawa_sdk::{
     runtime_permissions::RuntimePermission,
     types::{ExtensionInstanceId, RuntimeScopeId},
 };
+use rintawa_world::StoredWorldEvent;
 
 use crate::{
     BootstrapBlockedActivation, BootstrapDeferredActivation, BootstrapRollback, BootstrapStall,
     HOST_SCOPE, HostCleanupFailure, HostCleanupOperation, HostError, HostHome, HostResult,
-    HostShutdownFailures,
+    HostShutdownFailures, world_runtime_scope_id,
 };
 
 struct BaselineHostAccess {
@@ -594,6 +595,41 @@ impl HostRuntime {
         self.ui_layer_provider.as_ref()
     }
 
+    /// Delivers committed durable world events to one active runtime scope.
+    ///
+    /// Routing uses each event's exact versioned schema as the runtime topic.
+    /// The callback payload is the serialized full `StoredWorldEvent` envelope,
+    /// not only its feature payload, so subscribers retain authoritative world,
+    /// position, actor/principal, causation, and correlation metadata.
+    ///
+    /// This method does not reinterpret or mutate the durable event. Delivery is
+    /// ephemeral and may be retried from persistent world storage by a higher
+    /// world-session supervisor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encoding error or Extension Engine delivery error.
+    pub fn dispatch_world_events(&mut self, events: &[StoredWorldEvent]) -> HostResult<usize> {
+        let Some(first) = events.first() else {
+            return Ok(0);
+        };
+        if events.iter().any(|event| event.world_id != first.world_id) {
+            return Err(HostError::MixedWorldEventBatch);
+        }
+
+        let scope_id = world_runtime_scope_id(first.world_id);
+        let mut delivered = 0_usize;
+        for event in events {
+            let payload = serde_json::to_vec(event)?;
+            delivered += self.engine.dispatch_runtime_event_in_scope(
+                &scope_id,
+                &event.schema.to_string(),
+                &payload,
+            )?;
+        }
+        Ok(delivered)
+    }
+
     /// Executes one cooperative runtime pump for active baseline components.
     ///
     /// The returned duration is the earliest requested next wake-up. `None` means
@@ -731,14 +767,18 @@ fn bootstrap_batch_error(
 mod tests {
     use super::*;
     use rintawa_sdk::{
-        context::RegistrationContext,
+        context::{ComponentContext, RegistrationContext},
         contracts::{
             ContractConsumer, ContractDefinition, ContractKey, ContractProvider, ContractVersion,
         },
         errors::{ExtensionError, ExtensionResult},
         manifest::ExtensionManifest,
         prelude::{Component, ComponentId, ContractResolutionPolicy, ExtensionId},
+        runtime_effects::RuntimeEffect,
+        world::{CommandId, CorrelationId, PrincipalId, UnixTimeMillis, WorldEventId, WorldId},
     };
+    use rintawa_world::{ActorRef, CommandProvenance};
+    use std::sync::{Arc, Mutex};
 
     struct ContractComponent {
         id: ComponentId,
@@ -785,6 +825,115 @@ mod tests {
             sdk: String::from("^0.0"),
             components: Vec::new(),
         }
+    }
+
+    struct WorldEventSubscriber {
+        id: ComponentId,
+        topic: String,
+        observed: Arc<Mutex<Vec<(String, StoredWorldEvent)>>>,
+    }
+
+    impl Component for WorldEventSubscriber {
+        fn id(&self) -> &ComponentId {
+            &self.id
+        }
+
+        fn start(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
+            ctx.register_runtime_effect(RuntimeEffect::event_subscription(self.topic.clone()))?;
+            Ok(())
+        }
+
+        fn handle_event(
+            &mut self,
+            _ctx: &mut dyn ComponentContext,
+            topic: &str,
+            payload: &[u8],
+        ) -> ExtensionResult<()> {
+            let event: StoredWorldEvent = serde_json::from_slice(payload)
+                .map_err(|error| ExtensionError::Message(error.to_string()))?;
+            self.observed
+                .lock()
+                .map_err(|_| ExtensionError::Message(String::from("event observer lock poisoned")))?
+                .push((topic.to_string(), event));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_should_deliver_full_durable_world_event_envelope() -> anyhow::Result<()> {
+        let world_id = WorldId::new();
+        let scope = world_runtime_scope_id(world_id);
+        let instance = ExtensionInstanceId::new("world-event-subscriber");
+        let schema: rintawa_sdk::world::SchemaKey = "rintawa.test.event@1".parse()?;
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = ExtensionEngine::new();
+
+        engine.register_extension_instance(
+            instance.clone(),
+            scope.clone(),
+            test_manifest("world-event-subscriber"),
+            vec![Box::new(WorldEventSubscriber {
+                id: ComponentId::new("runtime"),
+                topic: schema.to_string(),
+                observed: Arc::clone(&observed),
+            })],
+        )?;
+        engine.start_extension_instance(&instance)?;
+
+        let principal = PrincipalId::new();
+        let event = StoredWorldEvent {
+            world_id,
+            id: WorldEventId::new(),
+            commit_position: 7,
+            event_index: 0,
+            provenance: CommandProvenance {
+                command_id: CommandId::new(),
+                command_schema: "rintawa.test.command@1".parse()?,
+                principal,
+                actor: ActorRef::Principal(principal),
+                causation: None,
+                correlation_id: CorrelationId::new(),
+                effective_at: Some(UnixTimeMillis::new(1234)),
+                recorded_at: UnixTimeMillis::new(5678),
+            },
+            schema: schema.clone(),
+            payload: serde_json::json!({ "message": "hello" }),
+        };
+
+        let mut runtime = HostRuntime {
+            engine,
+            started_instances: vec![instance],
+            host_shell_provider: None,
+            ui_layer_provider: None,
+        };
+
+        let mut foreign_event = event.clone();
+        foreign_event.world_id = WorldId::new();
+        assert!(matches!(
+            runtime.dispatch_world_events(&[event.clone(), foreign_event]),
+            Err(HostError::MixedWorldEventBatch)
+        ));
+        assert!(
+            observed
+                .lock()
+                .map_err(|_| anyhow::anyhow!("event observer lock poisoned"))?
+                .is_empty()
+        );
+
+        assert_eq!(
+            runtime.dispatch_world_events(std::slice::from_ref(&event))?,
+            1
+        );
+        let deliveries = observed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("event observer lock poisoned"))?;
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].0, schema.to_string());
+        assert_eq!(deliveries[0].1, event);
+        drop(deliveries);
+
+        runtime.shutdown()?;
+        Ok(())
     }
 
     #[test]

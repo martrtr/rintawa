@@ -303,6 +303,62 @@ impl WasmTargetProviderEndpoint {
         result
     }
 
+    fn handle_event(
+        &self,
+        handle: u64,
+        ctx: &mut dyn ComponentContext,
+        topic: &str,
+        payload: &[u8],
+    ) -> ExtensionResult<()> {
+        if topic.len() > self.budget.max_host_message_bytes {
+            return Err(ExtensionError::HostMessageTooLarge {
+                operation: "target event topic",
+                actual_bytes: topic.len(),
+                maximum_bytes: self.budget.max_host_message_bytes,
+            });
+        }
+        if payload.len() > self.budget.max_host_message_bytes {
+            return Err(ExtensionError::HostMessageTooLarge {
+                operation: "target event payload",
+                actual_bytes: payload.len(),
+                maximum_bytes: self.budget.max_host_message_bytes,
+            });
+        }
+
+        let owner = rintawa_sdk::contracts::ComponentRef::new(
+            ctx.extension_instance_id().clone(),
+            ctx.component_id().clone(),
+        );
+        let mut runtime = self.runtime_for_callback()?;
+        let instance = Self::live_instance_for_callback(&mut runtime)?;
+        WasmComponent::set_callback_fuel(&mut instance.store, &self.budget, "target event")?;
+        instance
+            .store
+            .data_mut()
+            .begin_delegated_guest_execution(owner);
+        let result = match instance.target_provider.as_ref() {
+            Some(provider) => provider
+                .rintawa_engine_target_provider()
+                .call_handle_event(&mut instance.store, handle, topic, payload)
+                .map_err(|error| WasmComponent::execution_error("target event", error)),
+            None => Err(ExtensionError::Message(String::from(
+                "target-provider export view is unavailable",
+            ))),
+        };
+
+        match result {
+            Ok(Ok(())) => match instance.store.data_mut().finish_guest_execution(ctx) {
+                Ok(()) => Ok(()),
+                Err(error) => Err(instance.store.data_mut().abort_guest_execution(ctx, error)),
+            },
+            Ok(Err(error)) => {
+                let error = map_wit_target_host_error("event", error);
+                Err(instance.store.data_mut().abort_guest_execution(ctx, error))
+            }
+            Err(error) => Err(instance.store.data_mut().abort_guest_execution(ctx, error)),
+        }
+    }
+
     fn handle_ui_action(
         &self,
         handle: u64,
@@ -455,6 +511,15 @@ impl Component for WasmExecutionTargetProxy {
 
     fn stop(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
         self.provider.stop_component(self.handle, ctx)
+    }
+
+    fn handle_event(
+        &mut self,
+        ctx: &mut dyn ComponentContext,
+        topic: &str,
+        payload: &[u8],
+    ) -> ExtensionResult<()> {
+        self.provider.handle_event(self.handle, ctx, topic, payload)
     }
 
     fn handle_ui_action(

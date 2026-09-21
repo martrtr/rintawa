@@ -176,6 +176,53 @@ pub(super) fn mutations_after(
     .collect()
 }
 
+pub(super) fn events_at_position(
+    connection: &Connection,
+    world_id: WorldId,
+    position: u64,
+) -> StorageResult<Vec<StoredWorldEvent>> {
+    let position = position_to_sql(position)?;
+    let mut statement = connection.prepare(
+        "SELECT
+            e.event_id, e.commit_position, e.event_index,
+            e.schema_id, e.schema_version, e.payload_json,
+            c.command_id, c.command_schema_id, c.command_schema_version,
+            c.principal_id, c.actor_kind, c.actor_id,
+            c.causation_kind, c.causation_id, c.correlation_id,
+            c.effective_at_ms, c.recorded_at_ms
+         FROM world_events e
+         JOIN world_commits c ON c.commit_position = e.commit_position
+         WHERE e.commit_position = ?1
+         ORDER BY e.event_index",
+    )?;
+    let rows = statement.query_map(params![position], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, String>(5)?,
+            provenance_sql_from_row(row, 6)?,
+        ))
+    })?;
+
+    rows.map(|row| {
+        let (id, commit_position, event_index, schema_id, schema_version, payload, provenance) =
+            row?;
+        Ok(StoredWorldEvent {
+            world_id,
+            id: event_id_from_blob(id)?,
+            commit_position: position_from_sql(commit_position)?,
+            event_index: index_from_sql(event_index, "event_index")?,
+            provenance: decode_provenance(provenance)?,
+            schema: decode_schema_key(schema_id, schema_version)?,
+            payload: serde_json::from_str(&payload)?,
+        })
+    })
+    .collect()
+}
+
 pub(super) fn events_after(
     connection: &Connection,
     world_id: WorldId,

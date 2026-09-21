@@ -110,6 +110,10 @@ pub enum ExtensionError {
     #[error("UI registration is unavailable in this component context")]
     UiRegistrationUnavailable,
 
+    /// The component does not implement a handler for a subscribed runtime event.
+    #[error("event handler is unavailable for topic `{0}`")]
+    EventHandlerUnavailable(String),
+
     /// The component does not implement a handler for a routed UI action.
     #[error("UI action handler is unavailable for action `{0}`")]
     UiActionHandlerUnavailable(String),

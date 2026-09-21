@@ -1856,6 +1856,15 @@ impl Component for WasmComponent {
         Ok(())
     }
 
+    fn handle_event(
+        &mut self,
+        ctx: &mut dyn ComponentContext,
+        topic: &str,
+        payload: &[u8],
+    ) -> ExtensionResult<()> {
+        self.dispatch_event(ctx, topic, payload)
+    }
+
     fn poll_runtime(
         &mut self,
         ctx: &mut dyn ComponentContext,

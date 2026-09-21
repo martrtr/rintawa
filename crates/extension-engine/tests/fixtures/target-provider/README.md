@@ -6,7 +6,7 @@
 
 The fixture is generated against `crates/extension-engine/wit/engine.wit` with
 `wit-bindgen 0.57.1`, compiled for `wasm32-unknown-unknown`, and wrapped with
-`wit-component 0.247.0`. It intentionally publishes `test.wasm-target@1` from
+`wasm-tools 1.258.0`. It intentionally publishes `test.wasm-target@1` from
 its normal `start` callback and reads `payload.bin` only through the borrowed
 `artifact-source` resource before returning a provider-local component handle.
 

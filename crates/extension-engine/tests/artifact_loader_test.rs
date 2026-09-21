@@ -555,20 +555,37 @@ entry = "payload.bin"
         import_source(&dependent_source, &dependent_artifacts)?;
     let dependent_instance = ExtensionInstanceId::new("wasm-target-dependent-instance");
 
+    let world_scope = RuntimeScopeId::new("baseline");
     RtwExtensionLoader::new().load_stored_extension(
         &mut engine,
         &dependent_store,
         &dependent_digest,
         dependent_instance.clone(),
-        RuntimeScopeId::new("baseline"),
+        world_scope.clone(),
     )?;
     engine.start_extension_instance(&dependent_instance)?;
     assert_eq!(
         engine.extension_instance_state(&dependent_instance),
         Some(ExtensionState::Active)
     );
+    assert_eq!(
+        engine.dispatch_runtime_event_in_scope(
+            &world_scope,
+            "test.delegated-event@1",
+            b"delegated payload",
+        )?,
+        1
+    );
 
     engine.unregister_extension_instance(&dependent_instance)?;
+    assert_eq!(
+        engine.dispatch_runtime_event_in_scope(
+            &world_scope,
+            "test.delegated-event@1",
+            b"delegated payload",
+        )?,
+        0
+    );
     engine.stop_extension_instance(&provider_instance)?;
     assert_eq!(engine.execution_target_owner("test.wasm-target@1"), None);
     engine.unregister_extension_instance(&provider_instance)?;

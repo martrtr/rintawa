@@ -302,6 +302,16 @@ impl SqliteWorldStorage {
         query::mutations_after(&connection, position, limit)
     }
 
+    /// Reads durable events from one exact authoritative commit position.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when persisted events cannot be decoded.
+    pub fn events_at_position(&self, position: u64) -> StorageResult<Vec<StoredWorldEvent>> {
+        let connection = self.reader()?;
+        query::events_at_position(&connection, self.world_id, position)
+    }
+
     /// Reads durable events after an exclusive commit position.
     ///
     /// The requested batch is bounded internally to protect host memory.

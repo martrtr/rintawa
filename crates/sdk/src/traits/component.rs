@@ -73,6 +73,25 @@ pub trait Component: Send {
         Ok(None)
     }
 
+    /// Handles one runtime event for which this component owns an active subscription.
+    ///
+    /// Runtime events are ephemeral delivery notifications. Durable world-event
+    /// semantics, when used, are encoded by the publishing feature contract and
+    /// are not inferred by the Extension Engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtensionError::EventHandlerUnavailable`] by default or a
+    /// component-specific execution failure from an implementation.
+    fn handle_event(
+        &mut self,
+        _ctx: &mut dyn ComponentContext,
+        topic: &str,
+        _payload: &[u8],
+    ) -> ExtensionResult<()> {
+        Err(ExtensionError::EventHandlerUnavailable(topic.to_string()))
+    }
+
     /// Handles one validated semantic action from the active UI Layer.
     ///
     /// # Errors

@@ -102,6 +102,19 @@ impl ManagedComponent {
         component.stop(context)
     }
 
+    fn handle_event(
+        &self,
+        context: &mut dyn ComponentContext,
+        topic: &str,
+        payload: &[u8],
+    ) -> ExtensionResult<()> {
+        let mut component = self
+            .handle
+            .lock()
+            .map_err(|_| ExtensionError::Message(String::from("component lock was poisoned")))?;
+        component.handle_event(context, topic, payload)
+    }
+
     fn handle_ui_action(
         &self,
         context: &mut dyn ComponentContext,
@@ -1415,6 +1428,106 @@ impl ExtensionEngine {
         }
 
         Ok(next_wake)
+    }
+
+    /// Dispatches one runtime event in the legacy default runtime scope.
+    ///
+    /// Component callback failures are contained by quarantining the owning
+    /// extension instance. Other active subscribers continue to receive the
+    /// event in deterministic principal order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty topic or when host-owned quarantine
+    /// infrastructure cannot complete safely.
+    pub fn dispatch_runtime_event(&mut self, topic: &str, payload: &[u8]) -> EngineResult<usize> {
+        self.dispatch_runtime_event_in_scope(&default_scope_id(), topic, payload)
+    }
+
+    /// Dispatches one runtime event to exact-topic subscribers in one scope.
+    ///
+    /// The returned count contains successful component callbacks. Subscription
+    /// handles are owner-scoped runtime effects; stopped or quarantined owners
+    /// are skipped even when they appeared in the initial routing snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::InvalidRuntimeEventTopic`] for an empty topic or
+    /// a host-level lifecycle error when quarantining a failed subscriber cannot
+    /// complete safely. Component callback errors themselves are logged and
+    /// contained so one extension cannot block delivery to unrelated subscribers.
+    pub fn dispatch_runtime_event_in_scope(
+        &mut self,
+        scope_id: &RuntimeScopeId,
+        topic: &str,
+        payload: &[u8],
+    ) -> EngineResult<usize> {
+        if topic.trim().is_empty() {
+            return Err(EngineError::InvalidRuntimeEventTopic);
+        }
+
+        let subscribers = self.runtime_effects.event_subscribers(topic);
+        let mut delivered = 0_usize;
+
+        for owner in subscribers {
+            let Some((logical_id, component_handle)) = self
+                .extensions
+                .get(&owner.instance_id)
+                .filter(|extension| {
+                    extension.state == ExtensionState::Active && &extension.scope_id == scope_id
+                })
+                .and_then(|extension| {
+                    extension
+                        .components
+                        .iter()
+                        .find(|component| component.id() == &owner.component_id)
+                        .map(|component| (extension.manifest.id.clone(), component.handle.clone()))
+                })
+            else {
+                continue;
+            };
+
+            let event_result = {
+                let identity = ComponentIdentity::new(
+                    logical_id.clone(),
+                    owner.instance_id.clone(),
+                    scope_id.clone(),
+                    owner.component_id.clone(),
+                );
+                let mut context = EngineComponentContext::new(
+                    identity,
+                    &mut self.runtime_effects,
+                    &self.secrets,
+                    &self.services,
+                    &self.ui,
+                    true,
+                );
+                let managed = ManagedComponent {
+                    id: owner.component_id.clone(),
+                    handle: component_handle,
+                };
+                managed.handle_event(&mut context, topic, payload)
+            };
+
+            match event_result {
+                Ok(()) => {
+                    delivered += 1;
+                }
+                Err(error) => {
+                    warn!(
+                        extension_id = %logical_id,
+                        instance_id = %owner.instance_id,
+                        component_id = %owner.component_id,
+                        topic = %topic,
+                        reason = %error,
+                        "runtime event callback failed; quarantining extension instance"
+                    );
+                    self.quarantine_extension_instance(&owner.instance_id)?;
+                }
+            }
+        }
+
+        Ok(delivered)
     }
 
     /// Attaches the statically registered descriptor for the selected UI Layer provider.

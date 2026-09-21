@@ -80,6 +80,31 @@ impl RuntimeEffectRegistry {
         self.effects.retain(|_, effect| effect.owner != *owner);
     }
 
+    /// Returns exact component principals subscribed to one event topic.
+    ///
+    /// Multiple active subscription handles owned by the same component still
+    /// produce one callback. Owners are returned in deterministic principal order.
+    pub(crate) fn event_subscribers(&self, topic: &str) -> Vec<ComponentRef> {
+        let mut subscribers = self
+            .effects
+            .values()
+            .filter_map(|effect| match &effect.effect {
+                RuntimeEffect::EventSubscription {
+                    topic: subscribed_topic,
+                } if subscribed_topic == topic => Some(effect.owner.clone()),
+                RuntimeEffect::EventSubscription { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        subscribers.sort_by(|left, right| {
+            left.instance_id
+                .as_str()
+                .cmp(right.instance_id.as_str())
+                .then_with(|| left.component_id.as_str().cmp(right.component_id.as_str()))
+        });
+        subscribers.dedup();
+        subscribers
+    }
+
     /// Returns all currently installed effects with their runtime owner.
     pub(crate) fn active_effects(&self) -> Vec<(&RuntimeEffectId, &ComponentRef, &RuntimeEffect)> {
         let mut effects: Vec<_> = self
@@ -158,6 +183,43 @@ mod tests {
         let effects = registry.active_effects();
         assert_eq!(effects.len(), 1);
         assert_eq!(effects[0].1, &healthy_owner);
+    }
+
+    #[test]
+    fn test_should_return_event_subscribers_once_in_principal_order() {
+        let mut registry = RuntimeEffectRegistry::default();
+        let owner_b = owner("b-instance", "runtime");
+        let owner_a = owner("a-instance", "runtime");
+
+        registry
+            .register(
+                owner_b.clone(),
+                RuntimeEffect::event_subscription("dialogue.message"),
+            )
+            .unwrap();
+        registry
+            .register(
+                owner_a.clone(),
+                RuntimeEffect::event_subscription("dialogue.message"),
+            )
+            .unwrap();
+        registry
+            .register(
+                owner_a.clone(),
+                RuntimeEffect::event_subscription("dialogue.message"),
+            )
+            .unwrap();
+        registry
+            .register(
+                owner_a.clone(),
+                RuntimeEffect::event_subscription("dialogue.other"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            registry.event_subscribers("dialogue.message"),
+            vec![owner_a, owner_b]
+        );
     }
 
     #[test]

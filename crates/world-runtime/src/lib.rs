@@ -17,8 +17,9 @@ pub use error::{
     WorldRuntimeResult,
 };
 pub use runtime::{
-    DEFAULT_COMMAND_QUEUE_CAPACITY, MAX_COMMAND_QUEUE_CAPACITY, WorldCommandTicket, WorldRuntime,
-    WorldRuntimeBuilder, WorldRuntimePolicy, WorldSystemPrivileges,
+    DEFAULT_COMMAND_QUEUE_CAPACITY, MAX_COMMAND_QUEUE_CAPACITY, WorldCommandOutcome,
+    WorldCommandTicket, WorldRuntime, WorldRuntimeBuilder, WorldRuntimePolicy,
+    WorldSystemPrivileges,
 };
 pub use snapshot::WorldSnapshot;
 pub use system::WorldSystem;

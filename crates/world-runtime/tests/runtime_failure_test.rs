@@ -185,12 +185,25 @@ fn test_should_skip_system_on_identical_command_retry() -> Result<()> {
         principal,
         serde_json::json!({ "kind": "retry" }),
     );
-    let first = runtime.submit(command.clone())?.wait()?;
-    let replay = runtime.submit(command)?.wait()?;
+    let first = runtime.submit(command.clone())?.wait_outcome()?;
+    let replay = runtime.submit(command)?.wait_outcome()?;
 
-    assert_eq!(first.disposition(), CommitDisposition::Committed);
-    assert_eq!(replay.disposition(), CommitDisposition::AlreadyCommitted);
-    assert_eq!(replay.position(), first.position());
+    assert_eq!(first.receipt().disposition(), CommitDisposition::Committed);
+    assert_eq!(
+        replay.receipt().disposition(),
+        CommitDisposition::AlreadyCommitted
+    );
+    assert_eq!(replay.receipt().position(), first.receipt().position());
+    assert_eq!(first.committed_events().len(), 1);
+    assert_eq!(replay.committed_events(), first.committed_events());
+    assert_eq!(
+        first.committed_events()[0].id,
+        first.receipt().event_ids()[0]
+    );
+    assert_eq!(
+        first.committed_events()[0].payload,
+        serde_json::json!({ "kind": "retry" })
+    );
     assert_eq!(evaluations.load(Ordering::SeqCst), 1);
     runtime.shutdown()?;
     Ok(())

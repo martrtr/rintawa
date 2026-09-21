@@ -12,7 +12,9 @@ use std::{
 
 use rintawa_sdk::world::{CommandId, SchemaKey, WorldId};
 use rintawa_storage::SqliteWorldStorage;
-use rintawa_world::{CommitReceipt, SchemaKind, WorldCommand, WorldMutation, WorldTransaction};
+use rintawa_world::{
+    CommitReceipt, SchemaKind, StoredWorldEvent, WorldCommand, WorldMutation, WorldTransaction,
+};
 
 use crate::{WorldRuntimeError, WorldRuntimeResult, WorldSnapshot, WorldSystem};
 
@@ -283,10 +285,41 @@ impl Drop for WorldRuntime {
     }
 }
 
+/// Completed command result together with durable events from its commit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorldCommandOutcome {
+    receipt: CommitReceipt,
+    committed_events: Vec<StoredWorldEvent>,
+}
+
+impl WorldCommandOutcome {
+    fn new(receipt: CommitReceipt, committed_events: Vec<StoredWorldEvent>) -> Self {
+        Self {
+            receipt,
+            committed_events,
+        }
+    }
+
+    /// Returns the durable command receipt.
+    pub const fn receipt(&self) -> &CommitReceipt {
+        &self.receipt
+    }
+
+    /// Returns durable event envelopes created by this command's commit.
+    pub fn committed_events(&self) -> &[StoredWorldEvent] {
+        &self.committed_events
+    }
+
+    /// Consumes the outcome and returns its durable receipt.
+    pub fn into_receipt(self) -> CommitReceipt {
+        self.receipt
+    }
+}
+
 /// Handle for one queued command result.
 pub struct WorldCommandTicket {
     command_id: CommandId,
-    receiver: Receiver<WorldRuntimeResult<CommitReceipt>>,
+    receiver: Receiver<WorldRuntimeResult<WorldCommandOutcome>>,
 }
 
 impl WorldCommandTicket {
@@ -302,6 +335,20 @@ impl WorldCommandTicket {
     /// Returns the command/runtime error, or WorkerStopped if the worker ended
     /// before producing a result.
     pub fn wait(self) -> WorldRuntimeResult<CommitReceipt> {
+        self.wait_outcome().map(WorldCommandOutcome::into_receipt)
+    }
+
+    /// Waits for the authoritative commit and returns its durable event envelopes.
+    ///
+    /// Idempotent replay returns the original receipt and original committed
+    /// events. Callers that bridge events into ephemeral runtimes should inspect
+    /// the receipt disposition before deciding whether to redeliver them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the command/runtime error, or WorkerStopped if the worker ended
+    /// before producing a result.
+    pub fn wait_outcome(self) -> WorldRuntimeResult<WorldCommandOutcome> {
         self.receiver
             .recv()
             .map_err(|_| WorldRuntimeError::WorkerStopped)?
@@ -310,7 +357,7 @@ impl WorldCommandTicket {
 
 struct CommandJob {
     command: WorldCommand,
-    response: mpsc::Sender<WorldRuntimeResult<CommitReceipt>>,
+    response: mpsc::Sender<WorldRuntimeResult<WorldCommandOutcome>>,
 }
 
 fn validate_policy(policy: WorldRuntimePolicy) -> WorldRuntimeResult<()> {
@@ -339,9 +386,10 @@ fn process_command(
     storage: &Arc<SqliteWorldStorage>,
     systems: &BTreeMap<SchemaKey, RegisteredSystem>,
     command: WorldCommand,
-) -> WorldRuntimeResult<CommitReceipt> {
+) -> WorldRuntimeResult<WorldCommandOutcome> {
     if let Some(receipt) = storage.committed_receipt(&command)? {
-        return Ok(receipt);
+        let events = storage.events_at_position(receipt.position())?;
+        return Ok(WorldCommandOutcome::new(receipt, events));
     }
 
     let registered = systems
@@ -362,7 +410,9 @@ fn process_command(
 
     reject_privileged_authority_output(command.schema(), &output, registered.privileges)?;
 
-    Ok(storage.commit(&command, &output, evaluated_position)?)
+    let receipt = storage.commit(&command, &output, evaluated_position)?;
+    let events = storage.events_at_position(receipt.position())?;
+    Ok(WorldCommandOutcome::new(receipt, events))
 }
 
 fn reject_privileged_authority_output(
