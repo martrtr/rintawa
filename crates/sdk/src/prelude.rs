@@ -53,3 +53,9 @@ pub use crate::ui::{
     UiSelectNode, UiSelectOption, UiSplitAxis, UiSplitNode, UiSurfaceContribution, UiSurfaceId,
     UiSurfaceSnapshot, UiSurfaceTraitId, UiTextAreaNode, UiTextInputNode, UiTextNode,
 };
+
+pub use crate::world::{
+    CommandId, ControlGrantId, CorrelationId, EffectJobId, EntityId, PrincipalId, RelationId,
+    SchemaId, SchemaIdentifierError, SchemaKey, SchemaKeyParseError, SchemaVersion,
+    SchemaVersionError, UnixTimeMillis, WorldEventId, WorldId,
+};

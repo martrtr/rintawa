@@ -23,6 +23,7 @@
 //! - [`errors`] — error types
 //! - [`secrets`] — validated secret paths and redacted secret values
 //! - [`runtime_permissions`] — explicitly requested host runtime capabilities
+//! - [`world`] — feature-neutral world identifiers and schema keys
 //! - [`prelude`] — commonly used imports
 
 #![forbid(unsafe_code)]
@@ -41,5 +42,6 @@ pub mod services;
 pub mod traits;
 pub mod types;
 pub mod ui;
+pub mod world;
 
 pub mod prelude;

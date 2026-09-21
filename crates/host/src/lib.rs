@@ -26,7 +26,10 @@ use rintawa_sdk::{
     contracts::{ComponentRef, ContractKey},
     runtime_permissions::RuntimePermission,
     types::{ComponentId, ExtensionInstanceId, RuntimeScopeId},
+    world::WorldId,
 };
+use rintawa_storage::SqliteWorldStorage;
+use rintawa_world::WorldSessionState;
 use thiserror::Error;
 
 pub use profile::{
@@ -40,6 +43,8 @@ pub const HOST_SCOPE: &str = "host";
 /// File name of the current baseline host profile.
 pub const BASELINE_PROFILE_FILE: &str = "baseline.toml";
 const EXTENSION_CONTENT_V1: &str = "rintawa.extension@1";
+const WORLD_DATABASE_FILE: &str = "world.sqlite";
+const WORLD_ID_CREATION_ATTEMPTS: usize = 8;
 
 /// One baseline activation deferred because required execution targets are unavailable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,9 +206,42 @@ pub enum HostError {
     /// Extension inspection or lifecycle failed.
     #[error(transparent)]
     Engine(#[from] rintawa_extension_engine::EngineError),
+    /// Authoritative world storage failed.
+    #[error(transparent)]
+    Storage(#[from] rintawa_storage::StorageError),
     /// A filesystem operation failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// A world directory violates the host-owned storage layout.
+    #[error("invalid world directory `{path}`: {reason}")]
+    InvalidWorldDirectory {
+        /// Rejected directory path.
+        path: PathBuf,
+        /// Layout invariant that was violated.
+        reason: &'static str,
+    },
+    /// The directory identity and embedded database identity disagree.
+    #[error("world directory `{directory_id}` contains database for `{database_id}`")]
+    WorldDirectoryIdMismatch {
+        /// World ID encoded in the directory name.
+        directory_id: WorldId,
+        /// World ID embedded in the SQLite database.
+        database_id: WorldId,
+    },
+    /// A requested local world does not exist.
+    #[error("world `{0}` is not present in the local host home")]
+    WorldNotFound(WorldId),
+    /// Repeated UUID generation unexpectedly collided with existing world directories.
+    #[error("failed to allocate a unique world identifier")]
+    WorldIdCollision,
+    /// World creation failed and cleanup of the partial directory also failed.
+    #[error("world creation failed: {creation}; cleanup also failed: {cleanup}")]
+    WorldCreateRollbackFailed {
+        /// Original storage creation failure.
+        creation: String,
+        /// Filesystem cleanup failure.
+        cleanup: String,
+    },
     /// Persisted host state could not be decoded.
     #[error("invalid host profile: {0}")]
     ProfileDecode(#[from] toml::de::Error),
@@ -385,11 +423,21 @@ pub struct InstallResult {
     pub disposition: ImportDisposition,
 }
 
-/// Persistent local Rintawa home containing CAS bytes and baseline composition.
+/// Summary of one persistent authoritative world available in the local host home.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorldSummary {
+    /// Stable authoritative world identity.
+    pub id: WorldId,
+    /// Last committed local world position.
+    pub commit_position: u64,
+}
+
+/// Persistent local Rintawa home containing CAS bytes, worlds, and baseline composition.
 pub struct HostHome {
     root: PathBuf,
     store: ArtifactStore,
     profile_path: PathBuf,
+    worlds_directory: PathBuf,
 }
 
 impl HostHome {
@@ -400,10 +448,13 @@ impl HostHome {
         let root = root.canonicalize()?;
         let store = ArtifactStore::open(root.join("artifacts"), RtwLimits::default())?;
         let profile_path = root.join("profiles").join(BASELINE_PROFILE_FILE);
+        let worlds_directory = root.join("worlds");
+        ensure_real_directory(&worlds_directory)?;
         Ok(Self {
             root,
             store,
             profile_path,
+            worlds_directory,
         })
     }
 
@@ -415,6 +466,99 @@ impl HostHome {
     /// Returns the immutable artifact store.
     pub fn artifact_store(&self) -> &ArtifactStore {
         &self.store
+    }
+
+    /// Creates one empty persistent authoritative world.
+    ///
+    /// # Errors
+    ///
+    /// Returns a filesystem or storage error if the world directory/database
+    /// cannot be created safely.
+    pub fn create_world(&self) -> HostResult<WorldSummary> {
+        for _ in 0..WORLD_ID_CREATION_ATTEMPTS {
+            let world_id = WorldId::new();
+            let directory = self.worlds_directory.join(world_id.to_string());
+            match std::fs::create_dir(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+
+            let database = directory.join(WORLD_DATABASE_FILE);
+            match SqliteWorldStorage::create(&database, world_id) {
+                Ok(storage) => {
+                    let state = storage.load_session()?;
+                    return Ok(world_summary(&state));
+                }
+                Err(error) => {
+                    if let Err(cleanup) = std::fs::remove_dir_all(&directory) {
+                        return Err(HostError::WorldCreateRollbackFailed {
+                            creation: error.to_string(),
+                            cleanup: cleanup.to_string(),
+                        });
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+
+        Err(HostError::WorldIdCollision)
+    }
+
+    /// Lists all persistent worlds in deterministic identifier order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any host-owned world directory is malformed or its
+    /// embedded database identity disagrees with the directory identity.
+    pub fn list_worlds(&self) -> HostResult<Vec<WorldSummary>> {
+        let mut entries =
+            std::fs::read_dir(&self.worlds_directory)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+
+        let mut worlds = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let directory = entry.path();
+            validate_world_directory(&directory)?;
+            let name =
+                entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| HostError::InvalidWorldDirectory {
+                        path: directory.clone(),
+                        reason: "directory name must be a UTF-8 WorldId",
+                    })?;
+            let world_id =
+                name.parse::<WorldId>()
+                    .map_err(|_| HostError::InvalidWorldDirectory {
+                        path: directory.clone(),
+                        reason: "directory name must be a canonical WorldId",
+                    })?;
+            let storage = open_world_database(&directory, world_id)?;
+            worlds.push(world_summary(&storage.load_session()?));
+        }
+
+        worlds.sort_by_key(|world| world.id);
+        Ok(worlds)
+    }
+
+    /// Loads durable metadata for one persistent world.
+    ///
+    /// # Errors
+    ///
+    /// Returns WorldNotFound when the world directory is absent, or a storage
+    /// integrity/version error when the world cannot be opened safely.
+    pub fn load_world_state(&self, world_id: WorldId) -> HostResult<WorldSessionState> {
+        let directory = self.worlds_directory.join(world_id.to_string());
+        match std::fs::symlink_metadata(&directory) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(HostError::WorldNotFound(world_id));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        validate_world_directory(&directory)?;
+        Ok(open_world_database(&directory, world_id)?.load_session()?)
     }
 
     /// Loads the baseline pre-world composition.
@@ -752,5 +896,52 @@ impl HostHome {
                 })
             })
             .collect()
+    }
+}
+
+fn ensure_real_directory(path: &Path) -> HostResult<()> {
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(HostError::InvalidWorldDirectory {
+                    path: path.to_path_buf(),
+                    reason: "host worlds path must be a real directory",
+                });
+            }
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_world_directory(path: &Path) -> HostResult<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(HostError::InvalidWorldDirectory {
+            path: path.to_path_buf(),
+            reason: "world path must be a real directory",
+        });
+    }
+    Ok(())
+}
+
+fn open_world_database(directory: &Path, directory_id: WorldId) -> HostResult<SqliteWorldStorage> {
+    validate_world_directory(directory)?;
+    let storage = SqliteWorldStorage::open(directory.join(WORLD_DATABASE_FILE))?;
+    if storage.world_id() != directory_id {
+        return Err(HostError::WorldDirectoryIdMismatch {
+            directory_id,
+            database_id: storage.world_id(),
+        });
+    }
+    Ok(storage)
+}
+
+fn world_summary(state: &WorldSessionState) -> WorldSummary {
+    WorldSummary {
+        id: state.id(),
+        commit_position: state.commit_position(),
     }
 }

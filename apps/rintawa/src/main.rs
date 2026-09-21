@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 use rintawa_host::{HOST_SCOPE, HostHome, HostRuntime};
 use rintawa_sdk::{
     contracts::ComponentRef, runtime_permissions::RuntimePermission, types::RuntimeScopeId,
+    world::WorldId,
 };
 
 #[derive(Debug, Parser)]
@@ -64,6 +65,15 @@ enum Commands {
         #[arg(long, default_value = HOST_SCOPE)]
         scope: String,
     },
+    /// Create an empty persistent authoritative world.
+    WorldCreate,
+    /// List persistent worlds in the local Rintawa home.
+    WorldList,
+    /// Show durable metadata for one persistent world.
+    WorldInfo {
+        /// Stable world identifier.
+        id: WorldId,
+    },
     /// Start the pre-world baseline composition from persisted exact digests.
     Run {
         /// Start the composition once, then shut down.
@@ -93,6 +103,9 @@ fn main() -> Result<()> {
             permission,
             scope,
         } => revoke_runtime_permission(&home, instance, component, permission, scope),
+        Commands::WorldCreate => world_create(&home),
+        Commands::WorldList => world_list(&home),
+        Commands::WorldInfo { id } => world_info(&home, id),
         Commands::Run { once } => run(&home, once),
     }
 }
@@ -184,6 +197,33 @@ fn revoke_runtime_permission(
         "{} {} {}: revoked",
         owner.instance_id, owner.component_id, permission
     );
+    Ok(())
+}
+
+fn world_create(home: &HostHome) -> Result<()> {
+    let world = home.create_world()?;
+    println!("world = {}", world.id);
+    println!("commit_position = {}", world.commit_position);
+    Ok(())
+}
+
+fn world_list(home: &HostHome) -> Result<()> {
+    let worlds = home.list_worlds()?;
+    if worlds.is_empty() {
+        println!("No worlds created.");
+        return Ok(());
+    }
+    for world in worlds {
+        println!("{} {}", world.id, world.commit_position);
+    }
+    Ok(())
+}
+
+fn world_info(home: &HostHome, world_id: WorldId) -> Result<()> {
+    let world = home.load_world_state(world_id)?;
+    println!("world = {}", world.id());
+    println!("commit_position = {}", world.commit_position());
+    println!("schemas = {}", world.schemas().len());
     Ok(())
 }
 

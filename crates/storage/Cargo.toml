@@ -1,5 +1,5 @@
 [package]
-name = "rintawa-host"
+name = "rintawa-storage"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,19 +7,17 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
-description = "Local Rintawa host composition and activation primitives"
+description = "Persistent world storage implementations for Rintawa"
 
 [dependencies]
-serde.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
-toml.workspace = true
-tempfile.workspace = true
 
-rintawa-artifacts = { path = "../artifacts" }
-rintawa-extension-engine = { path = "../extension-engine" }
 rintawa-sdk = { path = "../sdk" }
-rintawa-storage = { path = "../storage" }
 rintawa-world = { path = "../world" }
 
 [dev-dependencies]
 anyhow.workspace = true
+tempfile.workspace = true
