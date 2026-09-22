@@ -36,7 +36,7 @@ pub use profile::{
     ActivationRecord, BaselineProfile, PROFILE_SCHEMA, PreferredProviderSelection,
     RuntimePermissionGrant,
 };
-pub use runtime::HostRuntime;
+pub use runtime::{HostRuntime, WorldCommandDispatchOutcome};
 
 /// Stable runtime scope used by the pre-world/bootstrap composition.
 pub const HOST_SCOPE: &str = "host";
@@ -176,16 +176,34 @@ impl std::error::Error for BootstrapRollback {
     }
 }
 
-/// Aggregated failures observed while shutting down a running baseline composition.
+/// One failure observed while stopping an active authoritative world runtime.
+#[derive(Debug)]
+pub struct WorldRuntimeCleanupFailure {
+    /// World whose worker could not shut down cleanly.
+    pub world_id: WorldId,
+    /// Exact authoritative runtime shutdown error.
+    pub error: rintawa_world_runtime::WorldRuntimeError,
+}
+
+/// Aggregated failures observed while shutting down a running host composition.
 #[derive(Debug)]
 pub struct HostShutdownFailures {
+    /// World runtime failures observed while shutdown continued.
+    pub world_failures: Vec<WorldRuntimeCleanupFailure>,
     /// Stop/unregister failures observed while shutdown continued.
     pub cleanup_failures: Vec<HostCleanupFailure>,
 }
 
 impl fmt::Display for HostShutdownFailures {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("baseline shutdown cleanup failed")?;
+        formatter.write_str("host shutdown cleanup failed")?;
+        for failure in &self.world_failures {
+            write!(
+                formatter,
+                "; world `{}` shutdown failed: {}",
+                failure.world_id, failure.error
+            )?;
+        }
         for failure in &self.cleanup_failures {
             write!(
                 formatter,
@@ -199,9 +217,14 @@ impl fmt::Display for HostShutdownFailures {
 
 impl std::error::Error for HostShutdownFailures {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.cleanup_failures
+        self.world_failures
             .first()
             .map(|failure| &failure.error as &(dyn std::error::Error + 'static))
+            .or_else(|| {
+                self.cleanup_failures
+                    .first()
+                    .map(|failure| &failure.error as &(dyn std::error::Error + 'static))
+            })
     }
 }
 
@@ -217,6 +240,9 @@ pub enum HostError {
     /// Authoritative world storage failed.
     #[error(transparent)]
     Storage(#[from] rintawa_storage::StorageError),
+    /// Authoritative world command runtime failed.
+    #[error(transparent)]
+    WorldRuntime(#[from] rintawa_world_runtime::WorldRuntimeError),
     /// A filesystem operation failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -239,6 +265,12 @@ pub enum HostError {
     /// A requested local world does not exist.
     #[error("world `{0}` is not present in the local host home")]
     WorldNotFound(WorldId),
+    /// A world runtime is already active in this host process.
+    #[error("world `{0}` is already active")]
+    WorldAlreadyActive(WorldId),
+    /// A world runtime is not active in this host process.
+    #[error("world `{0}` is not active")]
+    WorldNotActive(WorldId),
     /// Repeated UUID generation unexpectedly collided with existing world directories.
     #[error("failed to allocate a unique world identifier")]
     WorldIdCollision,
@@ -556,13 +588,7 @@ impl HostHome {
         Ok(worlds)
     }
 
-    /// Loads durable metadata for one persistent world.
-    ///
-    /// # Errors
-    ///
-    /// Returns WorldNotFound when the world directory is absent, or a storage
-    /// integrity/version error when the world cannot be opened safely.
-    pub fn load_world_state(&self, world_id: WorldId) -> HostResult<WorldSessionState> {
+    pub(crate) fn open_world_storage(&self, world_id: WorldId) -> HostResult<SqliteWorldStorage> {
         let directory = self.worlds_directory.join(world_id.to_string());
         match std::fs::symlink_metadata(&directory) {
             Ok(_) => {}
@@ -572,7 +598,17 @@ impl HostHome {
             Err(error) => return Err(error.into()),
         }
         validate_world_directory(&directory)?;
-        Ok(open_world_database(&directory, world_id)?.load_session()?)
+        open_world_database(&directory, world_id)
+    }
+
+    /// Loads durable metadata for one persistent world.
+    ///
+    /// # Errors
+    ///
+    /// Returns WorldNotFound when the world directory is absent, or a storage
+    /// integrity/version error when the world cannot be opened safely.
+    pub fn load_world_state(&self, world_id: WorldId) -> HostResult<WorldSessionState> {
+        Ok(self.open_world_storage(world_id)?.load_session()?)
     }
 
     /// Loads the baseline pre-world composition.

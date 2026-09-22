@@ -1,7 +1,7 @@
 //! Runtime orchestration for exact artifact activations in a local Rintawa host.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -21,15 +21,18 @@ use rintawa_sdk::{
     },
     runtime_permissions::RuntimePermission,
     types::{ExtensionId, ExtensionInstanceId, RuntimeScopeId},
-    world::SchemaKey,
+    world::{SchemaKey, WorldId},
 };
-use rintawa_world::StoredWorldEvent;
-use rintawa_world_runtime::{ServiceWorldSystem, world_system_service_contract_key};
+use rintawa_world::{CommitDisposition, SchemaKind, StoredWorldEvent, WorldCommand};
+use rintawa_world_runtime::{
+    ServiceWorldSystem, WorldCommandOutcome, WorldRuntime, WorldRuntimeBuilder,
+    world_system_service_contract_key,
+};
 
 use crate::{
     BootstrapBlockedActivation, BootstrapDeferredActivation, BootstrapRollback, BootstrapStall,
     HOST_SCOPE, HostCleanupFailure, HostCleanupOperation, HostError, HostHome, HostResult,
-    HostShutdownFailures, world_runtime_scope_id,
+    HostShutdownFailures, WorldRuntimeCleanupFailure, world_runtime_scope_id,
 };
 
 struct BaselineHostAccess {
@@ -298,8 +301,37 @@ fn map_host_access_error(error: HostError) -> HostAccessError {
     }
 }
 
-/// Running baseline host composition loaded exclusively from exact local RTW digests.
+/// Authoritative command result plus best-effort live event delivery status.
+#[derive(Debug)]
+pub struct WorldCommandDispatchOutcome {
+    authoritative: WorldCommandOutcome,
+    live_delivery: HostResult<usize>,
+}
+
+impl WorldCommandDispatchOutcome {
+    /// Returns the durable authoritative command outcome.
+    pub const fn authoritative(&self) -> &WorldCommandOutcome {
+        &self.authoritative
+    }
+
+    /// Returns successful live subscriber callbacks, or the post-commit delivery failure.
+    ///
+    /// A delivery error never means that the authoritative command was rolled back.
+    pub fn live_delivery(&self) -> Result<usize, &HostError> {
+        self.live_delivery.as_ref().copied()
+    }
+
+    /// Consumes the result into authoritative and ephemeral delivery parts.
+    pub fn into_parts(self) -> (WorldCommandOutcome, HostResult<usize>) {
+        (self.authoritative, self.live_delivery)
+    }
+}
+
+/// Running host composition containing baseline extensions and active worlds.
 pub struct HostRuntime {
+    // World workers are declared before the Engine so implicit field drop also
+    // tears down command execution before provider component state disappears.
+    active_worlds: BTreeMap<WorldId, WorldRuntime>,
     engine: ExtensionEngine,
     started_instances: Vec<ExtensionInstanceId>,
     host_shell_provider: Option<ComponentRef>,
@@ -576,6 +608,7 @@ impl HostRuntime {
         }
 
         Ok(Self {
+            active_worlds: BTreeMap::new(),
             engine,
             started_instances: started,
             host_shell_provider,
@@ -598,6 +631,97 @@ impl HostRuntime {
         self.ui_layer_provider.as_ref()
     }
 
+    /// Returns whether one authoritative world currently owns a running worker.
+    pub fn is_world_active(&self, world_id: WorldId) -> bool {
+        self.active_worlds.contains_key(&world_id)
+    }
+
+    /// Opens one persistent world and starts its authoritative command worker.
+    ///
+    /// Every persisted command schema is bound to a platform service owned by the
+    /// extension that owns that schema. Provider availability remains dynamic:
+    /// activating the world does not require every System provider to be online.
+    ///
+    /// # Errors
+    ///
+    /// Returns WorldAlreadyActive for duplicate activation, world/storage errors,
+    /// contract reservation errors, or World Runtime startup errors.
+    pub fn activate_world(&mut self, home: &HostHome, world_id: WorldId) -> HostResult<()> {
+        if self.active_worlds.contains_key(&world_id) {
+            return Err(HostError::WorldAlreadyActive(world_id));
+        }
+
+        let storage = home.open_world_storage(world_id)?;
+        let session = storage.load_session()?;
+        let mut builder = WorldRuntimeBuilder::new(storage);
+        for definition in session
+            .schemas()
+            .iter()
+            .filter(|definition| definition.kind() == SchemaKind::Command)
+        {
+            builder.register_system(self.bind_world_system(
+                world_id,
+                definition.key().clone(),
+                definition.owner().clone(),
+            )?)?;
+        }
+
+        let runtime = builder.start()?;
+        self.active_worlds.insert(world_id, runtime);
+        Ok(())
+    }
+
+    /// Stops one active authoritative world worker after draining queued commands.
+    ///
+    /// # Errors
+    ///
+    /// Returns WorldNotActive when the world is not running, or the runtime
+    /// shutdown failure after the world has been removed from the active set.
+    pub fn deactivate_world(&mut self, world_id: WorldId) -> HostResult<()> {
+        let runtime = self
+            .active_worlds
+            .remove(&world_id)
+            .ok_or(HostError::WorldNotActive(world_id))?;
+        runtime.shutdown()?;
+        Ok(())
+    }
+
+    /// Executes one command in an active world and then performs live event delivery.
+    ///
+    /// The outer result covers authoritative command execution only. Once a commit
+    /// succeeds, live runtime-event delivery is reported separately inside
+    /// WorldCommandDispatchOutcome so an ephemeral delivery failure cannot make a
+    /// committed command appear rolled back. Idempotent replay is never redelivered.
+    ///
+    /// # Errors
+    ///
+    /// Returns WorldNotActive or an authoritative World Runtime failure.
+    pub fn submit_world_command(
+        &mut self,
+        world_id: WorldId,
+        command: WorldCommand,
+    ) -> HostResult<WorldCommandDispatchOutcome> {
+        let authoritative = {
+            let runtime = self
+                .active_worlds
+                .get(&world_id)
+                .ok_or(HostError::WorldNotActive(world_id))?;
+            runtime.submit(command)?.wait_outcome()?
+        };
+
+        let live_delivery = if authoritative.receipt().disposition() == CommitDisposition::Committed
+        {
+            self.dispatch_world_events(authoritative.committed_events())
+        } else {
+            Ok(0)
+        };
+
+        Ok(WorldCommandDispatchOutcome {
+            authoritative,
+            live_delivery,
+        })
+    }
+
     /// Binds one exact command schema to an extension-provided World System service.
     ///
     /// The service contract is platform-owned and scoped to the authoritative world.
@@ -611,9 +735,9 @@ impl HostRuntime {
     ///
     /// Returns an Extension Engine contract-definition error when the same key was
     /// already reserved incompatibly or defined by an extension.
-    pub fn bind_world_system(
+    fn bind_world_system(
         &mut self,
-        world_id: rintawa_sdk::world::WorldId,
+        world_id: WorldId,
         command_schema: SchemaKey,
         schema_owner: ExtensionId,
     ) -> HostResult<ServiceWorldSystem> {
@@ -677,21 +801,36 @@ impl HostRuntime {
         Ok(self.engine.poll_runtime()?)
     }
 
-    /// Stops and unregisters every baseline runtime instance in reverse activation order.
+    /// Stops every active world, then unregisters baseline runtime instances.
     pub fn shutdown(mut self) -> HostResult<()> {
+        let world_failures = shutdown_worlds(&mut self.active_worlds);
         let cleanup_failures = cleanup_instances(
             &mut self.engine,
             &self.started_instances,
             &self.started_instances,
         );
-        if cleanup_failures.is_empty() {
+        if world_failures.is_empty() && cleanup_failures.is_empty() {
             Ok(())
         } else {
             Err(HostError::ShutdownFailed(Box::new(HostShutdownFailures {
+                world_failures,
                 cleanup_failures,
             })))
         }
     }
+}
+
+fn shutdown_worlds(
+    active_worlds: &mut BTreeMap<WorldId, WorldRuntime>,
+) -> Vec<WorldRuntimeCleanupFailure> {
+    let worlds = std::mem::take(active_worlds);
+    let mut failures = Vec::new();
+    for (world_id, runtime) in worlds.into_iter().rev() {
+        if let Err(error) = runtime.shutdown() {
+            failures.push(WorldRuntimeCleanupFailure { world_id, error });
+        }
+    }
+    failures
 }
 
 fn cleanup_instances(
@@ -1000,6 +1139,7 @@ mod tests {
         ))?;
 
         let mut host = HostRuntime {
+            active_worlds: BTreeMap::new(),
             engine: ExtensionEngine::new(),
             started_instances: Vec::new(),
             host_shell_provider: None,
@@ -1063,6 +1203,126 @@ mod tests {
     }
 
     #[test]
+    fn test_should_supervise_world_commit_delivery_replay_and_deactivation() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let created = home.create_world()?;
+        let world_id = created.id;
+        let command_schema: SchemaKey = "rintawa.test.supervised-command@1".parse()?;
+        let event_schema: SchemaKey = "rintawa.test.supervised-event@1".parse()?;
+        let owner = ExtensionId::new("rintawa.supervised-system");
+        let storage = home.open_world_storage(world_id)?;
+        storage.register_schema(&SchemaDefinition::new(
+            command_schema.clone(),
+            SchemaKind::Command,
+            owner.clone(),
+            serde_json::json!({ "type": "object" }),
+        ))?;
+        storage.register_schema(&SchemaDefinition::new(
+            event_schema.clone(),
+            SchemaKind::Event,
+            owner.clone(),
+            serde_json::json!({ "type": "object" }),
+        ))?;
+        drop(storage);
+
+        let mut host = HostRuntime::start(&home)?;
+        host.activate_world(&home, world_id)?;
+        assert!(host.is_world_active(world_id));
+        assert!(matches!(
+            host.activate_world(&home, world_id),
+            Err(HostError::WorldAlreadyActive(id)) if id == world_id
+        ));
+
+        let scope = world_runtime_scope_id(world_id);
+        let contract = world_system_service_contract_key(&command_schema);
+        let provider_instance = ExtensionInstanceId::new("supervised-system-provider");
+        host.engine.register_extension_instance(
+            provider_instance.clone(),
+            scope.clone(),
+            test_manifest(owner.as_str()),
+            vec![Box::new(WorldSystemProvider {
+                id: ComponentId::new("runtime"),
+                contract,
+                event_schema: event_schema.clone(),
+            })],
+        )?;
+        host.engine.start_extension_instance(&provider_instance)?;
+        host.started_instances.push(provider_instance);
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let subscriber_instance = ExtensionInstanceId::new("supervised-event-subscriber");
+        host.engine.register_extension_instance(
+            subscriber_instance.clone(),
+            scope,
+            test_manifest("rintawa.supervised-subscriber"),
+            vec![Box::new(WorldEventSubscriber {
+                id: ComponentId::new("runtime"),
+                topic: event_schema.to_string(),
+                observed: Arc::clone(&observed),
+            })],
+        )?;
+        host.engine.start_extension_instance(&subscriber_instance)?;
+        host.started_instances.push(subscriber_instance);
+
+        let principal = PrincipalId::new();
+        let command = WorldCommand::new(
+            command_schema.clone(),
+            principal,
+            ActorRef::Principal(principal),
+            serde_json::json!({ "kind": "supervised" }),
+        );
+        let first = host.submit_world_command(world_id, command.clone())?;
+        assert_eq!(
+            first.authoritative().receipt().disposition(),
+            CommitDisposition::Committed
+        );
+        assert_eq!(first.authoritative().receipt().position(), 1);
+        assert!(matches!(first.live_delivery(), Ok(1)));
+        assert_eq!(
+            observed
+                .lock()
+                .map_err(|_| anyhow::anyhow!("event observer lock poisoned"))?
+                .len(),
+            1
+        );
+
+        let replay = host.submit_world_command(world_id, command)?;
+        assert_eq!(
+            replay.authoritative().receipt().disposition(),
+            CommitDisposition::AlreadyCommitted
+        );
+        assert!(matches!(replay.live_delivery(), Ok(0)));
+        assert_eq!(
+            observed
+                .lock()
+                .map_err(|_| anyhow::anyhow!("event observer lock poisoned"))?
+                .len(),
+            1
+        );
+
+        host.deactivate_world(world_id)?;
+        assert!(!host.is_world_active(world_id));
+        let next = WorldCommand::new(
+            command_schema,
+            principal,
+            ActorRef::Principal(principal),
+            serde_json::json!({ "kind": "after-stop" }),
+        );
+        assert!(matches!(
+            host.submit_world_command(world_id, next),
+            Err(HostError::WorldNotActive(id)) if id == world_id
+        ));
+        assert!(matches!(
+            host.deactivate_world(world_id),
+            Err(HostError::WorldNotActive(id)) if id == world_id
+        ));
+
+        host.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
     fn test_should_deliver_full_durable_world_event_envelope() -> anyhow::Result<()> {
         let world_id = WorldId::new();
         let scope = world_runtime_scope_id(world_id);
@@ -1104,6 +1364,7 @@ mod tests {
         };
 
         let mut runtime = HostRuntime {
+            active_worlds: BTreeMap::new(),
             engine,
             started_instances: vec![instance],
             host_shell_provider: None,
