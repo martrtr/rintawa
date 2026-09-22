@@ -31,10 +31,11 @@ use rintawa_sdk::{
 use rintawa_storage::SqliteWorldStorage;
 use rintawa_world::WorldSessionState;
 use thiserror::Error;
+use uuid::Uuid;
 
 pub use profile::{
-    ActivationRecord, BaselineProfile, PROFILE_SCHEMA, PreferredProviderSelection,
-    RuntimePermissionGrant,
+    ActivationRecord, BaselineProfile, CompositionProfile, PROFILE_SCHEMA,
+    PreferredProviderSelection, RuntimePermissionGrant,
 };
 pub use runtime::{HostRuntime, WorldCommandDispatchOutcome};
 
@@ -52,12 +53,13 @@ pub fn world_runtime_scope_id(world_id: WorldId) -> RuntimeScopeId {
 pub const BASELINE_PROFILE_FILE: &str = "baseline.toml";
 const EXTENSION_CONTENT_V1: &str = "rintawa.extension@1";
 const WORLD_DATABASE_FILE: &str = "world.sqlite";
+const WORLD_COMPOSITION_FILE: &str = "composition.toml";
 const WORLD_ID_CREATION_ATTEMPTS: usize = 8;
 
-/// One baseline activation deferred because required execution targets are unavailable.
+/// One composition activation deferred because required execution targets are unavailable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapDeferredActivation {
-    /// Handler-defined activation identity from the baseline profile.
+    /// Handler-defined activation identity from the composition profile.
     pub subject: String,
     /// Concrete runtime instance that could not be registered yet.
     pub instance_id: ExtensionInstanceId,
@@ -67,7 +69,7 @@ pub struct BootstrapDeferredActivation {
     pub missing_required_targets: Vec<DeferredExecutionTarget>,
 }
 
-/// One registered baseline activation blocked by required contract composition.
+/// One registered composition activation blocked by required contract composition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapBlockedActivation {
     /// Concrete runtime instance that could not enter `Active`.
@@ -76,7 +78,7 @@ pub struct BootstrapBlockedActivation {
     pub reason: ActivationPlanError,
 }
 
-/// Structured diagnostics produced when baseline bootstrap reaches a fixed point.
+/// Structured diagnostics produced when composition activation reaches a fixed point.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapStall {
     /// Activations waiting for execution targets that never appeared.
@@ -89,7 +91,7 @@ pub struct BootstrapStall {
 
 impl fmt::Display for BootstrapStall {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("baseline bootstrap reached a fixed point")?;
+        formatter.write_str("composition activation reached a fixed point")?;
         for activation in &self.deferred {
             write!(
                 formatter,
@@ -271,6 +273,17 @@ pub enum HostError {
     /// A world runtime is not active in this host process.
     #[error("world `{0}` is not active")]
     WorldNotActive(WorldId),
+    /// Persisted composition policy contains a record for another runtime scope.
+    #[error("composition scope mismatch: expected `{expected_scope}`, found `{actual_scope}`")]
+    CompositionScopeMismatch {
+        /// Scope owning the profile file.
+        expected_scope: String,
+        /// Scope encoded by an invalid record.
+        actual_scope: String,
+    },
+    /// Host persistence has no composition owner for this runtime scope.
+    #[error("unsupported persistent composition scope `{0}`")]
+    UnsupportedCompositionScope(String),
     /// Repeated UUID generation unexpectedly collided with existing world directories.
     #[error("failed to allocate a unique world identifier")]
     WorldIdCollision,
@@ -297,8 +310,8 @@ pub enum HostError {
     /// The persisted profile schema is newer than this host understands.
     #[error("unsupported host profile schema {0}")]
     UnsupportedProfileSchema(u32),
-    /// No activation with the requested subject exists in the baseline profile.
-    #[error("activation `{0}` is not installed in the baseline profile")]
+    /// No activation with the requested subject exists in the selected composition.
+    #[error("activation `{0}` is not installed in the selected composition")]
     ActivationNotFound(String),
     /// The baseline profile contains multiple choices for the same scoped contract.
     #[error(
@@ -441,11 +454,11 @@ pub struct InstalledActivation {
     pub instance_id: ExtensionInstanceId,
     /// Runtime composition scope.
     pub scope_id: RuntimeScopeId,
-    /// Whether the baseline activation should start automatically.
+    /// Whether the selected composition activation should start automatically.
     pub enabled: bool,
 }
 
-/// Requested and granted runtime permissions for one exact baseline component.
+/// Requested and granted runtime permissions for one exact composition component.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePermissionPolicyEntry {
     /// Runtime scope containing the component.
@@ -613,7 +626,76 @@ impl HostHome {
 
     /// Loads the baseline pre-world composition.
     pub fn load_profile(&self) -> HostResult<BaselineProfile> {
-        BaselineProfile::load(&self.profile_path)
+        let profile = BaselineProfile::load(&self.profile_path)?;
+        profile.validate_scope(&RuntimeScopeId::new(HOST_SCOPE))?;
+        Ok(profile)
+    }
+
+    /// Loads the exact composition overlay persisted with one world.
+    pub fn load_world_composition(&self, world_id: WorldId) -> HostResult<CompositionProfile> {
+        let path = self.world_composition_path(world_id)?;
+        let profile = CompositionProfile::load(&path)?;
+        profile.validate_scope(&world_runtime_scope_id(world_id))?;
+        Ok(profile)
+    }
+
+    fn save_world_composition(
+        &self,
+        world_id: WorldId,
+        profile: &CompositionProfile,
+    ) -> HostResult<()> {
+        profile.validate_scope(&world_runtime_scope_id(world_id))?;
+        profile.save(&self.world_composition_path(world_id)?)
+    }
+
+    fn world_composition_path(&self, world_id: WorldId) -> HostResult<PathBuf> {
+        let storage = self.open_world_storage(world_id)?;
+        drop(storage);
+        Ok(self
+            .worlds_directory
+            .join(world_id.to_string())
+            .join(WORLD_COMPOSITION_FILE))
+    }
+
+    fn world_id_for_composition_scope(
+        &self,
+        scope_id: &RuntimeScopeId,
+    ) -> HostResult<Option<WorldId>> {
+        if scope_id.as_str() == HOST_SCOPE {
+            return Ok(None);
+        }
+        let Some(raw) = scope_id.as_str().strip_prefix(WORLD_SCOPE_PREFIX) else {
+            return Err(HostError::UnsupportedCompositionScope(scope_id.to_string()));
+        };
+        let world_id = raw
+            .parse::<WorldId>()
+            .map_err(|_| HostError::UnsupportedCompositionScope(scope_id.to_string()))?;
+        if world_runtime_scope_id(world_id) != *scope_id {
+            return Err(HostError::UnsupportedCompositionScope(scope_id.to_string()));
+        }
+        Ok(Some(world_id))
+    }
+
+    fn load_composition_for_scope(
+        &self,
+        scope_id: &RuntimeScopeId,
+    ) -> HostResult<CompositionProfile> {
+        match self.world_id_for_composition_scope(scope_id)? {
+            None => self.load_profile(),
+            Some(world_id) => self.load_world_composition(world_id),
+        }
+    }
+
+    fn save_composition_for_scope(
+        &self,
+        scope_id: &RuntimeScopeId,
+        profile: &CompositionProfile,
+    ) -> HostResult<()> {
+        profile.validate_scope(scope_id)?;
+        match self.world_id_for_composition_scope(scope_id)? {
+            None => profile.save(&self.profile_path),
+            Some(world_id) => self.save_world_composition(world_id, profile),
+        }
     }
 
     /// Imports a local RTW supported by this host and selects it in the baseline profile.
@@ -660,6 +742,29 @@ impl HostHome {
         digest: &ArtifactDigest,
         enabled: Option<bool>,
     ) -> HostResult<InstalledActivation> {
+        self.select_stored_rtw_in_scope(RuntimeScopeId::new(HOST_SCOPE), digest, enabled)
+    }
+
+    /// Selects one already-stored exact RTW artifact in a world's composition overlay.
+    ///
+    /// The same logical extension may be active in baseline and multiple worlds.
+    /// Each world owns an opaque host-generated instance ID that remains stable when
+    /// the same activation subject is repointed to another exact artifact.
+    pub fn select_world_stored_rtw(
+        &self,
+        world_id: WorldId,
+        digest: &ArtifactDigest,
+        enabled: Option<bool>,
+    ) -> HostResult<InstalledActivation> {
+        self.select_stored_rtw_in_scope(world_runtime_scope_id(world_id), digest, enabled)
+    }
+
+    fn select_stored_rtw_in_scope(
+        &self,
+        scope_id: RuntimeScopeId,
+        digest: &ArtifactDigest,
+        enabled: Option<bool>,
+    ) -> HostResult<InstalledActivation> {
         let archive = self.store.open_artifact(digest)?;
         let content = archive.manifest().content.clone();
         if content.to_string() != EXTENSION_CONTENT_V1 {
@@ -670,10 +775,18 @@ impl HostHome {
         let engine = ExtensionEngine::new();
         let manifest =
             RtwExtensionLoader::new().read_stored_manifest(&engine, &self.store, digest)?;
-        let mut profile = self.load_profile()?;
+        let world_id = self.world_id_for_composition_scope(&scope_id)?;
+        let mut profile = self.load_composition_for_scope(&scope_id)?;
         let subject = manifest.id.to_string();
-        let scope_id = RuntimeScopeId::new(HOST_SCOPE);
-        let instance_id = ExtensionInstanceId::new(subject.clone());
+        let instance_id = match world_id {
+            Some(_) => profile
+                .activations
+                .iter()
+                .find(|activation| activation.subject == subject && activation.scope_id == scope_id)
+                .map(|activation| activation.instance_id.clone())
+                .unwrap_or_else(|| ExtensionInstanceId::new(Uuid::now_v7().to_string())),
+            None => ExtensionInstanceId::new(subject.clone()),
+        };
         let enabled = profile.upsert(
             ActivationRecord {
                 subject: subject.clone(),
@@ -694,7 +807,7 @@ impl HostHome {
                     && component.permissions.runtime.contains(&grant.permission)
             })
         });
-        profile.save(&self.profile_path)?;
+        self.save_composition_for_scope(&scope_id, &profile)?;
 
         Ok(InstalledActivation {
             subject,
@@ -708,20 +821,52 @@ impl HostHome {
         })
     }
 
+    /// Changes one world-overlay activation's enabled state.
+    pub fn set_world_enabled(
+        &self,
+        world_id: WorldId,
+        subject: &str,
+        enabled: bool,
+    ) -> HostResult<()> {
+        self.set_enabled_in_scope(&world_runtime_scope_id(world_id), subject, enabled)
+    }
+
+    /// Removes one activation and its scoped policy from a world overlay.
+    pub fn remove_world_activation(&self, world_id: WorldId, subject: &str) -> HostResult<()> {
+        self.remove_activation_in_scope(&world_runtime_scope_id(world_id), subject)
+    }
+
     /// Changes the baseline enabled state for one handler-defined activation subject.
     pub fn set_enabled(&self, subject: &str, enabled: bool) -> HostResult<()> {
-        let mut profile = self.load_profile()?;
+        self.set_enabled_in_scope(&RuntimeScopeId::new(HOST_SCOPE), subject, enabled)
+    }
+
+    fn set_enabled_in_scope(
+        &self,
+        scope_id: &RuntimeScopeId,
+        subject: &str,
+        enabled: bool,
+    ) -> HostResult<()> {
+        let mut profile = self.load_composition_for_scope(scope_id)?;
         profile.set_enabled(subject, enabled)?;
-        profile.save(&self.profile_path)
+        self.save_composition_for_scope(scope_id, &profile)
     }
 
     /// Removes one baseline activation and policy entries that reference its instance.
     ///
     /// Stored CAS bytes remain immutable and may still be referenced by another scope later.
     pub fn remove_activation(&self, subject: &str) -> HostResult<()> {
-        let mut profile = self.load_profile()?;
+        self.remove_activation_in_scope(&RuntimeScopeId::new(HOST_SCOPE), subject)
+    }
+
+    fn remove_activation_in_scope(
+        &self,
+        scope_id: &RuntimeScopeId,
+        subject: &str,
+    ) -> HostResult<()> {
+        let mut profile = self.load_composition_for_scope(scope_id)?;
         profile.remove_activation(subject)?;
-        profile.save(&self.profile_path)
+        self.save_composition_for_scope(scope_id, &profile)
     }
 
     /// Reads one owner-scoped non-authoritative extension preference.
@@ -731,7 +876,8 @@ impl HostHome {
         owner: &ComponentRef,
         key: &str,
     ) -> HostResult<Option<String>> {
-        self.load_profile()?.get_preference(scope_id, owner, key)
+        self.load_composition_for_scope(scope_id)?
+            .get_preference(scope_id, owner, key)
     }
 
     /// Persists one owner-scoped non-authoritative extension preference.
@@ -742,9 +888,9 @@ impl HostHome {
         key: String,
         value: String,
     ) -> HostResult<()> {
-        let mut profile = self.load_profile()?;
-        profile.set_preference(scope_id, owner, key, value)?;
-        profile.save(&self.profile_path)
+        let mut profile = self.load_composition_for_scope(&scope_id)?;
+        profile.set_preference(scope_id.clone(), owner, key, value)?;
+        self.save_composition_for_scope(&scope_id, &profile)
     }
 
     /// Deletes one owner-scoped non-authoritative extension preference.
@@ -754,14 +900,22 @@ impl HostHome {
         owner: &ComponentRef,
         key: &str,
     ) -> HostResult<()> {
-        let mut profile = self.load_profile()?;
+        let mut profile = self.load_composition_for_scope(scope_id)?;
         profile.delete_preference(scope_id, owner, key)?;
-        profile.save(&self.profile_path)
+        self.save_composition_for_scope(scope_id, &profile)
     }
 
-    /// Lists requested and granted runtime permissions for every exact baseline component.
+    /// Lists requested and granted runtime permissions for the baseline composition.
     pub fn list_runtime_permission_policy(&self) -> HostResult<Vec<RuntimePermissionPolicyEntry>> {
-        let profile = self.load_profile()?;
+        self.list_runtime_permission_policy_in_scope(&RuntimeScopeId::new(HOST_SCOPE))
+    }
+
+    /// Lists requested and granted runtime permissions for one exact composition scope.
+    pub fn list_runtime_permission_policy_in_scope(
+        &self,
+        scope_id: &RuntimeScopeId,
+    ) -> HostResult<Vec<RuntimePermissionPolicyEntry>> {
+        let profile = self.load_composition_for_scope(scope_id)?;
         let engine = ExtensionEngine::new();
         let loader = RtwExtensionLoader::new();
         let mut entries = Vec::new();
@@ -806,7 +960,7 @@ impl HostHome {
         Ok(entries)
     }
 
-    /// Persists one explicit runtime capability approval for an exact baseline component.
+    /// Persists one explicit runtime capability approval for an exact composition component.
     ///
     /// The activation must exist in the same scope and its exact stored manifest must
     /// request the permission. This method never expands package-declared capability
@@ -817,7 +971,7 @@ impl HostHome {
         owner: ComponentRef,
         permission: RuntimePermission,
     ) -> HostResult<()> {
-        let mut profile = self.load_profile()?;
+        let mut profile = self.load_composition_for_scope(&scope_id)?;
         let activation = profile
             .activations
             .iter()
@@ -858,8 +1012,12 @@ impl HostHome {
                 permission: permission.to_string(),
             });
         }
-        profile.grant_runtime_permission(RuntimePermissionGrant::new(scope_id, owner, permission));
-        profile.save(&self.profile_path)
+        profile.grant_runtime_permission(RuntimePermissionGrant::new(
+            scope_id.clone(),
+            owner,
+            permission,
+        ));
+        self.save_composition_for_scope(&scope_id, &profile)
     }
 
     /// Removes one persisted runtime capability approval.
@@ -872,22 +1030,22 @@ impl HostHome {
         owner: &ComponentRef,
         permission: RuntimePermission,
     ) -> HostResult<()> {
-        let mut profile = self.load_profile()?;
+        let mut profile = self.load_composition_for_scope(scope_id)?;
         profile.revoke_runtime_permission(scope_id, owner, permission);
-        profile.save(&self.profile_path)
+        self.save_composition_for_scope(scope_id, &profile)
     }
 
-    /// Persists one explicit preferred-provider choice for the baseline composition.
+    /// Persists one explicit preferred-provider choice for one host composition.
     ///
     /// The provider instance must already be installed in the same runtime scope.
-    /// Provider capability itself is validated during bootstrap after registration.
+    /// Provider capability itself is validated during composition activation.
     pub fn set_preferred_provider(
         &self,
         scope_id: RuntimeScopeId,
         contract: ContractKey,
         provider: ComponentRef,
     ) -> HostResult<()> {
-        let mut profile = self.load_profile()?;
+        let mut profile = self.load_composition_for_scope(&scope_id)?;
         let activation = profile
             .activations
             .iter()
@@ -903,27 +1061,44 @@ impl HostHome {
             });
         }
         profile.set_preferred_provider(PreferredProviderSelection::new(
-            scope_id, contract, provider,
+            scope_id.clone(),
+            contract,
+            provider,
         ));
-        profile.save(&self.profile_path)
+        self.save_composition_for_scope(&scope_id, &profile)
     }
 
-    /// Clears an explicit preferred-provider choice from the baseline composition.
+    /// Clears an explicit preferred-provider choice from one host composition.
     pub fn clear_preferred_provider(
         &self,
         scope_id: &RuntimeScopeId,
         contract: &ContractKey,
     ) -> HostResult<()> {
-        let mut profile = self.load_profile()?;
+        let mut profile = self.load_composition_for_scope(scope_id)?;
         profile.clear_preferred_provider(scope_id, contract);
-        profile.save(&self.profile_path)
+        self.save_composition_for_scope(scope_id, &profile)
+    }
+
+    /// Lists RTW activations selected by one world composition overlay.
+    pub fn list_world_activations(
+        &self,
+        world_id: WorldId,
+    ) -> HostResult<Vec<InstalledActivation>> {
+        self.list_activations_in_scope(&world_runtime_scope_id(world_id))
     }
 
     /// Lists RTW activations selected by the baseline profile.
     pub fn list_activations(&self) -> HostResult<Vec<InstalledActivation>> {
+        self.list_activations_in_scope(&RuntimeScopeId::new(HOST_SCOPE))
+    }
+
+    fn list_activations_in_scope(
+        &self,
+        scope_id: &RuntimeScopeId,
+    ) -> HostResult<Vec<InstalledActivation>> {
         let engine = ExtensionEngine::new();
         let loader = RtwExtensionLoader::new();
-        self.load_profile()?
+        self.load_composition_for_scope(scope_id)?
             .activations
             .into_iter()
             .map(|activation| {

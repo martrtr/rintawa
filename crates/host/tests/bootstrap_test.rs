@@ -4,7 +4,7 @@ use std::{fs, time::Duration};
 
 use rintawa_artifacts::{ImportDisposition, RtwLimits, pack_directory};
 use rintawa_extension_engine::UnresolvedContractReason;
-use rintawa_host::{HOST_SCOPE, HostError, HostHome, HostRuntime};
+use rintawa_host::{HOST_SCOPE, HostError, HostHome, HostRuntime, world_runtime_scope_id};
 use rintawa_sdk::{
     contracts::{ComponentRef, host_shell_contract_key, ui_layer_contract_key},
     runtime_permissions::RuntimePermission,
@@ -15,6 +15,8 @@ const TEST_TARGET_PROVIDER_COMPONENT: &[u8] =
     include_bytes!("../../extension-engine/tests/fixtures/target-provider/component.wasm");
 const TEST_TASK_COMPONENT: &[u8] =
     include_bytes!("../../extension-engine/tests/fixtures/task-runtime/component.wasm");
+const TEST_SERVICE_PROVIDER_COMPONENT: &[u8] =
+    include_bytes!("../../extension-engine/tests/fixtures/service-routing/provider.wasm");
 
 fn build_target_provider(root: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     let source = root.join("target-provider-source");
@@ -81,6 +83,36 @@ entry = "task.wasm"
     )?;
     fs::write(source.join("task.wasm"), TEST_TASK_COMPONENT)?;
     let artifact = root.join(format!("task-runtime-{suffix}.rtw"));
+    pack_directory(&source, &artifact, RtwLimits::default())?;
+    Ok(artifact)
+}
+
+fn build_service_provider(root: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let source = root.join("service-provider-source");
+    fs::create_dir_all(&source)?;
+    fs::write(
+        source.join("rtw.toml"),
+        "format = 1\ncontent = \"rintawa.extension@1\"\nentry = \"manifest.toml\"\n",
+    )?;
+    fs::write(
+        source.join("manifest.toml"),
+        r#"id = "bootstrap.service-provider"
+name = "Service Provider"
+version = "0.1.0"
+sdk = "^0.0"
+
+[[components]]
+id = "runtime"
+kind = "runtime"
+target = "rintawa.runtime.wasm-component@1"
+entry = "provider.wasm"
+"#,
+    )?;
+    fs::write(
+        source.join("provider.wasm"),
+        TEST_SERVICE_PROVIDER_COMPONENT,
+    )?;
+    let artifact = root.join("service-provider.rtw");
     pack_directory(&source, &artifact, RtwLimits::default())?;
     Ok(artifact)
 }
@@ -158,6 +190,142 @@ fn test_should_persist_local_install_enable_disable_and_restart() -> anyhow::Res
     assert_eq!(runtime.host_shell_provider(), None);
     assert_eq!(runtime.ui_layer_provider(), None);
     runtime.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn test_should_activate_same_exact_rtw_in_independent_world_overlays() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let artifact = build_service_provider(root.path())?;
+    let home = HostHome::open(root.path().join("home"))?;
+    let imported = home.import_rtw_bytes(&fs::read(&artifact)?)?;
+    let world_a = home.create_world()?.id;
+    let world_b = home.create_world()?.id;
+
+    let activation_a = home.select_world_stored_rtw(world_a, imported.digest(), Some(true))?;
+    let activation_b = home.select_world_stored_rtw(world_b, imported.digest(), Some(true))?;
+    let activation_a_reselected = home.select_world_stored_rtw(world_a, imported.digest(), None)?;
+
+    assert_eq!(
+        activation_a.instance_id,
+        activation_a_reselected.instance_id
+    );
+    assert_eq!(activation_a.digest, activation_b.digest);
+    assert_eq!(activation_a.subject, activation_b.subject);
+    assert_ne!(activation_a.instance_id, activation_b.instance_id);
+    assert_eq!(activation_a.scope_id, world_runtime_scope_id(world_a));
+    assert_eq!(activation_b.scope_id, world_runtime_scope_id(world_b));
+    assert!(home.list_activations()?.is_empty());
+    assert_eq!(home.list_world_activations(world_a)?, vec![activation_a]);
+    assert_eq!(home.list_world_activations(world_b)?, vec![activation_b]);
+
+    let mut runtime = HostRuntime::start(&home)?;
+    runtime.activate_world(&home, world_a)?;
+    runtime.activate_world(&home, world_b)?;
+    assert!(runtime.is_world_active(world_a));
+    assert!(runtime.is_world_active(world_b));
+
+    runtime.deactivate_world(world_a)?;
+    assert!(!runtime.is_world_active(world_a));
+    assert!(runtime.is_world_active(world_b));
+
+    runtime.deactivate_world(world_b)?;
+    runtime.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_world_composition_record_from_foreign_scope() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let artifact = build_service_provider(root.path())?;
+    let home_path = root.path().join("home");
+    let home = HostHome::open(&home_path)?;
+    let imported = home.import_rtw_bytes(&fs::read(&artifact)?)?;
+    let world_id = home.create_world()?.id;
+    home.select_world_stored_rtw(world_id, imported.digest(), Some(true))?;
+
+    let composition_path = home_path
+        .join("worlds")
+        .join(world_id.to_string())
+        .join("composition.toml");
+    let scope = world_runtime_scope_id(world_id).to_string();
+    let source = fs::read_to_string(&composition_path)?;
+    assert!(source.contains(&scope));
+    fs::write(&composition_path, source.replace(&scope, HOST_SCOPE))?;
+
+    assert!(matches!(
+        home.load_world_composition(world_id),
+        Err(HostError::CompositionScopeMismatch {
+            expected_scope,
+            actual_scope,
+        }) if expected_scope == world_runtime_scope_id(world_id).to_string()
+            && actual_scope == HOST_SCOPE
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_should_persist_world_policy_separately_and_apply_runtime_grant() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let artifact = build_task_runtime(root.path(), true)?;
+    let home_path = root.path().join("home");
+    let home = HostHome::open(&home_path)?;
+    let imported = home.import_rtw_bytes(&fs::read(&artifact)?)?;
+    let world_id = home.create_world()?.id;
+    let activation = home.select_world_stored_rtw(world_id, imported.digest(), Some(true))?;
+    let owner = ComponentRef::new(activation.instance_id.clone(), "runtime");
+
+    home.set_preference(
+        activation.scope_id.clone(),
+        owner.clone(),
+        "mode".to_string(),
+        "world".to_string(),
+    )?;
+    home.grant_runtime_permission(
+        activation.scope_id.clone(),
+        owner.clone(),
+        RuntimePermission::BackgroundTask,
+    )?;
+
+    let baseline = home.load_profile()?;
+    assert!(baseline.activations.is_empty());
+    assert!(baseline.preferences.is_empty());
+    assert!(baseline.runtime_permissions.is_empty());
+
+    let world = home.load_world_composition(world_id)?;
+    assert_eq!(world.activations.len(), 1);
+    assert_eq!(world.preferences.len(), 1);
+    assert_eq!(world.runtime_permissions.len(), 1);
+    let policy = home.list_runtime_permission_policy_in_scope(&activation.scope_id)?;
+    assert_eq!(policy.len(), 1);
+    assert_eq!(policy[0].granted, vec![RuntimePermission::BackgroundTask]);
+    assert_eq!(
+        home.get_preference(&activation.scope_id, &owner, "mode")?
+            .as_deref(),
+        Some("world")
+    );
+
+    let mut runtime = HostRuntime::start(&home)?;
+    runtime.activate_world(&home, world_id)?;
+    runtime.deactivate_world(world_id)?;
+    runtime.shutdown()?;
+
+    let reopened = HostHome::open(&home_path)?;
+    assert_eq!(
+        reopened
+            .get_preference(&activation.scope_id, &owner, "mode")?
+            .as_deref(),
+        Some("world")
+    );
+    assert!(matches!(
+        reopened.set_preference(
+            RuntimeScopeId::new("unsupported:scope"),
+            owner,
+            "key".to_string(),
+            "value".to_string(),
+        ),
+        Err(HostError::UnsupportedCompositionScope(_))
+    ));
     Ok(())
 }
 

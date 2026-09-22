@@ -31,15 +31,15 @@ use rintawa_world_runtime::{
 
 use crate::{
     BootstrapBlockedActivation, BootstrapDeferredActivation, BootstrapRollback, BootstrapStall,
-    HOST_SCOPE, HostCleanupFailure, HostCleanupOperation, HostError, HostHome, HostResult,
-    HostShutdownFailures, WorldRuntimeCleanupFailure, world_runtime_scope_id,
+    CompositionProfile, HOST_SCOPE, HostCleanupFailure, HostCleanupOperation, HostError, HostHome,
+    HostResult, HostShutdownFailures, WorldRuntimeCleanupFailure, world_runtime_scope_id,
 };
 
-struct BaselineHostAccess {
+struct LocalHostAccess {
     home_root: PathBuf,
 }
 
-impl BaselineHostAccess {
+impl LocalHostAccess {
     fn new(home_root: &Path) -> Self {
         Self {
             home_root: home_root.to_path_buf(),
@@ -51,7 +51,7 @@ impl BaselineHostAccess {
     }
 }
 
-impl ArtifactStoreAccess for BaselineHostAccess {
+impl ArtifactStoreAccess for LocalHostAccess {
     fn import_rtw(&self, bytes: &[u8]) -> HostAccessResult<ImportedArtifact> {
         let home = self.home()?;
         let imported = home
@@ -68,7 +68,7 @@ impl ArtifactStoreAccess for BaselineHostAccess {
     }
 }
 
-impl PreferenceAccess for BaselineHostAccess {
+impl PreferenceAccess for LocalHostAccess {
     fn get(
         &self,
         scope_id: &str,
@@ -121,7 +121,7 @@ impl PreferenceAccess for BaselineHostAccess {
 }
 
 fn inspect_runtime_artifact(
-    access: &BaselineHostAccess,
+    access: &LocalHostAccess,
     digest: &str,
 ) -> HostAccessResult<RuntimeArtifactPolicy> {
     let digest: ArtifactDigest = digest.parse().map_err(|_| HostAccessError::InvalidDigest)?;
@@ -151,7 +151,7 @@ fn inspect_runtime_artifact(
     })
 }
 
-impl RuntimePolicyAccess for BaselineHostAccess {
+impl RuntimePolicyAccess for LocalHostAccess {
     fn inspect_artifact(&self, digest: &str) -> HostAccessResult<RuntimeArtifactPolicy> {
         inspect_runtime_artifact(self, digest)
     }
@@ -159,26 +159,17 @@ impl RuntimePolicyAccess for BaselineHostAccess {
     fn list_components(&self) -> HostAccessResult<Vec<RuntimePolicyComponent>> {
         self.home()?
             .list_runtime_permission_policy()
-            .map(|entries| {
-                entries
-                    .into_iter()
-                    .map(|entry| RuntimePolicyComponent {
-                        scope_id: entry.scope_id.to_string(),
-                        instance_id: entry.instance_id.to_string(),
-                        component_id: entry.component_id.to_string(),
-                        requested: entry
-                            .requested
-                            .into_iter()
-                            .map(|permission| permission.to_string())
-                            .collect(),
-                        granted: entry
-                            .granted
-                            .into_iter()
-                            .map(|permission| permission.to_string())
-                            .collect(),
-                    })
-                    .collect()
-            })
+            .map(to_runtime_policy_components)
+            .map_err(map_host_access_error)
+    }
+
+    fn list_components_in_scope(
+        &self,
+        scope_id: &str,
+    ) -> HostAccessResult<Vec<RuntimePolicyComponent>> {
+        self.home()?
+            .list_runtime_permission_policy_in_scope(&RuntimeScopeId::new(scope_id))
+            .map(to_runtime_policy_components)
             .map_err(map_host_access_error)
     }
 
@@ -221,7 +212,30 @@ impl RuntimePolicyAccess for BaselineHostAccess {
     }
 }
 
-impl CompositionAccess for BaselineHostAccess {
+fn to_runtime_policy_components(
+    entries: Vec<crate::RuntimePermissionPolicyEntry>,
+) -> Vec<RuntimePolicyComponent> {
+    entries
+        .into_iter()
+        .map(|entry| RuntimePolicyComponent {
+            scope_id: entry.scope_id.to_string(),
+            instance_id: entry.instance_id.to_string(),
+            component_id: entry.component_id.to_string(),
+            requested: entry
+                .requested
+                .into_iter()
+                .map(|permission| permission.to_string())
+                .collect(),
+            granted: entry
+                .granted
+                .into_iter()
+                .map(|permission| permission.to_string())
+                .collect(),
+        })
+        .collect()
+}
+
+impl CompositionAccess for LocalHostAccess {
     fn list_activations(&self) -> HostAccessResult<Vec<CompositionActivation>> {
         self.home()?
             .list_activations()
@@ -239,8 +253,7 @@ impl CompositionAccess for BaselineHostAccess {
         digest: &str,
         enabled: Option<bool>,
     ) -> HostAccessResult<CompositionActivation> {
-        let digest: rintawa_artifacts::ArtifactDigest =
-            digest.parse().map_err(|_| HostAccessError::InvalidDigest)?;
+        let digest: ArtifactDigest = digest.parse().map_err(|_| HostAccessError::InvalidDigest)?;
         self.home()?
             .select_stored_rtw(&digest, enabled)
             .map(to_composition_activation)
@@ -256,6 +269,51 @@ impl CompositionAccess for BaselineHostAccess {
     fn remove_activation(&self, subject: &str) -> HostAccessResult<()> {
         self.home()?
             .remove_activation(subject)
+            .map_err(map_host_access_error)
+    }
+
+    fn list_activations_in_scope(
+        &self,
+        scope_id: &str,
+    ) -> HostAccessResult<Vec<CompositionActivation>> {
+        self.home()?
+            .list_activations_in_scope(&RuntimeScopeId::new(scope_id))
+            .map(|activations| {
+                activations
+                    .into_iter()
+                    .map(to_composition_activation)
+                    .collect()
+            })
+            .map_err(map_host_access_error)
+    }
+
+    fn select_artifact_in_scope(
+        &self,
+        scope_id: &str,
+        digest: &str,
+        enabled: Option<bool>,
+    ) -> HostAccessResult<CompositionActivation> {
+        let digest: ArtifactDigest = digest.parse().map_err(|_| HostAccessError::InvalidDigest)?;
+        self.home()?
+            .select_stored_rtw_in_scope(RuntimeScopeId::new(scope_id), &digest, enabled)
+            .map(to_composition_activation)
+            .map_err(map_host_access_error)
+    }
+
+    fn set_enabled_in_scope(
+        &self,
+        scope_id: &str,
+        subject: &str,
+        enabled: bool,
+    ) -> HostAccessResult<()> {
+        self.home()?
+            .set_enabled_in_scope(&RuntimeScopeId::new(scope_id), subject, enabled)
+            .map_err(map_host_access_error)
+    }
+
+    fn remove_activation_in_scope(&self, scope_id: &str, subject: &str) -> HostAccessResult<()> {
+        self.home()?
+            .remove_activation_in_scope(&RuntimeScopeId::new(scope_id), subject)
             .map_err(map_host_access_error)
     }
 }
@@ -327,11 +385,17 @@ impl WorldCommandDispatchOutcome {
     }
 }
 
+struct ActiveWorld {
+    runtime: WorldRuntime,
+    registered_instances: Vec<ExtensionInstanceId>,
+    started_instances: Vec<ExtensionInstanceId>,
+}
+
 /// Running host composition containing baseline extensions and active worlds.
 pub struct HostRuntime {
-    // World workers are declared before the Engine so implicit field drop also
+    // Active worlds are declared before the Engine so implicit field drop also
     // tears down command execution before provider component state disappears.
-    active_worlds: BTreeMap<WorldId, WorldRuntime>,
+    active_worlds: BTreeMap<WorldId, ActiveWorld>,
     engine: ExtensionEngine,
     started_instances: Vec<ExtensionInstanceId>,
     host_shell_provider: Option<ComponentRef>,
@@ -349,7 +413,7 @@ impl HostRuntime {
     /// deterministic full-topology activation plan.
     pub fn start(home: &HostHome) -> HostResult<Self> {
         let profile = home.load_profile()?;
-        let access = Arc::new(BaselineHostAccess::new(home.root()));
+        let access = Arc::new(LocalHostAccess::new(home.root()));
         let artifact_store_access: Arc<dyn ArtifactStoreAccess> = access.clone();
         let composition_access: Arc<dyn CompositionAccess> = access.clone();
         let preference_access: Arc<dyn PreferenceAccess> = access.clone();
@@ -374,185 +438,13 @@ impl HostRuntime {
             ContractResolutionPolicy::Single,
         )?;
 
-        let loader = RtwExtensionLoader::new();
-        let mut registered = Vec::new();
-        let mut started = Vec::new();
+        let activated = activate_composition(&mut engine, home, &profile, &host_scope)?;
+        let registered = activated.registered_instances;
+        let started = activated.started_instances;
         let mut host_shell_provider = None;
         let mut ui_layer_provider = None;
 
         let result: HostResult<()> = (|| {
-            let activations: Vec<_> = profile
-                .activations
-                .iter()
-                .filter(|item| item.enabled)
-                .cloned()
-                .collect();
-            for activation in &activations {
-                if activation.content.to_string() != "rintawa.extension@1" {
-                    return Err(HostError::UnsupportedContent(
-                        activation.content.to_string(),
-                    ));
-                }
-            }
-
-            // Provider policy must already be visible while early bootstrap
-            // instances are evaluated. A preferred provider may itself still be
-            // deferred; in that case required consumers remain blocked until it loads.
-            for selection in &profile.preferred_providers {
-                engine.set_preferred_contract_provider_policy_in_scope(
-                    selection.scope_id.clone(),
-                    selection.contract(),
-                    selection.provider(),
-                );
-            }
-
-            let mut pending = activations.clone();
-            let mut registered_set = HashSet::new();
-            let mut started_set = HashSet::new();
-            let mut bootstrap_instances = HashSet::new();
-
-            while !pending.is_empty() {
-                let mut made_progress = false;
-                let mut next_pending = Vec::new();
-                let mut deferred = Vec::new();
-
-                for activation in pending {
-                    match loader.try_load_stored_extension(
-                        &mut engine,
-                        home.artifact_store(),
-                        &activation.artifact,
-                        activation.instance_id.clone(),
-                        activation.scope_id.clone(),
-                    )? {
-                        RtwExtensionLoadOutcome::Loaded(loaded) => {
-                            // Registration is already a completed lifecycle transition.
-                            // Record it before applying any fallible host policy so startup
-                            // rollback always unregisters this instance explicitly.
-                            registered_set.insert(activation.instance_id.clone());
-                            registered.push(activation.instance_id.clone());
-                            if loaded.can_publish_execution_targets {
-                                bootstrap_instances.insert(activation.instance_id.clone());
-                            }
-                            for grant in profile.runtime_permissions.iter().filter(|grant| {
-                                grant.scope_id == activation.scope_id
-                                    && grant.instance_id == activation.instance_id
-                            }) {
-                                engine.grant_requested_runtime_permission_for_instance(
-                                    &activation.instance_id,
-                                    &grant.component_id,
-                                    grant.permission,
-                                )?;
-                            }
-                            made_progress = true;
-                        }
-                        RtwExtensionLoadOutcome::Deferred(waiting) => {
-                            deferred.push(BootstrapDeferredActivation {
-                                subject: activation.subject.clone(),
-                                instance_id: activation.instance_id.clone(),
-                                extension_id: waiting.extension_id.to_string(),
-                                missing_required_targets: waiting
-                                    .missing_required_targets()
-                                    .cloned()
-                                    .collect(),
-                            });
-                            next_pending.push(activation);
-                        }
-                    }
-                }
-                pending = next_pending;
-
-                if pending.is_empty() {
-                    break;
-                }
-
-                // Only runtime-provider-capable roots and their required contract
-                // dependency closure may start before the complete baseline is loaded.
-                // Ordinary consumers wait for the final full-topology activation plan.
-                let mut blocked = Vec::new();
-                loop {
-                    blocked.clear();
-                    let mut started_one = false;
-                    let mut expanded_dependencies = false;
-                    for activation in &activations {
-                        if !bootstrap_instances.contains(&activation.instance_id)
-                            || !registered_set.contains(&activation.instance_id)
-                            || started_set.contains(&activation.instance_id)
-                        {
-                            continue;
-                        }
-                        match engine.start_extension_instance(&activation.instance_id) {
-                            Ok(()) => {
-                                started_set.insert(activation.instance_id.clone());
-                                started.push(activation.instance_id.clone());
-                                made_progress = true;
-                                started_one = true;
-                                break;
-                            }
-                            Err(EngineError::ActivationPlan(reason)) => {
-                                expanded_dependencies |= expand_bootstrap_dependencies(
-                                    &engine,
-                                    &activation.scope_id,
-                                    &activation.instance_id,
-                                    &reason,
-                                    &registered_set,
-                                    &mut bootstrap_instances,
-                                );
-                                blocked.push(BootstrapBlockedActivation {
-                                    instance_id: activation.instance_id.clone(),
-                                    reason,
-                                });
-                            }
-                            Err(error) => return Err(HostError::Engine(error)),
-                        }
-                    }
-                    if started_one {
-                        continue;
-                    }
-                    if expanded_dependencies {
-                        continue;
-                    }
-                    break;
-                }
-
-                if made_progress {
-                    continue;
-                }
-
-                let blocked_instances: Vec<_> = activations
-                    .iter()
-                    .filter(|activation| {
-                        bootstrap_instances.contains(&activation.instance_id)
-                            && registered_set.contains(&activation.instance_id)
-                            && !started_set.contains(&activation.instance_id)
-                    })
-                    .map(|activation| activation.instance_id.clone())
-                    .collect();
-                let batch_error = bootstrap_batch_error(&engine, &blocked_instances)?;
-                return Err(HostError::BootstrapStalled(Box::new(BootstrapStall {
-                    deferred,
-                    blocked,
-                    batch_error,
-                })));
-            }
-
-            // Once every enabled artifact is registered, resolve the complete
-            // contract topology and start every remaining instance using the
-            // ordinary deterministic provider-before-consumer activation plan.
-            let remaining_instances: Vec<_> = activations
-                .iter()
-                .filter(|activation| {
-                    registered_set.contains(&activation.instance_id)
-                        && !started_set.contains(&activation.instance_id)
-                })
-                .map(|activation| activation.instance_id.clone())
-                .collect();
-            let plan = engine.plan_extension_activation(&remaining_instances)?;
-            for instance_id in plan.into_ordered_instances() {
-                engine.start_extension_instance(&instance_id)?;
-                started_set.insert(instance_id.clone());
-                started.push(instance_id);
-            }
-
             let has_explicit_shell_selection =
                 profile.preferred_providers.iter().any(|selection| {
                     selection.scope_id == host_scope && selection.contract() == host_shell_contract
@@ -651,23 +543,54 @@ impl HostRuntime {
             return Err(HostError::WorldAlreadyActive(world_id));
         }
 
-        let storage = home.open_world_storage(world_id)?;
-        let session = storage.load_session()?;
-        let mut builder = WorldRuntimeBuilder::new(storage);
-        for definition in session
-            .schemas()
-            .iter()
-            .filter(|definition| definition.kind() == SchemaKind::Command)
-        {
-            builder.register_system(self.bind_world_system(
-                world_id,
-                definition.key().clone(),
-                definition.owner().clone(),
-            )?)?;
-        }
+        let profile = home.load_world_composition(world_id)?;
+        let scope_id = world_runtime_scope_id(world_id);
+        let overlay = activate_composition(&mut self.engine, home, &profile, &scope_id)?;
+        let runtime_result: HostResult<WorldRuntime> = (|| {
+            let storage = home.open_world_storage(world_id)?;
+            let session = storage.load_session()?;
+            let mut builder = WorldRuntimeBuilder::new(storage);
+            for definition in session
+                .schemas()
+                .iter()
+                .filter(|definition| definition.kind() == SchemaKind::Command)
+            {
+                builder.register_system(self.bind_world_system(
+                    world_id,
+                    definition.key().clone(),
+                    definition.owner().clone(),
+                )?)?;
+            }
+            Ok(builder.start()?)
+        })();
 
-        let runtime = builder.start()?;
-        self.active_worlds.insert(world_id, runtime);
+        let runtime = match runtime_result {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let cleanup_failures = cleanup_instances(
+                    &mut self.engine,
+                    &overlay.started_instances,
+                    &overlay.registered_instances,
+                );
+                clear_world_scope_topology(&mut self.engine, &scope_id);
+                if cleanup_failures.is_empty() {
+                    return Err(error);
+                }
+                return Err(HostError::BootstrapRollback(Box::new(BootstrapRollback {
+                    primary: Box::new(error),
+                    cleanup_failures,
+                })));
+            }
+        };
+
+        self.active_worlds.insert(
+            world_id,
+            ActiveWorld {
+                runtime,
+                registered_instances: overlay.registered_instances,
+                started_instances: overlay.started_instances,
+            },
+        );
         Ok(())
     }
 
@@ -678,12 +601,20 @@ impl HostRuntime {
     /// Returns WorldNotActive when the world is not running, or the runtime
     /// shutdown failure after the world has been removed from the active set.
     pub fn deactivate_world(&mut self, world_id: WorldId) -> HostResult<()> {
-        let runtime = self
+        let active = self
             .active_worlds
             .remove(&world_id)
             .ok_or(HostError::WorldNotActive(world_id))?;
-        runtime.shutdown()?;
-        Ok(())
+        let (world_failures, cleanup_failures) =
+            cleanup_active_world(&mut self.engine, world_id, active);
+        if world_failures.is_empty() && cleanup_failures.is_empty() {
+            Ok(())
+        } else {
+            Err(HostError::ShutdownFailed(Box::new(HostShutdownFailures {
+                world_failures,
+                cleanup_failures,
+            })))
+        }
     }
 
     /// Executes one command in an active world and then performs live event delivery.
@@ -702,11 +633,11 @@ impl HostRuntime {
         command: WorldCommand,
     ) -> HostResult<WorldCommandDispatchOutcome> {
         let authoritative = {
-            let runtime = self
+            let active = self
                 .active_worlds
                 .get(&world_id)
                 .ok_or(HostError::WorldNotActive(world_id))?;
-            runtime.submit(command)?.wait_outcome()?
+            active.runtime.submit(command)?.wait_outcome()?
         };
 
         let live_delivery = if authoritative.receipt().disposition() == CommitDisposition::Committed
@@ -803,12 +734,13 @@ impl HostRuntime {
 
     /// Stops every active world, then unregisters baseline runtime instances.
     pub fn shutdown(mut self) -> HostResult<()> {
-        let world_failures = shutdown_worlds(&mut self.active_worlds);
-        let cleanup_failures = cleanup_instances(
+        let (world_failures, mut cleanup_failures) =
+            shutdown_worlds(&mut self.active_worlds, &mut self.engine);
+        cleanup_failures.extend(cleanup_instances(
             &mut self.engine,
             &self.started_instances,
             &self.started_instances,
-        );
+        ));
         if world_failures.is_empty() && cleanup_failures.is_empty() {
             Ok(())
         } else {
@@ -820,17 +752,238 @@ impl HostRuntime {
     }
 }
 
-fn shutdown_worlds(
-    active_worlds: &mut BTreeMap<WorldId, WorldRuntime>,
-) -> Vec<WorldRuntimeCleanupFailure> {
-    let worlds = std::mem::take(active_worlds);
-    let mut failures = Vec::new();
-    for (world_id, runtime) in worlds.into_iter().rev() {
-        if let Err(error) = runtime.shutdown() {
-            failures.push(WorldRuntimeCleanupFailure { world_id, error });
+struct ActivatedComposition {
+    registered_instances: Vec<ExtensionInstanceId>,
+    started_instances: Vec<ExtensionInstanceId>,
+}
+
+fn activate_composition(
+    engine: &mut ExtensionEngine,
+    home: &HostHome,
+    profile: &CompositionProfile,
+    scope_id: &RuntimeScopeId,
+) -> HostResult<ActivatedComposition> {
+    profile.validate_scope(scope_id)?;
+    engine.clear_preferred_contract_provider_policies_in_scope(scope_id);
+    let loader = RtwExtensionLoader::new();
+    let mut registered = Vec::new();
+    let mut started = Vec::new();
+
+    let result: HostResult<()> = (|| {
+        let activations: Vec<_> = profile
+            .activations
+            .iter()
+            .filter(|item| item.enabled)
+            .cloned()
+            .collect();
+        for activation in &activations {
+            if activation.content.to_string() != "rintawa.extension@1" {
+                return Err(HostError::UnsupportedContent(
+                    activation.content.to_string(),
+                ));
+            }
         }
+
+        for selection in &profile.preferred_providers {
+            engine.set_preferred_contract_provider_policy_in_scope(
+                selection.scope_id.clone(),
+                selection.contract(),
+                selection.provider(),
+            );
+        }
+
+        let mut pending = activations.clone();
+        let mut registered_set = HashSet::new();
+        let mut started_set = HashSet::new();
+        let mut bootstrap_instances = HashSet::new();
+
+        while !pending.is_empty() {
+            let mut made_progress = false;
+            let mut next_pending = Vec::new();
+            let mut deferred = Vec::new();
+
+            for activation in pending {
+                match loader.try_load_stored_extension(
+                    engine,
+                    home.artifact_store(),
+                    &activation.artifact,
+                    activation.instance_id.clone(),
+                    activation.scope_id.clone(),
+                )? {
+                    RtwExtensionLoadOutcome::Loaded(loaded) => {
+                        registered_set.insert(activation.instance_id.clone());
+                        registered.push(activation.instance_id.clone());
+                        if loaded.can_publish_execution_targets {
+                            bootstrap_instances.insert(activation.instance_id.clone());
+                        }
+                        for grant in profile.runtime_permissions.iter().filter(|grant| {
+                            grant.scope_id == activation.scope_id
+                                && grant.instance_id == activation.instance_id
+                        }) {
+                            engine.grant_requested_runtime_permission_for_instance(
+                                &activation.instance_id,
+                                &grant.component_id,
+                                grant.permission,
+                            )?;
+                        }
+                        made_progress = true;
+                    }
+                    RtwExtensionLoadOutcome::Deferred(waiting) => {
+                        deferred.push(BootstrapDeferredActivation {
+                            subject: activation.subject.clone(),
+                            instance_id: activation.instance_id.clone(),
+                            extension_id: waiting.extension_id.to_string(),
+                            missing_required_targets: waiting
+                                .missing_required_targets()
+                                .cloned()
+                                .collect(),
+                        });
+                        next_pending.push(activation);
+                    }
+                }
+            }
+            pending = next_pending;
+
+            if pending.is_empty() {
+                break;
+            }
+
+            let mut blocked = Vec::new();
+            loop {
+                blocked.clear();
+                let mut started_one = false;
+                let mut expanded_dependencies = false;
+                for activation in &activations {
+                    if !bootstrap_instances.contains(&activation.instance_id)
+                        || !registered_set.contains(&activation.instance_id)
+                        || started_set.contains(&activation.instance_id)
+                    {
+                        continue;
+                    }
+                    match engine.start_extension_instance(&activation.instance_id) {
+                        Ok(()) => {
+                            started_set.insert(activation.instance_id.clone());
+                            started.push(activation.instance_id.clone());
+                            made_progress = true;
+                            started_one = true;
+                            break;
+                        }
+                        Err(EngineError::ActivationPlan(reason)) => {
+                            expanded_dependencies |= expand_bootstrap_dependencies(
+                                engine,
+                                &activation.scope_id,
+                                &activation.instance_id,
+                                &reason,
+                                &registered_set,
+                                &mut bootstrap_instances,
+                            );
+                            blocked.push(BootstrapBlockedActivation {
+                                instance_id: activation.instance_id.clone(),
+                                reason,
+                            });
+                        }
+                        Err(error) => return Err(HostError::Engine(error)),
+                    }
+                }
+                if started_one || expanded_dependencies {
+                    continue;
+                }
+                break;
+            }
+
+            if made_progress {
+                continue;
+            }
+
+            let blocked_instances: Vec<_> = activations
+                .iter()
+                .filter(|activation| {
+                    bootstrap_instances.contains(&activation.instance_id)
+                        && registered_set.contains(&activation.instance_id)
+                        && !started_set.contains(&activation.instance_id)
+                })
+                .map(|activation| activation.instance_id.clone())
+                .collect();
+            let batch_error = bootstrap_batch_error(engine, &blocked_instances)?;
+            return Err(HostError::BootstrapStalled(Box::new(BootstrapStall {
+                deferred,
+                blocked,
+                batch_error,
+            })));
+        }
+
+        let remaining_instances: Vec<_> = activations
+            .iter()
+            .filter(|activation| {
+                registered_set.contains(&activation.instance_id)
+                    && !started_set.contains(&activation.instance_id)
+            })
+            .map(|activation| activation.instance_id.clone())
+            .collect();
+        let plan = engine.plan_extension_activation(&remaining_instances)?;
+        for instance_id in plan.into_ordered_instances() {
+            engine.start_extension_instance(&instance_id)?;
+            started_set.insert(instance_id.clone());
+            started.push(instance_id);
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        let cleanup_failures = cleanup_instances(engine, &started, &registered);
+        engine.clear_preferred_contract_provider_policies_in_scope(scope_id);
+        if cleanup_failures.is_empty() {
+            return Err(error);
+        }
+        return Err(HostError::BootstrapRollback(Box::new(BootstrapRollback {
+            primary: Box::new(error),
+            cleanup_failures,
+        })));
     }
-    failures
+
+    Ok(ActivatedComposition {
+        registered_instances: registered,
+        started_instances: started,
+    })
+}
+
+fn cleanup_active_world(
+    engine: &mut ExtensionEngine,
+    world_id: WorldId,
+    active: ActiveWorld,
+) -> (Vec<WorldRuntimeCleanupFailure>, Vec<HostCleanupFailure>) {
+    let mut world_failures = Vec::new();
+    if let Err(error) = active.runtime.shutdown() {
+        world_failures.push(WorldRuntimeCleanupFailure { world_id, error });
+    }
+    let cleanup_failures = cleanup_instances(
+        engine,
+        &active.started_instances,
+        &active.registered_instances,
+    );
+    clear_world_scope_topology(engine, &world_runtime_scope_id(world_id));
+    (world_failures, cleanup_failures)
+}
+
+fn clear_world_scope_topology(engine: &mut ExtensionEngine, scope_id: &RuntimeScopeId) {
+    engine.clear_preferred_contract_provider_policies_in_scope(scope_id);
+    engine.clear_platform_contract_definitions_in_scope(scope_id);
+}
+
+fn shutdown_worlds(
+    active_worlds: &mut BTreeMap<WorldId, ActiveWorld>,
+    engine: &mut ExtensionEngine,
+) -> (Vec<WorldRuntimeCleanupFailure>, Vec<HostCleanupFailure>) {
+    let worlds = std::mem::take(active_worlds);
+    let mut world_failures = Vec::new();
+    let mut cleanup_failures = Vec::new();
+    for (world_id, active) in worlds.into_iter().rev() {
+        let (mut world_errors, mut extension_errors) =
+            cleanup_active_world(engine, world_id, active);
+        world_failures.append(&mut world_errors);
+        cleanup_failures.append(&mut extension_errors);
+    }
+    (world_failures, cleanup_failures)
 }
 
 fn cleanup_instances(

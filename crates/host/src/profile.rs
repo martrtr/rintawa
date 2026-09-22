@@ -13,7 +13,7 @@ use tempfile::NamedTempFile;
 
 use crate::{HostError, HostResult};
 
-/// Current baseline profile schema.
+/// Current host composition profile schema.
 pub const PROFILE_SCHEMA: u32 = 4;
 const LEGACY_PROFILE_SCHEMA_V1: u32 = 1;
 const LEGACY_PROFILE_SCHEMA_V2: u32 = 2;
@@ -24,11 +24,11 @@ const MAX_PREFERENCE_KEY_BYTES: usize = 128;
 const MAX_PREFERENCE_VALUE_BYTES: usize = 64 * 1024;
 const MAX_PREFERENCE_TOTAL_BYTES_PER_COMPONENT: usize = 1024 * 1024;
 
-/// One exact activation selected for the pre-world host composition.
+/// One exact activation selected for a host-owned composition.
 ///
 /// `subject` is defined by the RTW content handler. For `rintawa.extension@1`
-/// it is the logical extension ID. Future world state can overlay these records
-/// without changing CAS identity or the RTW container format.
+/// it is the logical extension ID. Baseline and World compositions reuse this
+/// record while keeping independent runtime scopes and concrete instance IDs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ActivationRecord {
@@ -91,10 +91,10 @@ impl PreferredProviderSelection {
     }
 }
 
-/// One explicit host-approved runtime permission for an exact baseline component.
+/// One explicit host-approved runtime permission for an exact composition component.
 ///
 /// The extension manifest must request the permission separately. This record is
-/// profile policy only and never expands package-declared capabilities.
+/// composition policy only and never expands package-declared capabilities.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct RuntimePermissionGrant {
@@ -153,10 +153,10 @@ impl PreferenceRecord {
     }
 }
 
-/// Persistent baseline composition used before any State Engine world is opened.
+/// Persistent exact-artifact composition for one host-owned runtime scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct BaselineProfile {
+pub struct CompositionProfile {
     /// Version of this persistence schema.
     pub schema: u32,
     /// Ordered exact activations. Order remains explicit for future composition policy.
@@ -173,7 +173,10 @@ pub struct BaselineProfile {
     pub preferences: Vec<PreferenceRecord>,
 }
 
-impl Default for BaselineProfile {
+/// Backward-compatible public name for the pre-world composition profile.
+pub type BaselineProfile = CompositionProfile;
+
+impl Default for CompositionProfile {
     fn default() -> Self {
         Self {
             schema: PROFILE_SCHEMA,
@@ -185,7 +188,7 @@ impl Default for BaselineProfile {
     }
 }
 
-impl BaselineProfile {
+impl CompositionProfile {
     pub(crate) fn load(path: &Path) -> HostResult<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -201,6 +204,24 @@ impl BaselineProfile {
         }
         profile.validate()?;
         Ok(profile)
+    }
+
+    pub(crate) fn validate_scope(&self, expected: &RuntimeScopeId) -> HostResult<()> {
+        let actual = self
+            .activations
+            .iter()
+            .map(|item| &item.scope_id)
+            .chain(self.preferred_providers.iter().map(|item| &item.scope_id))
+            .chain(self.runtime_permissions.iter().map(|item| &item.scope_id))
+            .chain(self.preferences.iter().map(|item| &item.scope_id))
+            .find(|scope| *scope != expected);
+        if let Some(actual) = actual {
+            return Err(HostError::CompositionScopeMismatch {
+                expected_scope: expected.to_string(),
+                actual_scope: actual.to_string(),
+            });
+        }
+        Ok(())
     }
 
     pub(crate) fn save(&self, path: &Path) -> HostResult<()> {

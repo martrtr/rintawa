@@ -5,7 +5,7 @@ use rintawa_sdk::{
 };
 
 use crate::{
-    host_access::{CompositionActivation, HostAccessError},
+    host_access::{CompositionActivation, HostAccessError, RuntimePolicyComponent},
     runtime::wasm::{
         ArtifactStoreError, ArtifactStoreHost, CompositionError, CompositionHost, PreferenceError,
         PreferencesHost, RuntimePermissionCheck, RuntimePolicyError, RuntimePolicyHost,
@@ -160,42 +160,29 @@ impl RuntimePolicyHost for WasmHostState {
     }
 
     fn list_components(&mut self) -> Result<Vec<WitRuntimePolicyComponent>, RuntimePolicyError> {
-        if !self.host_access_active {
-            return Err(RuntimePolicyError::AccessNotActive);
-        }
-        self.runtime_permission_owner(RuntimePermission::RuntimePolicyRead)
-            .map_err(|error| match error {
-                RuntimePermissionCheck::Denied => RuntimePolicyError::PermissionDenied,
-                RuntimePermissionCheck::Unavailable => RuntimePolicyError::Unavailable,
-            })?;
-
+        self.require_runtime_policy_read()?;
         let components = self
             .host_access
             .runtime_policy
             .list_components()
             .map_err(map_runtime_policy_access_error)?;
-        let message_bytes = components.iter().fold(0_usize, |total, component| {
-            total
-                .saturating_add(component.scope_id.len())
-                .saturating_add(component.instance_id.len())
-                .saturating_add(component.component_id.len())
-                .saturating_add(component.requested.iter().map(String::len).sum::<usize>())
-                .saturating_add(component.granted.iter().map(String::len).sum::<usize>())
-        });
-        if message_bytes > self.max_host_message_bytes {
+        self.bound_runtime_policy_components(components)
+    }
+
+    fn list_components_in_scope(
+        &mut self,
+        scope_id: String,
+    ) -> Result<Vec<WitRuntimePolicyComponent>, RuntimePolicyError> {
+        self.require_runtime_policy_read()?;
+        if scope_id.len() > self.max_host_message_bytes {
             return Err(RuntimePolicyError::MessageTooLarge);
         }
-
-        Ok(components
-            .into_iter()
-            .map(|component| WitRuntimePolicyComponent {
-                scope_id: component.scope_id,
-                instance_id: component.instance_id,
-                component_id: component.component_id,
-                requested: component.requested,
-                granted: component.granted,
-            })
-            .collect())
+        let components = self
+            .host_access
+            .runtime_policy
+            .list_components_in_scope(&scope_id)
+            .map_err(map_runtime_policy_access_error)?;
+        self.bound_runtime_policy_components(components)
     }
 
     fn grant(
@@ -246,6 +233,18 @@ impl RuntimePolicyHost for WasmHostState {
 }
 
 impl WasmHostState {
+    fn require_runtime_policy_read(&self) -> Result<(), RuntimePolicyError> {
+        if !self.host_access_active {
+            return Err(RuntimePolicyError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::RuntimePolicyRead)
+            .map(|_| ())
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => RuntimePolicyError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => RuntimePolicyError::Unavailable,
+            })
+    }
+
     fn require_runtime_policy_write(&self) -> Result<(), RuntimePolicyError> {
         if !self.host_access_active {
             return Err(RuntimePolicyError::AccessNotActive);
@@ -257,43 +256,45 @@ impl WasmHostState {
                 RuntimePermissionCheck::Unavailable => RuntimePolicyError::Unavailable,
             })
     }
+
+    fn bound_runtime_policy_components(
+        &self,
+        components: Vec<RuntimePolicyComponent>,
+    ) -> Result<Vec<WitRuntimePolicyComponent>, RuntimePolicyError> {
+        let message_bytes = components.iter().fold(0_usize, |total, component| {
+            total
+                .saturating_add(component.scope_id.len())
+                .saturating_add(component.instance_id.len())
+                .saturating_add(component.component_id.len())
+                .saturating_add(component.requested.iter().map(String::len).sum::<usize>())
+                .saturating_add(component.granted.iter().map(String::len).sum::<usize>())
+        });
+        if message_bytes > self.max_host_message_bytes {
+            return Err(RuntimePolicyError::MessageTooLarge);
+        }
+
+        Ok(components
+            .into_iter()
+            .map(|component| WitRuntimePolicyComponent {
+                scope_id: component.scope_id,
+                instance_id: component.instance_id,
+                component_id: component.component_id,
+                requested: component.requested,
+                granted: component.granted,
+            })
+            .collect())
+    }
 }
 
 impl CompositionHost for WasmHostState {
     fn list_activations(&mut self) -> Result<Vec<WitCompositionActivation>, CompositionError> {
-        if !self.host_access_active {
-            return Err(CompositionError::AccessNotActive);
-        }
-        self.runtime_permission_owner(RuntimePermission::CompositionRead)
-            .map_err(|error| match error {
-                RuntimePermissionCheck::Denied => CompositionError::PermissionDenied,
-                RuntimePermissionCheck::Unavailable => CompositionError::Unavailable,
-            })?;
-
+        self.require_composition_read()?;
         let activations = self
             .host_access
             .composition
             .list_activations()
             .map_err(map_composition_access_error)?;
-        let message_bytes = activations.iter().fold(0_usize, |total, activation| {
-            total
-                .saturating_add(activation.subject.len())
-                .saturating_add(activation.content.len())
-                .saturating_add(activation.name.len())
-                .saturating_add(activation.version.as_ref().map_or(0, String::len))
-                .saturating_add(activation.digest.len())
-                .saturating_add(activation.instance_id.len())
-                .saturating_add(activation.scope_id.len())
-                .saturating_add(1)
-        });
-        if message_bytes > self.max_host_message_bytes {
-            return Err(CompositionError::Rejected);
-        }
-
-        Ok(activations
-            .into_iter()
-            .map(to_wit_composition_activation)
-            .collect())
+        self.bound_composition_activations(activations)
     }
 
     fn select_artifact(
@@ -334,9 +335,85 @@ impl CompositionHost for WasmHostState {
             .remove_activation(&subject)
             .map_err(map_composition_access_error)
     }
+
+    fn list_activations_in_scope(
+        &mut self,
+        scope_id: String,
+    ) -> Result<Vec<WitCompositionActivation>, CompositionError> {
+        self.require_composition_read()?;
+        if scope_id.len() > self.max_host_message_bytes {
+            return Err(CompositionError::Rejected);
+        }
+        let activations = self
+            .host_access
+            .composition
+            .list_activations_in_scope(&scope_id)
+            .map_err(map_composition_access_error)?;
+        self.bound_composition_activations(activations)
+    }
+
+    fn select_artifact_in_scope(
+        &mut self,
+        scope_id: String,
+        digest: String,
+        enabled: Option<bool>,
+    ) -> Result<WitCompositionActivation, CompositionError> {
+        self.require_composition_write()?;
+        if scope_id.len().saturating_add(digest.len()) > self.max_host_message_bytes {
+            return Err(CompositionError::Rejected);
+        }
+        self.host_access
+            .composition
+            .select_artifact_in_scope(&scope_id, &digest, enabled)
+            .map(to_wit_composition_activation)
+            .map_err(map_composition_access_error)
+    }
+
+    fn set_enabled_in_scope(
+        &mut self,
+        scope_id: String,
+        subject: String,
+        enabled: bool,
+    ) -> Result<(), CompositionError> {
+        self.require_composition_write()?;
+        if scope_id.len().saturating_add(subject.len()) > self.max_host_message_bytes {
+            return Err(CompositionError::Rejected);
+        }
+        self.host_access
+            .composition
+            .set_enabled_in_scope(&scope_id, &subject, enabled)
+            .map_err(map_composition_access_error)
+    }
+
+    fn remove_activation_in_scope(
+        &mut self,
+        scope_id: String,
+        subject: String,
+    ) -> Result<(), CompositionError> {
+        self.require_composition_write()?;
+        if scope_id.len().saturating_add(subject.len()) > self.max_host_message_bytes {
+            return Err(CompositionError::Rejected);
+        }
+        self.host_access
+            .composition
+            .remove_activation_in_scope(&scope_id, &subject)
+            .map_err(map_composition_access_error)
+    }
 }
 
 impl WasmHostState {
+    fn require_composition_read(&self) -> Result<(), CompositionError> {
+        if !self.host_access_active {
+            return Err(CompositionError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::CompositionRead)
+            .map(|_| ())
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => CompositionError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => CompositionError::Unavailable,
+            })
+    }
+
     fn require_composition_write(&self) -> Result<(), CompositionError> {
         if !self.host_access_active {
             return Err(CompositionError::AccessNotActive);
@@ -347,6 +424,31 @@ impl WasmHostState {
                 RuntimePermissionCheck::Denied => CompositionError::PermissionDenied,
                 RuntimePermissionCheck::Unavailable => CompositionError::Unavailable,
             })
+    }
+
+    fn bound_composition_activations(
+        &self,
+        activations: Vec<CompositionActivation>,
+    ) -> Result<Vec<WitCompositionActivation>, CompositionError> {
+        let message_bytes = activations.iter().fold(0_usize, |total, activation| {
+            total
+                .saturating_add(activation.subject.len())
+                .saturating_add(activation.content.len())
+                .saturating_add(activation.name.len())
+                .saturating_add(activation.version.as_ref().map_or(0, String::len))
+                .saturating_add(activation.digest.len())
+                .saturating_add(activation.instance_id.len())
+                .saturating_add(activation.scope_id.len())
+                .saturating_add(1)
+        });
+        if message_bytes > self.max_host_message_bytes {
+            return Err(CompositionError::Rejected);
+        }
+
+        Ok(activations
+            .into_iter()
+            .map(to_wit_composition_activation)
+            .collect())
     }
 }
 

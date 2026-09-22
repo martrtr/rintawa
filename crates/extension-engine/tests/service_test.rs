@@ -253,6 +253,50 @@ fn test_platform_caller_only_invokes_platform_owned_service_contracts() -> Resul
 }
 
 #[test]
+fn test_clearing_platform_contract_scope_removes_service_route_and_reservation() -> Result<()> {
+    let scope = RuntimeScopeId::new("world:clear-platform");
+    let contract = contract("rintawa.test.platform-clear");
+    let provider_instance = ExtensionInstanceId::new("platform-provider");
+    let mut engine = ExtensionEngine::new();
+
+    engine.define_platform_service_contract_in_scope(
+        scope.clone(),
+        contract.clone(),
+        ContractResolutionPolicy::Single,
+    )?;
+    engine.register_extension_instance(
+        provider_instance.clone(),
+        scope.clone(),
+        manifest("platform-provider"),
+        vec![Box::new(
+            ServiceComponent::new("runtime")
+                .providing(ContractProvider::new(contract.clone()))
+                .responding(b"pong".to_vec()),
+        )],
+    )?;
+    engine.start_extension_instance(&provider_instance)?;
+
+    let caller = engine.platform_service_caller(scope.clone());
+    assert_eq!(caller.call(&contract, b"ping")?, b"pong");
+
+    engine.clear_platform_contract_definitions_in_scope(&scope);
+    assert_eq!(
+        caller.call(&contract, b"ping"),
+        Err(ServiceCallError::Unavailable)
+    );
+
+    engine.register_extension_instance(
+        ExtensionInstanceId::new("extension-owner"),
+        scope,
+        manifest("extension-owner"),
+        vec![Box::new(ServiceComponent::new("runtime").defining(
+            ContractDefinition::service(contract, ContractResolutionPolicy::Single),
+        ))],
+    )?;
+    Ok(())
+}
+
+#[test]
 fn test_platform_caller_can_pin_provider_extension_owner() -> Result<()> {
     let contract = contract("rintawa.test.owner-pinned-platform-service");
     let scope = RuntimeScopeId::new("world:owner-pinned");

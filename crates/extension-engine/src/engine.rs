@@ -509,6 +509,16 @@ impl ExtensionEngine {
         )
     }
 
+    /// Removes every platform-owned contract reservation in one exact runtime scope.
+    ///
+    /// Scope supervisors call this only after their extension instances and
+    /// host-owned workers are stopped. The service router is cleared together with
+    /// the composition index so stale platform roles cannot survive reactivation.
+    pub fn clear_platform_contract_definitions_in_scope(&mut self, scope_id: &RuntimeScopeId) {
+        self.services.clear_platform_contracts_in_scope(scope_id);
+        self.platform_contract_definitions.remove(scope_id);
+    }
+
     fn define_platform_contract_in_scope(
         &mut self,
         scope_id: RuntimeScopeId,
@@ -1371,6 +1381,24 @@ impl ExtensionEngine {
             }
         }
         self.services.clear_preferred_provider(scope_id, contract);
+    }
+
+    /// Removes every preferred-provider selection in one exact runtime scope.
+    ///
+    /// Host-owned composition lifecycles use this before restoring persisted policy
+    /// so removed selections cannot survive a deactivate/reactivate cycle.
+    pub fn clear_preferred_contract_provider_policies_in_scope(
+        &mut self,
+        scope_id: &RuntimeScopeId,
+    ) {
+        let contracts = self
+            .preferred_contract_providers
+            .remove(scope_id)
+            .map(|providers| providers.into_keys().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for contract in contracts {
+            self.services.clear_preferred_provider(scope_id, &contract);
+        }
     }
 
     /// Executes one cooperative runtime pump across every active component.

@@ -293,6 +293,30 @@ interface composition {
     /// Removes a persisted baseline selection and related policy references.
     /// Running instances are not torn down implicitly.
     remove-activation: func(subject: string) -> result<_, error>;
+
+    /// Lists exact selections in one explicit host composition scope.
+    list-activations-in-scope: func(scope-id: string) -> result<list<activation>, error>;
+
+    /// Selects one already-imported exact artifact in one explicit composition scope.
+    select-artifact-in-scope: func(
+        scope-id: string,
+        digest: string,
+        enabled: option<bool>,
+    ) -> result<activation, error>;
+
+    /// Changes persisted enabled state in one explicit composition scope.
+    set-enabled-in-scope: func(
+        scope-id: string,
+        subject: string,
+        enabled: bool,
+    ) -> result<_, error>;
+
+    /// Removes one persisted selection from one explicit composition scope.
+    /// Running instances are not torn down implicitly.
+    remove-activation-in-scope: func(
+        scope-id: string,
+        subject: string,
+    ) -> result<_, error>;
 }
 
 
@@ -338,6 +362,12 @@ interface runtime-policy {
 
     /// Lists baseline component permission policy. Requires runtime-policy-read.
     list-components: func() -> result<list<component-policy>, error>;
+
+    /// Lists component permission policy in one explicit composition scope.
+    /// Requires runtime-policy-read.
+    list-components-in-scope: func(
+        scope-id: string,
+    ) -> result<list<component-policy>, error>;
 
     /// Grants one manifest-requested permission. Requires runtime-policy-write.
     grant: func(

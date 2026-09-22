@@ -147,6 +147,16 @@ pub trait RuntimePolicyAccess: Send + Sync {
     /// Lists requested and granted runtime permissions for baseline components.
     fn list_components(&self) -> HostAccessResult<Vec<RuntimePolicyComponent>>;
 
+    /// Lists requested and granted runtime permissions in one exact composition scope.
+    ///
+    /// Implementations that do not support scoped compositions fail closed.
+    fn list_components_in_scope(
+        &self,
+        _scope_id: &str,
+    ) -> HostAccessResult<Vec<RuntimePolicyComponent>> {
+        Err(HostAccessError::Rejected)
+    }
+
     /// Grants one permission to an exact component principal.
     fn grant(
         &self,
@@ -183,6 +193,41 @@ pub trait CompositionAccess: Send + Sync {
 
     /// Removes one persisted selection and policy entries that reference it.
     fn remove_activation(&self, subject: &str) -> HostAccessResult<()>;
+
+    /// Lists exact selections in one explicit composition scope.
+    ///
+    /// Implementations that do not support scoped compositions fail closed.
+    fn list_activations_in_scope(
+        &self,
+        _scope_id: &str,
+    ) -> HostAccessResult<Vec<CompositionActivation>> {
+        Err(HostAccessError::Rejected)
+    }
+
+    /// Selects one exact artifact in one explicit composition scope.
+    fn select_artifact_in_scope(
+        &self,
+        _scope_id: &str,
+        _digest: &str,
+        _enabled: Option<bool>,
+    ) -> HostAccessResult<CompositionActivation> {
+        Err(HostAccessError::Rejected)
+    }
+
+    /// Changes persisted enabled state in one explicit composition scope.
+    fn set_enabled_in_scope(
+        &self,
+        _scope_id: &str,
+        _subject: &str,
+        _enabled: bool,
+    ) -> HostAccessResult<()> {
+        Err(HostAccessError::Rejected)
+    }
+
+    /// Removes one exact selection from one explicit composition scope.
+    fn remove_activation_in_scope(&self, _scope_id: &str, _subject: &str) -> HostAccessResult<()> {
+        Err(HostAccessError::Rejected)
+    }
 }
 
 #[derive(Default)]

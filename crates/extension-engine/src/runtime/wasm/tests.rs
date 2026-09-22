@@ -1,7 +1,14 @@
 //! Unit tests for WASM host state, sandbox boundaries, and delegated execution.
 
 use super::*;
-use crate::secrets::InMemorySecretVault;
+use crate::{
+    host_access::{
+        ArtifactStoreAccess, CompositionAccess, CompositionActivation, HostAccessError,
+        HostAccessResult, ImportedArtifact, PreferenceAccess, RuntimeArtifactPolicy,
+        RuntimePolicyAccess, RuntimePolicyComponent,
+    },
+    secrets::InMemorySecretVault,
+};
 use rintawa_sdk::{
     api::{LogLevel, LoggerApi},
     secrets::{SecretPath, SecretPathPattern, SecretValue},
@@ -26,6 +33,163 @@ fn begin_test_registration(state: &mut WasmHostState, extension_id: ExtensionId)
     state
         .begin_registration(extension_id, test_instance_id(), test_scope_id())
         .unwrap();
+}
+
+#[derive(Default)]
+struct RecordingScopedHostAccess {
+    composition_reads: Mutex<Vec<String>>,
+    composition_writes: Mutex<Vec<String>>,
+    runtime_policy_reads: Mutex<Vec<String>>,
+}
+
+impl ArtifactStoreAccess for RecordingScopedHostAccess {
+    fn import_rtw(&self, _bytes: &[u8]) -> HostAccessResult<ImportedArtifact> {
+        Err(HostAccessError::Rejected)
+    }
+}
+
+impl PreferenceAccess for RecordingScopedHostAccess {
+    fn get(
+        &self,
+        _scope_id: &str,
+        _instance_id: &str,
+        _component_id: &str,
+        _key: &str,
+    ) -> HostAccessResult<Option<String>> {
+        Err(HostAccessError::Rejected)
+    }
+
+    fn set(
+        &self,
+        _scope_id: &str,
+        _instance_id: &str,
+        _component_id: &str,
+        _key: &str,
+        _value: &str,
+    ) -> HostAccessResult<()> {
+        Err(HostAccessError::Rejected)
+    }
+
+    fn delete(
+        &self,
+        _scope_id: &str,
+        _instance_id: &str,
+        _component_id: &str,
+        _key: &str,
+    ) -> HostAccessResult<()> {
+        Err(HostAccessError::Rejected)
+    }
+}
+
+impl CompositionAccess for RecordingScopedHostAccess {
+    fn list_activations(&self) -> HostAccessResult<Vec<CompositionActivation>> {
+        Err(HostAccessError::Rejected)
+    }
+
+    fn select_artifact(
+        &self,
+        _digest: &str,
+        _enabled: Option<bool>,
+    ) -> HostAccessResult<CompositionActivation> {
+        Err(HostAccessError::Rejected)
+    }
+
+    fn set_enabled(&self, _subject: &str, _enabled: bool) -> HostAccessResult<()> {
+        Err(HostAccessError::Rejected)
+    }
+
+    fn remove_activation(&self, _subject: &str) -> HostAccessResult<()> {
+        Err(HostAccessError::Rejected)
+    }
+
+    fn list_activations_in_scope(
+        &self,
+        scope_id: &str,
+    ) -> HostAccessResult<Vec<CompositionActivation>> {
+        self.composition_reads
+            .lock()
+            .expect("test composition-read lock must stay healthy")
+            .push(scope_id.to_string());
+        Ok(vec![CompositionActivation {
+            subject: String::from("example.extension"),
+            content: String::from("rintawa.extension@1"),
+            name: String::from("Example"),
+            version: Some(String::from("1.0.0")),
+            digest: String::from("sha256:example"),
+            instance_id: String::from("instance"),
+            scope_id: scope_id.to_string(),
+            enabled: true,
+        }])
+    }
+
+    fn select_artifact_in_scope(
+        &self,
+        scope_id: &str,
+        _digest: &str,
+        _enabled: Option<bool>,
+    ) -> HostAccessResult<CompositionActivation> {
+        self.composition_writes
+            .lock()
+            .expect("test composition-write lock must stay healthy")
+            .push(scope_id.to_string());
+        Ok(CompositionActivation {
+            subject: String::from("example.extension"),
+            content: String::from("rintawa.extension@1"),
+            name: String::from("Example"),
+            version: Some(String::from("1.0.0")),
+            digest: String::from("sha256:example"),
+            instance_id: String::from("instance"),
+            scope_id: scope_id.to_string(),
+            enabled: true,
+        })
+    }
+}
+
+impl RuntimePolicyAccess for RecordingScopedHostAccess {
+    fn inspect_artifact(&self, _digest: &str) -> HostAccessResult<RuntimeArtifactPolicy> {
+        Err(HostAccessError::Rejected)
+    }
+
+    fn list_components(&self) -> HostAccessResult<Vec<RuntimePolicyComponent>> {
+        Err(HostAccessError::Rejected)
+    }
+
+    fn list_components_in_scope(
+        &self,
+        scope_id: &str,
+    ) -> HostAccessResult<Vec<RuntimePolicyComponent>> {
+        self.runtime_policy_reads
+            .lock()
+            .expect("test runtime-policy lock must stay healthy")
+            .push(scope_id.to_string());
+        Ok(vec![RuntimePolicyComponent {
+            scope_id: scope_id.to_string(),
+            instance_id: String::from("instance"),
+            component_id: String::from("runtime"),
+            requested: Vec::new(),
+            granted: Vec::new(),
+        }])
+    }
+
+    fn grant(
+        &self,
+        _scope_id: &str,
+        _instance_id: &str,
+        _component_id: &str,
+        _permission: &str,
+    ) -> HostAccessResult<()> {
+        Err(HostAccessError::Rejected)
+    }
+
+    fn revoke(
+        &self,
+        _scope_id: &str,
+        _instance_id: &str,
+        _component_id: &str,
+        _permission: &str,
+    ) -> HostAccessResult<()> {
+        Err(HostAccessError::Rejected)
+    }
 }
 
 #[test]
@@ -628,6 +792,103 @@ fn test_should_discard_pending_execution_targets_when_start_scope_aborts() {
 
     state.discard_guest_execution();
     assert!(state.pending_execution_targets.is_empty());
+}
+
+#[test]
+fn test_should_route_scoped_composition_and_runtime_policy_access() {
+    let access = Arc::new(RecordingScopedHostAccess::default());
+    let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
+    let mut services = WasmHostServices::standalone(secrets);
+    services.host_access = HostAccessServices::new(
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+    );
+    let mut state = WasmHostState::with_host_services_and_budget(
+        ComponentId::new("runtime"),
+        services,
+        false,
+        &WasmExecutionBudget::default(),
+    );
+    begin_test_registration(&mut state, ExtensionId::new("admin.ui"));
+    state.finish_registration().unwrap();
+    state.begin_guest_execution();
+
+    let scope = String::from("world:00000000-0000-7000-8000-000000000001");
+    assert!(matches!(
+        CompositionHost::list_activations_in_scope(&mut state, scope.clone()),
+        Err(CompositionError::PermissionDenied)
+    ));
+    assert!(matches!(
+        CompositionHost::select_artifact_in_scope(
+            &mut state,
+            scope.clone(),
+            String::from("sha256:example"),
+            Some(true),
+        ),
+        Err(CompositionError::PermissionDenied)
+    ));
+    assert!(matches!(
+        RuntimePolicyHost::list_components_in_scope(&mut state, scope.clone()),
+        Err(RuntimePolicyError::PermissionDenied)
+    ));
+
+    let owner = state.registered_owner().unwrap();
+    state
+        .runtime_permissions
+        .grant(owner.clone(), RuntimePermission::CompositionRead)
+        .unwrap();
+    let activations =
+        CompositionHost::list_activations_in_scope(&mut state, scope.clone()).unwrap();
+    assert_eq!(activations.len(), 1);
+    assert_eq!(activations[0].scope_id, scope);
+
+    state
+        .runtime_permissions
+        .grant(owner.clone(), RuntimePermission::CompositionWrite)
+        .unwrap();
+    let selected = CompositionHost::select_artifact_in_scope(
+        &mut state,
+        scope.clone(),
+        String::from("sha256:example"),
+        Some(true),
+    )
+    .unwrap();
+    assert_eq!(selected.scope_id, scope);
+
+    state
+        .runtime_permissions
+        .grant(owner, RuntimePermission::RuntimePolicyRead)
+        .unwrap();
+    let policies = RuntimePolicyHost::list_components_in_scope(&mut state, scope.clone()).unwrap();
+    assert_eq!(policies.len(), 1);
+    assert_eq!(policies[0].scope_id, scope);
+
+    assert_eq!(
+        access
+            .composition_reads
+            .lock()
+            .expect("test composition-read lock must stay healthy")
+            .as_slice(),
+        std::slice::from_ref(&scope)
+    );
+    assert_eq!(
+        access
+            .composition_writes
+            .lock()
+            .expect("test composition-write lock must stay healthy")
+            .as_slice(),
+        std::slice::from_ref(&scope)
+    );
+    assert_eq!(
+        access
+            .runtime_policy_reads
+            .lock()
+            .expect("test runtime-policy lock must stay healthy")
+            .as_slice(),
+        [scope]
+    );
 }
 
 #[test]

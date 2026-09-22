@@ -222,6 +222,16 @@ impl ServiceRuntime {
         Ok(())
     }
 
+    pub(crate) fn clear_platform_contracts_in_scope(&self, scope_id: &RuntimeScopeId) {
+        let mut state = match self.state.write() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.platform_definitions.remove(scope_id).is_some() {
+            state.topology_changed();
+        }
+    }
+
     pub(crate) fn register_instance(
         &self,
         registration: ServiceInstanceRegistration,

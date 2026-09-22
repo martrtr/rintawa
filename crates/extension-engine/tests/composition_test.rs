@@ -819,6 +819,62 @@ fn test_should_resolve_platform_owned_binding_provider_with_persisted_policy_sem
 }
 
 #[test]
+fn test_should_clear_all_preferred_provider_policy_in_one_scope() -> anyhow::Result<()> {
+    let scope = RuntimeScopeId::new("world:policy-reset");
+    let first = contract("rintawa.test.first-role");
+    let second = contract("rintawa.test.second-role");
+    let mut engine = ExtensionEngine::new();
+
+    for contract in [&first, &second] {
+        engine.define_platform_binding_contract_in_scope(
+            scope.clone(),
+            contract.clone(),
+            ContractResolutionPolicy::Single,
+        )?;
+    }
+
+    for instance in ["a-provider", "z-provider"] {
+        engine.register_extension_instance(
+            ExtensionInstanceId::new(instance),
+            scope.clone(),
+            manifest(instance),
+            vec![Box::new(
+                ContractComponent::new("runtime")
+                    .providing(ContractProvider::new(first.clone()))
+                    .providing(ContractProvider::new(second.clone())),
+            )],
+        )?;
+        engine.start_extension_instance(&ExtensionInstanceId::new(instance))?;
+    }
+
+    let selected = ComponentRef::new("z-provider", "runtime");
+    for contract in [&first, &second] {
+        engine.set_preferred_contract_provider_policy_in_scope(
+            scope.clone(),
+            contract.clone(),
+            selected.clone(),
+        );
+        assert_eq!(
+            engine
+                .resolve_active_contract_providers_in_scope(&scope, contract)
+                .map_err(|reason| anyhow::anyhow!(reason.to_string()))?,
+            vec![selected.clone()]
+        );
+    }
+
+    engine.clear_preferred_contract_provider_policies_in_scope(&scope);
+    for contract in [&first, &second] {
+        assert_eq!(
+            engine
+                .resolve_active_contract_providers_in_scope(&scope, contract)
+                .map_err(|reason| anyhow::anyhow!(reason.to_string()))?,
+            vec![ComponentRef::new("a-provider", "runtime")]
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn test_should_reject_platform_contract_protocol_change() -> anyhow::Result<()> {
     let scope = RuntimeScopeId::new("host");
     let contract = contract("rintawa.test.platform-role");
