@@ -1,12 +1,12 @@
 //! Consistent read-only SQLite snapshot for one authoritative world.
 
-use rintawa_sdk::world::{EntityId, RelationId, SchemaKey, WorldId};
-use rintawa_world::{EntityRecord, FacetRecord, FacetTarget, RelationRecord};
+use rintawa_sdk::world::{EntityId, PrincipalId, RelationId, SchemaKey, WorldId};
+use rintawa_world::{EntityRecord, FacetRecord, FacetTarget, RelationRecord, SchemaDefinition};
 use rusqlite::Connection;
 
 use crate::StorageResult;
 
-use super::query;
+use super::{codec, query};
 
 /// Consistent read-only view pinned to one SQLite WAL snapshot.
 ///
@@ -68,5 +68,35 @@ impl SqliteWorldSnapshot {
         schema: &SchemaKey,
     ) -> StorageResult<Option<FacetRecord>> {
         query::load_facet(&self.connection, target, schema)
+    }
+
+    /// Loads one immutable world-schema definition from the pinned snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when persisted schema metadata cannot be decoded.
+    pub fn load_schema(&self, key: &SchemaKey) -> StorageResult<Option<SchemaDefinition>> {
+        codec::load_schema(&self.connection, key)
+    }
+
+    /// Returns whether one principal may issue an exact command as an entity actor
+    /// at this snapshot position.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when durable authority state cannot be queried.
+    pub fn principal_can_control(
+        &self,
+        principal: PrincipalId,
+        actor_entity: EntityId,
+        command_schema: &SchemaKey,
+    ) -> StorageResult<bool> {
+        query::principal_can_control(
+            &self.connection,
+            principal,
+            actor_entity,
+            command_schema,
+            self.position,
+        )
     }
 }

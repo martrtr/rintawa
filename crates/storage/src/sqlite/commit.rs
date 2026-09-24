@@ -17,6 +17,7 @@ use rintawa_world::{
 use crate::sqlite::codec::{
     digest_from_blob, effect_job_id_from_blob, event_id_from_blob, load_schema_registry,
 };
+use crate::sqlite::query;
 use crate::{StorageError, StorageResult};
 
 pub(super) fn command_digest(command: &WorldCommand) -> StorageResult<[u8; 32]> {
@@ -289,40 +290,13 @@ fn authorize_command(
         }
         .into()),
         ActorRef::Entity(actor_entity) => {
-            let is_authorized: i64 = connection.query_row(
-                "SELECT EXISTS(
-                    SELECT 1
-                    FROM control_grants g
-                    WHERE g.principal_id = ?1
-                      AND g.actor_entity_id = ?2
-                      AND (
-                        g.valid_through_position IS NULL
-                        OR g.valid_through_position >= ?3
-                      )
-                      AND (
-                        g.scope_kind = 1
-                        OR (
-                            g.scope_kind = 2
-                            AND EXISTS(
-                                SELECT 1
-                                FROM control_grant_schemas s
-                                WHERE s.grant_id = g.grant_id
-                                  AND s.schema_id = ?4
-                                  AND s.schema_version = ?5
-                            )
-                        )
-                      )
-                )",
-                params![
-                    command.principal().into_bytes().as_slice(),
-                    actor_entity.into_bytes().as_slice(),
-                    position_to_sql(position)?,
-                    command.schema().id().as_str(),
-                    i64::from(command.schema().version().get()),
-                ],
-                |row| row.get(0),
-            )?;
-            if is_authorized != 0 {
+            if query::principal_can_control(
+                connection,
+                command.principal(),
+                actor_entity,
+                command.schema(),
+                position,
+            )? {
                 return Ok(());
             }
             Err(WorldError::ActorUnauthorized {

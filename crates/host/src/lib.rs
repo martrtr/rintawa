@@ -27,7 +27,7 @@ use rintawa_sdk::{
     contracts::{ComponentRef, ContractKey},
     runtime_permissions::RuntimePermission,
     types::{ComponentId, ExtensionInstanceId, RuntimeScopeId},
-    world::WorldId,
+    world::{SchemaKey, WorldId},
 };
 use rintawa_storage::SqliteWorldStorage;
 use rintawa_world::WorldSessionState;
@@ -253,6 +253,12 @@ pub enum HostError {
     /// Authoritative world command runtime failed.
     #[error(transparent)]
     WorldRuntime(#[from] rintawa_world_runtime::WorldRuntimeError),
+    /// A Principal-specific world projection could not be built safely.
+    #[error(transparent)]
+    WorldProjection(#[from] rintawa_world_runtime::WorldProjectionError),
+    /// No registered Projection schema is available under this exact key.
+    #[error("world projection `{0}` is not available in the active world")]
+    WorldProjectionUnavailable(SchemaKey),
     /// A filesystem operation failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

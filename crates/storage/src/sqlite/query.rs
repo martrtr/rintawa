@@ -1,6 +1,8 @@
 //! Read-side SQLite projections for current state, events, and outbox jobs.
 
-use rintawa_sdk::world::{EffectJobId, EntityId, RelationId, SchemaKey, UnixTimeMillis, WorldId};
+use rintawa_sdk::world::{
+    EffectJobId, EntityId, PrincipalId, RelationId, SchemaKey, UnixTimeMillis, WorldId,
+};
 use rintawa_world::{
     ActorRef, CausationRef, CommandProvenance, EntityRecord, FacetRecord, FacetTarget,
     RelationRecord, StoredEffectJob, StoredWorldEvent, StoredWorldMutation,
@@ -126,6 +128,49 @@ pub(super) fn load_facet(
             ))
         })
         .transpose()
+}
+
+pub(super) fn principal_can_control(
+    connection: &Connection,
+    principal: PrincipalId,
+    actor_entity: EntityId,
+    command_schema: &SchemaKey,
+    position: u64,
+) -> StorageResult<bool> {
+    let allowed: i64 = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM control_grants g
+            WHERE g.principal_id = ?1
+              AND g.actor_entity_id = ?2
+              AND (
+                g.valid_through_position IS NULL
+                OR g.valid_through_position >= ?3
+              )
+              AND (
+                g.scope_kind = 1
+                OR (
+                    g.scope_kind = 2
+                    AND EXISTS(
+                        SELECT 1
+                        FROM control_grant_schemas s
+                        WHERE s.grant_id = g.grant_id
+                          AND s.schema_id = ?4
+                          AND s.schema_version = ?5
+                    )
+                )
+              )
+        )",
+        params![
+            principal.into_bytes().as_slice(),
+            actor_entity.into_bytes().as_slice(),
+            position_to_sql(position)?,
+            command_schema.id().as_str(),
+            i64::from(command_schema.version().get()),
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(allowed != 0)
 }
 
 pub(super) fn mutations_after(

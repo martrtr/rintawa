@@ -93,6 +93,7 @@ interface world-registration {
         command,
         event,
         effect,
+        projection,
     }
 
     /// Failure while declaring immutable world metadata.

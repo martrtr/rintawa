@@ -512,13 +512,30 @@ fn test_should_stage_wasm_world_schema_registration() {
         Err(WorldRegistrationError::DuplicateWorldSchema)
     ));
 
+    WorldRegistrationHost::register_world_schema(
+        &mut state,
+        String::from("example.character-view"),
+        1,
+        WitSchemaKind::Projection,
+        String::from(r#"{"type":"object"}"#),
+    )
+    .unwrap();
+
     let registrations = state.finish_registration().unwrap();
-    assert_eq!(registrations.world_schemas.len(), 1);
+    assert_eq!(registrations.world_schemas.len(), 2);
     assert_eq!(
         registrations.world_schemas[0].key().to_string(),
         "example.message@1"
     );
     assert_eq!(registrations.world_schemas[0].kind(), SchemaKind::Event);
+    assert_eq!(
+        registrations.world_schemas[1].key().to_string(),
+        "example.character-view@1"
+    );
+    assert_eq!(
+        registrations.world_schemas[1].kind(),
+        SchemaKind::Projection
+    );
     assert_eq!(
         registrations.world_schemas[0].definition_json(),
         r#"{"type":"object"}"#

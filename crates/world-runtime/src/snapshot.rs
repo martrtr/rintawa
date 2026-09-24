@@ -1,8 +1,8 @@
-//! Read-only snapshot capability exposed to command Systems.
+//! Read-only authoritative snapshot capability used by Systems and Host-side projections.
 
-use rintawa_sdk::world::{EntityId, RelationId, SchemaKey, WorldId};
+use rintawa_sdk::world::{EntityId, PrincipalId, RelationId, SchemaKey, WorldId};
 use rintawa_storage::SqliteWorldSnapshot;
-use rintawa_world::{EntityRecord, FacetRecord, FacetTarget, RelationRecord};
+use rintawa_world::{EntityRecord, FacetRecord, FacetTarget, RelationRecord, SchemaDefinition};
 
 use crate::WorldReadResult;
 
@@ -62,5 +62,23 @@ impl WorldSnapshot {
         schema: &SchemaKey,
     ) -> WorldReadResult<Option<FacetRecord>> {
         Ok(self.storage.load_facet(target, schema)?)
+    }
+
+    pub(crate) fn load_schema_definition(
+        &self,
+        key: &SchemaKey,
+    ) -> WorldReadResult<Option<SchemaDefinition>> {
+        Ok(self.storage.load_schema(key)?)
+    }
+
+    pub(crate) fn principal_can_control(
+        &self,
+        principal: PrincipalId,
+        actor_entity: EntityId,
+        command_schema: &SchemaKey,
+    ) -> WorldReadResult<bool> {
+        Ok(self
+            .storage
+            .principal_can_control(principal, actor_entity, command_schema)?)
     }
 }

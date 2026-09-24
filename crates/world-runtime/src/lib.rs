@@ -9,6 +9,7 @@
 
 mod effect;
 mod error;
+mod projection;
 mod runtime;
 mod service;
 mod snapshot;
@@ -23,6 +24,14 @@ pub use effect::{
 pub use error::{
     SystemError, SystemResult, WorldReadError, WorldReadResult, WorldRuntimeError,
     WorldRuntimeResult,
+};
+pub use projection::{
+    MAX_WORLD_PROJECTION_DIAGNOSTIC_BYTES, MAX_WORLD_PROJECTION_INPUT_BYTES,
+    MAX_WORLD_PROJECTION_SERVICE_READS, MAX_WORLD_PROJECTION_SERVICE_ROUNDS,
+    ServiceWorldProjection, WORLD_PROJECTION_SERVICE_PROTOCOL_VERSION, WorldProjectionError,
+    WorldProjectionReadRequest, WorldProjectionReadResult, WorldProjectionResult,
+    WorldProjectionServiceClient, WorldProjectionServiceRequest, WorldProjectionServiceResponse,
+    WorldProjectionView, world_projection_service_contract_key,
 };
 pub use runtime::{
     DEFAULT_COMMAND_QUEUE_CAPACITY, MAX_COMMAND_QUEUE_CAPACITY, WorldCommandOutcome,

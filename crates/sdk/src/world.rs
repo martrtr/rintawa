@@ -142,6 +142,8 @@ pub enum SchemaKind {
     Event,
     /// Schema describing one durable external effect/job payload.
     Effect,
+    /// Schema describing one extension-owned policy-filtered projection payload.
+    Projection,
 }
 
 impl fmt::Display for SchemaKind {
@@ -153,6 +155,7 @@ impl fmt::Display for SchemaKind {
             Self::Command => "command",
             Self::Event => "event",
             Self::Effect => "effect",
+            Self::Projection => "projection",
         })
     }
 }

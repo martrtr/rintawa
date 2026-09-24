@@ -1319,6 +1319,7 @@ impl WorldRegistrationHost for WasmHostState {
             WitSchemaKind::Command => SchemaKind::Command,
             WitSchemaKind::Event => SchemaKind::Event,
             WitSchemaKind::Effect => SchemaKind::Effect,
+            WitSchemaKind::Projection => SchemaKind::Projection,
         };
         self.queue_world_schema(WorldSchemaContribution::new(key, kind, definition_json))
     }

@@ -107,6 +107,7 @@ pub(super) fn schema_kind_code(kind: SchemaKind) -> i64 {
         SchemaKind::Command => 4,
         SchemaKind::Event => 5,
         SchemaKind::Effect => 6,
+        SchemaKind::Projection => 7,
     }
 }
 
@@ -118,6 +119,7 @@ fn schema_kind_from_code(code: i64) -> StorageResult<SchemaKind> {
         4 => Ok(SchemaKind::Command),
         5 => Ok(SchemaKind::Event),
         6 => Ok(SchemaKind::Effect),
+        7 => Ok(SchemaKind::Projection),
         _ => Err(StorageError::CorruptData(format!(
             "unknown schema kind code {code}"
         ))),

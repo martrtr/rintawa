@@ -22,16 +22,17 @@ use rintawa_sdk::{
     runtime_permissions::RuntimePermission,
     runtime_signals::RuntimeSignal,
     types::{ExtensionId, ExtensionInstanceId, RuntimeScopeId},
-    world::{SchemaKey, UnixTimeMillis, WorldId},
+    world::{PrincipalId, SchemaKey, UnixTimeMillis, WorldId},
 };
 use rintawa_storage::SqliteWorldStorage;
 use rintawa_world::{
     CommitDisposition, SchemaDefinition, SchemaKind, StoredWorldEvent, WorldCommand,
 };
 use rintawa_world_runtime::{
-    MAX_WORLD_EFFECT_DIAGNOSTIC_BYTES, ServiceWorldEffectHandler, ServiceWorldSystem,
-    WorldCommandOutcome, WorldEffectServiceResponse, WorldRuntime, WorldRuntimeBuilder,
-    world_effect_service_contract_key, world_system_service_contract_key,
+    MAX_WORLD_EFFECT_DIAGNOSTIC_BYTES, ServiceWorldEffectHandler, ServiceWorldProjection,
+    ServiceWorldSystem, WorldCommandOutcome, WorldEffectServiceResponse, WorldProjectionView,
+    WorldRuntime, WorldRuntimeBuilder, world_effect_service_contract_key,
+    world_projection_service_contract_key, world_system_service_contract_key,
 };
 
 use crate::{
@@ -407,10 +408,18 @@ impl WorldCommandDispatchOutcome {
     }
 }
 
+struct ActiveWorldRuntimeParts {
+    runtime: WorldRuntime,
+    outbox: SqliteWorldStorage,
+    effect_handlers: BTreeMap<SchemaKey, ServiceWorldEffectHandler>,
+    projections: BTreeMap<SchemaKey, ServiceWorldProjection>,
+}
+
 struct ActiveWorld {
     runtime: WorldRuntime,
     outbox: SqliteWorldStorage,
     effect_handlers: BTreeMap<SchemaKey, ServiceWorldEffectHandler>,
+    projections: BTreeMap<SchemaKey, ServiceWorldProjection>,
     signals: RuntimeSignalQueue,
     registered_instances: Vec<ExtensionInstanceId>,
     started_instances: Vec<ExtensionInstanceId>,
@@ -571,11 +580,7 @@ impl HostRuntime {
         let profile = home.load_world_composition(world_id)?;
         let scope_id = world_runtime_scope_id(world_id);
         let overlay = activate_composition(&mut self.engine, home, &profile, &scope_id)?;
-        let runtime_result: HostResult<(
-            WorldRuntime,
-            SqliteWorldStorage,
-            BTreeMap<SchemaKey, ServiceWorldEffectHandler>,
-        )> = (|| {
+        let runtime_result: HostResult<ActiveWorldRuntimeParts> = (|| {
             let storage = home.open_world_storage(world_id)?;
             register_world_schema_contributions(
                 &self.engine,
@@ -610,11 +615,31 @@ impl HostRuntime {
                     )?,
                 );
             }
+            let mut projections = BTreeMap::new();
+            for definition in session
+                .schemas()
+                .iter()
+                .filter(|definition| definition.kind() == SchemaKind::Projection)
+            {
+                projections.insert(
+                    definition.key().clone(),
+                    self.bind_world_projection(
+                        world_id,
+                        definition.key().clone(),
+                        definition.owner().clone(),
+                    )?,
+                );
+            }
             let outbox = home.open_world_storage(world_id)?;
-            Ok((builder.start()?, outbox, effect_handlers))
+            Ok(ActiveWorldRuntimeParts {
+                runtime: builder.start()?,
+                outbox,
+                effect_handlers,
+                projections,
+            })
         })();
 
-        let (runtime, outbox, effect_handlers) = match runtime_result {
+        let runtime_parts = match runtime_result {
             Ok(runtime) => runtime,
             Err(error) => {
                 let cleanup_failures = cleanup_instances(
@@ -636,9 +661,10 @@ impl HostRuntime {
         self.active_worlds.insert(
             world_id,
             ActiveWorld {
-                runtime,
-                outbox,
-                effect_handlers,
+                runtime: runtime_parts.runtime,
+                outbox: runtime_parts.outbox,
+                effect_handlers: runtime_parts.effect_handlers,
+                projections: runtime_parts.projections,
                 signals: RuntimeSignalQueue::default(),
                 registered_instances: overlay.registered_instances,
                 started_instances: overlay.started_instances,
@@ -706,6 +732,35 @@ impl HostRuntime {
         })
     }
 
+    /// Builds one schema-addressed, Principal-specific view of an active World.
+    ///
+    /// The projection provider receives only bounded owner-filtered reads from one
+    /// pinned snapshot. It never receives SQLite handles or the raw WorldSnapshot,
+    /// and the final value is validated against the registered Projection schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns WorldNotActive, WorldProjectionUnavailable, a snapshot/storage error,
+    /// or a typed projection protocol/policy failure.
+    pub fn project_world(
+        &self,
+        world_id: WorldId,
+        principal: PrincipalId,
+        projection_schema: &SchemaKey,
+        input: serde_json::Value,
+    ) -> HostResult<WorldProjectionView> {
+        let active = self
+            .active_worlds
+            .get(&world_id)
+            .ok_or(HostError::WorldNotActive(world_id))?;
+        let projection = active
+            .projections
+            .get(projection_schema)
+            .ok_or_else(|| HostError::WorldProjectionUnavailable(projection_schema.clone()))?;
+        let snapshot = active.runtime.snapshot()?;
+        Ok(projection.project(&snapshot, principal, input)?)
+    }
+
     /// Binds one exact command schema to an extension-provided World System service.
     ///
     /// The service contract is platform-owned and scoped to the authoritative world.
@@ -766,6 +821,35 @@ impl HostRuntime {
         Ok(ServiceWorldEffectHandler::new(
             world_id,
             effect_schema,
+            move |contract: &ContractKey, request: &[u8]| caller.call(contract, request),
+        ))
+    }
+
+    /// Binds one exact Projection schema to its extension-owned filtering service.
+    ///
+    /// Provider resolution is pinned to the immutable schema owner in the exact
+    /// world scope. The service receives a Host-fixed Principal and bounded read
+    /// continuations; raw world storage remains behind the authoritative Host.
+    fn bind_world_projection(
+        &mut self,
+        world_id: WorldId,
+        projection_schema: SchemaKey,
+        schema_owner: ExtensionId,
+    ) -> HostResult<ServiceWorldProjection> {
+        let scope_id = world_runtime_scope_id(world_id);
+        let contract = world_projection_service_contract_key(&projection_schema);
+        self.engine.define_platform_service_contract_in_scope(
+            scope_id.clone(),
+            contract,
+            ContractResolutionPolicy::Single,
+        )?;
+        let caller = self
+            .engine
+            .platform_service_caller_for_extension(scope_id, schema_owner.clone());
+        Ok(ServiceWorldProjection::new(
+            world_id,
+            projection_schema,
+            schema_owner,
             move |contract: &ContractKey, request: &[u8]| caller.call(contract, request),
         ))
     }
@@ -1487,9 +1571,10 @@ mod tests {
         WorldCommand, WorldEventDraft, WorldTransaction,
     };
     use rintawa_world_runtime::{
-        WorldEffectServiceRequest, WorldEffectServiceResponse, WorldRuntimeBuilder,
-        WorldSystemServiceRequest, WorldSystemServiceResponse, world_effect_service_contract_key,
-        world_system_service_contract_key,
+        WorldEffectServiceRequest, WorldEffectServiceResponse, WorldProjectionServiceRequest,
+        WorldProjectionServiceResponse, WorldRuntimeBuilder, WorldSystemServiceRequest,
+        WorldSystemServiceResponse, world_effect_service_contract_key,
+        world_projection_service_contract_key, world_system_service_contract_key,
     };
     use std::sync::{Arc, Mutex};
 
@@ -1660,6 +1745,56 @@ mod tests {
             };
             serde_json::to_vec(&response)
                 .map_err(|error| ExtensionError::Message(error.to_string()))
+        }
+    }
+
+    struct WorldProjectionProvider {
+        id: ComponentId,
+        contract: ContractKey,
+        reject: bool,
+        observed: Arc<Mutex<Vec<WorldProjectionServiceRequest>>>,
+    }
+
+    impl Component for WorldProjectionProvider {
+        fn id(&self) -> &ComponentId {
+            &self.id
+        }
+
+        fn register(&mut self, ctx: &mut dyn RegistrationContext) -> ExtensionResult<()> {
+            ctx.provide_contract(ContractProvider::new(self.contract.clone()))
+        }
+
+        fn handle_service(
+            &mut self,
+            _ctx: &mut dyn ComponentContext,
+            contract: &ContractKey,
+            request: &[u8],
+        ) -> ExtensionResult<Vec<u8>> {
+            if contract != &self.contract {
+                return Err(ExtensionError::ServiceHandlerUnavailable(
+                    contract.to_string(),
+                ));
+            }
+            let request: WorldProjectionServiceRequest = serde_json::from_slice(request)
+                .map_err(|error| ExtensionError::Message(error.to_string()))?;
+            self.observed
+                .lock()
+                .map_err(|_| {
+                    ExtensionError::Message(String::from("projection observer lock poisoned"))
+                })?
+                .push(request.clone());
+            if self.reject {
+                return Err(ExtensionError::Message(String::from(
+                    "hijacker projection provider invoked",
+                )));
+            }
+            serde_json::to_vec(&WorldProjectionServiceResponse::Complete {
+                value: serde_json::json!({
+                    "provider": "owner",
+                    "principal": request.principal().to_string(),
+                }),
+            })
+            .map_err(|error| ExtensionError::Message(error.to_string()))
         }
     }
 
@@ -2040,6 +2175,115 @@ mod tests {
     }
 
     #[test]
+    fn test_should_route_world_projection_only_to_schema_owner() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("world.sqlite");
+        let world_id = WorldId::new();
+        let storage = SqliteWorldStorage::create(&path, world_id)?;
+        let projection_schema: SchemaKey = "rintawa.test.owner-view@1".parse()?;
+        let owner = ExtensionId::new("rintawa.test-projection");
+        storage.register_schema(&SchemaDefinition::new(
+            projection_schema.clone(),
+            SchemaKind::Projection,
+            owner.clone(),
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "provider": { "const": "owner" },
+                    "principal": { "type": "string" }
+                },
+                "required": ["provider", "principal"],
+                "additionalProperties": false
+            }),
+        ))?;
+        let outbox = SqliteWorldStorage::open(&path)?;
+
+        let mut host = HostRuntime {
+            active_worlds: BTreeMap::new(),
+            engine: ExtensionEngine::new(),
+            started_instances: Vec::new(),
+            host_shell_provider: None,
+            ui_layer_provider: None,
+        };
+        let projection =
+            host.bind_world_projection(world_id, projection_schema.clone(), owner.clone())?;
+        let contract = world_projection_service_contract_key(&projection_schema);
+        let scope = world_runtime_scope_id(world_id);
+        let hijacker_observed = Arc::new(Mutex::new(Vec::new()));
+        let owner_observed = Arc::new(Mutex::new(Vec::new()));
+
+        let hijacker_instance = ExtensionInstanceId::new("a-projection-hijacker");
+        host.engine.register_extension_instance(
+            hijacker_instance.clone(),
+            scope.clone(),
+            test_manifest("rintawa.projection-hijacker"),
+            vec![Box::new(WorldProjectionProvider {
+                id: ComponentId::new("runtime"),
+                contract: contract.clone(),
+                reject: true,
+                observed: Arc::clone(&hijacker_observed),
+            })],
+        )?;
+        host.engine.start_extension_instance(&hijacker_instance)?;
+
+        let owner_instance = ExtensionInstanceId::new("z-projection-owner");
+        host.engine.register_extension_instance(
+            owner_instance.clone(),
+            scope,
+            test_manifest(owner.as_str()),
+            vec![Box::new(WorldProjectionProvider {
+                id: ComponentId::new("runtime"),
+                contract,
+                reject: false,
+                observed: Arc::clone(&owner_observed),
+            })],
+        )?;
+        host.engine.start_extension_instance(&owner_instance)?;
+
+        let runtime = WorldRuntimeBuilder::new(storage).start()?;
+        host.active_worlds.insert(
+            world_id,
+            ActiveWorld {
+                runtime,
+                outbox,
+                effect_handlers: BTreeMap::new(),
+                projections: BTreeMap::from([(projection_schema.clone(), projection)]),
+                signals: RuntimeSignalQueue::default(),
+                registered_instances: vec![hijacker_instance.clone(), owner_instance.clone()],
+                started_instances: vec![hijacker_instance, owner_instance],
+            },
+        );
+
+        let principal = PrincipalId::new();
+        let view = host.project_world(
+            world_id,
+            principal,
+            &projection_schema,
+            serde_json::json!({ "kind": "test" }),
+        )?;
+        assert_eq!(view.principal(), principal);
+        assert_eq!(view.value()["provider"], "owner");
+        assert_eq!(view.value()["principal"], principal.to_string());
+        assert!(
+            hijacker_observed
+                .lock()
+                .map_err(|_| anyhow::anyhow!("hijacker observer lock poisoned"))?
+                .is_empty()
+        );
+        assert_eq!(
+            owner_observed
+                .lock()
+                .map_err(|_| anyhow::anyhow!("owner observer lock poisoned"))?
+                .len(),
+            1
+        );
+
+        host.deactivate_world(world_id)?;
+        host.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
     fn test_should_supervise_world_commit_delivery_replay_and_deactivation() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let home = HostHome::open(root.path().join("home"))?;
@@ -2405,6 +2649,7 @@ mod tests {
                     runtime: world_runtime,
                     outbox,
                     effect_handlers: BTreeMap::new(),
+                    projections: BTreeMap::new(),
                     signals: RuntimeSignalQueue::default(),
                     registered_instances: vec![instance.clone()],
                     started_instances: vec![instance],
