@@ -9,7 +9,7 @@ use std::{
 use rintawa_sdk::{
     context::ComponentContext,
     contracts::{ComponentRef, ContractDefinition, ContractKey, ContractResolutionPolicy},
-    contributions::ContributionDescriptor,
+    contributions::{ContributionDescriptor, WorldSchemaContribution},
     errors::{ExtensionError, ExtensionResult},
     manifest::ExtensionManifest,
     runtime_effects::RuntimeEffect,
@@ -34,7 +34,8 @@ use crate::{
         UnresolvedContractReason, resolve_contract_providers, resolve_contracts,
     },
     context::{
-        ComponentIdentity, EngineComponentContext, EngineRegistrationContext, RegistrationBuffers,
+        ComponentIdentity, EngineComponentContext, EngineRegistrationContext,
+        OwnedWorldSchemaContribution, RegistrationBuffers,
     },
     errors::{ComponentStopFailure, EngineError, EngineResult},
     execution_targets::{ExecutionTargetDependency, ExecutionTargetRegistry},
@@ -66,6 +67,41 @@ pub enum ExtensionState {
     Stopped,
 }
 
+/// One immutable world-schema declaration captured during component registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredWorldSchema {
+    extension_id: ExtensionId,
+    component_id: ComponentId,
+    contribution: WorldSchemaContribution,
+}
+
+impl RegisteredWorldSchema {
+    /// Returns the extension identity that owns the declaration.
+    pub const fn extension_id(&self) -> &ExtensionId {
+        &self.extension_id
+    }
+
+    /// Returns the component that declared the schema.
+    pub const fn component_id(&self) -> &ComponentId {
+        &self.component_id
+    }
+
+    /// Returns the extension-supplied immutable schema declaration.
+    pub const fn contribution(&self) -> &WorldSchemaContribution {
+        &self.contribution
+    }
+}
+
+impl From<&OwnedWorldSchemaContribution> for RegisteredWorldSchema {
+    fn from(value: &OwnedWorldSchemaContribution) -> Self {
+        Self {
+            extension_id: value.extension_id.clone(),
+            component_id: value.component_id.clone(),
+            contribution: value.contribution.clone(),
+        }
+    }
+}
+
 struct ManagedExtension {
     instance_id: ExtensionInstanceId,
     scope_id: RuntimeScopeId,
@@ -73,6 +109,7 @@ struct ManagedExtension {
     state: ExtensionState,
     components: Vec<ManagedComponent>,
     contributions: Vec<OwnedContribution>,
+    world_schemas: Vec<OwnedWorldSchemaContribution>,
     contract_definitions: Vec<OwnedContractDefinition>,
     contract_providers: Vec<OwnedContractProvider>,
     contract_consumers: Vec<OwnedContractConsumer>,
@@ -634,6 +671,7 @@ impl ExtensionEngine {
 
         let mut registered_descriptors = Vec::new();
         let mut extension_contributions = Vec::new();
+        let mut world_schemas = Vec::new();
         let mut contract_definitions = Vec::new();
         let mut contract_providers = Vec::new();
         let mut contract_consumers = Vec::new();
@@ -644,6 +682,7 @@ impl ExtensionEngine {
             let first_contribution = registered_descriptors.len();
             let buffers = RegistrationBuffers {
                 contributions: &mut registered_descriptors,
+                world_schemas: &mut world_schemas,
                 contract_definitions: &mut contract_definitions,
                 contract_providers: &mut contract_providers,
                 contract_consumers: &mut contract_consumers,
@@ -728,6 +767,7 @@ impl ExtensionEngine {
             state: ExtensionState::Registered,
             components,
             contributions: extension_contributions,
+            world_schemas,
             contract_definitions,
             contract_providers,
             contract_consumers,
@@ -736,6 +776,26 @@ impl ExtensionEngine {
 
         self.extensions.insert(instance_id, managed);
         Ok(())
+    }
+
+    /// Returns immutable world schemas declared by one registered extension instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::ExtensionInstanceNotFound`] when the instance is unknown.
+    pub fn registered_world_schemas(
+        &self,
+        instance_id: &ExtensionInstanceId,
+    ) -> EngineResult<Vec<RegisteredWorldSchema>> {
+        let extension = self
+            .extensions
+            .get(instance_id)
+            .ok_or_else(|| EngineError::ExtensionInstanceNotFound(instance_id.to_string()))?;
+        Ok(extension
+            .world_schemas
+            .iter()
+            .map(RegisteredWorldSchema::from)
+            .collect())
     }
 
     /// Approves a manifest-requested secret grant for the default instance.
@@ -1517,7 +1577,7 @@ impl ExtensionEngine {
         self.dispatch_runtime_event_in_scope(&default_scope_id(), topic, payload)
     }
 
-    /// Dispatches one runtime event to exact-topic subscribers in one scope.
+    /// Dispatches one runtime event to exact-topic event subscribers in one scope.
     ///
     /// The returned count contains successful component callbacks. Subscription
     /// handles are owner-scoped runtime effects; stopped or quarantined owners
@@ -1538,10 +1598,41 @@ impl ExtensionEngine {
         if topic.trim().is_empty() {
             return Err(EngineError::InvalidRuntimeEventTopic);
         }
-
         let subscribers = self.runtime_effects.event_subscribers(topic);
-        let mut delivered = 0_usize;
+        self.dispatch_runtime_subscribers(scope_id, topic, payload, subscribers, "event")
+    }
 
+    /// Dispatches one ephemeral runtime signal to exact-topic signal subscribers.
+    ///
+    /// Signal subscriptions are intentionally disjoint from durable-event
+    /// subscriptions even when their topic strings are identical.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::InvalidRuntimeSignalTopic`] for an empty topic or
+    /// a host-level lifecycle error while quarantining a failed subscriber.
+    pub fn dispatch_runtime_signal_in_scope(
+        &mut self,
+        scope_id: &RuntimeScopeId,
+        topic: &str,
+        payload: &[u8],
+    ) -> EngineResult<usize> {
+        if topic.trim().is_empty() {
+            return Err(EngineError::InvalidRuntimeSignalTopic);
+        }
+        let subscribers = self.runtime_effects.signal_subscribers(topic);
+        self.dispatch_runtime_subscribers(scope_id, topic, payload, subscribers, "signal")
+    }
+
+    fn dispatch_runtime_subscribers(
+        &mut self,
+        scope_id: &RuntimeScopeId,
+        topic: &str,
+        payload: &[u8],
+        subscribers: Vec<ComponentRef>,
+        stream: &'static str,
+    ) -> EngineResult<usize> {
+        let mut delivered = 0_usize;
         for owner in subscribers {
             let Some((logical_id, component_handle)) = self
                 .extensions
@@ -1560,7 +1651,7 @@ impl ExtensionEngine {
                 continue;
             };
 
-            let event_result = {
+            let callback_result = {
                 let identity = ComponentIdentity::new(
                     logical_id.clone(),
                     owner.instance_id.clone(),
@@ -1582,24 +1673,22 @@ impl ExtensionEngine {
                 managed.handle_event(&mut context, topic, payload)
             };
 
-            match event_result {
-                Ok(()) => {
-                    delivered += 1;
-                }
+            match callback_result {
+                Ok(()) => delivered += 1,
                 Err(error) => {
                     warn!(
                         extension_id = %logical_id,
                         instance_id = %owner.instance_id,
                         component_id = %owner.component_id,
                         topic = %topic,
+                        stream,
                         reason = %error,
-                        "runtime event callback failed; quarantining extension instance"
+                        "runtime callback failed; quarantining extension instance"
                     );
                     self.quarantine_extension_instance(&owner.instance_id)?;
                 }
             }
         }
-
         Ok(delivered)
     }
 

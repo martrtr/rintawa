@@ -7,6 +7,7 @@ use crate::{
     api::LoggerApi,
     contracts::{ContractConsumer, ContractDefinition, ContractProvider},
     contributions::ContributionDescriptor,
+    contributions::WorldSchemaContribution,
     errors::ExtensionResult,
     runtime_effects::RuntimeEffect,
     secrets::{SecretPath, SecretValue},
@@ -166,6 +167,19 @@ pub trait RegistrationContext: ComponentContext {
     /// the component already consumes the same contract.
     fn consume_contract(&mut self, _consumer: ContractConsumer) -> ExtensionResult<()> {
         Err(crate::errors::ExtensionError::ContractRegistrationUnavailable)
+    }
+
+    /// Declares one immutable versioned world schema owned by this extension.
+    ///
+    /// The declaration carries no owner field; the host assigns the current
+    /// extension identity when it commits registration metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when world-schema registration is unavailable or the same
+    /// schema key was already declared by this extension instance.
+    fn register_world_schema(&mut self, _schema: WorldSchemaContribution) -> ExtensionResult<()> {
+        Err(crate::errors::ExtensionError::WorldSchemaRegistrationUnavailable)
     }
 
     /// Registers one static portable UI surface owned by this component.

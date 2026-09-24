@@ -4,7 +4,7 @@ use rintawa_sdk::{
     api::{LogLevel, LoggerApi},
     context::{ComponentContext, RegistrationContext},
     contracts::{ContractConsumer, ContractDefinition, ContractProvider},
-    contributions::ContributionDescriptor,
+    contributions::{ContributionDescriptor, WorldSchemaContribution},
     errors::{ExtensionError, ExtensionResult},
     runtime_effects::RuntimeEffect,
     secrets::{SecretPath, SecretValue},
@@ -93,8 +93,16 @@ impl LoggerApi for EngineLogger {
 }
 
 /// Mutable registration buffers populated by one component register callback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnedWorldSchemaContribution {
+    pub(crate) extension_id: ExtensionId,
+    pub(crate) component_id: ComponentId,
+    pub(crate) contribution: WorldSchemaContribution,
+}
+
 pub(crate) struct RegistrationBuffers<'a> {
     pub(crate) contributions: &'a mut Vec<ContributionDescriptor>,
+    pub(crate) world_schemas: &'a mut Vec<OwnedWorldSchemaContribution>,
     pub(crate) contract_definitions: &'a mut Vec<OwnedContractDefinition>,
     pub(crate) contract_providers: &'a mut Vec<OwnedContractProvider>,
     pub(crate) contract_consumers: &'a mut Vec<OwnedContractConsumer>,
@@ -166,6 +174,27 @@ impl<'a> RegistrationContext for EngineRegistrationContext<'a> {
         }
 
         self.buffers.contributions.push(contribution);
+        Ok(())
+    }
+
+    fn register_world_schema(&mut self, schema: WorldSchemaContribution) -> ExtensionResult<()> {
+        if self
+            .buffers
+            .world_schemas
+            .iter()
+            .any(|registered| registered.contribution.key() == schema.key())
+        {
+            return Err(ExtensionError::DuplicateWorldSchema(
+                schema.key().to_string(),
+            ));
+        }
+        self.buffers
+            .world_schemas
+            .push(OwnedWorldSchemaContribution {
+                extension_id: self.identity.extension_id.clone(),
+                component_id: self.identity.component_id.clone(),
+                contribution: schema,
+            });
         Ok(())
     }
 

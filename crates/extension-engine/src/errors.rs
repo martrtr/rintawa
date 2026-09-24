@@ -266,6 +266,10 @@ pub enum EngineError {
     #[error("runtime event topic must not be empty")]
     InvalidRuntimeEventTopic,
 
+    /// A host attempted to dispatch an invalid runtime signal topic.
+    #[error("runtime signal topic must not be empty")]
+    InvalidRuntimeSignalTopic,
+
     /// A component failed while handling a validated portable UI action.
     #[error(
         "component `{component_id}` in extension `{extension_id}` failed UI action `{action_id}`: {reason}"

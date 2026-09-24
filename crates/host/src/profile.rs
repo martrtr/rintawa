@@ -1,6 +1,10 @@
 //! Persistent host profile schema, validation, and atomic storage.
 
-use std::{collections::HashSet, io::Write, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Write,
+    path::Path,
+};
 
 use rintawa_artifacts::{ArtifactDigest, ContentType};
 use rintawa_sdk::{
@@ -10,14 +14,16 @@ use rintawa_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
+use uuid::Uuid;
 
 use crate::{HostError, HostResult};
 
 /// Current host composition profile schema.
-pub const PROFILE_SCHEMA: u32 = 4;
+pub const PROFILE_SCHEMA: u32 = 5;
 const LEGACY_PROFILE_SCHEMA_V1: u32 = 1;
 const LEGACY_PROFILE_SCHEMA_V2: u32 = 2;
 const LEGACY_PROFILE_SCHEMA_V3: u32 = 3;
+const LEGACY_PROFILE_SCHEMA_V4: u32 = 4;
 
 const MAX_PREFERENCE_ENTRIES_PER_COMPONENT: usize = 256;
 const MAX_PREFERENCE_KEY_BYTES: usize = 128;
@@ -44,6 +50,12 @@ pub struct ActivationRecord {
     pub scope_id: RuntimeScopeId,
     /// Whether the activation starts automatically in this profile.
     pub enabled: bool,
+    /// Whether a baseline activation is materialized into newly created worlds.
+    ///
+    /// World-scoped records always clear this flag because they are already explicit,
+    /// compatibility-pinned overlay selections rather than inheritance templates.
+    #[serde(default)]
+    pub world_default: bool,
 }
 
 /// One explicit provider choice for a versioned contract in one runtime scope.
@@ -197,7 +209,10 @@ impl CompositionProfile {
         let mut profile: Self = toml::from_str(&source)?;
         match profile.schema {
             PROFILE_SCHEMA => {}
-            LEGACY_PROFILE_SCHEMA_V1 | LEGACY_PROFILE_SCHEMA_V2 | LEGACY_PROFILE_SCHEMA_V3 => {
+            LEGACY_PROFILE_SCHEMA_V1
+            | LEGACY_PROFILE_SCHEMA_V2
+            | LEGACY_PROFILE_SCHEMA_V3
+            | LEGACY_PROFILE_SCHEMA_V4 => {
                 profile.schema = PROFILE_SCHEMA;
             }
             unsupported => return Err(HostError::UnsupportedProfileSchema(unsupported)),
@@ -477,6 +492,81 @@ impl CompositionProfile {
         });
     }
 
+    pub(crate) fn materialize_world_defaults(&self, scope_id: RuntimeScopeId) -> Self {
+        let mut instance_map = HashMap::new();
+        let activations = self
+            .activations
+            .iter()
+            .filter(|activation| activation.world_default)
+            .map(|activation| {
+                let instance_id = ExtensionInstanceId::new(Uuid::now_v7().to_string());
+                instance_map.insert(activation.instance_id.clone(), instance_id.clone());
+                ActivationRecord {
+                    subject: activation.subject.clone(),
+                    content: activation.content.clone(),
+                    artifact: activation.artifact.clone(),
+                    instance_id,
+                    scope_id: scope_id.clone(),
+                    enabled: activation.enabled,
+                    world_default: false,
+                }
+            })
+            .collect();
+
+        let preferred_providers = self
+            .preferred_providers
+            .iter()
+            .filter_map(|selection| {
+                instance_map
+                    .get(&selection.provider_instance_id)
+                    .map(|provider_instance_id| PreferredProviderSelection {
+                        scope_id: scope_id.clone(),
+                        contract_id: selection.contract_id.clone(),
+                        contract_version: selection.contract_version,
+                        provider_instance_id: provider_instance_id.clone(),
+                        provider_component_id: selection.provider_component_id.clone(),
+                    })
+            })
+            .collect();
+        let runtime_permissions = self
+            .runtime_permissions
+            .iter()
+            .filter_map(|grant| {
+                instance_map
+                    .get(&grant.instance_id)
+                    .map(|instance_id| RuntimePermissionGrant {
+                        scope_id: scope_id.clone(),
+                        instance_id: instance_id.clone(),
+                        component_id: grant.component_id.clone(),
+                        permission: grant.permission,
+                    })
+            })
+            .collect();
+        let preferences = self
+            .preferences
+            .iter()
+            .filter_map(|preference| {
+                instance_map
+                    .get(&preference.instance_id)
+                    .map(|instance_id| PreferenceRecord {
+                        scope_id: scope_id.clone(),
+                        instance_id: instance_id.clone(),
+                        component_id: preference.component_id.clone(),
+                        key: preference.key.clone(),
+                        value: preference.value.clone(),
+                    })
+            })
+            .collect();
+
+        Self {
+            schema: PROFILE_SCHEMA,
+            activations,
+            preferred_providers,
+            runtime_permissions,
+            preferences,
+        }
+    }
+
     pub(crate) fn upsert(
         &mut self,
         activation: ActivationRecord,
@@ -486,8 +576,10 @@ impl CompositionProfile {
             existing.subject == activation.subject && existing.scope_id == activation.scope_id
         }) {
             let enabled = override_enabled.unwrap_or(existing.enabled);
+            let world_default = existing.world_default;
             *existing = ActivationRecord {
                 enabled,
+                world_default,
                 ..activation
             };
             return enabled;
@@ -507,6 +599,20 @@ impl CompositionProfile {
             .find(|activation| activation.subject == subject)
             .ok_or_else(|| HostError::ActivationNotFound(subject.to_string()))?;
         activation.enabled = enabled;
+        Ok(())
+    }
+
+    pub(crate) fn set_world_default(
+        &mut self,
+        subject: &str,
+        world_default: bool,
+    ) -> HostResult<()> {
+        let activation = self
+            .activations
+            .iter_mut()
+            .find(|activation| activation.subject == subject)
+            .ok_or_else(|| HostError::ActivationNotFound(subject.to_string()))?;
+        activation.world_default = world_default;
         Ok(())
     }
 

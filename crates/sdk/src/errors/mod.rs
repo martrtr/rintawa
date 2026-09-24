@@ -98,6 +98,14 @@ pub enum ExtensionError {
     #[error("contract registration is unavailable in this component context")]
     ContractRegistrationUnavailable,
 
+    /// The extension declared the same world schema key more than once.
+    #[error("duplicate world schema declaration `{0}`")]
+    DuplicateWorldSchema(String),
+
+    /// The host cannot register world-schema metadata in the current context.
+    #[error("world schema registration is unavailable in this component context")]
+    WorldSchemaRegistrationUnavailable,
+
     /// The component registered the same portable UI surface more than once.
     #[error("duplicate UI surface `{0}`")]
     DuplicateUiSurface(String),

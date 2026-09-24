@@ -9,6 +9,7 @@
 
 mod profile;
 mod runtime;
+mod runtime_signal;
 
 use std::{
     fmt,
@@ -37,7 +38,14 @@ pub use profile::{
     ActivationRecord, BaselineProfile, CompositionProfile, PROFILE_SCHEMA,
     PreferredProviderSelection, RuntimePermissionGrant,
 };
-pub use runtime::{HostRuntime, WorldCommandDispatchOutcome};
+pub use runtime::{
+    EFFECT_JOB_LEASE_MILLIS, EFFECT_RETRY_BASE_MILLIS, EFFECT_RETRY_MAX_MILLIS, HostRuntime,
+    MAX_EFFECT_JOBS_PER_PUMP, WorldCommandDispatchOutcome,
+};
+pub use runtime_signal::{
+    DEFAULT_RUNTIME_SIGNAL_QUEUE_CAPACITY, MAX_RUNTIME_SIGNAL_MESSAGE_BYTES,
+    MAX_RUNTIME_SIGNAL_TOPIC_BYTES,
+};
 
 /// Stable runtime scope used by the pre-world/bootstrap composition.
 pub const HOST_SCOPE: &str = "host";
@@ -298,9 +306,39 @@ pub enum HostError {
     /// A runtime event envelope could not be serialized for extension delivery.
     #[error("failed to encode runtime event envelope: {0}")]
     EventEnvelopeEncode(#[from] serde_json::Error),
+    /// An extension declared malformed JSON for one immutable world schema.
+    #[error("world schema `{schema}` contains invalid JSON: {source}")]
+    InvalidWorldSchemaJson {
+        /// Rejected versioned schema identity.
+        schema: rintawa_sdk::world::SchemaKey,
+        /// JSON syntax error reported before durable publication.
+        #[source]
+        source: serde_json::Error,
+    },
     /// One delivery batch mixed events owned by different authoritative worlds.
     #[error("world event delivery batch contains multiple WorldIds")]
     MixedWorldEventBatch,
+    /// An ephemeral runtime signal used an empty or oversized routing topic.
+    #[error("runtime signal topic must be non-empty and within host bounds")]
+    InvalidRuntimeSignalTopic,
+    /// An active world's bounded ephemeral signal queue has no remaining capacity.
+    #[error("runtime signal queue for world `{0}` is full")]
+    RuntimeSignalQueueFull(WorldId),
+    /// A runtime signal envelope exceeded the host message bound.
+    #[error("runtime signal envelope is {actual_bytes} bytes; maximum is {maximum_bytes}")]
+    RuntimeSignalMessageTooLarge {
+        /// Encoded envelope size observed by the host.
+        actual_bytes: usize,
+        /// Maximum encoded envelope size accepted by the host.
+        maximum_bytes: usize,
+    },
+    /// A runtime signal envelope could not be serialized for extension delivery.
+    #[error("failed to encode runtime signal envelope: {source}")]
+    RuntimeSignalEncode {
+        /// Serialization failure from the host envelope codec.
+        #[source]
+        source: serde_json::Error,
+    },
     /// Persisted host state could not be decoded.
     #[error("invalid host profile: {0}")]
     ProfileDecode(#[from] toml::de::Error),
@@ -456,6 +494,8 @@ pub struct InstalledActivation {
     pub scope_id: RuntimeScopeId,
     /// Whether the selected composition activation should start automatically.
     pub enabled: bool,
+    /// Whether this baseline activation is inherited by newly created worlds.
+    pub world_default: bool,
 }
 
 /// Requested and granted runtime permissions for one exact composition component.
@@ -534,6 +574,7 @@ impl HostHome {
     /// Returns a filesystem or storage error if the world directory/database
     /// cannot be created safely.
     pub fn create_world(&self) -> HostResult<WorldSummary> {
+        let baseline = self.load_profile()?;
         for _ in 0..WORLD_ID_CREATION_ATTEMPTS {
             let world_id = WorldId::new();
             let directory = self.worlds_directory.join(world_id.to_string());
@@ -544,11 +585,20 @@ impl HostHome {
             }
 
             let database = directory.join(WORLD_DATABASE_FILE);
-            match SqliteWorldStorage::create(&database, world_id) {
-                Ok(storage) => {
-                    let state = storage.load_session()?;
-                    return Ok(world_summary(&state));
-                }
+            let creation: HostResult<WorldSummary> =
+                match SqliteWorldStorage::create(&database, world_id) {
+                    Ok(storage) => (|| {
+                        let state = storage.load_session()?;
+                        drop(storage);
+                        let scope_id = world_runtime_scope_id(world_id);
+                        let profile = baseline.materialize_world_defaults(scope_id);
+                        self.save_world_composition(world_id, &profile)?;
+                        Ok(world_summary(&state))
+                    })(),
+                    Err(error) => Err(error.into()),
+                };
+            match creation {
+                Ok(summary) => return Ok(summary),
                 Err(error) => {
                     if let Err(cleanup) = std::fs::remove_dir_all(&directory) {
                         return Err(HostError::WorldCreateRollbackFailed {
@@ -556,7 +606,7 @@ impl HostHome {
                             cleanup: cleanup.to_string(),
                         });
                     }
-                    return Err(error.into());
+                    return Err(error);
                 }
             }
         }
@@ -795,6 +845,7 @@ impl HostHome {
                 instance_id: instance_id.clone(),
                 scope_id: scope_id.clone(),
                 enabled: true,
+                world_default: false,
             },
             enabled,
         );
@@ -808,6 +859,11 @@ impl HostHome {
             })
         });
         self.save_composition_for_scope(&scope_id, &profile)?;
+        let world_default = profile
+            .activations
+            .iter()
+            .find(|activation| activation.subject == subject)
+            .is_some_and(|activation| activation.world_default);
 
         Ok(InstalledActivation {
             subject,
@@ -818,6 +874,7 @@ impl HostHome {
             instance_id,
             scope_id,
             enabled,
+            world_default,
         })
     }
 
@@ -839,6 +896,16 @@ impl HostHome {
     /// Changes the baseline enabled state for one handler-defined activation subject.
     pub fn set_enabled(&self, subject: &str, enabled: bool) -> HostResult<()> {
         self.set_enabled_in_scope(&RuntimeScopeId::new(HOST_SCOPE), subject, enabled)
+    }
+
+    /// Marks whether one exact baseline activation is copied into newly created worlds.
+    ///
+    /// Existing worlds are compatibility-pinned and are never rewritten by this policy.
+    pub fn set_world_default(&self, subject: &str, world_default: bool) -> HostResult<()> {
+        let scope_id = RuntimeScopeId::new(HOST_SCOPE);
+        let mut profile = self.load_profile()?;
+        profile.set_world_default(subject, world_default)?;
+        self.save_composition_for_scope(&scope_id, &profile)
     }
 
     fn set_enabled_in_scope(
@@ -1118,6 +1185,7 @@ impl HostHome {
                     instance_id: activation.instance_id,
                     scope_id: activation.scope_id,
                     enabled: activation.enabled,
+                    world_default: activation.world_default,
                 })
             })
             .collect()

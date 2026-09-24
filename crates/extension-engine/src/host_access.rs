@@ -34,6 +34,8 @@ pub struct CompositionActivation {
     pub scope_id: String,
     /// Whether the activation is selected to start on next bootstrap.
     pub enabled: bool,
+    /// Whether a baseline activation is materialized into newly created worlds.
+    pub world_default: bool,
 }
 
 /// Generic failure returned by host artifact/composition/preference access.
@@ -191,6 +193,11 @@ pub trait CompositionAccess: Send + Sync {
     /// Changes persisted enabled state for an exact selection.
     fn set_enabled(&self, subject: &str, enabled: bool) -> HostAccessResult<()>;
 
+    /// Marks whether one baseline selection is inherited by newly created worlds.
+    fn set_world_default(&self, _subject: &str, _world_default: bool) -> HostAccessResult<()> {
+        Err(HostAccessError::Rejected)
+    }
+
     /// Removes one persisted selection and policy entries that reference it.
     fn remove_activation(&self, subject: &str) -> HostAccessResult<()>;
 
@@ -325,6 +332,10 @@ impl CompositionAccess for UnavailableCompositionAccess {
     }
 
     fn set_enabled(&self, _subject: &str, _enabled: bool) -> HostAccessResult<()> {
+        Err(HostAccessError::Unavailable)
+    }
+
+    fn set_world_default(&self, _subject: &str, _world_default: bool) -> HostAccessResult<()> {
         Err(HostAccessError::Unavailable)
     }
 

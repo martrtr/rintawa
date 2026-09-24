@@ -299,6 +299,50 @@ fn test_should_persist_schema_registry_idempotently() -> Result<()> {
 }
 
 #[test]
+fn test_should_register_schema_batch_atomically() -> Result<()> {
+    let (_root, storage) = create_storage()?;
+    let existing = schema(
+        "rintawa.test.existing@1",
+        SchemaKind::Facet,
+        serde_json::json!({ "type": "string" }),
+    )?;
+    storage.register_schema(&existing)?;
+
+    let staged = schema(
+        "rintawa.test.staged@1",
+        SchemaKind::Event,
+        serde_json::json!({ "type": "object" }),
+    )?;
+    let conflicting = SchemaDefinition::new(
+        existing.key().clone(),
+        SchemaKind::Facet,
+        ExtensionId::new("rintawa.other-owner"),
+        existing.definition().clone(),
+    );
+
+    assert!(matches!(
+        storage.register_schemas(&[staged.clone(), conflicting]),
+        Err(StorageError::World(WorldError::SchemaConflict { .. }))
+    ));
+    let session = storage.load_session()?;
+    assert!(session.schemas().get(staged.key()).is_none());
+    assert_eq!(session.schemas().get(existing.key()), Some(&existing));
+
+    assert_eq!(
+        storage.register_schemas(&[existing.clone(), staged.clone()])?,
+        vec![
+            SchemaRegistration::AlreadyPresent,
+            SchemaRegistration::Registered,
+        ]
+    );
+    assert_eq!(
+        storage.load_session()?.schemas().get(staged.key()),
+        Some(&staged)
+    );
+    Ok(())
+}
+
+#[test]
 fn test_should_commit_state_event_and_effect_atomically_across_restart() -> Result<()> {
     let (root, storage) = create_storage()?;
     let path = root.path().join("world.sqlite");
@@ -913,6 +957,32 @@ fn test_should_reclaim_expired_effect_with_fencing_token() -> Result<()> {
         storage.cancel_effect(effect_id),
         Err(StorageError::EffectJobTerminal(id)) if id == effect_id
     ));
+    Ok(())
+}
+
+#[test]
+fn test_should_fence_worker_side_effect_cancellation() -> Result<()> {
+    let (_root, storage) = create_storage()?;
+    let schemas = register_test_schemas(&storage)?;
+    let effect_id = enqueue_effect(&storage, &schemas, PrincipalId::new(), "cancel-fence")?;
+
+    let first = storage
+        .claim_next_effect(UnixTimeMillis::new(10), UnixTimeMillis::new(20))?
+        .expect("effect must be claimable");
+    let second = storage
+        .claim_next_effect(UnixTimeMillis::new(20), UnixTimeMillis::new(30))?
+        .expect("expired claim must be reclaimable");
+
+    assert!(matches!(
+        storage.cancel_claimed_effect(effect_id, first.attempt(), "stale cancel"),
+        Err(StorageError::EffectJobClaimLost(id)) if id == effect_id
+    ));
+    storage.cancel_claimed_effect(effect_id, second.attempt(), "provider rejected request")?;
+    assert!(
+        storage
+            .claim_next_effect(UnixTimeMillis::new(40), UnixTimeMillis::new(50))?
+            .is_none()
+    );
     Ok(())
 }
 

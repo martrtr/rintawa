@@ -23,7 +23,7 @@ use rintawa_world::{
     SchemaRegistration, SchemaRegistry, StoredEffectJob, StoredWorldEvent, StoredWorldMutation,
     WORLD_FORMAT_VERSION, WorldCommand, WorldSessionState, WorldTransaction,
 };
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 use crate::{ClaimedEffectJob, StorageError, StorageResult};
 
@@ -172,6 +172,52 @@ impl SqliteWorldStorage {
             ],
         )?;
         Ok(SchemaRegistration::Registered)
+    }
+
+    /// Persists a set of immutable versioned schema definitions atomically.
+    ///
+    /// Existing exact definitions are idempotent. The complete batch is validated
+    /// against both durable schemas and earlier entries in the same batch before
+    /// the transaction commits, so a conflict cannot publish a partial batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a schema conflict/validation error, serialization error, or SQLite error.
+    pub fn register_schemas(
+        &self,
+        definitions: &[SchemaDefinition],
+    ) -> StorageResult<Vec<SchemaRegistration>> {
+        if definitions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut connection = self.writer()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut registry = load_schema_registry(&transaction)?;
+        let mut registrations = Vec::with_capacity(definitions.len());
+
+        for definition in definitions {
+            let registration = registry.register(definition.clone())?;
+            if registration == SchemaRegistration::Registered {
+                let definition_json = serde_json::to_string(definition.definition())?;
+                transaction.execute(
+                    "INSERT INTO world_schemas (
+                        schema_id, schema_version, kind, owner_extension_id, definition_json
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        definition.key().id().as_str(),
+                        i64::from(definition.key().version().get()),
+                        schema_kind_code(definition.kind()),
+                        definition.owner().as_str(),
+                        definition_json,
+                    ],
+                )?;
+            }
+            registrations.push(registration);
+        }
+
+        transaction.commit()?;
+        Ok(registrations)
     }
 
     /// Returns the previous receipt when an identical command already committed.
@@ -343,6 +389,19 @@ impl SqliteWorldStorage {
         query::pending_effects(&connection, self.world_id, limit)
     }
 
+    /// Returns the next time a pending retry or running lease can become claimable.
+    ///
+    /// `None` means there is currently no non-terminal durable effect job. This
+    /// lets cooperative hosts schedule the exact next wake-up without busy polling.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite/storage error when outbox timing metadata cannot be read.
+    pub fn next_effect_wakeup(&self) -> StorageResult<Option<UnixTimeMillis>> {
+        let connection = self.reader()?;
+        outbox::next_wakeup(&connection)
+    }
+
     /// Atomically leases the oldest due or expired durable effect job.
     ///
     /// A reclaimed expired job receives a new attempt number. The returned
@@ -394,6 +453,26 @@ impl SqliteWorldStorage {
     ) -> StorageResult<()> {
         let connection = self.writer()?;
         outbox::retry(&connection, job_id, attempt, available_at, diagnostic)
+    }
+
+    /// Cancels one currently leased effect job using its fencing attempt.
+    ///
+    /// This is the worker-side terminal transition. Unlike administrative
+    /// `cancel_effect`, a stale worker cannot cancel a job reclaimed by another
+    /// attempt. The diagnostic must already be sanitized and is durably bounded.
+    ///
+    /// # Errors
+    ///
+    /// Returns EffectJobClaimLost for stale attempts, EffectJobNotFound, a
+    /// bounded-error failure, or another storage error.
+    pub fn cancel_claimed_effect(
+        &self,
+        job_id: EffectJobId,
+        attempt: u32,
+        diagnostic: &str,
+    ) -> StorageResult<()> {
+        let connection = self.writer()?;
+        outbox::cancel_claimed(&connection, job_id, attempt, diagnostic)
     }
 
     /// Cancels a pending or running durable effect job.

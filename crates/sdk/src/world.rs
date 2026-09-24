@@ -126,6 +126,37 @@ impl UnixTimeMillis {
     }
 }
 
+/// Semantic category of one versioned world schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SchemaKind {
+    /// Schema identifying an entity type.
+    Entity,
+    /// Schema identifying a relation type.
+    Relation,
+    /// Schema describing one extension-owned facet payload.
+    Facet,
+    /// Schema describing one world command payload.
+    Command,
+    /// Schema describing one durable world-event payload.
+    Event,
+    /// Schema describing one durable external effect/job payload.
+    Effect,
+}
+
+impl fmt::Display for SchemaKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Entity => "entity",
+            Self::Relation => "relation",
+            Self::Facet => "facet",
+            Self::Command => "command",
+            Self::Event => "event",
+            Self::Effect => "effect",
+        })
+    }
+}
+
 /// Error returned when a schema identifier is not canonical.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[error("invalid schema identifier {value}: {reason}")]

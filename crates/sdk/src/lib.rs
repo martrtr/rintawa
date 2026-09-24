@@ -37,6 +37,7 @@ pub mod errors;
 pub mod manifest;
 pub mod runtime_effects;
 pub mod runtime_permissions;
+pub mod runtime_signals;
 pub mod secrets;
 pub mod services;
 pub mod traits;

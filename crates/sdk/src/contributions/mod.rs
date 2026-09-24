@@ -5,7 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::ContributionId;
+use crate::{
+    types::ContributionId,
+    world::{SchemaKey, SchemaKind},
+};
 
 /// Represents the kind of contribution an extension can make.
 ///
@@ -94,6 +97,43 @@ impl ContributionDescriptor {
             id: id.into(),
             kind,
         }
+    }
+}
+
+/// Static declaration of one immutable versioned world schema.
+///
+/// Ownership is intentionally absent from this extension-supplied value. The host
+/// assigns the current extension identity when committing the declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldSchemaContribution {
+    key: SchemaKey,
+    kind: SchemaKind,
+    definition_json: String,
+}
+
+impl WorldSchemaContribution {
+    /// Creates one schema declaration from canonical identity and JSON Schema text.
+    pub fn new(key: SchemaKey, kind: SchemaKind, definition_json: impl Into<String>) -> Self {
+        Self {
+            key,
+            kind,
+            definition_json: definition_json.into(),
+        }
+    }
+
+    /// Returns the exact versioned schema identity.
+    pub const fn key(&self) -> &SchemaKey {
+        &self.key
+    }
+
+    /// Returns the semantic world-schema category.
+    pub const fn kind(&self) -> SchemaKind {
+        self.kind
+    }
+
+    /// Returns the extension-supplied JSON Schema document.
+    pub fn definition_json(&self) -> &str {
+        &self.definition_json
     }
 }
 

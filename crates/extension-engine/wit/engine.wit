@@ -83,6 +83,36 @@ interface registration {
     unregister-capability: func(name: string) -> result<_, error>;
 }
 
+/// World-schema declarations available only from guest `register`.
+interface world-registration {
+    /// Semantic category of one immutable world schema.
+    enum schema-kind {
+        entity,
+        relation,
+        facet,
+        command,
+        event,
+        effect,
+    }
+
+    /// Failure while declaring immutable world metadata.
+    variant error {
+        registration-not-active,
+        duplicate-world-schema,
+        invalid-world-schema,
+        message-too-large,
+    }
+
+    /// Declares one immutable versioned world schema.
+    /// Ownership is assigned by the host from the current extension principal.
+    register-world-schema: func(
+        id: string,
+        version: u32,
+        kind: schema-kind,
+        definition-json: string,
+    ) -> result<_, error>;
+}
+
 /// Reversible effects available from guest `start` and `on-event`.
 interface runtime-effects {
     /// A guest-local handle for one host-owned runtime effect.
@@ -104,6 +134,12 @@ interface runtime-effects {
 
     /// Removes a subscription previously returned by `subscribe-event`.
     unsubscribe-event: func(handle: handle) -> result<_, error>;
+
+    /// Adds an owner-scoped ephemeral runtime-signal subscription.
+    subscribe-signal: func(topic: string) -> result<handle, error>;
+
+    /// Removes a signal subscription previously returned by `subscribe-signal`.
+    unsubscribe-signal: func(handle: handle) -> result<_, error>;
 }
 
 /// Owner-scoped cooperative background tasks.
@@ -264,6 +300,7 @@ interface composition {
         instance-id: string,
         scope-id: string,
         enabled: bool,
+        world-default: bool,
     }
 
     /// Failure while reading or mutating profile selection.
@@ -290,35 +327,35 @@ interface composition {
     /// Changes persisted enabled state. Changes take effect on a later bootstrap.
     set-enabled: func(subject: string, enabled: bool) -> result<_, error>;
 
+    /// Marks whether this baseline selection is copied into newly created worlds.
+    /// Existing world overlays remain pinned and are not rewritten.
+    set-world-default: func(subject: string, world-default: bool) -> result<_, error>;
+
     /// Removes a persisted baseline selection and related policy references.
     /// Running instances are not torn down implicitly.
     remove-activation: func(subject: string) -> result<_, error>;
 
-    /// Lists exact selections in one explicit host composition scope.
-    list-activations-in-scope: func(scope-id: string) -> result<list<activation>, error>;
 
-    /// Selects one already-imported exact artifact in one explicit composition scope.
-    select-artifact-in-scope: func(
+}
+
+
+/// Generic mutation/read boundary for one explicit host composition scope.
+interface scoped-composition {
+    use composition.{activation, error};
+
+    list-activations: func(scope-id: string) -> result<list<activation>, error>;
+    select-artifact: func(
         scope-id: string,
         digest: string,
         enabled: option<bool>,
     ) -> result<activation, error>;
-
-    /// Changes persisted enabled state in one explicit composition scope.
-    set-enabled-in-scope: func(
+    set-enabled: func(
         scope-id: string,
         subject: string,
         enabled: bool,
     ) -> result<_, error>;
-
-    /// Removes one persisted selection from one explicit composition scope.
-    /// Running instances are not torn down implicitly.
-    remove-activation-in-scope: func(
-        scope-id: string,
-        subject: string,
-    ) -> result<_, error>;
+    remove-activation: func(scope-id: string, subject: string) -> result<_, error>;
 }
-
 
 /// Administrative runtime permission policy for exact baseline components.
 interface runtime-policy {
@@ -363,12 +400,6 @@ interface runtime-policy {
     /// Lists baseline component permission policy. Requires runtime-policy-read.
     list-components: func() -> result<list<component-policy>, error>;
 
-    /// Lists component permission policy in one explicit composition scope.
-    /// Requires runtime-policy-read.
-    list-components-in-scope: func(
-        scope-id: string,
-    ) -> result<list<component-policy>, error>;
-
     /// Grants one manifest-requested permission. Requires runtime-policy-write.
     grant: func(
         scope-id: string,
@@ -384,6 +415,13 @@ interface runtime-policy {
         component-id: string,
         permission: string,
     ) -> result<_, error>;
+}
+
+/// Administrative runtime-permission policy for one explicit composition scope.
+interface scoped-runtime-policy {
+    use runtime-policy.{component-policy, error};
+
+    list-components: func(scope-id: string) -> result<list<component-policy>, error>;
 }
 
 /// Dynamic execution targets published by an active runtime-provider component.
@@ -649,6 +687,7 @@ interface guest {
 world plugin {
     import host;
     import registration;
+    import world-registration;
     import runtime-effects;
     import runtime-tasks;
     import network;
@@ -656,7 +695,9 @@ world plugin {
     import artifact-store;
     import preferences;
     import composition;
+    import scoped-composition;
     import runtime-policy;
+    import scoped-runtime-policy;
     import execution-targets;
     import secrets;
     import services;
@@ -680,6 +721,7 @@ world task-plugin {
 world task-runtime-plugin {
     import host;
     import registration;
+    import world-registration;
     import runtime-effects;
     import runtime-tasks;
     import network;
@@ -687,7 +729,9 @@ world task-runtime-plugin {
     import artifact-store;
     import preferences;
     import composition;
+    import scoped-composition;
     import runtime-policy;
+    import scoped-runtime-policy;
     import execution-targets;
     import secrets;
     import services;
@@ -701,6 +745,7 @@ world task-runtime-plugin {
 world runtime-provider-plugin {
     import host;
     import registration;
+    import world-registration;
     import runtime-effects;
     import runtime-tasks;
     import network;
@@ -708,7 +753,9 @@ world runtime-provider-plugin {
     import artifact-store;
     import preferences;
     import composition;
+    import scoped-composition;
     import runtime-policy;
+    import scoped-runtime-policy;
     import execution-targets;
     import secrets;
     import services;
@@ -722,6 +769,7 @@ world runtime-provider-plugin {
 world runtime-provider-task-plugin {
     import host;
     import registration;
+    import world-registration;
     import runtime-effects;
     import runtime-tasks;
     import network;
@@ -729,7 +777,9 @@ world runtime-provider-task-plugin {
     import artifact-store;
     import preferences;
     import composition;
+    import scoped-composition;
     import runtime-policy;
+    import scoped-runtime-policy;
     import execution-targets;
     import secrets;
     import services;

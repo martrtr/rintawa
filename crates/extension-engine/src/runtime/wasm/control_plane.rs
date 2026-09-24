@@ -9,8 +9,9 @@ use crate::{
     runtime::wasm::{
         ArtifactStoreError, ArtifactStoreHost, CompositionError, CompositionHost, PreferenceError,
         PreferencesHost, RuntimePermissionCheck, RuntimePolicyError, RuntimePolicyHost,
-        WasmHostState, WitCompositionActivation, WitImportedArtifact, WitRuntimeArtifactPolicy,
-        WitRuntimePolicyComponent, WitRuntimePolicyRequest,
+        ScopedCompositionHost, ScopedRuntimePolicyHost, WasmHostState, WitCompositionActivation,
+        WitImportedArtifact, WitRuntimeArtifactPolicy, WitRuntimePolicyComponent,
+        WitRuntimePolicyRequest,
     },
 };
 
@@ -169,22 +170,6 @@ impl RuntimePolicyHost for WasmHostState {
         self.bound_runtime_policy_components(components)
     }
 
-    fn list_components_in_scope(
-        &mut self,
-        scope_id: String,
-    ) -> Result<Vec<WitRuntimePolicyComponent>, RuntimePolicyError> {
-        self.require_runtime_policy_read()?;
-        if scope_id.len() > self.max_host_message_bytes {
-            return Err(RuntimePolicyError::MessageTooLarge);
-        }
-        let components = self
-            .host_access
-            .runtime_policy
-            .list_components_in_scope(&scope_id)
-            .map_err(map_runtime_policy_access_error)?;
-        self.bound_runtime_policy_components(components)
-    }
-
     fn grant(
         &mut self,
         scope_id: String,
@@ -229,6 +214,24 @@ impl RuntimePolicyHost for WasmHostState {
             .runtime_policy
             .revoke(&scope_id, &instance_id, &component_id, &permission)
             .map_err(map_runtime_policy_access_error)
+    }
+}
+
+impl ScopedRuntimePolicyHost for WasmHostState {
+    fn list_components(
+        &mut self,
+        scope_id: String,
+    ) -> Result<Vec<WitRuntimePolicyComponent>, RuntimePolicyError> {
+        self.require_runtime_policy_read()?;
+        if scope_id.len() > self.max_host_message_bytes {
+            return Err(RuntimePolicyError::MessageTooLarge);
+        }
+        let components = self
+            .host_access
+            .runtime_policy
+            .list_components_in_scope(&scope_id)
+            .map_err(map_runtime_policy_access_error)?;
+        self.bound_runtime_policy_components(components)
     }
 }
 
@@ -325,6 +328,21 @@ impl CompositionHost for WasmHostState {
             .map_err(map_composition_access_error)
     }
 
+    fn set_world_default(
+        &mut self,
+        subject: String,
+        world_default: bool,
+    ) -> Result<(), CompositionError> {
+        self.require_composition_write()?;
+        if subject.len() > self.max_host_message_bytes {
+            return Err(CompositionError::Rejected);
+        }
+        self.host_access
+            .composition
+            .set_world_default(&subject, world_default)
+            .map_err(map_composition_access_error)
+    }
+
     fn remove_activation(&mut self, subject: String) -> Result<(), CompositionError> {
         self.require_composition_write()?;
         if subject.len() > self.max_host_message_bytes {
@@ -335,8 +353,10 @@ impl CompositionHost for WasmHostState {
             .remove_activation(&subject)
             .map_err(map_composition_access_error)
     }
+}
 
-    fn list_activations_in_scope(
+impl ScopedCompositionHost for WasmHostState {
+    fn list_activations(
         &mut self,
         scope_id: String,
     ) -> Result<Vec<WitCompositionActivation>, CompositionError> {
@@ -352,7 +372,7 @@ impl CompositionHost for WasmHostState {
         self.bound_composition_activations(activations)
     }
 
-    fn select_artifact_in_scope(
+    fn select_artifact(
         &mut self,
         scope_id: String,
         digest: String,
@@ -369,7 +389,7 @@ impl CompositionHost for WasmHostState {
             .map_err(map_composition_access_error)
     }
 
-    fn set_enabled_in_scope(
+    fn set_enabled(
         &mut self,
         scope_id: String,
         subject: String,
@@ -385,7 +405,7 @@ impl CompositionHost for WasmHostState {
             .map_err(map_composition_access_error)
     }
 
-    fn remove_activation_in_scope(
+    fn remove_activation(
         &mut self,
         scope_id: String,
         subject: String,
@@ -462,6 +482,7 @@ fn to_wit_composition_activation(activation: CompositionActivation) -> WitCompos
         instance_id: activation.instance_id,
         scope_id: activation.scope_id,
         enabled: activation.enabled,
+        world_default: activation.world_default,
     }
 }
 

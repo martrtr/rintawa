@@ -13,6 +13,20 @@ const STATUS_COMPLETED: i64 = 2;
 const STATUS_CANCELLED: i64 = 3;
 const MAX_LAST_ERROR_BYTES: usize = 8 * 1024;
 
+pub(super) fn next_wakeup(connection: &Connection) -> StorageResult<Option<UnixTimeMillis>> {
+    let value = connection.query_row(
+        "SELECT MIN(CASE
+            WHEN status = ?1 THEN available_at_ms
+            WHEN status = ?2 THEN lease_expires_at_ms
+         END)
+         FROM effect_jobs
+         WHERE status IN (?1, ?2)",
+        params![STATUS_PENDING, STATUS_RUNNING],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    Ok(value.map(UnixTimeMillis::new))
+}
+
 pub(super) fn claim_next(
     connection: &mut Connection,
     world_id: rintawa_sdk::world::WorldId,
@@ -125,6 +139,34 @@ pub(super) fn retry(
         params![
             STATUS_PENDING,
             available_at.get(),
+            diagnostic,
+            job_id.into_bytes().as_slice(),
+            STATUS_RUNNING,
+            i64::from(attempt)
+        ],
+    )
+}
+
+pub(super) fn cancel_claimed(
+    connection: &Connection,
+    job_id: EffectJobId,
+    attempt: u32,
+    diagnostic: &str,
+) -> StorageResult<()> {
+    if diagnostic.len() > MAX_LAST_ERROR_BYTES {
+        return Err(StorageError::EffectErrorTooLarge {
+            actual_bytes: diagnostic.len(),
+            maximum_bytes: MAX_LAST_ERROR_BYTES,
+        });
+    }
+    transition_claim(
+        connection,
+        job_id,
+        "UPDATE effect_jobs
+         SET status = ?1, lease_expires_at_ms = NULL, last_error = ?2
+         WHERE job_id = ?3 AND status = ?4 AND attempt_count = ?5",
+        params![
+            STATUS_CANCELLED,
             diagnostic,
             job_id.into_bytes().as_slice(),
             STATUS_RUNNING,

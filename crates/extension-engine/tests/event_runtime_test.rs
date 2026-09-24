@@ -30,6 +30,7 @@ struct EventSubscriber {
     label: String,
     state: RecordingState,
     duplicate_subscription: bool,
+    signal_subscription: bool,
     fail_on_event: bool,
     unsubscribe_on_event: bool,
     subscription: Option<RuntimeEffectId>,
@@ -43,6 +44,7 @@ impl EventSubscriber {
             label: label.to_string(),
             state,
             duplicate_subscription: false,
+            signal_subscription: false,
             fail_on_event: false,
             unsubscribe_on_event: false,
             subscription: None,
@@ -51,6 +53,11 @@ impl EventSubscriber {
 
     fn with_duplicate_subscription(mut self) -> Self {
         self.duplicate_subscription = true;
+        self
+    }
+
+    fn signal(mut self) -> Self {
+        self.signal_subscription = true;
         self
     }
 
@@ -71,11 +78,15 @@ impl Component for EventSubscriber {
     }
 
     fn start(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
-        let effect =
-            ctx.register_runtime_effect(RuntimeEffect::event_subscription(self.topic.clone()))?;
+        let runtime_effect = if self.signal_subscription {
+            RuntimeEffect::signal_subscription(self.topic.clone())
+        } else {
+            RuntimeEffect::event_subscription(self.topic.clone())
+        };
+        let effect = ctx.register_runtime_effect(runtime_effect.clone())?;
         self.subscription = Some(effect);
         if self.duplicate_subscription {
-            ctx.register_runtime_effect(RuntimeEffect::event_subscription(self.topic.clone()))?;
+            ctx.register_runtime_effect(runtime_effect)?;
         }
         Ok(())
     }
@@ -294,6 +305,57 @@ fn test_should_quarantine_failed_subscriber_and_continue_delivery() -> Result<()
         ]
     );
     Ok(())
+}
+
+#[test]
+fn test_should_keep_event_and_signal_subscriptions_disjoint() -> Result<()> {
+    let mut engine = ExtensionEngine::new();
+    let scope = RuntimeScopeId::new("world:test");
+    let state = RecordingState::new();
+    let topic = "example.shared@1";
+
+    register_subscriber(
+        &mut engine,
+        "event-subscriber",
+        &scope,
+        "example.event",
+        EventSubscriber::new("runtime", topic, "event", state.clone()),
+    )?;
+    register_subscriber(
+        &mut engine,
+        "signal-subscriber",
+        &scope,
+        "example.signal",
+        EventSubscriber::new("runtime", topic, "signal", state.clone()).signal(),
+    )?;
+
+    assert_eq!(
+        engine.dispatch_runtime_event_in_scope(&scope, topic, b"durable")?,
+        1
+    );
+    assert_eq!(
+        engine.dispatch_runtime_signal_in_scope(&scope, topic, b"ephemeral")?,
+        1
+    );
+    assert_eq!(
+        state.values(),
+        vec![
+            String::from("event:example.shared@1:durable"),
+            String::from("signal:example.shared@1:ephemeral"),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_empty_runtime_signal_topic() {
+    let mut engine = ExtensionEngine::new();
+    let scope = RuntimeScopeId::new("world:test");
+
+    assert!(matches!(
+        engine.dispatch_runtime_signal_in_scope(&scope, "   ", b"payload"),
+        Err(EngineError::InvalidRuntimeSignalTopic)
+    ));
 }
 
 #[test]

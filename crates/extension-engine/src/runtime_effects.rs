@@ -92,7 +92,31 @@ impl RuntimeEffectRegistry {
                 RuntimeEffect::EventSubscription {
                     topic: subscribed_topic,
                 } if subscribed_topic == topic => Some(effect.owner.clone()),
-                RuntimeEffect::EventSubscription { .. } => None,
+                RuntimeEffect::EventSubscription { .. }
+                | RuntimeEffect::SignalSubscription { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        subscribers.sort_by(|left, right| {
+            left.instance_id
+                .as_str()
+                .cmp(right.instance_id.as_str())
+                .then_with(|| left.component_id.as_str().cmp(right.component_id.as_str()))
+        });
+        subscribers.dedup();
+        subscribers
+    }
+
+    /// Returns exact component principals subscribed to one ephemeral signal topic.
+    pub(crate) fn signal_subscribers(&self, topic: &str) -> Vec<ComponentRef> {
+        let mut subscribers = self
+            .effects
+            .values()
+            .filter_map(|effect| match &effect.effect {
+                RuntimeEffect::SignalSubscription {
+                    topic: subscribed_topic,
+                } if subscribed_topic == topic => Some(effect.owner.clone()),
+                RuntimeEffect::SignalSubscription { .. }
+                | RuntimeEffect::EventSubscription { .. } => None,
             })
             .collect::<Vec<_>>();
         subscribers.sort_by(|left, right| {
@@ -124,7 +148,14 @@ fn validate_runtime_effect(effect: &RuntimeEffect) -> ExtensionResult<()> {
                 "event subscription topic must not be empty",
             )))
         }
-        RuntimeEffect::EventSubscription { .. } => Ok(()),
+        RuntimeEffect::SignalSubscription { topic } if topic.trim().is_empty() => {
+            Err(ExtensionError::InvalidRuntimeEffect(String::from(
+                "signal subscription topic must not be empty",
+            )))
+        }
+        RuntimeEffect::EventSubscription { .. } | RuntimeEffect::SignalSubscription { .. } => {
+            Ok(())
+        }
     }
 }
 

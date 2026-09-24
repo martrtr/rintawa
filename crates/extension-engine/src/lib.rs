@@ -39,7 +39,7 @@ pub use artifact_loader::{
 pub use composition::{
     CompositionSnapshot, ContractBinding, UnresolvedContract, UnresolvedContractReason,
 };
-pub use engine::{ExtensionEngine, ExtensionState};
+pub use engine::{ExtensionEngine, ExtensionState, RegisteredWorldSchema};
 pub use errors::{ComponentStopFailure, EngineError, EngineResult};
 pub use host_access::{
     ArtifactStoreAccess, CompositionAccess, CompositionActivation, HostAccessError,

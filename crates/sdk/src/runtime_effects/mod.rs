@@ -10,7 +10,12 @@ use serde::{Deserialize, Serialize};
 pub enum RuntimeEffect {
     /// Delivers matching runtime events to the owning component.
     EventSubscription {
-        /// The versioned event topic to receive.
+        /// The versioned durable-event topic to receive through live delivery.
+        topic: String,
+    },
+    /// Delivers matching ephemeral runtime signals to the owning component.
+    SignalSubscription {
+        /// Exact runtime-signal topic to receive.
         topic: String,
     },
 }
@@ -19,6 +24,13 @@ impl RuntimeEffect {
     /// Creates an event-subscription runtime effect for a topic.
     pub fn event_subscription(topic: impl Into<String>) -> Self {
         Self::EventSubscription {
+            topic: topic.into(),
+        }
+    }
+
+    /// Creates an ephemeral signal-subscription runtime effect for a topic.
+    pub fn signal_subscription(topic: impl Into<String>) -> Self {
+        Self::SignalSubscription {
             topic: topic.into(),
         }
     }

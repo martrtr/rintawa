@@ -39,6 +39,7 @@ fn begin_test_registration(state: &mut WasmHostState, extension_id: ExtensionId)
 struct RecordingScopedHostAccess {
     composition_reads: Mutex<Vec<String>>,
     composition_writes: Mutex<Vec<String>>,
+    world_default_writes: Mutex<Vec<(String, bool)>>,
     runtime_policy_reads: Mutex<Vec<String>>,
 }
 
@@ -98,6 +99,14 @@ impl CompositionAccess for RecordingScopedHostAccess {
         Err(HostAccessError::Rejected)
     }
 
+    fn set_world_default(&self, subject: &str, world_default: bool) -> HostAccessResult<()> {
+        self.world_default_writes
+            .lock()
+            .expect("test world-default lock must stay healthy")
+            .push((subject.to_string(), world_default));
+        Ok(())
+    }
+
     fn remove_activation(&self, _subject: &str) -> HostAccessResult<()> {
         Err(HostAccessError::Rejected)
     }
@@ -119,6 +128,7 @@ impl CompositionAccess for RecordingScopedHostAccess {
             instance_id: String::from("instance"),
             scope_id: scope_id.to_string(),
             enabled: true,
+            world_default: false,
         }])
     }
 
@@ -141,6 +151,7 @@ impl CompositionAccess for RecordingScopedHostAccess {
             instance_id: String::from("instance"),
             scope_id: scope_id.to_string(),
             enabled: true,
+            world_default: false,
         })
     }
 }
@@ -478,6 +489,43 @@ fn test_should_commit_wasm_capability_contributions_only_after_registration_fini
 }
 
 #[test]
+fn test_should_stage_wasm_world_schema_registration() {
+    let mut state = WasmHostState::new(ComponentId::new("runtime"));
+    begin_test_registration(&mut state, ExtensionId::new("example.extension"));
+
+    WorldRegistrationHost::register_world_schema(
+        &mut state,
+        String::from("example.message"),
+        1,
+        WitSchemaKind::Event,
+        String::from(r#"{"type":"object"}"#),
+    )
+    .unwrap();
+    assert!(matches!(
+        WorldRegistrationHost::register_world_schema(
+            &mut state,
+            String::from("example.message"),
+            1,
+            WitSchemaKind::Event,
+            String::from(r#"{"type":"object"}"#),
+        ),
+        Err(WorldRegistrationError::DuplicateWorldSchema)
+    ));
+
+    let registrations = state.finish_registration().unwrap();
+    assert_eq!(registrations.world_schemas.len(), 1);
+    assert_eq!(
+        registrations.world_schemas[0].key().to_string(),
+        "example.message@1"
+    );
+    assert_eq!(registrations.world_schemas[0].kind(), SchemaKind::Event);
+    assert_eq!(
+        registrations.world_schemas[0].definition_json(),
+        r#"{"type":"object"}"#
+    );
+}
+
+#[test]
 fn test_should_stage_wasm_contract_registrations() {
     let mut state = WasmHostState::new(ComponentId::new("runtime"));
     begin_test_registration(&mut state, ExtensionId::new("example.extension"));
@@ -627,13 +675,25 @@ fn test_should_install_and_revoke_wasm_runtime_effects_with_handles() {
     let mut context = TestRuntimeContext::new();
 
     state.begin_guest_execution();
-    let handle =
+    let event_handle =
         RuntimeEffectsHost::subscribe_event(&mut state, String::from("dialogue.message")).unwrap();
+    let signal_handle =
+        RuntimeEffectsHost::subscribe_signal(&mut state, String::from("rintawa.operation.chunk@1"))
+            .unwrap();
     state.finish_guest_execution(&mut context).unwrap();
-    assert_eq!(context.effects.len(), 1);
+    assert_eq!(context.effects.len(), 2);
+    assert!(context.effects.values().any(|effect| matches!(
+        effect,
+        RuntimeEffect::EventSubscription { topic } if topic == "dialogue.message"
+    )));
+    assert!(context.effects.values().any(|effect| matches!(
+        effect,
+        RuntimeEffect::SignalSubscription { topic } if topic == "rintawa.operation.chunk@1"
+    )));
 
     state.begin_guest_execution();
-    RuntimeEffectsHost::unsubscribe_event(&mut state, handle).unwrap();
+    RuntimeEffectsHost::unsubscribe_event(&mut state, event_handle).unwrap();
+    RuntimeEffectsHost::unsubscribe_signal(&mut state, signal_handle).unwrap();
     state.finish_guest_execution(&mut context).unwrap();
     assert!(context.effects.is_empty());
 }
@@ -644,6 +704,10 @@ fn test_should_reject_wasm_effect_or_registration_outside_its_lifecycle_scope() 
 
     assert!(matches!(
         RuntimeEffectsHost::subscribe_event(&mut state, String::from("dialogue.message")),
+        Err(RuntimeEffectError::RuntimeNotActive)
+    ));
+    assert!(matches!(
+        RuntimeEffectsHost::subscribe_signal(&mut state, String::from("rintawa.operation.chunk@1")),
         Err(RuntimeEffectError::RuntimeNotActive)
     ));
     assert!(matches!(
@@ -817,11 +881,11 @@ fn test_should_route_scoped_composition_and_runtime_policy_access() {
 
     let scope = String::from("world:00000000-0000-7000-8000-000000000001");
     assert!(matches!(
-        CompositionHost::list_activations_in_scope(&mut state, scope.clone()),
+        ScopedCompositionHost::list_activations(&mut state, scope.clone()),
         Err(CompositionError::PermissionDenied)
     ));
     assert!(matches!(
-        CompositionHost::select_artifact_in_scope(
+        ScopedCompositionHost::select_artifact(
             &mut state,
             scope.clone(),
             String::from("sha256:example"),
@@ -830,8 +894,12 @@ fn test_should_route_scoped_composition_and_runtime_policy_access() {
         Err(CompositionError::PermissionDenied)
     ));
     assert!(matches!(
-        RuntimePolicyHost::list_components_in_scope(&mut state, scope.clone()),
+        ScopedRuntimePolicyHost::list_components(&mut state, scope.clone()),
         Err(RuntimePolicyError::PermissionDenied)
+    ));
+    assert!(matches!(
+        CompositionHost::set_world_default(&mut state, String::from("example.extension"), true,),
+        Err(CompositionError::PermissionDenied)
     ));
 
     let owner = state.registered_owner().unwrap();
@@ -839,8 +907,7 @@ fn test_should_route_scoped_composition_and_runtime_policy_access() {
         .runtime_permissions
         .grant(owner.clone(), RuntimePermission::CompositionRead)
         .unwrap();
-    let activations =
-        CompositionHost::list_activations_in_scope(&mut state, scope.clone()).unwrap();
+    let activations = ScopedCompositionHost::list_activations(&mut state, scope.clone()).unwrap();
     assert_eq!(activations.len(), 1);
     assert_eq!(activations[0].scope_id, scope);
 
@@ -848,7 +915,7 @@ fn test_should_route_scoped_composition_and_runtime_policy_access() {
         .runtime_permissions
         .grant(owner.clone(), RuntimePermission::CompositionWrite)
         .unwrap();
-    let selected = CompositionHost::select_artifact_in_scope(
+    let selected = ScopedCompositionHost::select_artifact(
         &mut state,
         scope.clone(),
         String::from("sha256:example"),
@@ -856,12 +923,14 @@ fn test_should_route_scoped_composition_and_runtime_policy_access() {
     )
     .unwrap();
     assert_eq!(selected.scope_id, scope);
+    CompositionHost::set_world_default(&mut state, String::from("example.extension"), true)
+        .unwrap();
 
     state
         .runtime_permissions
         .grant(owner, RuntimePermission::RuntimePolicyRead)
         .unwrap();
-    let policies = RuntimePolicyHost::list_components_in_scope(&mut state, scope.clone()).unwrap();
+    let policies = ScopedRuntimePolicyHost::list_components(&mut state, scope.clone()).unwrap();
     assert_eq!(policies.len(), 1);
     assert_eq!(policies[0].scope_id, scope);
 
@@ -880,6 +949,14 @@ fn test_should_route_scoped_composition_and_runtime_policy_access() {
             .expect("test composition-write lock must stay healthy")
             .as_slice(),
         std::slice::from_ref(&scope)
+    );
+    assert_eq!(
+        access
+            .world_default_writes
+            .lock()
+            .expect("test world-default lock must stay healthy")
+            .as_slice(),
+        [(String::from("example.extension"), true)]
     );
     assert_eq!(
         access

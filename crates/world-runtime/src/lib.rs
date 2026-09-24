@@ -7,12 +7,19 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs, rustdoc::broken_intra_doc_links)]
 
+mod effect;
 mod error;
 mod runtime;
 mod service;
 mod snapshot;
 mod system;
 
+pub use effect::{
+    MAX_WORLD_EFFECT_DIAGNOSTIC_BYTES, ServiceWorldEffectHandler,
+    WORLD_EFFECT_SERVICE_PROTOCOL_VERSION, WorldEffectServiceClient, WorldEffectServiceError,
+    WorldEffectServiceRequest, WorldEffectServiceResponse, WorldEffectServiceResult,
+    effect_completion_command_id, world_effect_service_contract_key,
+};
 pub use error::{
     SystemError, SystemResult, WorldReadError, WorldReadResult, WorldRuntimeError,
     WorldRuntimeResult,

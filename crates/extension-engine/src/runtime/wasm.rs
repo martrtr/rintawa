@@ -17,7 +17,7 @@ use rintawa_sdk::{
         ContractConsumer, ContractDefinition, ContractGrantRequirement, ContractKey,
         ContractProtocol, ContractProvider, ContractResolutionPolicy, ContractVersion,
     },
-    contributions::{ContributionDescriptor, ContributionKind},
+    contributions::{ContributionDescriptor, ContributionKind, WorldSchemaContribution},
     errors::{ExtensionError, ExtensionResult},
     runtime_effects::RuntimeEffect,
     runtime_permissions::RuntimePermission,
@@ -26,6 +26,7 @@ use rintawa_sdk::{
     traits::Component,
     types::{ComponentId, ExtensionId, ExtensionInstanceId, RuntimeEffectId, RuntimeScopeId},
     ui::{UiActionEvent, UiLayerDescriptor, UiSurfaceContribution, UiSurfaceId},
+    world::{SchemaKey, SchemaKind},
 };
 use rintawa_ui_runtime::UiRuntime;
 use tracing::{debug, error, info, trace, warn};
@@ -132,9 +133,14 @@ use bindings::rintawa::engine::{
         Host as RuntimePolicyHost,
     },
     runtime_tasks::{Error as RuntimeTaskError, Host as RuntimeTasksHost},
+    scoped_composition::Host as ScopedCompositionHost,
+    scoped_runtime_policy::Host as ScopedRuntimePolicyHost,
     secrets::{Error as SecretError, Host as SecretsHost},
     services::{Error as ServiceTransportError, Host as ServicesHost},
     ui_layer::{Error as UiLayerError, Host as UiLayerHost},
+    world_registration::{
+        Error as WorldRegistrationError, Host as WorldRegistrationHost, SchemaKind as WitSchemaKind,
+    },
 };
 use target_provider_bindings::TargetProviderPlugin;
 use task_bindings::TaskPlugin;
@@ -190,6 +196,8 @@ pub struct WasmHostState {
 struct WasmRegistrationScope {
     contributions: Vec<ContributionDescriptor>,
     capabilities: HashSet<String>,
+    world_schemas: Vec<WorldSchemaContribution>,
+    world_schema_keys: HashSet<SchemaKey>,
     definitions: Vec<ContractDefinition>,
     definition_keys: HashSet<ContractKey>,
     providers: Vec<ContractProvider>,
@@ -203,6 +211,7 @@ struct WasmRegistrationScope {
 
 struct WasmRegistrations {
     contributions: Vec<ContributionDescriptor>,
+    world_schemas: Vec<WorldSchemaContribution>,
     definitions: Vec<ContractDefinition>,
     providers: Vec<ContractProvider>,
     consumers: Vec<ContractConsumer>,
@@ -215,7 +224,7 @@ enum WasmRuntimeEffectOperation {
     Subscribe {
         owner: rintawa_sdk::contracts::ComponentRef,
         handle: String,
-        topic: String,
+        effect: RuntimeEffect,
     },
     Unsubscribe {
         handle: String,
@@ -365,6 +374,8 @@ impl WasmHostState {
         self.registration_scope = Some(WasmRegistrationScope {
             contributions: Vec::new(),
             capabilities: HashSet::new(),
+            world_schemas: Vec::new(),
+            world_schema_keys: HashSet::new(),
             definitions: Vec::new(),
             definition_keys: HashSet::new(),
             providers: Vec::new(),
@@ -399,6 +410,8 @@ impl WasmHostState {
         self.registration_scope = Some(WasmRegistrationScope {
             contributions: Vec::new(),
             capabilities: HashSet::new(),
+            world_schemas: Vec::new(),
+            world_schema_keys: HashSet::new(),
             definitions: Vec::new(),
             definition_keys: HashSet::new(),
             providers: Vec::new(),
@@ -423,6 +436,7 @@ impl WasmHostState {
 
         Ok(WasmRegistrations {
             contributions: scope.contributions,
+            world_schemas: scope.world_schemas,
             definitions: scope.definitions,
             providers: scope.providers,
             consumers: scope.consumers,
@@ -487,6 +501,20 @@ impl WasmHostState {
         self.ui_access_active = false;
         self.execution_target_registration_active = false;
         self.pending_execution_targets.clear();
+    }
+
+    fn queue_world_schema(
+        &mut self,
+        schema: WorldSchemaContribution,
+    ) -> Result<(), WorldRegistrationError> {
+        let Some(scope) = self.registration_scope.as_mut() else {
+            return Err(WorldRegistrationError::RegistrationNotActive);
+        };
+        if !scope.world_schema_keys.insert(schema.key().clone()) {
+            return Err(WorldRegistrationError::DuplicateWorldSchema);
+        }
+        scope.world_schemas.push(schema);
+        Ok(())
     }
 
     fn queue_capability(&mut self, name: String) -> Result<(), RegistrationError> {
@@ -605,9 +633,24 @@ impl WasmHostState {
     }
 
     fn subscribe_event(&mut self, topic: String) -> Result<String, RuntimeEffectError> {
+        self.subscribe_runtime_effect(RuntimeEffect::event_subscription(topic))
+    }
+
+    fn subscribe_signal(&mut self, topic: String) -> Result<String, RuntimeEffectError> {
+        self.subscribe_runtime_effect(RuntimeEffect::signal_subscription(topic))
+    }
+
+    fn subscribe_runtime_effect(
+        &mut self,
+        effect: RuntimeEffect,
+    ) -> Result<String, RuntimeEffectError> {
         if !self.runtime_effects_active {
             return Err(RuntimeEffectError::RuntimeNotActive);
         }
+        let topic = match &effect {
+            RuntimeEffect::EventSubscription { topic }
+            | RuntimeEffect::SignalSubscription { topic } => topic,
+        };
         if topic.trim().is_empty() {
             return Err(RuntimeEffectError::InvalidTopic);
         }
@@ -625,12 +668,20 @@ impl WasmHostState {
             .push(WasmRuntimeEffectOperation::Subscribe {
                 owner,
                 handle: handle.clone(),
-                topic,
+                effect,
             });
         Ok(handle)
     }
 
     fn unsubscribe_event(&mut self, handle: String) -> Result<(), RuntimeEffectError> {
+        self.unsubscribe_runtime_effect(handle)
+    }
+
+    fn unsubscribe_signal(&mut self, handle: String) -> Result<(), RuntimeEffectError> {
+        self.unsubscribe_runtime_effect(handle)
+    }
+
+    fn unsubscribe_runtime_effect(&mut self, handle: String) -> Result<(), RuntimeEffectError> {
         if !self.runtime_effects_active {
             return Err(RuntimeEffectError::RuntimeNotActive);
         }
@@ -770,22 +821,20 @@ impl WasmHostState {
                 WasmRuntimeEffectOperation::Subscribe {
                     owner,
                     handle,
-                    topic,
-                } => {
-                    let effect = RuntimeEffect::event_subscription(topic);
-                    ctx.register_runtime_effect(effect.clone())
-                        .map(|effect_id| {
-                            self.effect_handles.insert(
-                                handle.clone(),
-                                ActiveWasmRuntimeEffect {
-                                    owner,
-                                    effect_id,
-                                    effect,
-                                },
-                            );
-                            registered_handles.push(handle);
-                        })
-                }
+                    effect,
+                } => ctx
+                    .register_runtime_effect(effect.clone())
+                    .map(|effect_id| {
+                        self.effect_handles.insert(
+                            handle.clone(),
+                            ActiveWasmRuntimeEffect {
+                                owner,
+                                effect_id,
+                                effect,
+                            },
+                        );
+                        registered_handles.push(handle);
+                    }),
                 WasmRuntimeEffectOperation::Unsubscribe { handle, effect } => {
                     ctx.revoke_runtime_effect(&effect.effect_id).map(|()| {
                         self.effect_handles.remove(&handle);
@@ -1093,6 +1142,19 @@ impl RuntimeEffectsHost for WasmHostState {
     fn unsubscribe_event(&mut self, handle: String) -> Result<(), RuntimeEffectError> {
         self.unsubscribe_event(handle)
     }
+
+    fn subscribe_signal(&mut self, topic: String) -> Result<String, RuntimeEffectError> {
+        debug!(
+            plugin = %self.component_id,
+            topic = %topic,
+            "WASM plugin subscribed to runtime signal"
+        );
+        self.subscribe_signal(topic)
+    }
+
+    fn unsubscribe_signal(&mut self, handle: String) -> Result<(), RuntimeEffectError> {
+        self.unsubscribe_signal(handle)
+    }
 }
 
 impl RuntimeTasksHost for WasmHostState {
@@ -1233,6 +1295,32 @@ impl RegistrationHost for WasmHostState {
             "WASM plugin unregistered capability"
         );
         self.remove_queued_capability(&name)
+    }
+}
+
+impl WorldRegistrationHost for WasmHostState {
+    fn register_world_schema(
+        &mut self,
+        id: String,
+        version: u32,
+        kind: WitSchemaKind,
+        definition_json: String,
+    ) -> Result<(), WorldRegistrationError> {
+        if id.len().saturating_add(definition_json.len()) > self.max_host_message_bytes {
+            return Err(WorldRegistrationError::MessageTooLarge);
+        }
+        let key = format!("{id}@{version}")
+            .parse::<SchemaKey>()
+            .map_err(|_| WorldRegistrationError::InvalidWorldSchema)?;
+        let kind = match kind {
+            WitSchemaKind::Entity => SchemaKind::Entity,
+            WitSchemaKind::Relation => SchemaKind::Relation,
+            WitSchemaKind::Facet => SchemaKind::Facet,
+            WitSchemaKind::Command => SchemaKind::Command,
+            WitSchemaKind::Event => SchemaKind::Event,
+            WitSchemaKind::Effect => SchemaKind::Effect,
+        };
+        self.queue_world_schema(WorldSchemaContribution::new(key, kind, definition_json))
     }
 }
 
@@ -1519,6 +1607,9 @@ fn apply_wasm_registrations(
 ) -> ExtensionResult<()> {
     for contribution in registrations.contributions {
         ctx.register(contribution)?;
+    }
+    for schema in registrations.world_schemas {
+        ctx.register_world_schema(schema)?;
     }
     for definition in registrations.definitions {
         ctx.define_contract(definition)?;
