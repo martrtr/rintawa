@@ -2128,6 +2128,7 @@ mod tests {
             CommandId, CorrelationId, EffectJobId, PrincipalId, SchemaKey, UnixTimeMillis,
             WorldEventId, WorldId,
         },
+        world_system::{WorldSystemEventProposal, WorldSystemTransaction},
     };
     use rintawa_storage::SqliteWorldStorage;
     use rintawa_world::{
@@ -2332,11 +2333,11 @@ mod tests {
             }
             let request: WorldSystemServiceRequest = serde_json::from_slice(request)
                 .map_err(|error| ExtensionError::Message(error.to_string()))?;
-            let mut transaction = WorldTransaction::new();
-            transaction.push_event(WorldEventDraft::new(
-                self.event_schema.clone(),
-                request.command().payload().clone(),
-            ));
+            let mut transaction = WorldSystemTransaction::new();
+            transaction.push_event(WorldSystemEventProposal {
+                schema: self.event_schema.clone(),
+                payload: request.command().payload.clone(),
+            });
             serde_json::to_vec(&WorldSystemServiceResponse::Transaction { transaction })
                 .map_err(|error| ExtensionError::Message(error.to_string()))
         }

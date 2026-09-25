@@ -10,11 +10,10 @@ use std::sync::{
 use anyhow::Result;
 use rintawa_sdk::{
     services::ServiceCallError,
-    world::{ControlGrantId, EntityId, PrincipalId},
+    world::{EntityId, PrincipalId},
+    world_system::{WorldSystemEventProposal, WorldSystemTransaction},
 };
-use rintawa_world::{
-    ControlGrant, ControlScope, EntityRecord, WorldEventDraft, WorldMutation, WorldTransaction,
-};
+use rintawa_world::{EntityRecord, WorldMutation, WorldTransaction};
 use rintawa_world_runtime::{
     MAX_WORLD_SYSTEM_SERVICE_ROUNDS, ServiceWorldSystem, SystemError, WorldRuntimeBuilder,
     WorldRuntimeError, WorldSystemReadRequest, WorldSystemReadResult, WorldSystemServiceRequest,
@@ -75,11 +74,11 @@ fn test_service_system_reads_pinned_snapshot_and_commits_transaction() -> Result
                     other => panic!("unexpected read result: {other:?}"),
                 }
 
-                let mut transaction = WorldTransaction::new();
-                transaction.push_event(WorldEventDraft::new(
-                    event_schema.clone(),
-                    serde_json::json!({ "kind": "service-system" }),
-                ));
+                let mut transaction = WorldSystemTransaction::new();
+                transaction.push_event(WorldSystemEventProposal {
+                    schema: event_schema.clone(),
+                    payload: serde_json::json!({ "kind": "service-system" }),
+                });
                 WorldSystemServiceResponse::Transaction { transaction }
             }
             other => panic!("unexpected service call {other}"),
@@ -245,29 +244,22 @@ fn test_service_system_bounds_read_rounds() -> Result<()> {
 }
 
 #[test]
-fn test_service_system_cannot_mutate_authority_without_host_privilege() -> Result<()> {
+fn test_service_system_transport_rejects_authority_mutation_variant() -> Result<()> {
     let (root, storage, schemas) = create_storage()?;
     let world_id = storage.world_id();
     let path = root.path().join("world.sqlite");
     let principal = PrincipalId::new();
-    let entity_id = EntityId::new();
-    let controlled_schema = schemas.command.clone();
-    let entity_schema = schemas.entity.clone();
 
     let client = move |_: &_, _: &[u8]| {
-        let scope = ControlScope::exact([controlled_schema.clone()])
-            .expect("test control scope must be valid");
-        let mut transaction = WorldTransaction::new();
-        transaction.push_mutation(WorldMutation::CreateEntity {
-            entity: EntityRecord::new(entity_id, entity_schema.clone()),
-        });
-        transaction.push_mutation(WorldMutation::GrantControl {
-            grant: ControlGrant::with_id(ControlGrantId::new(), principal, entity_id, scope, None),
-        });
-        Ok(
-            serde_json::to_vec(&WorldSystemServiceResponse::Transaction { transaction })
-                .expect("service response must encode"),
-        )
+        Ok(serde_json::to_vec(&serde_json::json!({
+            "kind": "transaction",
+            "transaction": {
+                "mutations": [{ "operation": "grant-control" }],
+                "events": [],
+                "effects": []
+            }
+        }))
+        .expect("malformed test response must encode"))
     };
 
     let mut builder = WorldRuntimeBuilder::new(storage);
@@ -284,18 +276,19 @@ fn test_service_system_cannot_mutate_authority_without_host_privilege() -> Resul
             serde_json::json!({ "kind": "grant" }),
         ))?
         .wait()
-        .expect_err("ordinary extension System must not mutate authority");
+        .expect_err("ordinary System transport must not represent authority mutations");
 
     assert!(matches!(
         error,
-        WorldRuntimeError::AuthorityMutationDenied(schema)
-            if schema == schemas.authority_command
+        WorldRuntimeError::SystemFailed {
+            source: SystemError::Failed(reason),
+            ..
+        } if reason.contains("invalid System service response")
     ));
     runtime.shutdown()?;
 
     let storage = rintawa_storage::SqliteWorldStorage::open(path)?;
     assert_eq!(storage.load_session()?.commit_position(), 0);
-    assert!(storage.load_entity(entity_id)?.is_none());
     Ok(())
 }
 

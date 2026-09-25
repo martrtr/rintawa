@@ -2515,6 +2515,7 @@ dependencies = [
 name = "rintawa-sdk"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "secrecy",
  "serde",
  "serde_json",

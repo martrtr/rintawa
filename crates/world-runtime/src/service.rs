@@ -3,159 +3,33 @@
 use std::{collections::HashSet, sync::Arc};
 
 use rintawa_sdk::{
-    contracts::{ContractKey, ContractVersion},
+    contracts::ContractKey,
     services::ServiceCallResult,
-    world::{EntityId, RelationId, SchemaKey, WorldId},
+    world::{SchemaKey, WorldId},
+    world_system::{
+        WorldSystemActor, WorldSystemCausation, WorldSystemCommand, WorldSystemEffectProposal,
+        WorldSystemEntityRecord, WorldSystemEventProposal, WorldSystemFacetRecord,
+        WorldSystemFacetTarget, WorldSystemMutation, WorldSystemRelationRecord,
+    },
 };
 use rintawa_world::{
-    EntityRecord, FacetRecord, FacetTarget, RelationRecord, WorldCommand, WorldTransaction,
+    ActorRef, CausationRef, EffectJobDraft, EntityRecord, FacetRecord, FacetTarget, RelationRecord,
+    WorldCommand, WorldEventDraft, WorldMutation, WorldTransaction,
 };
-use serde::{Deserialize, Serialize};
 
 use crate::{SystemError, SystemResult, WorldSnapshot, WorldSystem};
 
-/// Major version of the platform World System service protocol.
-pub const WORLD_SYSTEM_SERVICE_PROTOCOL_VERSION: ContractVersion = ContractVersion::new(1);
+pub use rintawa_sdk::world_system::{
+    WORLD_SYSTEM_SERVICE_PROTOCOL_VERSION, WorldSystemReadRequest, WorldSystemReadResult,
+    WorldSystemServiceRequest, WorldSystemServiceResponse, WorldSystemTransaction,
+    world_system_service_contract_key,
+};
+
 /// Maximum read/continuation rounds permitted for one System evaluation.
 pub const MAX_WORLD_SYSTEM_SERVICE_ROUNDS: usize = 8;
 /// Maximum distinct snapshot reads permitted for one System evaluation.
 pub const MAX_WORLD_SYSTEM_SERVICE_READS: usize = 256;
 const MAX_SYSTEM_DIAGNOSTIC_BYTES: usize = 8 * 1024;
-
-/// Returns the platform service contract for one exact command schema.
-pub fn world_system_service_contract_key(command_schema: &SchemaKey) -> ContractKey {
-    ContractKey::new(
-        format!(
-            "rintawa.world.system.{}.v{}",
-            command_schema.id(),
-            command_schema.version().get()
-        ),
-        WORLD_SYSTEM_SERVICE_PROTOCOL_VERSION,
-    )
-}
-
-/// One bounded read that an extension System may request from its pinned snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", tag = "kind")]
-pub enum WorldSystemReadRequest {
-    /// Loads one entity by stable identity.
-    Entity {
-        /// Entity to read.
-        entity_id: EntityId,
-    },
-    /// Loads one relation by stable identity.
-    Relation {
-        /// Relation to read.
-        relation_id: RelationId,
-    },
-    /// Loads one exact facet from one state target.
-    Facet {
-        /// Target carrying the facet.
-        target: FacetTarget,
-        /// Exact versioned facet schema.
-        schema: SchemaKey,
-    },
-}
-
-/// One result resolved from the same pinned snapshot used for evaluation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", tag = "kind")]
-pub enum WorldSystemReadResult {
-    /// Result of an entity read.
-    Entity {
-        /// Requested entity identity.
-        entity_id: EntityId,
-        /// Entity value, or None when absent.
-        value: Option<EntityRecord>,
-    },
-    /// Result of a relation read.
-    Relation {
-        /// Requested relation identity.
-        relation_id: RelationId,
-        /// Relation value, or None when absent.
-        value: Option<RelationRecord>,
-    },
-    /// Result of a facet read.
-    Facet {
-        /// Requested target.
-        target: FacetTarget,
-        /// Requested facet schema.
-        schema: SchemaKey,
-        /// Facet value, or None when absent.
-        value: Option<FacetRecord>,
-    },
-}
-
-/// Stateless evaluation envelope sent to an extension System provider.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WorldSystemServiceRequest {
-    world_id: WorldId,
-    snapshot_position: u64,
-    command: WorldCommand,
-    reads: Vec<WorldSystemReadResult>,
-}
-
-impl WorldSystemServiceRequest {
-    fn new(
-        world_id: WorldId,
-        snapshot_position: u64,
-        command: WorldCommand,
-        reads: Vec<WorldSystemReadResult>,
-    ) -> Self {
-        Self {
-            world_id,
-            snapshot_position,
-            command,
-            reads,
-        }
-    }
-
-    /// Returns the authoritative world being evaluated.
-    pub const fn world_id(&self) -> WorldId {
-        self.world_id
-    }
-
-    /// Returns the exact pinned state position used for all reads.
-    pub const fn snapshot_position(&self) -> u64 {
-        self.snapshot_position
-    }
-
-    /// Returns the immutable command envelope.
-    pub const fn command(&self) -> &WorldCommand {
-        &self.command
-    }
-
-    /// Returns every read result resolved in earlier protocol rounds.
-    pub fn reads(&self) -> &[WorldSystemReadResult] {
-        &self.reads
-    }
-}
-
-/// Response produced by one extension System service invocation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", tag = "kind")]
-pub enum WorldSystemServiceResponse {
-    /// Evaluation finished with a proposed authoritative transaction.
-    Transaction {
-        /// Transaction still subject to normal runtime validation and commit.
-        transaction: WorldTransaction,
-    },
-    /// Evaluation needs additional data from the same pinned snapshot.
-    Read {
-        /// New reads required before the provider can finish evaluation.
-        requests: Vec<WorldSystemReadRequest>,
-    },
-    /// Domain rules deliberately rejected the command.
-    Rejected {
-        /// Sanitized, non-secret diagnostic suitable for user-visible failure.
-        reason: String,
-    },
-    /// The provider could not evaluate the command.
-    Failed {
-        /// Sanitized, non-secret diagnostic suitable for host logs.
-        reason: String,
-    },
-}
 
 /// Transport used by a service-backed System implementation.
 pub trait WorldSystemServiceClient: Send + Sync + 'static {
@@ -240,12 +114,12 @@ impl WorldSystem for ServiceWorldSystem {
         let mut seen_reads = HashSet::new();
 
         for _ in 0..MAX_WORLD_SYSTEM_SERVICE_ROUNDS {
-            let envelope = WorldSystemServiceRequest::new(
-                snapshot.world_id(),
-                snapshot.position(),
-                command.clone(),
-                reads.clone(),
-            );
+            let envelope = WorldSystemServiceRequest {
+                world_id: snapshot.world_id(),
+                snapshot_position: snapshot.position(),
+                command: encode_command(command),
+                reads: reads.clone(),
+            };
             let request = serde_json::to_vec(&envelope).map_err(|_| {
                 SystemError::Failed(String::from("failed to encode System request"))
             })?;
@@ -261,7 +135,9 @@ impl WorldSystem for ServiceWorldSystem {
                 })?;
 
             match response {
-                WorldSystemServiceResponse::Transaction { transaction } => return Ok(transaction),
+                WorldSystemServiceResponse::Transaction { transaction } => {
+                    return decode_transaction(transaction);
+                }
                 WorldSystemServiceResponse::Rejected { reason } => {
                     return Err(SystemError::Rejected(validate_diagnostic(reason)?));
                 }
@@ -297,6 +173,27 @@ impl WorldSystem for ServiceWorldSystem {
     }
 }
 
+fn encode_command(command: &WorldCommand) -> WorldSystemCommand {
+    WorldSystemCommand {
+        id: command.id(),
+        schema: command.schema().clone(),
+        principal: command.principal(),
+        actor: match command.actor() {
+            ActorRef::Principal(principal) => WorldSystemActor::Principal(principal),
+            ActorRef::Entity(entity) => WorldSystemActor::Entity(entity),
+        },
+        expected_position: command.expected_position(),
+        causation: command.causation().map(|causation| match causation {
+            CausationRef::Command(id) => WorldSystemCausation::Command(id),
+            CausationRef::Event(id) => WorldSystemCausation::Event(id),
+            CausationRef::Effect(id) => WorldSystemCausation::Effect(id),
+        }),
+        correlation_id: command.correlation_id(),
+        effective_at: command.effective_at_timestamp(),
+        payload: command.payload().clone(),
+    }
+}
+
 fn resolve_read(
     snapshot: &WorldSnapshot,
     request: WorldSystemReadRequest,
@@ -304,20 +201,108 @@ fn resolve_read(
     match request {
         WorldSystemReadRequest::Entity { entity_id } => Ok(WorldSystemReadResult::Entity {
             entity_id,
-            value: snapshot.load_entity(entity_id)?,
+            value: snapshot.load_entity(entity_id)?.map(encode_entity),
         }),
         WorldSystemReadRequest::Relation { relation_id } => Ok(WorldSystemReadResult::Relation {
             relation_id,
-            value: snapshot.load_relation(relation_id)?,
+            value: snapshot.load_relation(relation_id)?.map(encode_relation),
         }),
         WorldSystemReadRequest::Facet { target, schema } => {
-            let value = snapshot.load_facet(target, &schema)?;
+            let target = decode_facet_target(target);
+            let value = snapshot.load_facet(target, &schema)?.map(encode_facet);
             Ok(WorldSystemReadResult::Facet {
-                target,
+                target: encode_facet_target(target),
                 schema,
                 value,
             })
         }
+    }
+}
+
+fn encode_entity(entity: EntityRecord) -> WorldSystemEntityRecord {
+    WorldSystemEntityRecord {
+        id: entity.id(),
+        schema: entity.schema().clone(),
+    }
+}
+
+fn encode_relation(relation: RelationRecord) -> WorldSystemRelationRecord {
+    WorldSystemRelationRecord {
+        id: relation.id(),
+        schema: relation.schema().clone(),
+        from: relation.from(),
+        to: relation.to(),
+    }
+}
+
+fn encode_facet(facet: FacetRecord) -> WorldSystemFacetRecord {
+    WorldSystemFacetRecord {
+        target: encode_facet_target(facet.target()),
+        schema: facet.schema().clone(),
+        payload: facet.payload().clone(),
+    }
+}
+
+fn encode_facet_target(target: FacetTarget) -> WorldSystemFacetTarget {
+    match target {
+        FacetTarget::World => WorldSystemFacetTarget::World,
+        FacetTarget::Entity(entity) => WorldSystemFacetTarget::Entity(entity),
+        FacetTarget::Relation(relation) => WorldSystemFacetTarget::Relation(relation),
+    }
+}
+
+fn decode_facet_target(target: WorldSystemFacetTarget) -> FacetTarget {
+    match target {
+        WorldSystemFacetTarget::World => FacetTarget::World,
+        WorldSystemFacetTarget::Entity(entity) => FacetTarget::Entity(entity),
+        WorldSystemFacetTarget::Relation(relation) => FacetTarget::Relation(relation),
+    }
+}
+
+fn decode_transaction(proposal: WorldSystemTransaction) -> SystemResult<WorldTransaction> {
+    let mut transaction = WorldTransaction::new();
+    for mutation in proposal.mutations {
+        transaction.push_mutation(decode_mutation(mutation));
+    }
+    for WorldSystemEventProposal { schema, payload } in proposal.events {
+        transaction.push_event(WorldEventDraft::new(schema, payload));
+    }
+    for WorldSystemEffectProposal { schema, payload } in proposal.effects {
+        transaction.push_effect(EffectJobDraft::new(schema, payload));
+    }
+    Ok(transaction)
+}
+
+fn decode_mutation(mutation: WorldSystemMutation) -> WorldMutation {
+    match mutation {
+        WorldSystemMutation::CreateEntity { entity_id, schema } => WorldMutation::CreateEntity {
+            entity: EntityRecord::new(entity_id, schema),
+        },
+        WorldSystemMutation::DeleteEntity { entity_id } => {
+            WorldMutation::DeleteEntity { entity_id }
+        }
+        WorldSystemMutation::CreateRelation {
+            relation_id,
+            schema,
+            from,
+            to,
+        } => WorldMutation::CreateRelation {
+            relation: RelationRecord::new(relation_id, schema, from, to),
+        },
+        WorldSystemMutation::DeleteRelation { relation_id } => {
+            WorldMutation::DeleteRelation { relation_id }
+        }
+        WorldSystemMutation::SetFacet {
+            target,
+            schema,
+            payload,
+        } => WorldMutation::SetFacet {
+            facet: FacetRecord::new(decode_facet_target(target), schema, payload),
+        },
+        WorldSystemMutation::RemoveFacet { target, schema } => WorldMutation::RemoveFacet {
+            target: decode_facet_target(target),
+            schema,
+        },
     }
 }
 
