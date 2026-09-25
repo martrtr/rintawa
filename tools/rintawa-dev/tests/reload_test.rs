@@ -1,3 +1,5 @@
+//! Integration tests for development watch and reload behavior.
+
 use std::fs;
 
 use rintawa_dev::{DevError, ReloadOutcome, ReloadingDevSession};

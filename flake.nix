@@ -30,7 +30,7 @@
         in
         {
           default = pkgs.mkShell {
-            packages = [ rustToolchain ];
+            packages = [ rustToolchain pkgs.lld ];
           };
         });
     };

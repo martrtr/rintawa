@@ -1,3 +1,5 @@
+//! Integration tests for local project configuration, builds, and source revisions.
+
 use std::fs;
 
 use rintawa_dev::{DevError, DevProject};
@@ -124,12 +126,12 @@ fn test_source_revision_should_change_for_project_source() -> anyhow::Result<()>
 fn test_source_revision_should_ignore_nested_default_directories() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     write_minimal_rtw_root(temp.path())?;
-    fs::create_dir_all(temp.path().join("packages/example/node_modules"))?;
+    fs::create_dir_all(temp.path().join("sources/example/node_modules"))?;
     let project = DevProject::open(temp.path())?;
     let before = project.source_revision()?;
 
     fs::write(
-        temp.path().join("packages/example/node_modules/noise.js"),
+        temp.path().join("sources/example/node_modules/noise.js"),
         "ignored",
     )?;
     let after = project.source_revision()?;
@@ -145,18 +147,18 @@ fn test_source_revision_should_honor_gitignore_style_patterns() -> anyhow::Resul
         temp.path().join("rintawa-dev.toml"),
         concat!(
             "schema = 1\n",
-            "watch-ignore = [\"*.tmp\", \"**/build/\", \"packages/**/cache/\"]\n",
+            "watch-ignore = [\"*.tmp\", \"**/build/\", \"sources/**/cache/\"]\n",
         ),
     )?;
     fs::create_dir_all(temp.path().join("src/build"))?;
-    fs::create_dir_all(temp.path().join("packages/example/cache"))?;
+    fs::create_dir_all(temp.path().join("sources/example/cache"))?;
     let project = DevProject::open(temp.path())?;
     let before = project.source_revision()?;
 
     fs::write(temp.path().join("scratch.tmp"), "ignored")?;
     fs::write(temp.path().join("src/build/generated"), "ignored")?;
     fs::write(
-        temp.path().join("packages/example/cache/generated"),
+        temp.path().join("sources/example/cache/generated"),
         "ignored",
     )?;
     let after = project.source_revision()?;
@@ -203,5 +205,85 @@ fn test_source_revision_should_ignore_recreated_artifact_root() -> anyhow::Resul
     fs::write(temp.path().join("build/rtw/generated"), "ignored")?;
     let after = project.source_revision()?;
     assert_eq!(before, after);
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_rust_component_parent_escape() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    write_minimal_rtw_root(temp.path())?;
+    fs::write(
+        temp.path().join("rintawa-dev.toml"),
+        concat!(
+            "schema = 1\n",
+            "[[rust-components]]\n",
+            "manifest-path = \"../runtime/Cargo.toml\"\n",
+            "artifact = \"runtime\"\n",
+            "output = \"runtime.wasm\"\n",
+        ),
+    )?;
+
+    let error = DevProject::open(temp.path()).expect_err("component manifest escape must fail");
+    assert!(
+        matches!(error, DevError::InvalidArtifactRoot(path) if path == "../runtime/Cargo.toml")
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_duplicate_rust_component_outputs() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    write_minimal_rtw_root(temp.path())?;
+    fs::write(
+        temp.path().join("rintawa-dev.toml"),
+        concat!(
+            "schema = 1\n",
+            "[[rust-components]]\n",
+            "manifest-path = \"runtime-a/Cargo.toml\"\n",
+            "artifact = \"runtime_a\"\n",
+            "output = \"runtime.wasm\"\n",
+            "[[rust-components]]\n",
+            "manifest-path = \"runtime-b/Cargo.toml\"\n",
+            "artifact = \"runtime_b\"\n",
+            "output = \"runtime.wasm\"\n",
+        ),
+    )?;
+
+    let error = DevProject::open(temp.path()).expect_err("duplicate generated output must fail");
+    assert!(
+        matches!(error, DevError::InvalidRustComponentBuild(message) if message.contains("duplicate output"))
+    );
+    Ok(())
+}
+
+#[test]
+fn test_source_revision_should_ignore_generated_rust_component_output() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    write_minimal_rtw_root(temp.path())?;
+    fs::create_dir_all(temp.path().join("runtime"))?;
+    fs::write(
+        temp.path().join("runtime/Cargo.toml"),
+        "[package]\nname='dummy'\nversion='0.0.1'\n",
+    )?;
+    fs::write(
+        temp.path().join("rintawa-dev.toml"),
+        concat!(
+            "schema = 1\n",
+            "[[rust-components]]\n",
+            "manifest-path = \"runtime/Cargo.toml\"\n",
+            "artifact = \"dummy\"\n",
+            "output = \"runtime.wasm\"\n",
+        ),
+    )?;
+    let project = DevProject::open(temp.path())?;
+    let before = project.source_revision()?;
+
+    fs::write(temp.path().join("runtime.wasm"), b"generated once")?;
+    let after_first = project.source_revision()?;
+    fs::write(temp.path().join("runtime.wasm"), b"generated twice")?;
+    let after_second = project.source_revision()?;
+
+    assert_eq!(before, after_first);
+    assert_eq!(before, after_second);
     Ok(())
 }

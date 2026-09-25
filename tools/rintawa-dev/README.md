@@ -33,8 +33,31 @@ cargo run -p rintawa-dev -- watch path/to/extension
 `watch-ignore` uses gitignore-style patterns:
 
 ```toml
-watch-ignore = ["*.tmp", "**/build/", "packages/**/node_modules/"]
+watch-ignore = ["*.tmp", "**/build/", "sources/**/node_modules/"]
 ```
 
 `.git`, `target`, and `node_modules` are ignored by default. A separate build
 `artifact-root` is ignored automatically while a build command is configured.
+
+## Rust WebAssembly Components
+
+`rintawa-dev` can build Rust guest crates directly into Component Model binaries without
+requiring a separate `cargo-component` or `wasm-tools` CLI. The guest crate embeds the
+Rintawa WIT world with `wit-bindgen`; `rintawa-dev` compiles it to
+`wasm32-unknown-unknown` and wraps that core module through `wit-component`.
+
+```toml
+schema = 1
+artifact-root = "rtw"
+
+[[rust-components]]
+manifest-path = "runtime/Cargo.toml"
+artifact = "example_runtime"
+output = "runtime.wasm"
+```
+
+`output` is relative to `artifact-root` and is treated as generated content by watch
+fingerprinting. Rust component builds are locked and use `.rintawa-dev/target`, which is
+ignored by watch mode. The development environment therefore needs the
+`wasm32-unknown-unknown` Rust target and an LLD linker; the repository toolchain/flake
+provide both.

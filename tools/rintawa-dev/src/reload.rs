@@ -1,3 +1,5 @@
+//! Watch-mode rebuild and safe extension snapshot reload orchestration.
+
 use std::path::{Path, PathBuf};
 
 use rintawa_artifacts::ArtifactDigest;

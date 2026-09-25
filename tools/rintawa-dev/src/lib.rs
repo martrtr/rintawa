@@ -9,7 +9,7 @@ mod project;
 mod reload;
 mod session;
 
-pub use config::{DEV_CONFIG_FILE, DevConfig};
+pub use config::{DEV_CONFIG_FILE, DevConfig, RustComponentBuild};
 pub use error::{DevError, DevResult};
 pub use project::{DevProject, PreparedSnapshot, SourceRevision};
 pub use reload::{ReloadOutcome, ReloadingDevSession};

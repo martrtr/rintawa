@@ -1,3 +1,5 @@
+//! Command-line entry point for local Rintawa extension development.
+
 use std::{path::PathBuf, sync::mpsc, time::Duration};
 
 use anyhow::{Result, bail};

@@ -1,7 +1,10 @@
+//! Local project discovery, source fingerprinting, builds, and RTW snapshot preparation.
+
 use std::{
     collections::hash_map::DefaultHasher,
     fs,
     hash::{Hash, Hasher},
+    io::Write,
     path::{Component as PathComponent, Path, PathBuf},
     process::Command,
     time::UNIX_EPOCH,
@@ -11,10 +14,13 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use rintawa_artifacts::{ArtifactDigest, ArtifactStore, RtwLimits, pack_directory};
 use tempfile::TempDir;
 
-use crate::{DEV_CONFIG_FILE, DevConfig, DevError, DevResult};
+use crate::{DEV_CONFIG_FILE, DevConfig, DevError, DevResult, RustComponentBuild};
 
 const DEV_CONFIG_SCHEMA: u32 = 1;
-const DEFAULT_WATCH_IGNORE_PATTERNS: [&str; 3] = [".git/", "target/", "node_modules/"];
+const DEFAULT_WATCH_IGNORE_PATTERNS: [&str; 4] =
+    [".git/", ".rintawa-dev/", "target/", "node_modules/"];
+const RUST_COMPONENT_TARGET: &str = "wasm32-unknown-unknown";
+const MAX_COMPONENTIZE_DIAGNOSTIC_BYTES: usize = 4 * 1024;
 
 /// Local extension project.
 #[derive(Debug, Clone)]
@@ -77,6 +83,7 @@ impl DevProject {
     pub fn prepare_snapshot(&self) -> DevResult<PreparedSnapshot> {
         self.run_build()?;
         let artifact_root = self.resolve_artifact_root()?;
+        self.build_rust_components(&artifact_root)?;
         let workspace = tempfile::tempdir()?;
         let artifact_path = workspace.path().join("dev-snapshot.rtw");
         pack_directory(&artifact_root, &artifact_path, RtwLimits::default())?;
@@ -98,12 +105,14 @@ impl DevProject {
     pub fn source_revision(&self) -> DevResult<SourceRevision> {
         let ignore_matcher = self.watch_ignore_matcher()?;
         let generated_root = self.generated_artifact_root();
+        let generated_files = self.generated_component_outputs();
         let mut hasher = DefaultHasher::new();
         fingerprint_directory(
             &self.root,
             &self.root,
             &ignore_matcher,
             generated_root.as_deref(),
+            &generated_files,
             &mut hasher,
         )?;
         Ok(SourceRevision(hasher.finish()))
@@ -130,6 +139,119 @@ impl DevProject {
             return None;
         }
         Some(self.root.join(&config.artifact_root))
+    }
+
+    fn generated_component_outputs(&self) -> Vec<PathBuf> {
+        let Some(config) = &self.config else {
+            return Vec::new();
+        };
+        config
+            .rust_components
+            .iter()
+            .map(|component| {
+                self.root
+                    .join(&config.artifact_root)
+                    .join(&component.output)
+            })
+            .collect()
+    }
+
+    fn build_rust_components(&self, artifact_root: &Path) -> DevResult<()> {
+        let Some(config) = &self.config else {
+            return Ok(());
+        };
+        if config.rust_components.is_empty() {
+            return Ok(());
+        }
+
+        let target_dir = self.root.join(".rintawa-dev/target");
+        for component in &config.rust_components {
+            let manifest = self.resolve_component_manifest(component)?;
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let status = Command::new(cargo)
+                .arg("build")
+                .arg("--locked")
+                .arg("--manifest-path")
+                .arg(&manifest)
+                .arg("--target")
+                .arg(RUST_COMPONENT_TARGET)
+                .arg("--target-dir")
+                .arg(&target_dir)
+                .arg("--lib")
+                .current_dir(&self.root)
+                .status()?;
+            if !status.success() {
+                return Err(DevError::RustComponentBuildFailed {
+                    manifest: component.manifest_path.display().to_string(),
+                    status: status.to_string(),
+                });
+            }
+
+            let module_path = target_dir
+                .join(RUST_COMPONENT_TARGET)
+                .join("debug")
+                .join(format!("{}.wasm", component.artifact));
+            let module = fs::read(&module_path).map_err(|error| {
+                DevError::InvalidRustComponentBuild(format!(
+                    "Cargo did not produce `{}` for `{}`: {error}",
+                    module_path.display(),
+                    component.manifest_path.display()
+                ))
+            })?;
+            let mut encoder = wit_component::ComponentEncoder::default()
+                .module(&module)
+                .map_err(|error| DevError::ComponentizeFailed {
+                    artifact: component.artifact.clone(),
+                    reason: bounded_componentize_diagnostic(&error.to_string()),
+                })?
+                .validate(true);
+            let encoded = encoder
+                .encode()
+                .map_err(|error| DevError::ComponentizeFailed {
+                    artifact: component.artifact.clone(),
+                    reason: bounded_componentize_diagnostic(&error.to_string()),
+                })?;
+            let output = artifact_root.join(&component.output);
+            let parent = output.parent().ok_or_else(|| {
+                DevError::InvalidRustComponentBuild(format!(
+                    "component output `{}` has no parent",
+                    component.output.display()
+                ))
+            })?;
+            fs::create_dir_all(parent)?;
+            let parent = parent.canonicalize()?;
+            if !parent.starts_with(artifact_root) {
+                return Err(DevError::InvalidRustComponentBuild(format!(
+                    "component output `{}` escapes the artifact root",
+                    component.output.display()
+                )));
+            }
+            let file_name = output.file_name().ok_or_else(|| {
+                DevError::InvalidRustComponentBuild(format!(
+                    "component output `{}` has no file name",
+                    component.output.display()
+                ))
+            })?;
+            let output = parent.join(file_name);
+            let mut temporary = tempfile::NamedTempFile::new_in(&parent)?;
+            temporary.write_all(&encoded)?;
+            temporary.as_file_mut().sync_all()?;
+            temporary
+                .persist(&output)
+                .map_err(|error| DevError::Io(error.error))?;
+        }
+        Ok(())
+    }
+
+    fn resolve_component_manifest(&self, component: &RustComponentBuild) -> DevResult<PathBuf> {
+        let manifest = self.root.join(&component.manifest_path).canonicalize()?;
+        if !manifest.starts_with(&self.root) || !manifest.is_file() {
+            return Err(DevError::InvalidRustComponentBuild(format!(
+                "manifest `{}` escapes the project or is not a file",
+                component.manifest_path.display()
+            )));
+        }
+        Ok(manifest)
     }
 
     fn run_build(&self) -> DevResult<()> {
@@ -187,12 +309,62 @@ fn validate_config(config: &DevConfig) -> DevResult<()> {
     }
     validate_relative_path(&config.artifact_root)?;
     validate_watch_ignore_patterns(&config.watch_ignore_patterns)?;
+    validate_rust_components(config)?;
     if let Some(build) = &config.build
         && (build.is_empty() || build[0].trim().is_empty())
     {
         return Err(DevError::EmptyBuildCommand);
     }
     Ok(())
+}
+
+fn validate_rust_components(config: &DevConfig) -> DevResult<()> {
+    let mut outputs = std::collections::HashSet::new();
+    for component in &config.rust_components {
+        validate_relative_file_path(&component.manifest_path, "manifest-path")?;
+        validate_relative_file_path(&component.output, "output")?;
+        if !outputs.insert(component.output.clone()) {
+            return Err(DevError::InvalidRustComponentBuild(format!(
+                "duplicate output `{}`",
+                component.output.display()
+            )));
+        }
+        if component.artifact.is_empty()
+            || component.artifact.len() > 128
+            || !component
+                .artifact
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err(DevError::InvalidRustComponentBuild(format!(
+                "artifact `{}` must use 1..=128 bytes of [a-z0-9_]",
+                component.artifact
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_relative_file_path(path: &Path, field: &str) -> DevResult<()> {
+    validate_relative_path(path)?;
+    if path == Path::new(".") || path.file_name().is_none() {
+        return Err(DevError::InvalidRustComponentBuild(format!(
+            "{field} `{}` must identify a relative file",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn bounded_componentize_diagnostic(value: &str) -> String {
+    if value.len() <= MAX_COMPONENTIZE_DIAGNOSTIC_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_COMPONENTIZE_DIAGNOSTIC_BYTES;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value[..end].to_string()
 }
 
 fn validate_watch_ignore_patterns(patterns: &[String]) -> DevResult<()> {
@@ -233,6 +405,7 @@ fn fingerprint_directory(
     directory: &Path,
     ignore_matcher: &Gitignore,
     generated_root: Option<&Path>,
+    generated_files: &[PathBuf],
     hasher: &mut DefaultHasher,
 ) -> std::io::Result<()> {
     let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
@@ -243,7 +416,8 @@ fn fingerprint_directory(
         let metadata = fs::symlink_metadata(&path)?;
         let file_type = metadata.file_type();
         let is_directory = file_type.is_dir();
-        let is_generated = generated_root.is_some_and(|generated| path.starts_with(generated));
+        let is_generated = generated_root.is_some_and(|generated| path.starts_with(generated))
+            || generated_files.contains(&path);
         if is_generated || ignore_matcher.matched(&path, is_directory).is_ignore() {
             continue;
         }
@@ -255,7 +429,14 @@ fn fingerprint_directory(
         file_type.is_symlink().hash(hasher);
 
         if is_directory {
-            fingerprint_directory(root, &path, ignore_matcher, generated_root, hasher)?;
+            fingerprint_directory(
+                root,
+                &path,
+                ignore_matcher,
+                generated_root,
+                generated_files,
+                hasher,
+            )?;
             continue;
         }
         if file_type.is_symlink() {

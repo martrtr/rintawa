@@ -1,3 +1,5 @@
+//! Development-session lifecycle over the normal Extension Engine runtime path.
+
 use rintawa_artifacts::ArtifactDigest;
 use rintawa_extension_engine::{ExtensionEngine, ExtensionState, RtwExtensionLoader};
 use rintawa_sdk::types::{ExtensionId, ExtensionInstanceId, RuntimeScopeId};

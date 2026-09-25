@@ -1,3 +1,5 @@
+//! Typed errors returned by the local extension development toolchain.
+
 use std::io;
 
 use rintawa_artifacts::RtwError;
@@ -30,6 +32,25 @@ pub enum DevError {
     /// The build command failed.
     #[error("build command failed with status {0}")]
     BuildFailed(String),
+    /// A declarative Rust component build entry is invalid.
+    #[error("invalid Rust component build: {0}")]
+    InvalidRustComponentBuild(String),
+    /// A Rust component Cargo build failed.
+    #[error("Rust component build `{manifest}` failed with status {status}")]
+    RustComponentBuildFailed {
+        /// Project-relative Cargo manifest.
+        manifest: String,
+        /// Cargo process status.
+        status: String,
+    },
+    /// Core WASM could not be wrapped as a Component Model binary.
+    #[error("failed to componentize Rust guest `{artifact}`: {reason}")]
+    ComponentizeFailed {
+        /// Configured core-WASM artifact stem.
+        artifact: String,
+        /// Bounded tool diagnostic.
+        reason: String,
+    },
     /// RTW packing or store import failed.
     #[error("RTW artifact error: {0}")]
     Artifact(#[from] RtwError),

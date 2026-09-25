@@ -1,3 +1,5 @@
+//! Integration tests for development-session lifecycle behavior.
+
 use std::fs;
 
 use rintawa_dev::{DevProject, DevSession};
