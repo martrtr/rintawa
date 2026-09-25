@@ -25,6 +25,8 @@ pub enum RuntimePermission {
     AssetImport,
     /// Allows reading the persistent generic user-content library and descriptors.
     UserContentRead,
+    /// Allows requesting deferred validated imports/replacements in the user-content library.
+    UserContentWrite,
     /// Allows reading the persistent world catalog and runtime lifecycle status.
     WorldSessionRead,
     /// Allows creating worlds and requesting active/inactive world lifecycle transitions.
@@ -51,6 +53,7 @@ impl fmt::Display for RuntimePermission {
             Self::ArtifactImport => formatter.write_str("artifact-import"),
             Self::AssetImport => formatter.write_str("asset-import"),
             Self::UserContentRead => formatter.write_str("user-content-read"),
+            Self::UserContentWrite => formatter.write_str("user-content-write"),
             Self::WorldSessionRead => formatter.write_str("world-session-read"),
             Self::WorldSessionWrite => formatter.write_str("world-session-write"),
             Self::WorldCommandSubmit => formatter.write_str("world-command-submit"),
@@ -86,6 +89,7 @@ impl FromStr for RuntimePermission {
             "artifact-import" => Ok(Self::ArtifactImport),
             "asset-import" => Ok(Self::AssetImport),
             "user-content-read" => Ok(Self::UserContentRead),
+            "user-content-write" => Ok(Self::UserContentWrite),
             "world-session-read" => Ok(Self::WorldSessionRead),
             "world-session-write" => Ok(Self::WorldSessionWrite),
             "world-command-submit" => Ok(Self::WorldCommandSubmit),
@@ -112,15 +116,14 @@ mod tests {
     }
 
     #[test]
-    fn test_should_round_trip_user_content_read_permission() {
-        assert_eq!(
-            RuntimePermission::UserContentRead.to_string(),
-            "user-content-read"
-        );
-        assert_eq!(
-            "user-content-read".parse::<RuntimePermission>(),
-            Ok(RuntimePermission::UserContentRead)
-        );
+    fn test_should_round_trip_user_content_permissions() {
+        for permission in [
+            RuntimePermission::UserContentRead,
+            RuntimePermission::UserContentWrite,
+        ] {
+            let text = permission.to_string();
+            assert_eq!(text.parse::<RuntimePermission>(), Ok(permission));
+        }
     }
 
     #[test]

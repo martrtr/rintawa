@@ -305,16 +305,30 @@ interface user-content {
         descriptor: list<u8>,
     }
 
-    /// Failure while reading generic user content.
+    /// Failure while reading or requesting generic user-content mutations.
     variant error {
         access-not-active,
         permission-denied,
         invalid-id,
         invalid-content,
         not-found,
+        queue-full,
+        limit-exceeded,
         message-too-large,
         rejected,
         unavailable,
+    }
+
+    /// Host-generated identity for one accepted deferred write request.
+    record accepted-write {
+        operation-id: string,
+    }
+
+    /// Current state of one owner-scoped deferred write request.
+    variant write-state {
+        pending,
+        succeeded(entry),
+        failed(string),
     }
 
     /// Lists logical items, optionally restricted to one exact versioned content type.
@@ -324,6 +338,18 @@ interface user-content {
     /// Reads one bounded root descriptor by logical library identity.
     /// Requires `user-content-read`.
     read: func(id: string) -> result<document, error>;
+
+    /// Queues validation/publication of one complete RTW content revision.
+    /// Requires `user-content-write`; execution happens after the guest callback unwinds.
+    request-import: func(rtw: list<u8>) -> result<accepted-write, error>;
+
+    /// Queues replacement of one logical item with a complete RTW revision.
+    /// Requires `user-content-write`; content type cannot change.
+    request-replace: func(id: string, rtw: list<u8>) -> result<accepted-write, error>;
+
+    /// Reads owner-scoped status for one accepted write request.
+    /// Requires `user-content-write`.
+    write-status: func(operation-id: string) -> result<write-state, error>;
 }
 
 /// Generic persistent-world catalog and deferred runtime lifecycle control.

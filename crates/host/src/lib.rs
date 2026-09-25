@@ -338,6 +338,9 @@ pub enum HostError {
     /// An ephemeral runtime signal used an empty or oversized routing topic.
     #[error("runtime signal topic must be non-empty and within host bounds")]
     InvalidRuntimeSignalTopic,
+    /// Shared deferred user-content write control state became unavailable.
+    #[error("user-content deferred write control is unavailable")]
+    UserContentWriteControlUnavailable,
     /// Shared deferred world-session lifecycle control state became unavailable.
     #[error("world-session lifecycle control is unavailable")]
     WorldSessionControlUnavailable,

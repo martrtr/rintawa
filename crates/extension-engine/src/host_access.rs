@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use rintawa_sdk::contracts::ComponentRef;
+
 /// One immutable raw asset imported into the local asset store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportedAsset {
@@ -140,6 +142,52 @@ pub trait UserContentAccess: Send + Sync {
 
     /// Reads one bounded root content descriptor by logical identity.
     fn read_user_content(&self, id: &str) -> HostAccessResult<UserContentDocument>;
+}
+
+/// Host-generated identity for one accepted deferred user-content write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedUserContentWrite {
+    /// Opaque operation identity scoped to the exact requesting component.
+    pub operation_id: String,
+}
+
+/// Current state of one deferred user-content write operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserContentWriteStatus {
+    /// The request is accepted but has not finished handler validation/publication.
+    Pending,
+    /// The request published one exact immutable revision into the logical library.
+    Succeeded(UserContentSummary),
+    /// Validation, handler policy, or persistence rejected the request.
+    Failed(String),
+}
+
+/// Generic deferred mutation access to the persistent user-content library.
+///
+/// Requests are owner-scoped and must execute only after the current guest callback
+/// unwinds so extension-provided content handlers are never re-entered synchronously.
+pub trait UserContentWriteAccess: Send + Sync {
+    /// Queues one new RTW content revision for handler validation and publication.
+    fn request_import(
+        &self,
+        owner: &ComponentRef,
+        rtw: &[u8],
+    ) -> HostAccessResult<AcceptedUserContentWrite>;
+
+    /// Queues replacement of one logical item while preserving its content type.
+    fn request_replace(
+        &self,
+        owner: &ComponentRef,
+        id: &str,
+        rtw: &[u8],
+    ) -> HostAccessResult<AcceptedUserContentWrite>;
+
+    /// Reads status only when the operation belongs to the exact requesting component.
+    fn write_status(
+        &self,
+        owner: &ComponentRef,
+        operation_id: &str,
+    ) -> HostAccessResult<UserContentWriteStatus>;
 }
 
 /// Generic persistent-world catalog and lifecycle request operations.
@@ -426,6 +474,35 @@ impl UserContentAccess for UnavailableUserContentAccess {
     }
 }
 
+struct UnavailableUserContentWriteAccess;
+
+impl UserContentWriteAccess for UnavailableUserContentWriteAccess {
+    fn request_import(
+        &self,
+        _owner: &ComponentRef,
+        _rtw: &[u8],
+    ) -> HostAccessResult<AcceptedUserContentWrite> {
+        Err(HostAccessError::Unavailable)
+    }
+
+    fn request_replace(
+        &self,
+        _owner: &ComponentRef,
+        _id: &str,
+        _rtw: &[u8],
+    ) -> HostAccessResult<AcceptedUserContentWrite> {
+        Err(HostAccessError::Unavailable)
+    }
+
+    fn write_status(
+        &self,
+        _owner: &ComponentRef,
+        _operation_id: &str,
+    ) -> HostAccessResult<UserContentWriteStatus> {
+        Err(HostAccessError::Unavailable)
+    }
+}
+
 #[derive(Default)]
 struct UnavailableWorldSessionAccess;
 
@@ -557,6 +634,7 @@ pub(crate) struct HostAccessServices {
     pub(crate) artifact_store: Arc<dyn ArtifactStoreAccess>,
     pub(crate) asset_store: Arc<dyn AssetStoreAccess>,
     pub(crate) user_content: Arc<dyn UserContentAccess>,
+    pub(crate) user_content_write: Arc<dyn UserContentWriteAccess>,
     pub(crate) world_sessions: Arc<dyn WorldSessionAccess>,
     pub(crate) world_commands: Arc<dyn WorldCommandAccess>,
     pub(crate) composition: Arc<dyn CompositionAccess>,
@@ -577,6 +655,7 @@ impl HostAccessServices {
             artifact_store,
             asset_store,
             user_content: Arc::new(UnavailableUserContentAccess),
+            user_content_write: Arc::new(UnavailableUserContentWriteAccess),
             world_sessions,
             world_commands: Arc::new(UnavailableWorldCommandAccess),
             composition,
@@ -593,6 +672,14 @@ impl HostAccessServices {
         self
     }
 
+    pub(crate) fn with_user_content_write_access(
+        mut self,
+        user_content_write: Arc<dyn UserContentWriteAccess>,
+    ) -> Self {
+        self.user_content_write = user_content_write;
+        self
+    }
+
     pub(crate) fn with_world_command_access(
         mut self,
         world_commands: Arc<dyn WorldCommandAccess>,
@@ -606,6 +693,7 @@ impl HostAccessServices {
             artifact_store: Arc::new(UnavailableArtifactStoreAccess),
             asset_store: Arc::new(UnavailableAssetStoreAccess),
             user_content: Arc::new(UnavailableUserContentAccess),
+            user_content_write: Arc::new(UnavailableUserContentWriteAccess),
             world_sessions: Arc::new(UnavailableWorldSessionAccess),
             world_commands: Arc::new(UnavailableWorldCommandAccess),
             composition: Arc::new(UnavailableCompositionAccess),

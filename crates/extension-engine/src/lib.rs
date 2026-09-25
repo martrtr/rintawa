@@ -42,12 +42,13 @@ pub use composition::{
 pub use engine::{ExtensionEngine, ExtensionState, RegisteredWorldSchema};
 pub use errors::{ComponentStopFailure, EngineError, EngineResult};
 pub use host_access::{
-    AcceptedWorldCommand, ArtifactStoreAccess, AssetStoreAccess, CompositionAccess,
-    CompositionActivation, HostAccessError, HostAccessResult, ImportedArtifact, ImportedAsset,
-    PreferenceAccess, RuntimeArtifactPolicy, RuntimePolicyAccess, RuntimePolicyComponent,
-    RuntimePolicyRequest, UserContentAccess, UserContentDocument, UserContentSummary,
-    WorldCommandAccess, WorldCommandAccessError, WorldCommandAccessResult, WorldCommandActor,
-    WorldCommandRequest, WorldSessionAccess, WorldSessionSummary,
+    AcceptedUserContentWrite, AcceptedWorldCommand, ArtifactStoreAccess, AssetStoreAccess,
+    CompositionAccess, CompositionActivation, HostAccessError, HostAccessResult, ImportedArtifact,
+    ImportedAsset, PreferenceAccess, RuntimeArtifactPolicy, RuntimePolicyAccess,
+    RuntimePolicyComponent, RuntimePolicyRequest, UserContentAccess, UserContentDocument,
+    UserContentSummary, UserContentWriteAccess, UserContentWriteStatus, WorldCommandAccess,
+    WorldCommandAccessError, WorldCommandAccessResult, WorldCommandActor, WorldCommandRequest,
+    WorldSessionAccess, WorldSessionSummary,
 };
 pub use loader::ExtensionLoader;
 pub use runtime::{WasmComponent, WasmExecutionBudget, WasmRuntimeEngine};

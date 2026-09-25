@@ -41,8 +41,8 @@ use crate::{
     execution_targets::{ExecutionTargetDependency, ExecutionTargetRegistry},
     host_access::{
         ArtifactStoreAccess, AssetStoreAccess, CompositionAccess, HostAccessServices,
-        PreferenceAccess, RuntimePolicyAccess, UserContentAccess, WorldCommandAccess,
-        WorldSessionAccess,
+        PreferenceAccess, RuntimePolicyAccess, UserContentAccess, UserContentWriteAccess,
+        WorldCommandAccess, WorldSessionAccess,
     },
     runtime::WasmRuntimeEngine,
     runtime_effects::RuntimeEffectRegistry,
@@ -315,6 +315,17 @@ impl ExtensionEngine {
     /// unavailable capability. Guest access is still permission-gated per component.
     pub fn attach_user_content_access(&mut self, access: Arc<dyn UserContentAccess>) {
         self.host_access = self.host_access.clone().with_user_content_access(access);
+    }
+
+    /// Attaches generic deferred user-content library mutations.
+    ///
+    /// Embedded hosts that do not call this method remain fail-closed. Guest access
+    /// is still permission-gated and owner-scoped per exact component principal.
+    pub fn attach_user_content_write_access(&mut self, access: Arc<dyn UserContentWriteAccess>) {
+        self.host_access = self
+            .host_access
+            .clone()
+            .with_user_content_write_access(access);
     }
 
     /// Attaches generic authenticated world-command submission.

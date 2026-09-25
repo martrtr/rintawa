@@ -143,8 +143,9 @@ use bindings::rintawa::engine::{
     services::{Error as ServiceTransportError, Host as ServicesHost},
     ui_layer::{Error as UiLayerError, Host as UiLayerHost},
     user_content::{
-        Document as WitUserContentDocument, Entry as WitUserContentEntry,
-        Error as UserContentError, Host as UserContentHost,
+        AcceptedWrite as WitAcceptedUserContentWrite, Document as WitUserContentDocument,
+        Entry as WitUserContentEntry, Error as UserContentError, Host as UserContentHost,
+        WriteState as WitUserContentWriteState,
     },
     world_commands::{
         Accepted as WitAcceptedWorldCommand, Actor as WitWorldCommandActor,
@@ -201,6 +202,8 @@ pub struct WasmHostState {
     max_artifact_read_bytes: usize,
     max_artifact_import_bytes: usize,
     max_asset_import_bytes: usize,
+    max_user_content_writes_per_execution: usize,
+    user_content_writes_this_execution: usize,
     max_world_session_mutations_per_execution: usize,
     world_session_mutations_this_execution: usize,
     max_world_command_submissions_per_execution: usize,
@@ -367,6 +370,8 @@ impl WasmHostState {
             max_artifact_read_bytes: budget.max_artifact_read_bytes,
             max_artifact_import_bytes: budget.max_artifact_import_bytes,
             max_asset_import_bytes: budget.max_asset_import_bytes,
+            max_user_content_writes_per_execution: budget.max_user_content_writes_per_execution,
+            user_content_writes_this_execution: 0,
             max_world_session_mutations_per_execution: budget
                 .max_world_session_mutations_per_execution,
             world_session_mutations_this_execution: 0,
@@ -521,6 +526,7 @@ impl WasmHostState {
         self.task_access_active = false;
         self.network_access_active = false;
         self.host_access_active = false;
+        self.user_content_writes_this_execution = 0;
         self.world_session_mutations_this_execution = 0;
         self.world_command_submissions_this_execution = 0;
         self.pending_effects.clear();
@@ -745,6 +751,7 @@ impl WasmHostState {
         self.task_access_active = true;
         self.network_access_active = true;
         self.host_access_active = true;
+        self.user_content_writes_this_execution = 0;
         self.world_session_mutations_this_execution = 0;
         self.world_command_submissions_this_execution = 0;
         self.secret_access_active = true;
@@ -759,6 +766,7 @@ impl WasmHostState {
         self.task_access_active = true;
         self.network_access_active = true;
         self.host_access_active = true;
+        self.user_content_writes_this_execution = 0;
         self.world_session_mutations_this_execution = 0;
         self.world_command_submissions_this_execution = 0;
         self.secret_access_active = true;
@@ -776,6 +784,7 @@ impl WasmHostState {
         self.task_access_active = true;
         self.network_access_active = true;
         self.host_access_active = true;
+        self.user_content_writes_this_execution = 0;
         self.world_session_mutations_this_execution = 0;
         self.world_command_submissions_this_execution = 0;
         self.secret_access_active = true;

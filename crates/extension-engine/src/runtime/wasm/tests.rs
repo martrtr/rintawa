@@ -3,16 +3,18 @@
 use super::*;
 use crate::{
     host_access::{
-        AcceptedWorldCommand, ArtifactStoreAccess, AssetStoreAccess, CompositionAccess,
-        CompositionActivation, HostAccessError, HostAccessResult, ImportedArtifact, ImportedAsset,
-        PreferenceAccess, RuntimeArtifactPolicy, RuntimePolicyAccess, RuntimePolicyComponent,
-        UserContentAccess, UserContentDocument, UserContentSummary, WorldCommandAccess,
+        AcceptedUserContentWrite, AcceptedWorldCommand, ArtifactStoreAccess, AssetStoreAccess,
+        CompositionAccess, CompositionActivation, HostAccessError, HostAccessResult,
+        ImportedArtifact, ImportedAsset, PreferenceAccess, RuntimeArtifactPolicy,
+        RuntimePolicyAccess, RuntimePolicyComponent, UserContentAccess, UserContentDocument,
+        UserContentSummary, UserContentWriteAccess, UserContentWriteStatus, WorldCommandAccess,
         WorldCommandAccessResult, WorldCommandRequest, WorldSessionAccess, WorldSessionSummary,
     },
     secrets::InMemorySecretVault,
 };
 use rintawa_sdk::{
     api::{LogLevel, LoggerApi},
+    contracts::ComponentRef,
     secrets::{SecretPath, SecretPathPattern, SecretValue},
     types::ExtensionId,
     ui::{UiPatchBatch, UiSurfaceSnapshot},
@@ -43,6 +45,7 @@ struct RecordingScopedHostAccess {
     composition_writes: Mutex<Vec<String>>,
     world_default_writes: Mutex<Vec<(String, bool)>>,
     runtime_policy_reads: Mutex<Vec<String>>,
+    user_content_writes: Mutex<Vec<Vec<u8>>>,
     world_session_writes: Mutex<Vec<(String, bool)>>,
     world_command_writes: Mutex<Vec<WorldCommandRequest>>,
 }
@@ -96,6 +99,48 @@ impl UserContentAccess for RecordingScopedHostAccess {
             },
             descriptor: br#"{"name":"Example"}"#.to_vec(),
         })
+    }
+}
+
+impl UserContentWriteAccess for RecordingScopedHostAccess {
+    fn request_import(
+        &self,
+        _owner: &ComponentRef,
+        rtw: &[u8],
+    ) -> HostAccessResult<AcceptedUserContentWrite> {
+        self.user_content_writes
+            .lock()
+            .expect("test user-content lock must stay healthy")
+            .push(rtw.to_vec());
+        Ok(AcceptedUserContentWrite {
+            operation_id: String::from("018f0000-0000-7000-8000-000000000030"),
+        })
+    }
+
+    fn request_replace(
+        &self,
+        owner: &ComponentRef,
+        _id: &str,
+        rtw: &[u8],
+    ) -> HostAccessResult<AcceptedUserContentWrite> {
+        self.request_import(owner, rtw)
+    }
+
+    fn write_status(
+        &self,
+        _owner: &ComponentRef,
+        operation_id: &str,
+    ) -> HostAccessResult<UserContentWriteStatus> {
+        if operation_id != "018f0000-0000-7000-8000-000000000030" {
+            return Err(HostAccessError::NotFound);
+        }
+        Ok(UserContentWriteStatus::Succeeded(UserContentSummary {
+            id: String::from("018f0000-0000-7000-8000-000000000010"),
+            content: String::from("example.content@1"),
+            revision: String::from(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        }))
     }
 }
 
@@ -1084,6 +1129,77 @@ fn test_should_gate_and_bound_generic_user_content_reads() {
         UserContentHost::read(&mut state, String::from("missing")),
         Err(UserContentError::NotFound)
     ));
+}
+
+#[test]
+fn test_should_gate_bound_and_budget_deferred_user_content_writes() {
+    let access = Arc::new(RecordingScopedHostAccess::default());
+    let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
+    let mut services = WasmHostServices::standalone(secrets);
+    services.host_access = HostAccessServices::new(
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+    )
+    .with_user_content_access(access.clone())
+    .with_user_content_write_access(access.clone());
+    let budget = WasmExecutionBudget {
+        max_artifact_import_bytes: 8,
+        max_user_content_writes_per_execution: 2,
+        ..WasmExecutionBudget::default()
+    };
+    let mut state = WasmHostState::with_host_services_and_budget(
+        ComponentId::new("runtime"),
+        services,
+        false,
+        &budget,
+    );
+    begin_test_registration(&mut state, ExtensionId::new("content.writer"));
+    state.finish_registration().unwrap();
+
+    assert!(matches!(
+        UserContentHost::request_import(&mut state, b"rtw".to_vec()),
+        Err(UserContentError::AccessNotActive)
+    ));
+    state.begin_guest_execution();
+    assert!(matches!(
+        UserContentHost::request_import(&mut state, b"rtw".to_vec()),
+        Err(UserContentError::PermissionDenied)
+    ));
+    let owner = state.registered_owner().unwrap();
+    state
+        .runtime_permissions
+        .grant(owner, RuntimePermission::UserContentWrite)
+        .unwrap();
+    assert!(matches!(
+        UserContentHost::request_import(&mut state, vec![0; 9]),
+        Err(UserContentError::MessageTooLarge)
+    ));
+    let accepted = UserContentHost::request_import(&mut state, b"rtw".to_vec()).unwrap();
+    let status = UserContentHost::write_status(&mut state, accepted.operation_id).unwrap();
+    assert!(matches!(status, WitUserContentWriteState::Succeeded(_)));
+    assert!(
+        UserContentHost::request_replace(&mut state, String::from("logical-id"), b"rtw2".to_vec(),)
+            .is_ok()
+    );
+    assert!(matches!(
+        UserContentHost::request_import(&mut state, b"third".to_vec()),
+        Err(UserContentError::LimitExceeded)
+    ));
+    state.discard_guest_execution();
+    state.begin_guest_execution();
+    assert!(UserContentHost::request_import(&mut state, b"fresh".to_vec()).is_ok());
+    assert_eq!(
+        access
+            .user_content_writes
+            .lock()
+            .expect("test user-content lock must stay healthy")
+            .len(),
+        3
+    );
 }
 
 #[test]

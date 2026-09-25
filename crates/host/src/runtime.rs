@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
+    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -9,13 +10,14 @@ use std::{
 
 use rintawa_artifacts::{ArtifactDigest, ContentType, RtwArchive, RtwLimits};
 use rintawa_extension_engine::{
-    AcceptedWorldCommand, ActivationPlanError, ArtifactStoreAccess, AssetStoreAccess,
-    CompositionAccess, CompositionActivation, EngineError, ExtensionEngine, HostAccessError,
-    HostAccessResult, ImportedArtifact, ImportedAsset, PreferenceAccess, RtwExtensionLoadOutcome,
-    RtwExtensionLoader, RuntimeArtifactPolicy, RuntimePolicyAccess, RuntimePolicyComponent,
-    RuntimePolicyRequest, UnresolvedContractReason, UserContentAccess, UserContentDocument,
-    UserContentSummary, WorldCommandAccess, WorldCommandAccessError, WorldCommandAccessResult,
-    WorldCommandActor, WorldCommandRequest, WorldSessionAccess, WorldSessionSummary,
+    AcceptedUserContentWrite, AcceptedWorldCommand, ActivationPlanError, ArtifactStoreAccess,
+    AssetStoreAccess, CompositionAccess, CompositionActivation, EngineError, ExtensionEngine,
+    HostAccessError, HostAccessResult, ImportedArtifact, ImportedAsset, PreferenceAccess,
+    RtwExtensionLoadOutcome, RtwExtensionLoader, RuntimeArtifactPolicy, RuntimePolicyAccess,
+    RuntimePolicyComponent, RuntimePolicyRequest, UnresolvedContractReason, UserContentAccess,
+    UserContentDocument, UserContentSummary, UserContentWriteAccess, UserContentWriteStatus,
+    WorldCommandAccess, WorldCommandAccessError, WorldCommandAccessResult, WorldCommandActor,
+    WorldCommandRequest, WorldSessionAccess, WorldSessionSummary,
 };
 use rintawa_sdk::{
     content::{
@@ -42,7 +44,9 @@ use rintawa_world_runtime::{
     world_projection_service_contract_key, world_system_service_contract_key,
 };
 
+use tempfile::NamedTempFile;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::{
     BootstrapBlockedActivation, BootstrapDeferredActivation, BootstrapRollback, BootstrapStall,
@@ -59,6 +63,14 @@ pub const EFFECT_JOB_LEASE_MILLIS: i64 = 30_000;
 pub const EFFECT_RETRY_BASE_MILLIS: i64 = 1_000;
 /// Maximum host-owned retry delay regardless of attempt count.
 pub const EFFECT_RETRY_MAX_MILLIS: i64 = 60_000;
+/// Maximum deferred user-content writes accepted before a host pump drains them.
+const MAX_PENDING_USER_CONTENT_WRITES: usize = 32;
+/// Maximum total RTW bytes retained by the deferred user-content write queue.
+const MAX_PENDING_USER_CONTENT_WRITE_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum completed/pending write statuses retained for owner-scoped inspection.
+const MAX_RETAINED_USER_CONTENT_WRITE_STATUSES: usize = 256;
+/// Maximum diagnostic bytes retained for one failed deferred user-content write.
+const MAX_USER_CONTENT_WRITE_DIAGNOSTIC_BYTES: usize = 2 * 1024;
 /// Maximum distinct world lifecycle requests accepted before a host pump drains them.
 const MAX_PENDING_WORLD_SESSION_REQUESTS: usize = 64;
 /// Maximum deferred authoritative commands accepted before a host pump drains them.
@@ -157,6 +169,127 @@ impl WorldSessionRuntimeControl {
     }
 }
 
+enum DeferredUserContentWriteKind {
+    Import,
+    Replace(UserContentId),
+}
+
+struct DeferredUserContentWrite {
+    operation_id: String,
+    kind: DeferredUserContentWriteKind,
+    rtw: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct OwnedUserContentWriteStatus {
+    owner: ComponentRef,
+    status: UserContentWriteStatus,
+}
+
+#[derive(Default)]
+struct UserContentWriteRuntimeState {
+    queue: VecDeque<DeferredUserContentWrite>,
+    pending_bytes: usize,
+    statuses: BTreeMap<String, OwnedUserContentWriteStatus>,
+    completed: VecDeque<String>,
+}
+
+#[derive(Clone, Default)]
+struct UserContentWriteRuntimeControl {
+    state: Arc<Mutex<UserContentWriteRuntimeState>>,
+}
+
+impl UserContentWriteRuntimeControl {
+    fn request(
+        &self,
+        owner: ComponentRef,
+        kind: DeferredUserContentWriteKind,
+        rtw: Vec<u8>,
+    ) -> HostAccessResult<AcceptedUserContentWrite> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| HostAccessError::Unavailable)?;
+        let pending_bytes = state.pending_bytes.saturating_add(rtw.len());
+        if state.queue.len() >= MAX_PENDING_USER_CONTENT_WRITES
+            || pending_bytes > MAX_PENDING_USER_CONTENT_WRITE_BYTES
+        {
+            return Err(HostAccessError::QueueFull);
+        }
+        while state.statuses.len() >= MAX_RETAINED_USER_CONTENT_WRITE_STATUSES {
+            let Some(expired) = state.completed.pop_front() else {
+                return Err(HostAccessError::QueueFull);
+            };
+            state.statuses.remove(&expired);
+        }
+
+        let operation_id = Uuid::now_v7().to_string();
+        if state.statuses.contains_key(&operation_id) {
+            return Err(HostAccessError::Rejected);
+        }
+        state.statuses.insert(
+            operation_id.clone(),
+            OwnedUserContentWriteStatus {
+                owner: owner.clone(),
+                status: UserContentWriteStatus::Pending,
+            },
+        );
+        state.pending_bytes = pending_bytes;
+        state.queue.push_back(DeferredUserContentWrite {
+            operation_id: operation_id.clone(),
+            kind,
+            rtw,
+        });
+        Ok(AcceptedUserContentWrite { operation_id })
+    }
+
+    fn status(
+        &self,
+        owner: &ComponentRef,
+        operation_id: &str,
+    ) -> HostAccessResult<UserContentWriteStatus> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| HostAccessError::Unavailable)?;
+        let Some(operation) = state.statuses.get(operation_id) else {
+            return Err(HostAccessError::NotFound);
+        };
+        if &operation.owner != owner {
+            return Err(HostAccessError::NotFound);
+        }
+        Ok(operation.status.clone())
+    }
+
+    fn drain_pending(&self) -> HostResult<Vec<DeferredUserContentWrite>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| HostError::UserContentWriteControlUnavailable)?;
+        state.pending_bytes = 0;
+        Ok(state.queue.drain(..).collect())
+    }
+
+    fn record_outcome(&self, operation_id: &str, status: UserContentWriteStatus) -> HostResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| HostError::UserContentWriteControlUnavailable)?;
+        let Some(operation) = state.statuses.get_mut(operation_id) else {
+            return Err(HostError::UserContentWriteControlUnavailable);
+        };
+        operation.status = status;
+        state.completed.push_back(operation_id.to_string());
+        while state.statuses.len() > MAX_RETAINED_USER_CONTENT_WRITE_STATUSES {
+            let Some(expired) = state.completed.pop_front() else {
+                return Err(HostError::UserContentWriteControlUnavailable);
+            };
+            state.statuses.remove(&expired);
+        }
+        Ok(())
+    }
+}
+
 struct DeferredWorldCommand {
     world_id: WorldId,
     command: WorldCommand,
@@ -201,6 +334,7 @@ impl WorldCommandRuntimeControl {
 struct LocalHostAccess {
     home_root: PathBuf,
     local_principal: PrincipalId,
+    user_content_writes: UserContentWriteRuntimeControl,
     world_sessions: WorldSessionRuntimeControl,
     world_commands: WorldCommandRuntimeControl,
 }
@@ -209,12 +343,14 @@ impl LocalHostAccess {
     fn new(
         home_root: &Path,
         local_principal: PrincipalId,
+        user_content_writes: UserContentWriteRuntimeControl,
         world_sessions: WorldSessionRuntimeControl,
         world_commands: WorldCommandRuntimeControl,
     ) -> Self {
         Self {
             home_root: home_root.to_path_buf(),
             local_principal,
+            user_content_writes,
             world_sessions,
             world_commands,
         }
@@ -314,6 +450,47 @@ fn to_user_content_summary(entry: UserContentEntry) -> UserContentSummary {
         id: entry.id.to_string(),
         content: entry.content.to_string(),
         revision: entry.revision.to_string(),
+    }
+}
+
+impl UserContentWriteAccess for LocalHostAccess {
+    fn request_import(
+        &self,
+        owner: &ComponentRef,
+        rtw: &[u8],
+    ) -> HostAccessResult<AcceptedUserContentWrite> {
+        self.user_content_writes.request(
+            owner.clone(),
+            DeferredUserContentWriteKind::Import,
+            rtw.to_vec(),
+        )
+    }
+
+    fn request_replace(
+        &self,
+        owner: &ComponentRef,
+        id: &str,
+        rtw: &[u8],
+    ) -> HostAccessResult<AcceptedUserContentWrite> {
+        let id = id
+            .parse::<UserContentId>()
+            .map_err(|_| HostAccessError::InvalidUserContentId)?;
+        self.home()?
+            .indexed_user_content(id)
+            .map_err(map_host_access_error)?;
+        self.user_content_writes.request(
+            owner.clone(),
+            DeferredUserContentWriteKind::Replace(id),
+            rtw.to_vec(),
+        )
+    }
+
+    fn write_status(
+        &self,
+        owner: &ComponentRef,
+        operation_id: &str,
+    ) -> HostAccessResult<UserContentWriteStatus> {
+        self.user_content_writes.status(owner, operation_id)
     }
 }
 
@@ -774,17 +951,20 @@ impl HostRuntime {
     /// deterministic full-topology activation plan.
     pub fn start(home: &HostHome) -> HostResult<Self> {
         let profile = home.load_profile()?;
+        let user_content_writes = UserContentWriteRuntimeControl::default();
         let world_sessions = WorldSessionRuntimeControl::default();
         let world_commands = WorldCommandRuntimeControl::default();
         let access = Arc::new(LocalHostAccess::new(
             home.root(),
             home.local_principal(),
+            user_content_writes,
             world_sessions,
             world_commands,
         ));
         let artifact_store_access: Arc<dyn ArtifactStoreAccess> = access.clone();
         let asset_store_access: Arc<dyn AssetStoreAccess> = access.clone();
         let user_content_access: Arc<dyn UserContentAccess> = access.clone();
+        let user_content_write_access: Arc<dyn UserContentWriteAccess> = access.clone();
         let world_session_access: Arc<dyn WorldSessionAccess> = access.clone();
         let world_command_access: Arc<dyn WorldCommandAccess> = access.clone();
         let composition_access: Arc<dyn CompositionAccess> = access.clone();
@@ -799,6 +979,7 @@ impl HostRuntime {
             runtime_policy_access,
         );
         engine.attach_user_content_access(user_content_access);
+        engine.attach_user_content_write_access(user_content_write_access);
         engine.attach_world_command_access(world_command_access);
         let host_scope = RuntimeScopeId::new(HOST_SCOPE);
         let host_shell_contract = host_shell_contract_key();
@@ -1618,6 +1799,44 @@ impl HostRuntime {
         Ok(handled)
     }
 
+    fn pump_user_content_write_requests(&mut self) -> HostResult<usize> {
+        let Some(access) = self.host_access.clone() else {
+            return Ok(0);
+        };
+        let requests = access.user_content_writes.drain_pending()?;
+        if requests.is_empty() {
+            return Ok(0);
+        }
+        let home = HostHome::open(&access.home_root)?;
+        let mut handled = 0_usize;
+        for request in requests {
+            let result = (|| -> HostResult<UserContentEntry> {
+                let mut temporary = NamedTempFile::new_in(home.root())?;
+                temporary.write_all(&request.rtw)?;
+                temporary.as_file_mut().flush()?;
+                match request.kind {
+                    DeferredUserContentWriteKind::Import => {
+                        self.import_user_content_rtw(&home, temporary.path())
+                    }
+                    DeferredUserContentWriteKind::Replace(id) => {
+                        self.replace_user_content_rtw(&home, id, temporary.path())
+                    }
+                }
+            })();
+            let status = match result {
+                Ok(entry) => UserContentWriteStatus::Succeeded(to_user_content_summary(entry)),
+                Err(error) => UserContentWriteStatus::Failed(
+                    bounded_user_content_write_diagnostic(&error.to_string()),
+                ),
+            };
+            access
+                .user_content_writes
+                .record_outcome(&request.operation_id, status)?;
+            handled = handled.saturating_add(1);
+        }
+        Ok(handled)
+    }
+
     fn pump_world_command_requests(&mut self) -> HostResult<usize> {
         let Some(access) = self.host_access.clone() else {
             return Ok(0);
@@ -1658,11 +1877,13 @@ impl HostRuntime {
     /// no active component currently owns scheduled cooperative work.
     pub fn poll_runtime(&mut self) -> HostResult<Option<Duration>> {
         self.pump_world_session_requests()?;
+        self.pump_user_content_write_requests()?;
         self.pump_world_command_requests()?;
         self.pump_all_runtime_signals()?;
         self.pump_all_effect_outboxes()?;
         let engine_delay = self.engine.poll_runtime()?;
         self.pump_world_session_requests()?;
+        self.pump_user_content_write_requests()?;
         self.pump_world_command_requests()?;
         let effect_delay = self.next_effect_wakeup_delay(current_unix_time_millis())?;
         Ok(min_optional_duration(engine_delay, effect_delay))
@@ -1686,6 +1907,17 @@ impl HostRuntime {
             })))
         }
     }
+}
+
+fn bounded_user_content_write_diagnostic(value: &str) -> String {
+    if value.len() <= MAX_USER_CONTENT_WRITE_DIAGNOSTIC_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_USER_CONTENT_WRITE_DIAGNOSTIC_BYTES.min(value.len());
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value[..end].to_string()
 }
 
 fn bounded_world_session_diagnostic(value: &str) -> String {
@@ -2758,6 +2990,7 @@ mod tests {
         let access = LocalHostAccess::new(
             home.root(),
             home.local_principal(),
+            UserContentWriteRuntimeControl::default(),
             WorldSessionRuntimeControl::default(),
             WorldCommandRuntimeControl::default(),
         );
@@ -2799,6 +3032,64 @@ mod tests {
         ));
         assert!(home.list_user_content()?.is_empty());
         assert!(home.artifact_store().open_artifact(&digest).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_bound_and_isolate_deferred_user_content_write_queue() -> anyhow::Result<()> {
+        let control = UserContentWriteRuntimeControl::default();
+        let owner_a = ComponentRef::new("instance-a", "runtime");
+        let owner_b = ComponentRef::new("instance-b", "runtime");
+        let accepted = control
+            .request(
+                owner_a.clone(),
+                DeferredUserContentWriteKind::Import,
+                b"rtw".to_vec(),
+            )
+            .map_err(|error| anyhow::anyhow!("queue request failed: {error:?}"))?;
+        assert_eq!(
+            control.status(&owner_a, &accepted.operation_id),
+            Ok(UserContentWriteStatus::Pending)
+        );
+        assert_eq!(
+            control.status(&owner_b, &accepted.operation_id),
+            Err(HostAccessError::NotFound)
+        );
+        let drained = control.drain_pending()?;
+        assert_eq!(drained.len(), 1);
+        control.record_outcome(
+            &accepted.operation_id,
+            UserContentWriteStatus::Failed(String::from("rejected")),
+        )?;
+        assert_eq!(
+            control.status(&owner_a, &accepted.operation_id),
+            Ok(UserContentWriteStatus::Failed(String::from("rejected")))
+        );
+
+        for index in 0..MAX_PENDING_USER_CONTENT_WRITES {
+            control
+                .request(
+                    owner_a.clone(),
+                    DeferredUserContentWriteKind::Import,
+                    vec![u8::try_from(index).unwrap_or(0)],
+                )
+                .map_err(|error| anyhow::anyhow!("queue fill failed: {error:?}"))?;
+        }
+        assert_eq!(
+            control.request(
+                owner_a.clone(),
+                DeferredUserContentWriteKind::Import,
+                b"overflow".to_vec(),
+            ),
+            Err(HostAccessError::QueueFull)
+        );
+        let _ = control.drain_pending()?;
+
+        let oversized = vec![0_u8; MAX_PENDING_USER_CONTENT_WRITE_BYTES + 1];
+        assert_eq!(
+            control.request(owner_a, DeferredUserContentWriteKind::Import, oversized),
+            Err(HostAccessError::QueueFull)
+        );
         Ok(())
     }
 
@@ -3019,6 +3310,134 @@ mod tests {
     }
 
     #[test]
+    fn test_should_defer_validate_and_publish_user_content_writes() -> anyhow::Result<()> {
+        let root = tempfile::TempDir::new()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let mut host = HostRuntime::start(&home)?;
+        let content = ContentType::parse("rintawa.test-content@1")?;
+        let contract = content_handler_service_contract_key(content.id(), content.major());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let provider_instance = ExtensionInstanceId::new("deferred-content-handler");
+        host.engine.register_extension_instance(
+            provider_instance.clone(),
+            RuntimeScopeId::new(HOST_SCOPE),
+            test_manifest("rintawa.test-content-handler"),
+            vec![Box::new(ContentHandlerProvider {
+                id: ComponentId::new("runtime"),
+                contract,
+                observed: Arc::clone(&observed),
+            })],
+        )?;
+        host.engine.start_extension_instance(&provider_instance)?;
+
+        let access = host
+            .host_access
+            .as_ref()
+            .expect("production HostRuntime must retain host access")
+            .clone();
+        let owner = ComponentRef::new("writer-instance", "runtime");
+        let other_owner = ComponentRef::new("other-instance", "runtime");
+        assert_eq!(
+            UserContentWriteAccess::request_replace(access.as_ref(), &owner, "not-an-id", b"rtw",),
+            Err(HostAccessError::InvalidUserContentId)
+        );
+        let first_path = write_test_content_rtw(
+            root.path(),
+            "deferred-content-1",
+            &content.to_string(),
+            b"revision-one",
+        )?;
+        let first_bytes = std::fs::read(&first_path)?;
+        let accepted =
+            UserContentWriteAccess::request_import(access.as_ref(), &owner, &first_bytes)
+                .map_err(|error| anyhow::anyhow!("deferred import request failed: {error:?}"))?;
+
+        assert!(home.list_user_content()?.is_empty());
+        assert_eq!(
+            UserContentWriteAccess::write_status(access.as_ref(), &owner, &accepted.operation_id,),
+            Ok(UserContentWriteStatus::Pending)
+        );
+        assert_eq!(
+            UserContentWriteAccess::write_status(
+                access.as_ref(),
+                &other_owner,
+                &accepted.operation_id,
+            ),
+            Err(HostAccessError::NotFound)
+        );
+
+        host.poll_runtime()?;
+        let first = match UserContentWriteAccess::write_status(
+            access.as_ref(),
+            &owner,
+            &accepted.operation_id,
+        ) {
+            Ok(UserContentWriteStatus::Succeeded(entry)) => entry,
+            other => return Err(anyhow::anyhow!("unexpected import status: {other:?}")),
+        };
+        let first_id: UserContentId = first.id.parse()?;
+        assert_eq!(home.list_user_content()?.len(), 1);
+
+        let second_path = write_test_content_rtw(
+            root.path(),
+            "deferred-content-2",
+            &content.to_string(),
+            b"revision-two",
+        )?;
+        let replace = UserContentWriteAccess::request_replace(
+            access.as_ref(),
+            &owner,
+            &first.id,
+            &std::fs::read(second_path)?,
+        )
+        .map_err(|error| anyhow::anyhow!("deferred replace request failed: {error:?}"))?;
+        host.poll_runtime()?;
+        let second = match UserContentWriteAccess::write_status(
+            access.as_ref(),
+            &owner,
+            &replace.operation_id,
+        ) {
+            Ok(UserContentWriteStatus::Succeeded(entry)) => entry,
+            other => return Err(anyhow::anyhow!("unexpected replace status: {other:?}")),
+        };
+        assert_eq!(second.id, first.id);
+        assert_ne!(second.revision, first.revision);
+        assert_eq!(home.list_user_content()?[0].id, first_id);
+
+        let rejected_path = write_test_content_rtw(
+            root.path(),
+            "deferred-content-rejected",
+            &content.to_string(),
+            b"reject",
+        )?;
+        let rejected = UserContentWriteAccess::request_import(
+            access.as_ref(),
+            &owner,
+            &std::fs::read(rejected_path)?,
+        )
+        .map_err(|error| anyhow::anyhow!("deferred rejected request failed: {error:?}"))?;
+        host.poll_runtime()?;
+        assert!(matches!(
+            UserContentWriteAccess::write_status(
+                access.as_ref(),
+                &owner,
+                &rejected.operation_id,
+            ),
+            Ok(UserContentWriteStatus::Failed(diagnostic))
+                if diagnostic.contains("descriptor rejected by test handler")
+        ));
+        assert_eq!(home.list_user_content()?.len(), 1);
+        assert_eq!(
+            observed
+                .lock()
+                .map_err(|_| anyhow::anyhow!("content observer lock poisoned"))?
+                .len(),
+            3
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_should_validate_and_revision_user_content_through_extension_handler()
     -> anyhow::Result<()> {
         let root = tempfile::TempDir::new()?;
@@ -3144,6 +3563,7 @@ mod tests {
         let access = LocalHostAccess::new(
             home.root(),
             principal,
+            UserContentWriteRuntimeControl::default(),
             world_sessions.clone(),
             world_commands.clone(),
         );

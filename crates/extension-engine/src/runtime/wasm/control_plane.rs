@@ -7,18 +7,19 @@ use rintawa_sdk::{
 use crate::{
     host_access::{
         CompositionActivation, HostAccessError, RuntimePolicyComponent, UserContentDocument,
-        UserContentSummary, WorldCommandAccessError, WorldCommandActor as HostWorldCommandActor,
-        WorldCommandRequest, WorldSessionSummary,
+        UserContentSummary, UserContentWriteStatus, WorldCommandAccessError,
+        WorldCommandActor as HostWorldCommandActor, WorldCommandRequest, WorldSessionSummary,
     },
     runtime::wasm::{
         ArtifactStoreError, ArtifactStoreHost, AssetStoreError, AssetStoreHost, CompositionError,
         CompositionHost, PreferenceError, PreferencesHost, RuntimePermissionCheck,
         RuntimePolicyError, RuntimePolicyHost, ScopedCompositionHost, ScopedRuntimePolicyHost,
-        UserContentError, UserContentHost, WasmHostState, WitAcceptedWorldCommand, WitAssetRef,
-        WitCompositionActivation, WitImportedArtifact, WitRuntimeArtifactPolicy,
-        WitRuntimePolicyComponent, WitRuntimePolicyRequest, WitUserContentDocument,
-        WitUserContentEntry, WitWorldCommandActor, WitWorldCommandRequest, WitWorldSummary,
-        WorldCommandError, WorldCommandsHost, WorldSessionError, WorldSessionsHost,
+        UserContentError, UserContentHost, WasmHostState, WitAcceptedUserContentWrite,
+        WitAcceptedWorldCommand, WitAssetRef, WitCompositionActivation, WitImportedArtifact,
+        WitRuntimeArtifactPolicy, WitRuntimePolicyComponent, WitRuntimePolicyRequest,
+        WitUserContentDocument, WitUserContentEntry, WitUserContentWriteState,
+        WitWorldCommandActor, WitWorldCommandRequest, WitWorldSummary, WorldCommandError,
+        WorldCommandsHost, WorldSessionError, WorldSessionsHost,
     },
 };
 
@@ -112,6 +113,61 @@ impl UserContentHost for WasmHostState {
             .read_user_content(&id)
             .map_err(map_user_content_access_error)?;
         self.bound_user_content_document(document)
+    }
+
+    fn request_import(
+        &mut self,
+        rtw: Vec<u8>,
+    ) -> Result<WitAcceptedUserContentWrite, UserContentError> {
+        let owner = self.require_user_content_write()?;
+        if rtw.len() > self.max_artifact_import_bytes {
+            return Err(UserContentError::MessageTooLarge);
+        }
+        self.consume_user_content_write_budget()?;
+        let accepted = self
+            .host_access
+            .user_content_write
+            .request_import(&owner, &rtw)
+            .map_err(map_user_content_access_error)?;
+        Ok(WitAcceptedUserContentWrite {
+            operation_id: accepted.operation_id,
+        })
+    }
+
+    fn request_replace(
+        &mut self,
+        id: String,
+        rtw: Vec<u8>,
+    ) -> Result<WitAcceptedUserContentWrite, UserContentError> {
+        let owner = self.require_user_content_write()?;
+        if id.len() > self.max_host_message_bytes || rtw.len() > self.max_artifact_import_bytes {
+            return Err(UserContentError::MessageTooLarge);
+        }
+        self.consume_user_content_write_budget()?;
+        let accepted = self
+            .host_access
+            .user_content_write
+            .request_replace(&owner, &id, &rtw)
+            .map_err(map_user_content_access_error)?;
+        Ok(WitAcceptedUserContentWrite {
+            operation_id: accepted.operation_id,
+        })
+    }
+
+    fn write_status(
+        &mut self,
+        operation_id: String,
+    ) -> Result<WitUserContentWriteState, UserContentError> {
+        let owner = self.require_user_content_write()?;
+        if operation_id.len() > self.max_host_message_bytes {
+            return Err(UserContentError::MessageTooLarge);
+        }
+        let status = self
+            .host_access
+            .user_content_write
+            .write_status(&owner, &operation_id)
+            .map_err(map_user_content_access_error)?;
+        self.bound_user_content_write_status(status)
     }
 }
 
@@ -586,6 +642,26 @@ impl WasmHostState {
             })
     }
 
+    fn require_user_content_write(&self) -> Result<ComponentRef, UserContentError> {
+        if !self.host_access_active {
+            return Err(UserContentError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::UserContentWrite)
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => UserContentError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => UserContentError::Unavailable,
+            })
+    }
+
+    fn consume_user_content_write_budget(&mut self) -> Result<(), UserContentError> {
+        if self.user_content_writes_this_execution >= self.max_user_content_writes_per_execution {
+            return Err(UserContentError::LimitExceeded);
+        }
+        self.user_content_writes_this_execution =
+            self.user_content_writes_this_execution.saturating_add(1);
+        Ok(())
+    }
+
     fn bound_user_content_entries(
         &self,
         entries: Vec<UserContentSummary>,
@@ -620,6 +696,26 @@ impl WasmHostState {
             metadata: to_wit_user_content_entry(document.metadata),
             descriptor: document.descriptor,
         })
+    }
+
+    fn bound_user_content_write_status(
+        &self,
+        status: UserContentWriteStatus,
+    ) -> Result<WitUserContentWriteState, UserContentError> {
+        match status {
+            UserContentWriteStatus::Pending => Ok(WitUserContentWriteState::Pending),
+            UserContentWriteStatus::Succeeded(entry) => {
+                let entry = self.bound_user_content_entries(vec![entry])?;
+                let entry = entry.into_iter().next().ok_or(UserContentError::Rejected)?;
+                Ok(WitUserContentWriteState::Succeeded(entry))
+            }
+            UserContentWriteStatus::Failed(diagnostic) => {
+                if diagnostic.len() > self.max_host_message_bytes {
+                    return Err(UserContentError::MessageTooLarge);
+                }
+                Ok(WitUserContentWriteState::Failed(diagnostic))
+            }
+        }
     }
 
     fn require_world_command_submit(&self) -> Result<(), WorldCommandError> {
@@ -806,13 +902,13 @@ fn map_user_content_access_error(error: HostAccessError) -> UserContentError {
         HostAccessError::InvalidUserContentId => UserContentError::InvalidId,
         HostAccessError::InvalidContentType => UserContentError::InvalidContent,
         HostAccessError::NotFound => UserContentError::NotFound,
+        HostAccessError::QueueFull => UserContentError::QueueFull,
         HostAccessError::Unavailable => UserContentError::Unavailable,
         HostAccessError::Rejected
         | HostAccessError::InvalidArtifact
         | HostAccessError::InvalidAsset
         | HostAccessError::InvalidDigest
         | HostAccessError::InvalidWorldId
-        | HostAccessError::QueueFull
         | HostAccessError::UnsupportedContent
         | HostAccessError::InvalidPermission
         | HostAccessError::InvalidPreference

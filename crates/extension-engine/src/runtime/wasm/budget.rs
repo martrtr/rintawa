@@ -38,6 +38,8 @@ pub struct WasmExecutionBudget {
     pub max_artifact_import_bytes: usize,
     /// Maximum raw asset bytes accepted by one generic asset import call.
     pub max_asset_import_bytes: usize,
+    /// Maximum deferred user-content writes accepted during one guest callback.
+    pub max_user_content_writes_per_execution: usize,
     /// Maximum world-session mutations accepted during one guest callback.
     pub max_world_session_mutations_per_execution: usize,
     /// Maximum authoritative world commands accepted during one guest callback.
@@ -75,6 +77,7 @@ impl Default for WasmExecutionBudget {
             max_artifact_read_bytes: 8 * 1024 * 1024,
             max_artifact_import_bytes: 32 * 1024 * 1024,
             max_asset_import_bytes: 16 * 1024 * 1024,
+            max_user_content_writes_per_execution: 4,
             max_world_session_mutations_per_execution: 8,
             max_world_command_submissions_per_execution: 8,
             max_background_tasks: 8,
