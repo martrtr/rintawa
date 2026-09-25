@@ -15,6 +15,7 @@
 //! ## Modules
 //!
 //! - [`types`] — identifiers and primitive types
+//! - [`content`] — generic extension-provided RTW content-handler protocol
 //! - [`contributions`] — contribution descriptions
 //! - [`manifest`] — manifest file structure
 //! - [`traits`] — traits for component implementation
@@ -30,6 +31,7 @@
 #![warn(missing_docs, rustdoc::broken_intra_doc_links)]
 
 pub mod api;
+pub mod content;
 pub mod context;
 pub mod contracts;
 pub mod contributions;

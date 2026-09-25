@@ -7,7 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rintawa_artifacts::ArtifactDigest;
+use rintawa_artifacts::{ArtifactDigest, ContentType, RtwArchive, RtwLimits};
 use rintawa_extension_engine::{
     ActivationPlanError, ArtifactStoreAccess, CompositionAccess, CompositionActivation,
     EngineError, ExtensionEngine, HostAccessError, HostAccessResult, ImportedArtifact,
@@ -15,6 +15,10 @@ use rintawa_extension_engine::{
     RuntimePolicyAccess, RuntimePolicyComponent, RuntimePolicyRequest, UnresolvedContractReason,
 };
 use rintawa_sdk::{
+    content::{
+        ContentHandlerRequest, ContentHandlerResponse, MAX_CONTENT_HANDLER_DIAGNOSTIC_BYTES,
+        MAX_CONTENT_HANDLER_ENTRY_BYTES, content_handler_service_contract_key,
+    },
     contracts::{
         ComponentRef, ContractKey, ContractResolutionPolicy, host_shell_contract_key,
         ui_layer_contract_key,
@@ -38,7 +42,7 @@ use rintawa_world_runtime::{
 use crate::{
     BootstrapBlockedActivation, BootstrapDeferredActivation, BootstrapRollback, BootstrapStall,
     CompositionProfile, HOST_SCOPE, HostCleanupFailure, HostCleanupOperation, HostError, HostHome,
-    HostResult, HostShutdownFailures, WorldRuntimeCleanupFailure,
+    HostResult, HostShutdownFailures, UserContentEntry, UserContentId, WorldRuntimeCleanupFailure,
     runtime_signal::RuntimeSignalQueue, world_runtime_scope_id,
 };
 
@@ -555,6 +559,110 @@ impl HostRuntime {
     /// the portable UI presentation protocol.
     pub fn ui_layer_provider(&self) -> Option<&ComponentRef> {
         self.ui_layer_provider.as_ref()
+    }
+
+    /// Imports one extension-validated RTW artifact into the generic user-content library.
+    ///
+    /// The root container and bounded descriptor are validated before CAS publication.
+    /// Handler resolution uses the baseline `host` composition and ordinary `Single`
+    /// provider policy; Core does not interpret feature-specific content semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an RTW validation error, content-handler transport/protocol rejection,
+    /// artifact-store failure, or library persistence error.
+    pub fn import_user_content_rtw(
+        &mut self,
+        home: &HostHome,
+        source: impl AsRef<Path>,
+    ) -> HostResult<UserContentEntry> {
+        let source = source.as_ref();
+        let content = self.validate_user_content_rtw(source)?;
+        let imported = home.artifact_store().import(source)?;
+        home.insert_user_content_revision(content, imported.digest().clone())
+    }
+
+    /// Replaces the immutable revision of one logical user-content item.
+    ///
+    /// The logical [`UserContentId`] is preserved and the versioned RTW content type
+    /// cannot change. Validation completes before the new bytes enter the CAS.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::UserContentNotFound`] for an unknown ID,
+    /// [`HostError::UserContentTypeMismatch`] for a type change, or the same
+    /// validation/storage errors as [`Self::import_user_content_rtw`].
+    pub fn replace_user_content_rtw(
+        &mut self,
+        home: &HostHome,
+        id: UserContentId,
+        source: impl AsRef<Path>,
+    ) -> HostResult<UserContentEntry> {
+        let existing = home.indexed_user_content(id)?;
+        let source = source.as_ref();
+        let content = self.validate_user_content_rtw(source)?;
+        if content != existing.content {
+            return Err(HostError::UserContentTypeMismatch {
+                id,
+                expected: existing.content.to_string(),
+                actual: content.to_string(),
+            });
+        }
+        let imported = home.artifact_store().import(source)?;
+        home.replace_user_content_revision(id, content, imported.digest().clone())
+    }
+
+    fn validate_user_content_rtw(&mut self, source: &Path) -> HostResult<ContentType> {
+        let mut archive = RtwArchive::open(source, RtwLimits::default())?;
+        let content = archive.manifest().content.clone();
+        let entry = archive.manifest().entry.clone();
+        let maximum_entry_bytes =
+            u64::try_from(MAX_CONTENT_HANDLER_ENTRY_BYTES).unwrap_or(u64::MAX);
+        let descriptor = archive.read_with_limit(&entry, maximum_entry_bytes)?;
+        let contract = content_handler_service_contract_key(content.id(), content.major());
+        let host_scope = RuntimeScopeId::new(HOST_SCOPE);
+        self.engine.define_platform_service_contract_in_scope(
+            host_scope.clone(),
+            contract.clone(),
+            ContractResolutionPolicy::Single,
+        )?;
+        let request = ContentHandlerRequest::new(content.to_string(), descriptor);
+        let request = serde_json::to_vec(&request).map_err(|source| {
+            HostError::ContentHandlerRequestEncode {
+                content: content.to_string(),
+                source,
+            }
+        })?;
+        let response = self
+            .engine
+            .platform_service_caller(host_scope)
+            .call(&contract, &request)
+            .map_err(|source| HostError::ContentHandlerCall {
+                content: content.to_string(),
+                source,
+            })?;
+        let response: ContentHandlerResponse =
+            serde_json::from_slice(&response).map_err(|source| {
+                HostError::ContentHandlerResponseDecode {
+                    content: content.to_string(),
+                    source,
+                }
+            })?;
+        match response {
+            ContentHandlerResponse::Accepted => Ok(content),
+            ContentHandlerResponse::Rejected { diagnostic } => {
+                if diagnostic.len() > MAX_CONTENT_HANDLER_DIAGNOSTIC_BYTES {
+                    return Err(HostError::ContentHandlerDiagnosticTooLarge {
+                        content: content.to_string(),
+                        maximum_bytes: MAX_CONTENT_HANDLER_DIAGNOSTIC_BYTES,
+                    });
+                }
+                Err(HostError::UserContentRejected {
+                    content: content.to_string(),
+                    diagnostic,
+                })
+            }
+        }
     }
 
     /// Returns whether one authoritative world currently owns a running worker.
@@ -1625,6 +1733,70 @@ mod tests {
         }
     }
 
+    struct ContentHandlerProvider {
+        id: ComponentId,
+        contract: ContractKey,
+        observed: Arc<Mutex<Vec<ContentHandlerRequest>>>,
+    }
+
+    impl Component for ContentHandlerProvider {
+        fn id(&self) -> &ComponentId {
+            &self.id
+        }
+
+        fn register(&mut self, ctx: &mut dyn RegistrationContext) -> ExtensionResult<()> {
+            ctx.provide_contract(ContractProvider::new(self.contract.clone()))
+        }
+
+        fn handle_service(
+            &mut self,
+            _ctx: &mut dyn ComponentContext,
+            contract: &ContractKey,
+            request: &[u8],
+        ) -> ExtensionResult<Vec<u8>> {
+            if contract != &self.contract {
+                return Err(ExtensionError::ServiceHandlerUnavailable(
+                    contract.to_string(),
+                ));
+            }
+            let request: ContentHandlerRequest = serde_json::from_slice(request)
+                .map_err(|error| ExtensionError::Message(error.to_string()))?;
+            self.observed
+                .lock()
+                .map_err(|_| {
+                    ExtensionError::Message(String::from("content observer lock poisoned"))
+                })?
+                .push(request.clone());
+            let response = if request.descriptor == b"reject" {
+                ContentHandlerResponse::Rejected {
+                    diagnostic: String::from("descriptor rejected by test handler"),
+                }
+            } else {
+                ContentHandlerResponse::Accepted
+            };
+            serde_json::to_vec(&response)
+                .map_err(|error| ExtensionError::Message(error.to_string()))
+        }
+    }
+
+    fn write_test_content_rtw(
+        root: &Path,
+        name: &str,
+        content: &str,
+        descriptor: &[u8],
+    ) -> anyhow::Result<PathBuf> {
+        let source = root.join(format!("{name}-source"));
+        std::fs::create_dir(&source)?;
+        std::fs::write(
+            source.join("rtw.toml"),
+            format!("format = 1\ncontent = \"{content}\"\nentry = \"content.bin\"\n"),
+        )?;
+        std::fs::write(source.join("content.bin"), descriptor)?;
+        let output = root.join(format!("{name}.rtw"));
+        rintawa_artifacts::pack_directory(&source, &output, RtwLimits::default())?;
+        Ok(output)
+    }
+
     struct WorldSchemaComponent {
         id: ComponentId,
         schemas: Vec<WorldSchemaContribution>,
@@ -2086,6 +2258,142 @@ mod tests {
             Err(HostError::InvalidWorldSchemaJson { schema, .. }) if schema == invalid
         ));
         assert!(storage.load_session()?.schemas().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_not_publish_user_content_without_active_handler() -> anyhow::Result<()> {
+        let root = tempfile::TempDir::new()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let mut host = HostRuntime::start(&home)?;
+        let content = ContentType::parse("rintawa.unhandled-content@1")?;
+        let source = write_test_content_rtw(
+            root.path(),
+            "unhandled-content",
+            &content.to_string(),
+            b"valid-container",
+        )?;
+        let digest = ArtifactDigest::sha256(&std::fs::read(&source)?);
+
+        assert!(matches!(
+            host.import_user_content_rtw(&home, &source),
+            Err(HostError::ContentHandlerCall { .. })
+        ));
+        assert!(home.list_user_content()?.is_empty());
+        assert!(home.artifact_store().open_artifact(&digest).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_validate_and_revision_user_content_through_extension_handler()
+    -> anyhow::Result<()> {
+        let root = tempfile::TempDir::new()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let mut host = HostRuntime::start(&home)?;
+        let content = ContentType::parse("rintawa.test-content@1")?;
+        let contract = content_handler_service_contract_key(content.id(), content.major());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let provider_instance = ExtensionInstanceId::new("content-handler-provider");
+
+        host.engine.register_extension_instance(
+            provider_instance.clone(),
+            RuntimeScopeId::new(HOST_SCOPE),
+            test_manifest("rintawa.test-content-handler"),
+            vec![Box::new(ContentHandlerProvider {
+                id: ComponentId::new("runtime"),
+                contract,
+                observed: Arc::clone(&observed),
+            })],
+        )?;
+        host.engine.start_extension_instance(&provider_instance)?;
+
+        let oversized_descriptor = vec![b'x'; MAX_CONTENT_HANDLER_ENTRY_BYTES + 1];
+        let oversized = write_test_content_rtw(
+            root.path(),
+            "oversized-content",
+            &content.to_string(),
+            &oversized_descriptor,
+        )?;
+        let oversized_digest = ArtifactDigest::sha256(&std::fs::read(&oversized)?);
+        assert!(matches!(
+            host.import_user_content_rtw(&home, &oversized),
+            Err(HostError::Artifact(_))
+        ));
+        assert!(
+            home.artifact_store()
+                .open_artifact(&oversized_digest)
+                .is_err()
+        );
+        assert!(
+            observed
+                .lock()
+                .map_err(|_| anyhow::anyhow!("content observer lock poisoned"))?
+                .is_empty()
+        );
+
+        let rejected = write_test_content_rtw(
+            root.path(),
+            "rejected-content",
+            &content.to_string(),
+            b"reject",
+        )?;
+        let rejected_digest = ArtifactDigest::sha256(&std::fs::read(&rejected)?);
+        assert!(matches!(
+            host.import_user_content_rtw(&home, &rejected),
+            Err(HostError::UserContentRejected { .. })
+        ));
+        assert!(home.list_user_content()?.is_empty());
+        assert!(
+            home.artifact_store()
+                .open_artifact(&rejected_digest)
+                .is_err()
+        );
+
+        let first_path = write_test_content_rtw(
+            root.path(),
+            "accepted-content-1",
+            &content.to_string(),
+            b"revision-one",
+        )?;
+        let first = host.import_user_content_rtw(&home, &first_path)?;
+        home.artifact_store().verify(&first.revision)?;
+        let stored_first = home
+            .artifact_store()
+            .root()
+            .join("sha256")
+            .join(format!("{}.rtw", first.revision.hex()));
+        std::fs::write(stored_first, b"corrupted")?;
+        assert!(matches!(
+            home.list_user_content(),
+            Err(HostError::Artifact(_))
+        ));
+
+        let second_path = write_test_content_rtw(
+            root.path(),
+            "accepted-content-2",
+            &content.to_string(),
+            b"revision-two",
+        )?;
+        let second = host.replace_user_content_rtw(&home, first.id, &second_path)?;
+        home.artifact_store().verify(&second.revision)?;
+
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.content, content);
+        assert_ne!(second.revision, first.revision);
+        assert_eq!(home.list_user_content()?, vec![second]);
+
+        let observed = observed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("content observer lock poisoned"))?;
+        assert_eq!(observed.len(), 3);
+        assert!(
+            observed
+                .iter()
+                .all(|request| request.content == content.to_string())
+        );
+        assert_eq!(observed[0].descriptor, b"reject");
+        assert_eq!(observed[1].descriptor, b"revision-one");
+        assert_eq!(observed[2].descriptor, b"revision-two");
         Ok(())
     }
 

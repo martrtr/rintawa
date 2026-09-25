@@ -10,6 +10,7 @@
 mod profile;
 mod runtime;
 mod runtime_signal;
+mod user_content;
 
 use std::{
     fmt,
@@ -17,7 +18,8 @@ use std::{
 };
 
 use rintawa_artifacts::{
-    ArtifactDigest, ArtifactStore, ContentType, ImportDisposition, RtwArchive, RtwLimits,
+    ArtifactDigest, ArtifactStore, AssetStore, ContentType, ImportDisposition, RtwArchive,
+    RtwLimits,
 };
 use rintawa_extension_engine::{
     ActivationPlanError, DeferredExecutionTarget, EngineError, ExtensionEngine, RtwExtensionLoader,
@@ -46,6 +48,7 @@ pub use runtime_signal::{
     DEFAULT_RUNTIME_SIGNAL_QUEUE_CAPACITY, MAX_RUNTIME_SIGNAL_MESSAGE_BYTES,
     MAX_RUNTIME_SIGNAL_TOPIC_BYTES,
 };
+pub use user_content::{USER_CONTENT_LIBRARY_SCHEMA, UserContentEntry, UserContentId};
 
 /// Stable runtime scope used by the pre-world/bootstrap composition.
 pub const HOST_SCOPE: &str = "host";
@@ -63,6 +66,8 @@ const EXTENSION_CONTENT_V1: &str = "rintawa.extension@1";
 const WORLD_DATABASE_FILE: &str = "world.sqlite";
 const WORLD_COMPOSITION_FILE: &str = "composition.toml";
 const WORLD_ID_CREATION_ATTEMPTS: usize = 8;
+/// Maximum single raw asset size accepted by the local host asset store.
+pub const MAX_ASSET_BYTES: u64 = 512 * 1024 * 1024;
 
 /// One composition activation deferred because required execution targets are unavailable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,6 +249,9 @@ pub enum HostError {
     /// An RTW artifact operation failed.
     #[error(transparent)]
     Artifact(#[from] rintawa_artifacts::RtwError),
+    /// A raw asset reference/store operation failed.
+    #[error(transparent)]
+    Asset(#[from] rintawa_artifacts::AssetError),
     /// Extension inspection or lifecycle failed.
     #[error(transparent)]
     Engine(#[from] rintawa_extension_engine::EngineError),
@@ -476,6 +484,85 @@ pub enum HostError {
     /// A persisted activation uses a content type for which this host has no handler.
     #[error("no activation handler is available for RTW content `{0}`")]
     UnsupportedContent(String),
+    /// The generic user-content library path is not a regular host-owned file.
+    #[error("invalid user-content library file `{0}`")]
+    InvalidUserContentLibraryFile(PathBuf),
+    /// The persisted generic user-content library uses an unsupported schema.
+    #[error("unsupported user-content library schema {0}")]
+    UnsupportedUserContentLibrarySchema(u32),
+    /// The persisted generic user-content library contains a duplicate logical ID.
+    #[error("duplicate user-content library id `{0}`")]
+    DuplicateUserContentId(UserContentId),
+    /// The requested logical user-content item is absent from the library index.
+    #[error("user-content item `{0}` is not present in the library")]
+    UserContentNotFound(UserContentId),
+    /// An edit attempted to change the versioned content type of one logical item.
+    #[error("user-content item `{id}` has type `{expected}`, not `{actual}`")]
+    UserContentTypeMismatch {
+        /// Stable logical content identity.
+        id: UserContentId,
+        /// Existing versioned content type.
+        expected: String,
+        /// Rejected replacement content type.
+        actual: String,
+    },
+    /// The persisted user-content library could not be decoded.
+    #[error("invalid user-content library: {source}")]
+    UserContentLibraryDecode {
+        /// TOML decoding failure.
+        #[source]
+        source: toml::de::Error,
+    },
+    /// The user-content library could not be encoded for persistence.
+    #[error("failed to encode user-content library: {source}")]
+    UserContentLibraryEncode {
+        /// TOML encoding failure.
+        #[source]
+        source: toml::ser::Error,
+    },
+    /// A content-handler request could not be serialized.
+    #[error("failed to encode RTW content-handler request for `{content}`: {source}")]
+    ContentHandlerRequestEncode {
+        /// Exact versioned RTW content type.
+        content: String,
+        /// JSON encoding failure.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// The selected content-handler service could not complete validation.
+    #[error("RTW content handler for `{content}` is unavailable: {source}")]
+    ContentHandlerCall {
+        /// Exact versioned RTW content type.
+        content: String,
+        /// Generic service transport failure.
+        #[source]
+        source: rintawa_sdk::services::ServiceCallError,
+    },
+    /// A content handler returned malformed protocol bytes.
+    #[error("RTW content handler for `{content}` returned an invalid response: {source}")]
+    ContentHandlerResponseDecode {
+        /// Exact versioned RTW content type.
+        content: String,
+        /// JSON decoding failure.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// A content handler rejected an immutable RTW descriptor.
+    #[error("RTW content `{content}` was rejected by its handler: {diagnostic}")]
+    UserContentRejected {
+        /// Exact versioned RTW content type.
+        content: String,
+        /// Bounded handler diagnostic.
+        diagnostic: String,
+    },
+    /// A content handler returned a rejection diagnostic above the protocol bound.
+    #[error("RTW content handler diagnostic for `{content}` exceeds {maximum_bytes} bytes")]
+    ContentHandlerDiagnosticTooLarge {
+        /// Exact versioned RTW content type.
+        content: String,
+        /// Maximum accepted UTF-8 byte length.
+        maximum_bytes: usize,
+    },
 }
 
 /// Result type used by local host composition operations.
@@ -541,7 +628,9 @@ pub struct WorldSummary {
 pub struct HostHome {
     root: PathBuf,
     store: ArtifactStore,
+    asset_store: AssetStore,
     profile_path: PathBuf,
+    user_content_path: PathBuf,
     worlds_directory: PathBuf,
 }
 
@@ -552,13 +641,19 @@ impl HostHome {
         std::fs::create_dir_all(&root)?;
         let root = root.canonicalize()?;
         let store = ArtifactStore::open(root.join("artifacts"), RtwLimits::default())?;
+        let asset_store = AssetStore::open(root.join("assets"), MAX_ASSET_BYTES)?;
         let profile_path = root.join("profiles").join(BASELINE_PROFILE_FILE);
+        let content_directory = root.join("content");
+        ensure_real_directory(&content_directory)?;
+        let user_content_path = content_directory.join("library.toml");
         let worlds_directory = root.join("worlds");
         ensure_real_directory(&worlds_directory)?;
         Ok(Self {
             root,
             store,
+            asset_store,
             profile_path,
+            user_content_path,
             worlds_directory,
         })
     }
@@ -571,6 +666,11 @@ impl HostHome {
     /// Returns the immutable artifact store.
     pub fn artifact_store(&self) -> &ArtifactStore {
         &self.store
+    }
+
+    /// Returns the immutable raw asset store used by [`rintawa_artifacts::AssetRef`].
+    pub fn asset_store(&self) -> &AssetStore {
+        &self.asset_store
     }
 
     /// Creates one empty persistent authoritative world.
