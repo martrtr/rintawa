@@ -5,6 +5,7 @@
 //! repositories, dependency resolution, updates, or runtime activation.
 
 mod archive;
+mod asset;
 mod digest;
 mod error;
 mod manifest;
@@ -13,6 +14,9 @@ mod path;
 mod store;
 
 pub use archive::{ArtifactEntry, RtwArchive, RtwLimits};
+pub use asset::{
+    AssetDigest, AssetError, AssetImport, AssetMediaType, AssetRef, AssetResult, AssetStore,
+};
 pub use digest::ArtifactDigest;
 pub use error::{RtwError, RtwResult};
 pub use manifest::{ContentType, RTW_FORMAT_VERSION, RTW_MANIFEST_PATH, RtwManifest};
