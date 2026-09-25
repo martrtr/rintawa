@@ -26,20 +26,36 @@ fi
 
 test_repository="${temporary_directory}/repository"
 mkdir -p "${test_repository}"
-git -C "${test_repository}" init -q
+
+# Git hooks inherit repository-local environment variables such as GIT_DIR and
+# GIT_INDEX_FILE. Clear every local variable before operating on the nested
+# self-test repository so the fixture cannot mutate the caller's index or HEAD.
+mapfile -t git_local_env_vars < <(git rev-parse --local-env-vars)
+with_clean_git_environment() (
+    local variable
+    for variable in "${git_local_env_vars[@]}"; do
+        unset "${variable}"
+    done
+    "$@"
+)
+git_in_test_repository() {
+    with_clean_git_environment git -C "${test_repository}" "$@"
+}
+
+git_in_test_repository init -q
 printf '%s\n' 'ordinary committed configuration' > "${test_repository}/config.txt"
-git -C "${test_repository}" add config.txt
-git -C "${test_repository}" \
+git_in_test_repository add config.txt
+git_in_test_repository \
     -c user.name='Rintawa Security Test' \
     -c user.email='security-test@example.invalid' \
     commit -qm 'baseline'
 
 printf 'api_key = "%s"\n' "${synthetic_secret}" \
     > "${test_repository}/provider.env"
-git -C "${test_repository}" add provider.env
+git_in_test_repository add provider.env
 
 set +e
-bash scripts/gitleaks.sh git \
+with_clean_git_environment bash scripts/gitleaks.sh git \
     --no-banner \
     --no-color \
     --redact=100 \
