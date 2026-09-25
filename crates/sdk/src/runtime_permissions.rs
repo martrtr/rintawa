@@ -29,6 +29,8 @@ pub enum RuntimePermission {
     WorldSessionRead,
     /// Allows creating worlds and requesting active/inactive world lifecycle transitions.
     WorldSessionWrite,
+    /// Allows submitting bounded authoritative commands as the host-authenticated principal.
+    WorldCommandSubmit,
     /// Allows reading the selected host composition without mutating it.
     CompositionRead,
     /// Allows changing exact artifact selections and enabled state in host composition.
@@ -51,6 +53,7 @@ impl fmt::Display for RuntimePermission {
             Self::UserContentRead => formatter.write_str("user-content-read"),
             Self::WorldSessionRead => formatter.write_str("world-session-read"),
             Self::WorldSessionWrite => formatter.write_str("world-session-write"),
+            Self::WorldCommandSubmit => formatter.write_str("world-command-submit"),
             Self::CompositionRead => formatter.write_str("composition-read"),
             Self::CompositionWrite => formatter.write_str("composition-write"),
             Self::RuntimePolicyRead => formatter.write_str("runtime-policy-read"),
@@ -85,6 +88,7 @@ impl FromStr for RuntimePermission {
             "user-content-read" => Ok(Self::UserContentRead),
             "world-session-read" => Ok(Self::WorldSessionRead),
             "world-session-write" => Ok(Self::WorldSessionWrite),
+            "world-command-submit" => Ok(Self::WorldCommandSubmit),
             "composition-read" => Ok(Self::CompositionRead),
             "composition-write" => Ok(Self::CompositionWrite),
             "runtime-policy-read" => Ok(Self::RuntimePolicyRead),
@@ -128,5 +132,17 @@ mod tests {
             let text = permission.to_string();
             assert_eq!(text.parse::<RuntimePermission>(), Ok(permission));
         }
+    }
+
+    #[test]
+    fn test_should_round_trip_world_command_submit_permission() {
+        assert_eq!(
+            RuntimePermission::WorldCommandSubmit.to_string(),
+            "world-command-submit"
+        );
+        assert_eq!(
+            "world-command-submit".parse::<RuntimePermission>(),
+            Ok(RuntimePermission::WorldCommandSubmit)
+        );
     }
 }

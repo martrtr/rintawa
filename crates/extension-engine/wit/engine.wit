@@ -362,6 +362,53 @@ interface world-sessions {
     set-active: func(world-id: string, active: bool) -> result<_, error>;
 }
 
+/// Deferred submission of commands to authoritative worlds.
+interface world-commands {
+    /// Role on whose behalf the host-authenticated principal requests the command.
+    variant actor {
+        /// The authenticated principal acts directly.
+        principal,
+        /// The authenticated principal acts through one world entity.
+        entity(string),
+    }
+
+    /// One bounded command request. Principal, CommandId, and correlation are host-owned.
+    record request {
+        world-id: string,
+        schema: string,
+        actor: actor,
+        expected-position: option<u64>,
+        payload-json: list<u8>,
+    }
+
+    /// Stable identities allocated before the deferred request enters the host queue.
+    record accepted {
+        command-id: string,
+        correlation-id: string,
+    }
+
+    /// Failure while validating or accepting a deferred world command.
+    variant error {
+        access-not-active,
+        permission-denied,
+        invalid-world-id,
+        invalid-schema,
+        invalid-actor,
+        invalid-payload,
+        not-found,
+        world-not-active,
+        queue-full,
+        limit-exceeded,
+        message-too-large,
+        rejected,
+        unavailable,
+    }
+
+    /// Queues one command for authoritative execution after the current guest callback unwinds.
+    /// Requires `world-command-submit`. The guest never supplies an authenticated PrincipalId.
+    submit: func(request: request) -> result<accepted, error>;
+}
+
 /// Owner-scoped non-authoritative persistent preferences.
 interface preferences {
     /// Failure while accessing one bounded preference value.
@@ -792,6 +839,7 @@ world plugin {
     import asset-store;
     import user-content;
     import world-sessions;
+    import world-commands;
     import preferences;
     import composition;
     import scoped-composition;
@@ -829,6 +877,7 @@ world task-runtime-plugin {
     import asset-store;
     import user-content;
     import world-sessions;
+    import world-commands;
     import preferences;
     import composition;
     import scoped-composition;
@@ -856,6 +905,7 @@ world runtime-provider-plugin {
     import asset-store;
     import user-content;
     import world-sessions;
+    import world-commands;
     import preferences;
     import composition;
     import scoped-composition;
@@ -883,6 +933,7 @@ world runtime-provider-task-plugin {
     import asset-store;
     import user-content;
     import world-sessions;
+    import world-commands;
     import preferences;
     import composition;
     import scoped-composition;

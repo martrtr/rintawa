@@ -41,7 +41,8 @@ use crate::{
     execution_targets::{ExecutionTargetDependency, ExecutionTargetRegistry},
     host_access::{
         ArtifactStoreAccess, AssetStoreAccess, CompositionAccess, HostAccessServices,
-        PreferenceAccess, RuntimePolicyAccess, UserContentAccess, WorldSessionAccess,
+        PreferenceAccess, RuntimePolicyAccess, UserContentAccess, WorldCommandAccess,
+        WorldSessionAccess,
     },
     runtime::WasmRuntimeEngine,
     runtime_effects::RuntimeEffectRegistry,
@@ -314,6 +315,14 @@ impl ExtensionEngine {
     /// unavailable capability. Guest access is still permission-gated per component.
     pub fn attach_user_content_access(&mut self, access: Arc<dyn UserContentAccess>) {
         self.host_access = self.host_access.clone().with_user_content_access(access);
+    }
+
+    /// Attaches generic authenticated world-command submission.
+    ///
+    /// Embedded hosts that do not call this method remain fail-closed. Guest access
+    /// is still permission-gated per exact component principal.
+    pub fn attach_world_command_access(&mut self, access: Arc<dyn WorldCommandAccess>) {
+        self.host_access = self.host_access.clone().with_world_command_access(access);
     }
 
     /// Creates an engine using a host-configured secret manager.

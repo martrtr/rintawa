@@ -7,16 +7,18 @@ use rintawa_sdk::{
 use crate::{
     host_access::{
         CompositionActivation, HostAccessError, RuntimePolicyComponent, UserContentDocument,
-        UserContentSummary, WorldSessionSummary,
+        UserContentSummary, WorldCommandAccessError, WorldCommandActor as HostWorldCommandActor,
+        WorldCommandRequest, WorldSessionSummary,
     },
     runtime::wasm::{
         ArtifactStoreError, ArtifactStoreHost, AssetStoreError, AssetStoreHost, CompositionError,
         CompositionHost, PreferenceError, PreferencesHost, RuntimePermissionCheck,
         RuntimePolicyError, RuntimePolicyHost, ScopedCompositionHost, ScopedRuntimePolicyHost,
-        UserContentError, UserContentHost, WasmHostState, WitAssetRef, WitCompositionActivation,
-        WitImportedArtifact, WitRuntimeArtifactPolicy, WitRuntimePolicyComponent,
-        WitRuntimePolicyRequest, WitUserContentDocument, WitUserContentEntry, WitWorldSummary,
-        WorldSessionError, WorldSessionsHost,
+        UserContentError, UserContentHost, WasmHostState, WitAcceptedWorldCommand, WitAssetRef,
+        WitCompositionActivation, WitImportedArtifact, WitRuntimeArtifactPolicy,
+        WitRuntimePolicyComponent, WitRuntimePolicyRequest, WitUserContentDocument,
+        WitUserContentEntry, WitWorldCommandActor, WitWorldCommandRequest, WitWorldSummary,
+        WorldCommandError, WorldCommandsHost, WorldSessionError, WorldSessionsHost,
     },
 };
 
@@ -145,6 +147,49 @@ impl WorldSessionsHost for WasmHostState {
             .world_sessions
             .set_active(&world_id, active)
             .map_err(map_world_session_access_error)
+    }
+}
+
+impl WorldCommandsHost for WasmHostState {
+    fn submit(
+        &mut self,
+        request: WitWorldCommandRequest,
+    ) -> Result<WitAcceptedWorldCommand, WorldCommandError> {
+        self.require_world_command_submit()?;
+        self.consume_world_command_submission_budget()?;
+        let actor_bytes = match &request.actor {
+            WitWorldCommandActor::Principal => 0,
+            WitWorldCommandActor::Entity(entity_id) => entity_id.len(),
+        };
+        let message_bytes = request
+            .world_id
+            .len()
+            .saturating_add(request.schema.len())
+            .saturating_add(actor_bytes)
+            .saturating_add(request.payload_json.len());
+        if message_bytes > self.max_host_message_bytes {
+            return Err(WorldCommandError::MessageTooLarge);
+        }
+
+        let actor = match request.actor {
+            WitWorldCommandActor::Principal => HostWorldCommandActor::Principal,
+            WitWorldCommandActor::Entity(entity_id) => HostWorldCommandActor::Entity(entity_id),
+        };
+        let accepted = self
+            .host_access
+            .world_commands
+            .submit_world_command(WorldCommandRequest {
+                world_id: request.world_id,
+                schema: request.schema,
+                actor,
+                expected_position: request.expected_position,
+                payload_json: request.payload_json,
+            })
+            .map_err(map_world_command_access_error)?;
+        Ok(WitAcceptedWorldCommand {
+            command_id: accepted.command_id,
+            correlation_id: accepted.correlation_id,
+        })
     }
 }
 
@@ -577,6 +622,30 @@ impl WasmHostState {
         })
     }
 
+    fn require_world_command_submit(&self) -> Result<(), WorldCommandError> {
+        if !self.host_access_active {
+            return Err(WorldCommandError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::WorldCommandSubmit)
+            .map(|_| ())
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => WorldCommandError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => WorldCommandError::Unavailable,
+            })
+    }
+
+    fn consume_world_command_submission_budget(&mut self) -> Result<(), WorldCommandError> {
+        if self.world_command_submissions_this_execution
+            >= self.max_world_command_submissions_per_execution
+        {
+            return Err(WorldCommandError::LimitExceeded);
+        }
+        self.world_command_submissions_this_execution = self
+            .world_command_submissions_this_execution
+            .saturating_add(1);
+        Ok(())
+    }
+
     fn require_world_session_permission(
         &self,
         permission: RuntimePermission,
@@ -715,6 +784,20 @@ fn to_wit_user_content_entry(entry: UserContentSummary) -> WitUserContentEntry {
         id: entry.id,
         content: entry.content,
         revision: entry.revision,
+    }
+}
+
+fn map_world_command_access_error(error: WorldCommandAccessError) -> WorldCommandError {
+    match error {
+        WorldCommandAccessError::InvalidWorldId => WorldCommandError::InvalidWorldId,
+        WorldCommandAccessError::InvalidSchema => WorldCommandError::InvalidSchema,
+        WorldCommandAccessError::InvalidActor => WorldCommandError::InvalidActor,
+        WorldCommandAccessError::InvalidPayload => WorldCommandError::InvalidPayload,
+        WorldCommandAccessError::NotFound => WorldCommandError::NotFound,
+        WorldCommandAccessError::WorldNotActive => WorldCommandError::WorldNotActive,
+        WorldCommandAccessError::QueueFull => WorldCommandError::QueueFull,
+        WorldCommandAccessError::Rejected => WorldCommandError::Rejected,
+        WorldCommandAccessError::Unavailable => WorldCommandError::Unavailable,
     }
 }
 

@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs, rustdoc::broken_intra_doc_links)]
 
+mod identity;
 mod profile;
 mod runtime;
 mod runtime_signal;
@@ -29,13 +30,14 @@ use rintawa_sdk::{
     contracts::{ComponentRef, ContractKey},
     runtime_permissions::RuntimePermission,
     types::{ComponentId, ExtensionInstanceId, RuntimeScopeId},
-    world::{SchemaKey, WorldId},
+    world::{PrincipalId, SchemaKey, WorldId},
 };
 use rintawa_storage::SqliteWorldStorage;
 use rintawa_world::WorldSessionState;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub use identity::HOST_IDENTITY_SCHEMA;
 pub use profile::{
     ActivationRecord, BaselineProfile, CompositionProfile, PROFILE_SCHEMA,
     PreferredProviderSelection, RuntimePermissionGrant,
@@ -63,6 +65,7 @@ pub fn world_runtime_scope_id(world_id: WorldId) -> RuntimeScopeId {
 /// File name of the current baseline host profile.
 pub const BASELINE_PROFILE_FILE: &str = "baseline.toml";
 const EXTENSION_CONTENT_V1: &str = "rintawa.extension@1";
+const HOST_IDENTITY_FILE: &str = "identity.toml";
 const WORLD_DATABASE_FILE: &str = "world.sqlite";
 const WORLD_COMPOSITION_FILE: &str = "composition.toml";
 const WORLD_ID_CREATION_ATTEMPTS: usize = 8;
@@ -338,6 +341,9 @@ pub enum HostError {
     /// Shared deferred world-session lifecycle control state became unavailable.
     #[error("world-session lifecycle control is unavailable")]
     WorldSessionControlUnavailable,
+    /// Shared deferred world-command control state became unavailable.
+    #[error("world-command deferred control is unavailable")]
+    WorldCommandControlUnavailable,
     /// An active world's bounded ephemeral signal queue has no remaining capacity.
     #[error("runtime signal queue for world `{0}` is full")]
     RuntimeSignalQueueFull(WorldId),
@@ -356,6 +362,23 @@ pub enum HostError {
         #[source]
         source: serde_json::Error,
     },
+    /// Host identity metadata path is not a safe regular file.
+    #[error("invalid host identity file `{path}`: {reason}")]
+    InvalidHostIdentityFile {
+        /// Rejected host identity path.
+        path: PathBuf,
+        /// Identity storage invariant that was violated.
+        reason: &'static str,
+    },
+    /// Persisted host identity metadata could not be decoded.
+    #[error("invalid host identity metadata: {0}")]
+    HostIdentityDecode(toml::de::Error),
+    /// Host identity metadata could not be encoded.
+    #[error("failed to encode host identity metadata: {0}")]
+    HostIdentityEncode(toml::ser::Error),
+    /// Persisted host identity schema is newer than this host understands.
+    #[error("unsupported host identity schema {0}")]
+    UnsupportedHostIdentitySchema(u32),
     /// Persisted host state could not be decoded.
     #[error("invalid host profile: {0}")]
     ProfileDecode(#[from] toml::de::Error),
@@ -632,6 +655,7 @@ pub struct HostHome {
     root: PathBuf,
     store: ArtifactStore,
     asset_store: AssetStore,
+    local_principal: PrincipalId,
     profile_path: PathBuf,
     user_content_path: PathBuf,
     worlds_directory: PathBuf,
@@ -645,6 +669,8 @@ impl HostHome {
         let root = root.canonicalize()?;
         let store = ArtifactStore::open(root.join("artifacts"), RtwLimits::default())?;
         let asset_store = AssetStore::open(root.join("assets"), MAX_ASSET_BYTES)?;
+        let local_principal =
+            identity::load_or_create_local_principal(&root.join(HOST_IDENTITY_FILE))?;
         let profile_path = root.join("profiles").join(BASELINE_PROFILE_FILE);
         let content_directory = root.join("content");
         ensure_real_directory(&content_directory)?;
@@ -655,6 +681,7 @@ impl HostHome {
             root,
             store,
             asset_store,
+            local_principal,
             profile_path,
             user_content_path,
             worlds_directory,
@@ -664,6 +691,11 @@ impl HostHome {
     /// Returns the canonical local Rintawa home path.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Returns the stable authenticated Principal of this local single-user host.
+    pub const fn local_principal(&self) -> PrincipalId {
+        self.local_principal
     }
 
     /// Returns the immutable artifact store.

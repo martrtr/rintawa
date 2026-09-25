@@ -154,6 +154,77 @@ pub trait WorldSessionAccess: Send + Sync {
     fn set_active(&self, world_id: &str, active: bool) -> HostAccessResult<()>;
 }
 
+/// Actor selected for one host-authenticated authoritative world command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorldCommandActor {
+    /// The host-authenticated outside principal acts directly.
+    Principal,
+    /// The authenticated principal acts through one world entity subject to ControlGrant policy.
+    Entity(String),
+}
+
+/// One bounded command request accepted from an ordinary extension component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorldCommandRequest {
+    /// Target authoritative world in canonical textual form.
+    pub world_id: String,
+    /// Exact versioned command schema.
+    pub schema: String,
+    /// Role on whose behalf the authenticated principal requests the command.
+    pub actor: WorldCommandActor,
+    /// Optional optimistic-concurrency world position.
+    pub expected_position: Option<u64>,
+    /// Extension-owned JSON command payload bytes.
+    pub payload_json: Vec<u8>,
+}
+
+/// Stable identities allocated by the host for one accepted deferred world command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedWorldCommand {
+    /// Host-generated idempotency identity of the command.
+    pub command_id: String,
+    /// Host-generated correlation identity of the new operation chain.
+    pub correlation_id: String,
+}
+
+/// Failure returned by generic authoritative world-command submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorldCommandAccessError {
+    /// Target WorldId is malformed.
+    InvalidWorldId,
+    /// Versioned command schema is malformed.
+    InvalidSchema,
+    /// Entity actor identity is malformed.
+    InvalidActor,
+    /// Command payload is not valid JSON.
+    InvalidPayload,
+    /// Target persistent world does not exist.
+    NotFound,
+    /// Target world is neither active nor accepted for deferred activation.
+    WorldNotActive,
+    /// Host-owned deferred command queue has no remaining capacity.
+    QueueFull,
+    /// Host policy or persistent state rejected the request.
+    Rejected,
+    /// Command submission is unavailable in the current host.
+    Unavailable,
+}
+
+/// Result used by generic authoritative world-command submission.
+pub type WorldCommandAccessResult<T> = Result<T, WorldCommandAccessError>;
+
+/// Generic deferred submission boundary for authoritative world commands.
+///
+/// The guest never supplies a PrincipalId. Implementations bind the command to the
+/// already authenticated host principal before it reaches authoritative validation.
+pub trait WorldCommandAccess: Send + Sync {
+    /// Validates and queues one command for execution after the current guest callback unwinds.
+    fn submit_world_command(
+        &self,
+        request: WorldCommandRequest,
+    ) -> WorldCommandAccessResult<AcceptedWorldCommand>;
+}
+
 /// Owner-scoped non-authoritative preference storage for ordinary extensions.
 ///
 /// Values are isolated by runtime scope + exact component principal. This is not world
@@ -373,6 +444,17 @@ impl WorldSessionAccess for UnavailableWorldSessionAccess {
 }
 
 #[derive(Default)]
+struct UnavailableWorldCommandAccess;
+
+impl WorldCommandAccess for UnavailableWorldCommandAccess {
+    fn submit_world_command(
+        &self,
+        _request: WorldCommandRequest,
+    ) -> WorldCommandAccessResult<AcceptedWorldCommand> {
+        Err(WorldCommandAccessError::Unavailable)
+    }
+}
+
 struct UnavailablePreferenceAccess;
 
 impl PreferenceAccess for UnavailablePreferenceAccess {
@@ -476,6 +558,7 @@ pub(crate) struct HostAccessServices {
     pub(crate) asset_store: Arc<dyn AssetStoreAccess>,
     pub(crate) user_content: Arc<dyn UserContentAccess>,
     pub(crate) world_sessions: Arc<dyn WorldSessionAccess>,
+    pub(crate) world_commands: Arc<dyn WorldCommandAccess>,
     pub(crate) composition: Arc<dyn CompositionAccess>,
     pub(crate) preferences: Arc<dyn PreferenceAccess>,
     pub(crate) runtime_policy: Arc<dyn RuntimePolicyAccess>,
@@ -495,6 +578,7 @@ impl HostAccessServices {
             asset_store,
             user_content: Arc::new(UnavailableUserContentAccess),
             world_sessions,
+            world_commands: Arc::new(UnavailableWorldCommandAccess),
             composition,
             preferences,
             runtime_policy,
@@ -509,12 +593,21 @@ impl HostAccessServices {
         self
     }
 
+    pub(crate) fn with_world_command_access(
+        mut self,
+        world_commands: Arc<dyn WorldCommandAccess>,
+    ) -> Self {
+        self.world_commands = world_commands;
+        self
+    }
+
     pub(crate) fn unavailable() -> Self {
         Self {
             artifact_store: Arc::new(UnavailableArtifactStoreAccess),
             asset_store: Arc::new(UnavailableAssetStoreAccess),
             user_content: Arc::new(UnavailableUserContentAccess),
             world_sessions: Arc::new(UnavailableWorldSessionAccess),
+            world_commands: Arc::new(UnavailableWorldCommandAccess),
             composition: Arc::new(UnavailableCompositionAccess),
             preferences: Arc::new(UnavailablePreferenceAccess),
             runtime_policy: Arc::new(UnavailableRuntimePolicyAccess),

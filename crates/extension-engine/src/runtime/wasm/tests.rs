@@ -3,10 +3,11 @@
 use super::*;
 use crate::{
     host_access::{
-        ArtifactStoreAccess, AssetStoreAccess, CompositionAccess, CompositionActivation,
-        HostAccessError, HostAccessResult, ImportedArtifact, ImportedAsset, PreferenceAccess,
-        RuntimeArtifactPolicy, RuntimePolicyAccess, RuntimePolicyComponent, UserContentAccess,
-        UserContentDocument, UserContentSummary, WorldSessionAccess, WorldSessionSummary,
+        AcceptedWorldCommand, ArtifactStoreAccess, AssetStoreAccess, CompositionAccess,
+        CompositionActivation, HostAccessError, HostAccessResult, ImportedArtifact, ImportedAsset,
+        PreferenceAccess, RuntimeArtifactPolicy, RuntimePolicyAccess, RuntimePolicyComponent,
+        UserContentAccess, UserContentDocument, UserContentSummary, WorldCommandAccess,
+        WorldCommandAccessResult, WorldCommandRequest, WorldSessionAccess, WorldSessionSummary,
     },
     secrets::InMemorySecretVault,
 };
@@ -43,6 +44,7 @@ struct RecordingScopedHostAccess {
     world_default_writes: Mutex<Vec<(String, bool)>>,
     runtime_policy_reads: Mutex<Vec<String>>,
     world_session_writes: Mutex<Vec<(String, bool)>>,
+    world_command_writes: Mutex<Vec<WorldCommandRequest>>,
 }
 
 impl ArtifactStoreAccess for RecordingScopedHostAccess {
@@ -124,6 +126,22 @@ impl WorldSessionAccess for RecordingScopedHostAccess {
             .expect("test world-session lock must stay healthy")
             .push((world_id.to_string(), active));
         Ok(())
+    }
+}
+
+impl WorldCommandAccess for RecordingScopedHostAccess {
+    fn submit_world_command(
+        &self,
+        request: WorldCommandRequest,
+    ) -> WorldCommandAccessResult<AcceptedWorldCommand> {
+        self.world_command_writes
+            .lock()
+            .expect("test world-command lock must stay healthy")
+            .push(request);
+        Ok(AcceptedWorldCommand {
+            command_id: String::from("018f0000-0000-7000-8000-000000000020"),
+            correlation_id: String::from("018f0000-0000-7000-8000-000000000021"),
+        })
     }
 }
 
@@ -1140,6 +1158,79 @@ fn test_should_gate_world_session_catalog_and_lifecycle_requests() {
             .as_slice(),
         &[(created.world_id, true)]
     );
+}
+
+#[test]
+fn test_should_gate_bound_and_budget_world_command_submission() {
+    let access = Arc::new(RecordingScopedHostAccess::default());
+    let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
+    let mut services = WasmHostServices::standalone(secrets);
+    services.host_access = HostAccessServices::new(
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+    )
+    .with_world_command_access(access.clone());
+    let budget = WasmExecutionBudget {
+        max_host_message_bytes: 128,
+        max_world_command_submissions_per_execution: 2,
+        ..WasmExecutionBudget::default()
+    };
+    let mut state = WasmHostState::with_host_services_and_budget(
+        ComponentId::new("runtime"),
+        services,
+        false,
+        &budget,
+    );
+    begin_test_registration(&mut state, ExtensionId::new("world.commander"));
+    state.finish_registration().unwrap();
+
+    let request = || WitWorldCommandRequest {
+        world_id: String::from("018f0000-0000-7000-8000-000000000001"),
+        schema: String::from("example.command@1"),
+        actor: WitWorldCommandActor::Principal,
+        expected_position: Some(7),
+        payload_json: br#"{"value":1}"#.to_vec(),
+    };
+    assert!(matches!(
+        WorldCommandsHost::submit(&mut state, request()),
+        Err(WorldCommandError::AccessNotActive)
+    ));
+
+    state.begin_guest_execution();
+    assert!(matches!(
+        WorldCommandsHost::submit(&mut state, request()),
+        Err(WorldCommandError::PermissionDenied)
+    ));
+    let owner = state.registered_owner().unwrap();
+    state
+        .runtime_permissions
+        .grant(owner, RuntimePermission::WorldCommandSubmit)
+        .unwrap();
+
+    let mut oversized = request();
+    oversized.payload_json = vec![b'x'; 129];
+    assert!(matches!(
+        WorldCommandsHost::submit(&mut state, oversized),
+        Err(WorldCommandError::MessageTooLarge)
+    ));
+    let accepted = WorldCommandsHost::submit(&mut state, request()).unwrap();
+    assert_eq!(accepted.command_id, "018f0000-0000-7000-8000-000000000020");
+    assert!(matches!(
+        WorldCommandsHost::submit(&mut state, request()),
+        Err(WorldCommandError::LimitExceeded)
+    ));
+
+    let writes = access
+        .world_command_writes
+        .lock()
+        .expect("test world-command lock must stay healthy");
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].expected_position, Some(7));
+    assert_eq!(writes[0].payload_json, br#"{"value":1}"#);
 }
 
 #[test]
