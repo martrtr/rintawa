@@ -104,6 +104,7 @@ use bindings::rintawa::engine::{
         Error as ArtifactStoreError, Host as ArtifactStoreHost,
         ImportedArtifact as WitImportedArtifact,
     },
+    asset_store::{AssetRef as WitAssetRef, Error as AssetStoreError, Host as AssetStoreHost},
     composition::{
         Activation as WitCompositionActivation, Error as CompositionError, Host as CompositionHost,
     },
@@ -140,6 +141,9 @@ use bindings::rintawa::engine::{
     ui_layer::{Error as UiLayerError, Host as UiLayerHost},
     world_registration::{
         Error as WorldRegistrationError, Host as WorldRegistrationHost, SchemaKind as WitSchemaKind,
+    },
+    world_sessions::{
+        Error as WorldSessionError, Host as WorldSessionsHost, Summary as WitWorldSummary,
     },
 };
 use target_provider_bindings::TargetProviderPlugin;
@@ -185,6 +189,9 @@ pub struct WasmHostState {
     max_host_message_bytes: usize,
     max_artifact_read_bytes: usize,
     max_artifact_import_bytes: usize,
+    max_asset_import_bytes: usize,
+    max_world_session_mutations_per_execution: usize,
+    world_session_mutations_this_execution: usize,
     execution_target_registration_active: bool,
     pending_execution_targets: Vec<String>,
     resource_limits: StoreLimits,
@@ -346,6 +353,10 @@ impl WasmHostState {
             max_host_message_bytes: budget.max_host_message_bytes,
             max_artifact_read_bytes: budget.max_artifact_read_bytes,
             max_artifact_import_bytes: budget.max_artifact_import_bytes,
+            max_asset_import_bytes: budget.max_asset_import_bytes,
+            max_world_session_mutations_per_execution: budget
+                .max_world_session_mutations_per_execution,
+            world_session_mutations_this_execution: 0,
             execution_target_registration_active: false,
             pending_execution_targets: Vec::new(),
             resource_limits: budget.store_limits(),
@@ -494,6 +505,7 @@ impl WasmHostState {
         self.task_access_active = false;
         self.network_access_active = false;
         self.host_access_active = false;
+        self.world_session_mutations_this_execution = 0;
         self.pending_effects.clear();
         self.pending_revocations.clear();
         self.secret_access_active = false;
@@ -716,6 +728,7 @@ impl WasmHostState {
         self.task_access_active = true;
         self.network_access_active = true;
         self.host_access_active = true;
+        self.world_session_mutations_this_execution = 0;
         self.secret_access_active = true;
         self.service_access_active = true;
         self.ui_access_active = true;
@@ -728,6 +741,7 @@ impl WasmHostState {
         self.task_access_active = true;
         self.network_access_active = true;
         self.host_access_active = true;
+        self.world_session_mutations_this_execution = 0;
         self.secret_access_active = true;
         self.service_access_active = true;
         self.ui_access_active = true;
@@ -743,6 +757,7 @@ impl WasmHostState {
         self.task_access_active = true;
         self.network_access_active = true;
         self.host_access_active = true;
+        self.world_session_mutations_this_execution = 0;
         self.secret_access_active = true;
         self.service_access_active = true;
         self.ui_access_active = true;

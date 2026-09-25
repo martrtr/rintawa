@@ -21,6 +21,12 @@ pub enum RuntimePermission {
     HttpFetch,
     /// Allows importing validated RTW bytes into the local immutable artifact store.
     ArtifactImport,
+    /// Allows importing bounded immutable raw assets into the local asset store.
+    AssetImport,
+    /// Allows reading the persistent world catalog and runtime lifecycle status.
+    WorldSessionRead,
+    /// Allows creating worlds and requesting active/inactive world lifecycle transitions.
+    WorldSessionWrite,
     /// Allows reading the selected host composition without mutating it.
     CompositionRead,
     /// Allows changing exact artifact selections and enabled state in host composition.
@@ -39,6 +45,9 @@ impl fmt::Display for RuntimePermission {
             Self::LoopbackConnect => formatter.write_str("loopback-connect"),
             Self::HttpFetch => formatter.write_str("http-fetch"),
             Self::ArtifactImport => formatter.write_str("artifact-import"),
+            Self::AssetImport => formatter.write_str("asset-import"),
+            Self::WorldSessionRead => formatter.write_str("world-session-read"),
+            Self::WorldSessionWrite => formatter.write_str("world-session-write"),
             Self::CompositionRead => formatter.write_str("composition-read"),
             Self::CompositionWrite => formatter.write_str("composition-write"),
             Self::RuntimePolicyRead => formatter.write_str("runtime-policy-read"),
@@ -69,11 +78,39 @@ impl FromStr for RuntimePermission {
             "loopback-connect" => Ok(Self::LoopbackConnect),
             "http-fetch" => Ok(Self::HttpFetch),
             "artifact-import" => Ok(Self::ArtifactImport),
+            "asset-import" => Ok(Self::AssetImport),
+            "world-session-read" => Ok(Self::WorldSessionRead),
+            "world-session-write" => Ok(Self::WorldSessionWrite),
             "composition-read" => Ok(Self::CompositionRead),
             "composition-write" => Ok(Self::CompositionWrite),
             "runtime-policy-read" => Ok(Self::RuntimePolicyRead),
             "runtime-policy-write" => Ok(Self::RuntimePolicyWrite),
             _ => Err(RuntimePermissionParseError(value.to_string())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_round_trip_asset_import_permission() {
+        assert_eq!(RuntimePermission::AssetImport.to_string(), "asset-import");
+        assert_eq!(
+            "asset-import".parse::<RuntimePermission>(),
+            Ok(RuntimePermission::AssetImport)
+        );
+    }
+
+    #[test]
+    fn test_should_round_trip_world_session_permissions() {
+        for permission in [
+            RuntimePermission::WorldSessionRead,
+            RuntimePermission::WorldSessionWrite,
+        ] {
+            let text = permission.to_string();
+            assert_eq!(text.parse::<RuntimePermission>(), Ok(permission));
         }
     }
 }

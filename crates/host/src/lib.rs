@@ -335,6 +335,9 @@ pub enum HostError {
     /// An ephemeral runtime signal used an empty or oversized routing topic.
     #[error("runtime signal topic must be non-empty and within host bounds")]
     InvalidRuntimeSignalTopic,
+    /// Shared deferred world-session lifecycle control state became unavailable.
+    #[error("world-session lifecycle control is unavailable")]
+    WorldSessionControlUnavailable,
     /// An active world's bounded ephemeral signal queue has no remaining capacity.
     #[error("runtime signal queue for world `{0}` is full")]
     RuntimeSignalQueueFull(WorldId),

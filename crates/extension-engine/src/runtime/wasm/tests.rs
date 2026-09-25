@@ -3,9 +3,10 @@
 use super::*;
 use crate::{
     host_access::{
-        ArtifactStoreAccess, CompositionAccess, CompositionActivation, HostAccessError,
-        HostAccessResult, ImportedArtifact, PreferenceAccess, RuntimeArtifactPolicy,
-        RuntimePolicyAccess, RuntimePolicyComponent,
+        ArtifactStoreAccess, AssetStoreAccess, CompositionAccess, CompositionActivation,
+        HostAccessError, HostAccessResult, ImportedArtifact, ImportedAsset, PreferenceAccess,
+        RuntimeArtifactPolicy, RuntimePolicyAccess, RuntimePolicyComponent, WorldSessionAccess,
+        WorldSessionSummary,
     },
     secrets::InMemorySecretVault,
 };
@@ -41,11 +42,54 @@ struct RecordingScopedHostAccess {
     composition_writes: Mutex<Vec<String>>,
     world_default_writes: Mutex<Vec<(String, bool)>>,
     runtime_policy_reads: Mutex<Vec<String>>,
+    world_session_writes: Mutex<Vec<(String, bool)>>,
 }
 
 impl ArtifactStoreAccess for RecordingScopedHostAccess {
     fn import_rtw(&self, _bytes: &[u8]) -> HostAccessResult<ImportedArtifact> {
         Err(HostAccessError::Rejected)
+    }
+}
+
+impl AssetStoreAccess for RecordingScopedHostAccess {
+    fn import_asset(&self, bytes: &[u8], media_type: &str) -> HostAccessResult<ImportedAsset> {
+        Ok(ImportedAsset {
+            digest: String::from(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            size: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            media_type: media_type.to_ascii_lowercase(),
+        })
+    }
+}
+
+impl WorldSessionAccess for RecordingScopedHostAccess {
+    fn list_worlds(&self) -> HostAccessResult<Vec<WorldSessionSummary>> {
+        Ok(vec![WorldSessionSummary {
+            world_id: String::from("018f0000-0000-7000-8000-000000000001"),
+            commit_position: 7,
+            active: true,
+            pending_active: None,
+            last_error: None,
+        }])
+    }
+
+    fn create_world(&self) -> HostAccessResult<WorldSessionSummary> {
+        Ok(WorldSessionSummary {
+            world_id: String::from("018f0000-0000-7000-8000-000000000002"),
+            commit_position: 0,
+            active: false,
+            pending_active: None,
+            last_error: None,
+        })
+    }
+
+    fn set_active(&self, world_id: &str, active: bool) -> HostAccessResult<()> {
+        self.world_session_writes
+            .lock()
+            .expect("test world-session lock must stay healthy")
+            .push((world_id.to_string(), active));
+        Ok(())
     }
 }
 
@@ -876,11 +920,141 @@ fn test_should_discard_pending_execution_targets_when_start_scope_aborts() {
 }
 
 #[test]
+fn test_should_gate_and_bound_generic_asset_import() {
+    let access = Arc::new(RecordingScopedHostAccess::default());
+    let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
+    let mut services = WasmHostServices::standalone(secrets);
+    services.host_access = HostAccessServices::new(
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access,
+    );
+    let budget = WasmExecutionBudget {
+        max_asset_import_bytes: 4,
+        ..WasmExecutionBudget::default()
+    };
+    let mut state = WasmHostState::with_host_services_and_budget(
+        ComponentId::new("runtime"),
+        services,
+        false,
+        &budget,
+    );
+    begin_test_registration(&mut state, ExtensionId::new("asset.importer"));
+    state.finish_registration().unwrap();
+
+    assert!(matches!(
+        AssetStoreHost::import_asset(&mut state, b"png".to_vec(), String::from("image/png")),
+        Err(AssetStoreError::AccessNotActive)
+    ));
+
+    state.begin_guest_execution();
+    assert!(matches!(
+        AssetStoreHost::import_asset(&mut state, b"png".to_vec(), String::from("image/png")),
+        Err(AssetStoreError::PermissionDenied)
+    ));
+    let owner = state.registered_owner().unwrap();
+    state
+        .runtime_permissions
+        .grant(owner, RuntimePermission::AssetImport)
+        .unwrap();
+    assert!(matches!(
+        AssetStoreHost::import_asset(&mut state, b"12345".to_vec(), String::from("image/png")),
+        Err(AssetStoreError::MessageTooLarge)
+    ));
+
+    let imported =
+        AssetStoreHost::import_asset(&mut state, b"png".to_vec(), String::from("Image/PNG"))
+            .unwrap();
+    assert_eq!(imported.size, 3);
+    assert_eq!(imported.media_type, "image/png");
+    assert!(imported.digest.starts_with("sha256:"));
+}
+
+#[test]
+fn test_should_gate_world_session_catalog_and_lifecycle_requests() {
+    let access = Arc::new(RecordingScopedHostAccess::default());
+    let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
+    let mut services = WasmHostServices::standalone(secrets);
+    services.host_access = HostAccessServices::new(
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+    );
+    let budget = WasmExecutionBudget {
+        max_world_session_mutations_per_execution: 2,
+        ..WasmExecutionBudget::default()
+    };
+    let mut state = WasmHostState::with_host_services_and_budget(
+        ComponentId::new("runtime"),
+        services,
+        false,
+        &budget,
+    );
+    begin_test_registration(&mut state, ExtensionId::new("world.manager"));
+    state.finish_registration().unwrap();
+
+    assert!(matches!(
+        WorldSessionsHost::list_worlds(&mut state),
+        Err(WorldSessionError::AccessNotActive)
+    ));
+    state.begin_guest_execution();
+    assert!(matches!(
+        WorldSessionsHost::list_worlds(&mut state),
+        Err(WorldSessionError::PermissionDenied)
+    ));
+
+    let owner = state.registered_owner().unwrap();
+    state
+        .runtime_permissions
+        .grant(owner.clone(), RuntimePermission::WorldSessionRead)
+        .unwrap();
+    let worlds = WorldSessionsHost::list_worlds(&mut state).unwrap();
+    assert_eq!(worlds.len(), 1);
+    assert_eq!(worlds[0].commit_position, 7);
+    assert!(worlds[0].active);
+
+    assert!(matches!(
+        WorldSessionsHost::create(&mut state),
+        Err(WorldSessionError::PermissionDenied)
+    ));
+    state
+        .runtime_permissions
+        .grant(owner, RuntimePermission::WorldSessionWrite)
+        .unwrap();
+    let created = WorldSessionsHost::create(&mut state).unwrap();
+    assert_eq!(created.commit_position, 0);
+    WorldSessionsHost::set_active(&mut state, created.world_id.clone(), true).unwrap();
+    assert!(matches!(
+        WorldSessionsHost::create(&mut state),
+        Err(WorldSessionError::LimitExceeded)
+    ));
+    state.discard_guest_execution();
+    state.begin_guest_execution();
+    assert!(WorldSessionsHost::create(&mut state).is_ok());
+    assert_eq!(
+        access
+            .world_session_writes
+            .lock()
+            .expect("test world-session lock must stay healthy")
+            .as_slice(),
+        &[(created.world_id, true)]
+    );
+}
+
+#[test]
 fn test_should_route_scoped_composition_and_runtime_policy_access() {
     let access = Arc::new(RecordingScopedHostAccess::default());
     let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
     let mut services = WasmHostServices::standalone(secrets);
     services.host_access = HostAccessServices::new(
+        access.clone(),
+        access.clone(),
         access.clone(),
         access.clone(),
         access.clone(),

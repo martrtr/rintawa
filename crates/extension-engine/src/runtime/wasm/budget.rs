@@ -36,6 +36,10 @@ pub struct WasmExecutionBudget {
     pub max_artifact_read_bytes: usize,
     /// Maximum RTW bytes accepted by one generic artifact import call.
     pub max_artifact_import_bytes: usize,
+    /// Maximum raw asset bytes accepted by one generic asset import call.
+    pub max_asset_import_bytes: usize,
+    /// Maximum world-session mutations accepted during one guest callback.
+    pub max_world_session_mutations_per_execution: usize,
     /// Maximum cooperative background tasks owned by one WASM component.
     pub max_background_tasks: usize,
     /// Smallest periodic task interval accepted from a guest.
@@ -68,6 +72,8 @@ impl Default for WasmExecutionBudget {
             max_host_message_bytes: 1024 * 1024,
             max_artifact_read_bytes: 8 * 1024 * 1024,
             max_artifact_import_bytes: 32 * 1024 * 1024,
+            max_asset_import_bytes: 16 * 1024 * 1024,
+            max_world_session_mutations_per_execution: 8,
             max_background_tasks: 8,
             min_background_task_interval_ms: 10,
             max_network_handles: 64,

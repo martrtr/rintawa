@@ -1,10 +1,36 @@
-//! Generic host-owned local artifact and composition access for sandboxed extensions.
+//! Generic host-owned local artifact, asset, and composition access for sandboxed extensions.
 //!
 //! These traits deliberately contain no repository, update, marketplace, package-manager,
 //! or network-source semantics. The production host can expose them to any explicitly
 //! authorized component principal.
 
 use std::sync::Arc;
+
+/// One immutable raw asset imported into the local asset store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedAsset {
+    /// Exact content-addressed SHA-256 digest.
+    pub digest: String,
+    /// Exact byte length of the stored asset.
+    pub size: u64,
+    /// Canonical media type attached to the immutable reference.
+    pub media_type: String,
+}
+
+/// One persistent world plus its host runtime lifecycle status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorldSessionSummary {
+    /// Stable persistent world identity in canonical textual form.
+    pub world_id: String,
+    /// Last committed authoritative world position.
+    pub commit_position: u64,
+    /// Whether the world currently owns a running authoritative runtime.
+    pub active: bool,
+    /// Requested active state awaiting the next host runtime pump, when any.
+    pub pending_active: Option<bool>,
+    /// Bounded diagnostic from the last failed lifecycle transition, when any.
+    pub last_error: Option<String>,
+}
 
 /// One validated RTW object imported into the immutable local artifact store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,13 +64,19 @@ pub struct CompositionActivation {
     pub world_default: bool,
 }
 
-/// Generic failure returned by host artifact/composition/preference access.
+/// Generic failure returned by host artifact/asset/composition/preference access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostAccessError {
     /// Input bytes are not a valid RTW artifact.
     InvalidArtifact,
+    /// Raw asset bytes or media metadata violate asset-store policy.
+    InvalidAsset,
     /// A digest string is malformed or does not identify a stored artifact.
     InvalidDigest,
+    /// A world identifier is malformed.
+    InvalidWorldId,
+    /// A bounded host-owned request queue has no remaining capacity.
+    QueueFull,
     /// The requested selection does not exist.
     NotFound,
     /// The host has no content handler for the selected RTW content type.
@@ -68,6 +100,24 @@ pub type HostAccessResult<T> = Result<T, HostAccessError>;
 pub trait ArtifactStoreAccess: Send + Sync {
     /// Validates and imports exact RTW bytes without selecting them for activation.
     fn import_rtw(&self, bytes: &[u8]) -> HostAccessResult<ImportedArtifact>;
+}
+
+/// Generic immutable raw-asset store operations.
+pub trait AssetStoreAccess: Send + Sync {
+    /// Imports exact bytes and returns their immutable digest/size/media reference.
+    fn import_asset(&self, bytes: &[u8], media_type: &str) -> HostAccessResult<ImportedAsset>;
+}
+
+/// Generic persistent-world catalog and lifecycle request operations.
+pub trait WorldSessionAccess: Send + Sync {
+    /// Lists persistent worlds together with current/pending runtime lifecycle state.
+    fn list_worlds(&self) -> HostAccessResult<Vec<WorldSessionSummary>>;
+
+    /// Creates one empty persistent authoritative world.
+    fn create_world(&self) -> HostAccessResult<WorldSessionSummary>;
+
+    /// Requests the desired active state to be applied after guest execution unwinds.
+    fn set_active(&self, world_id: &str, active: bool) -> HostAccessResult<()>;
 }
 
 /// Owner-scoped non-authoritative preference storage for ordinary extensions.
@@ -247,6 +297,32 @@ impl ArtifactStoreAccess for UnavailableArtifactStoreAccess {
 }
 
 #[derive(Default)]
+struct UnavailableAssetStoreAccess;
+
+impl AssetStoreAccess for UnavailableAssetStoreAccess {
+    fn import_asset(&self, _bytes: &[u8], _media_type: &str) -> HostAccessResult<ImportedAsset> {
+        Err(HostAccessError::Unavailable)
+    }
+}
+
+#[derive(Default)]
+struct UnavailableWorldSessionAccess;
+
+impl WorldSessionAccess for UnavailableWorldSessionAccess {
+    fn list_worlds(&self) -> HostAccessResult<Vec<WorldSessionSummary>> {
+        Err(HostAccessError::Unavailable)
+    }
+
+    fn create_world(&self) -> HostAccessResult<WorldSessionSummary> {
+        Err(HostAccessError::Unavailable)
+    }
+
+    fn set_active(&self, _world_id: &str, _active: bool) -> HostAccessResult<()> {
+        Err(HostAccessError::Unavailable)
+    }
+}
+
+#[derive(Default)]
 struct UnavailablePreferenceAccess;
 
 impl PreferenceAccess for UnavailablePreferenceAccess {
@@ -347,6 +423,8 @@ impl CompositionAccess for UnavailableCompositionAccess {
 #[derive(Clone)]
 pub(crate) struct HostAccessServices {
     pub(crate) artifact_store: Arc<dyn ArtifactStoreAccess>,
+    pub(crate) asset_store: Arc<dyn AssetStoreAccess>,
+    pub(crate) world_sessions: Arc<dyn WorldSessionAccess>,
     pub(crate) composition: Arc<dyn CompositionAccess>,
     pub(crate) preferences: Arc<dyn PreferenceAccess>,
     pub(crate) runtime_policy: Arc<dyn RuntimePolicyAccess>,
@@ -355,12 +433,16 @@ pub(crate) struct HostAccessServices {
 impl HostAccessServices {
     pub(crate) fn new(
         artifact_store: Arc<dyn ArtifactStoreAccess>,
+        asset_store: Arc<dyn AssetStoreAccess>,
+        world_sessions: Arc<dyn WorldSessionAccess>,
         composition: Arc<dyn CompositionAccess>,
         preferences: Arc<dyn PreferenceAccess>,
         runtime_policy: Arc<dyn RuntimePolicyAccess>,
     ) -> Self {
         Self {
             artifact_store,
+            asset_store,
+            world_sessions,
             composition,
             preferences,
             runtime_policy,
@@ -370,6 +452,8 @@ impl HostAccessServices {
     pub(crate) fn unavailable() -> Self {
         Self {
             artifact_store: Arc::new(UnavailableArtifactStoreAccess),
+            asset_store: Arc::new(UnavailableAssetStoreAccess),
+            world_sessions: Arc::new(UnavailableWorldSessionAccess),
             composition: Arc::new(UnavailableCompositionAccess),
             preferences: Arc::new(UnavailablePreferenceAccess),
             runtime_policy: Arc::new(UnavailableRuntimePolicyAccess),

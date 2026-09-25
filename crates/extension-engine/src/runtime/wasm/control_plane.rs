@@ -5,13 +5,16 @@ use rintawa_sdk::{
 };
 
 use crate::{
-    host_access::{CompositionActivation, HostAccessError, RuntimePolicyComponent},
+    host_access::{
+        CompositionActivation, HostAccessError, RuntimePolicyComponent, WorldSessionSummary,
+    },
     runtime::wasm::{
-        ArtifactStoreError, ArtifactStoreHost, CompositionError, CompositionHost, PreferenceError,
-        PreferencesHost, RuntimePermissionCheck, RuntimePolicyError, RuntimePolicyHost,
-        ScopedCompositionHost, ScopedRuntimePolicyHost, WasmHostState, WitCompositionActivation,
-        WitImportedArtifact, WitRuntimeArtifactPolicy, WitRuntimePolicyComponent,
-        WitRuntimePolicyRequest,
+        ArtifactStoreError, ArtifactStoreHost, AssetStoreError, AssetStoreHost, CompositionError,
+        CompositionHost, PreferenceError, PreferencesHost, RuntimePermissionCheck,
+        RuntimePolicyError, RuntimePolicyHost, ScopedCompositionHost, ScopedRuntimePolicyHost,
+        WasmHostState, WitAssetRef, WitCompositionActivation, WitImportedArtifact,
+        WitRuntimeArtifactPolicy, WitRuntimePolicyComponent, WitRuntimePolicyRequest,
+        WitWorldSummary, WorldSessionError, WorldSessionsHost,
     },
 };
 
@@ -38,6 +41,74 @@ impl ArtifactStoreHost for WasmHostState {
             digest: imported.digest,
             content: imported.content,
         })
+    }
+}
+
+impl AssetStoreHost for WasmHostState {
+    fn import_asset(
+        &mut self,
+        bytes: Vec<u8>,
+        media_type: String,
+    ) -> Result<WitAssetRef, AssetStoreError> {
+        if !self.host_access_active {
+            return Err(AssetStoreError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::AssetImport)
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => AssetStoreError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => AssetStoreError::Unavailable,
+            })?;
+        if bytes.len() > self.max_asset_import_bytes
+            || media_type.len() > self.max_host_message_bytes
+        {
+            return Err(AssetStoreError::MessageTooLarge);
+        }
+
+        let imported = self
+            .host_access
+            .asset_store
+            .import_asset(&bytes, &media_type)
+            .map_err(map_asset_store_access_error)?;
+        Ok(WitAssetRef {
+            digest: imported.digest,
+            size: imported.size,
+            media_type: imported.media_type,
+        })
+    }
+}
+
+impl WorldSessionsHost for WasmHostState {
+    fn list_worlds(&mut self) -> Result<Vec<WitWorldSummary>, WorldSessionError> {
+        self.require_world_session_permission(RuntimePermission::WorldSessionRead)?;
+        let worlds = self
+            .host_access
+            .world_sessions
+            .list_worlds()
+            .map_err(map_world_session_access_error)?;
+        self.bound_world_session_summaries(worlds)
+    }
+
+    fn create(&mut self) -> Result<WitWorldSummary, WorldSessionError> {
+        self.require_world_session_permission(RuntimePermission::WorldSessionWrite)?;
+        self.consume_world_session_mutation_budget()?;
+        let world = self
+            .host_access
+            .world_sessions
+            .create_world()
+            .map_err(map_world_session_access_error)?;
+        self.bound_world_session_summary(world)
+    }
+
+    fn set_active(&mut self, world_id: String, active: bool) -> Result<(), WorldSessionError> {
+        self.require_world_session_permission(RuntimePermission::WorldSessionWrite)?;
+        self.consume_world_session_mutation_budget()?;
+        if world_id.len() > self.max_host_message_bytes {
+            return Err(WorldSessionError::MessageTooLarge);
+        }
+        self.host_access
+            .world_sessions
+            .set_active(&world_id, active)
+            .map_err(map_world_session_access_error)
     }
 }
 
@@ -422,6 +493,65 @@ impl ScopedCompositionHost for WasmHostState {
 }
 
 impl WasmHostState {
+    fn require_world_session_permission(
+        &self,
+        permission: RuntimePermission,
+    ) -> Result<(), WorldSessionError> {
+        if !self.host_access_active {
+            return Err(WorldSessionError::AccessNotActive);
+        }
+        self.runtime_permission_owner(permission)
+            .map(|_| ())
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => WorldSessionError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => WorldSessionError::Unavailable,
+            })
+    }
+
+    fn consume_world_session_mutation_budget(&mut self) -> Result<(), WorldSessionError> {
+        if self.world_session_mutations_this_execution
+            >= self.max_world_session_mutations_per_execution
+        {
+            return Err(WorldSessionError::LimitExceeded);
+        }
+        self.world_session_mutations_this_execution = self
+            .world_session_mutations_this_execution
+            .saturating_add(1);
+        Ok(())
+    }
+
+    fn bound_world_session_summaries(
+        &self,
+        worlds: Vec<WorldSessionSummary>,
+    ) -> Result<Vec<WitWorldSummary>, WorldSessionError> {
+        let message_bytes = worlds.iter().fold(0_usize, |total, world| {
+            total
+                .saturating_add(world.world_id.len())
+                .saturating_add(world.last_error.as_ref().map_or(0, String::len))
+                .saturating_add(24)
+        });
+        if message_bytes > self.max_host_message_bytes {
+            return Err(WorldSessionError::MessageTooLarge);
+        }
+        Ok(worlds.into_iter().map(to_wit_world_summary).collect())
+    }
+
+    fn bound_world_session_summary(
+        &self,
+        world: WorldSessionSummary,
+    ) -> Result<WitWorldSummary, WorldSessionError> {
+        if world
+            .world_id
+            .len()
+            .saturating_add(world.last_error.as_ref().map_or(0, String::len))
+            .saturating_add(24)
+            > self.max_host_message_bytes
+        {
+            return Err(WorldSessionError::MessageTooLarge);
+        }
+        Ok(to_wit_world_summary(world))
+    }
+
     fn require_composition_read(&self) -> Result<(), CompositionError> {
         if !self.host_access_active {
             return Err(CompositionError::AccessNotActive);
@@ -472,6 +602,16 @@ impl WasmHostState {
     }
 }
 
+fn to_wit_world_summary(world: WorldSessionSummary) -> WitWorldSummary {
+    WitWorldSummary {
+        world_id: world.world_id,
+        commit_position: world.commit_position,
+        active: world.active,
+        pending_active: world.pending_active,
+        last_error: world.last_error,
+    }
+}
+
 fn to_wit_composition_activation(activation: CompositionActivation) -> WitCompositionActivation {
     WitCompositionActivation {
         subject: activation.subject,
@@ -486,6 +626,23 @@ fn to_wit_composition_activation(activation: CompositionActivation) -> WitCompos
     }
 }
 
+fn map_world_session_access_error(error: HostAccessError) -> WorldSessionError {
+    match error {
+        HostAccessError::InvalidWorldId => WorldSessionError::InvalidWorldId,
+        HostAccessError::NotFound => WorldSessionError::NotFound,
+        HostAccessError::QueueFull => WorldSessionError::QueueFull,
+        HostAccessError::Unavailable => WorldSessionError::Unavailable,
+        HostAccessError::InvalidArtifact
+        | HostAccessError::InvalidAsset
+        | HostAccessError::InvalidDigest
+        | HostAccessError::UnsupportedContent
+        | HostAccessError::InvalidPermission
+        | HostAccessError::InvalidPreference
+        | HostAccessError::PreferenceQuotaExceeded
+        | HostAccessError::Rejected => WorldSessionError::Rejected,
+    }
+}
+
 fn map_artifact_store_access_error(error: HostAccessError) -> ArtifactStoreError {
     match error {
         HostAccessError::InvalidArtifact | HostAccessError::InvalidDigest => {
@@ -493,11 +650,32 @@ fn map_artifact_store_access_error(error: HostAccessError) -> ArtifactStoreError
         }
         HostAccessError::Unavailable => ArtifactStoreError::Unavailable,
         HostAccessError::NotFound
+        | HostAccessError::InvalidWorldId
+        | HostAccessError::QueueFull
+        | HostAccessError::InvalidAsset
         | HostAccessError::UnsupportedContent
         | HostAccessError::InvalidPermission
         | HostAccessError::InvalidPreference
         | HostAccessError::PreferenceQuotaExceeded
         | HostAccessError::Rejected => ArtifactStoreError::Rejected,
+    }
+}
+
+fn map_asset_store_access_error(error: HostAccessError) -> AssetStoreError {
+    match error {
+        HostAccessError::InvalidAsset | HostAccessError::InvalidDigest => {
+            AssetStoreError::InvalidAsset
+        }
+        HostAccessError::Unavailable => AssetStoreError::Unavailable,
+        HostAccessError::InvalidArtifact
+        | HostAccessError::InvalidWorldId
+        | HostAccessError::QueueFull
+        | HostAccessError::NotFound
+        | HostAccessError::UnsupportedContent
+        | HostAccessError::InvalidPermission
+        | HostAccessError::InvalidPreference
+        | HostAccessError::PreferenceQuotaExceeded
+        | HostAccessError::Rejected => AssetStoreError::Rejected,
     }
 }
 
@@ -507,7 +685,10 @@ fn map_preference_access_error(error: HostAccessError) -> PreferenceError {
         HostAccessError::PreferenceQuotaExceeded => PreferenceError::QuotaExceeded,
         HostAccessError::Unavailable => PreferenceError::Unavailable,
         HostAccessError::InvalidArtifact
+        | HostAccessError::InvalidAsset
         | HostAccessError::InvalidDigest
+        | HostAccessError::InvalidWorldId
+        | HostAccessError::QueueFull
         | HostAccessError::NotFound
         | HostAccessError::UnsupportedContent
         | HostAccessError::InvalidPermission
@@ -521,7 +702,10 @@ fn map_runtime_policy_access_error(error: HostAccessError) -> RuntimePolicyError
         HostAccessError::NotFound => RuntimePolicyError::NotFound,
         HostAccessError::Unavailable => RuntimePolicyError::Unavailable,
         HostAccessError::InvalidArtifact
+        | HostAccessError::InvalidAsset
         | HostAccessError::InvalidDigest
+        | HostAccessError::InvalidWorldId
+        | HostAccessError::QueueFull
         | HostAccessError::UnsupportedContent
         | HostAccessError::InvalidPreference
         | HostAccessError::PreferenceQuotaExceeded
@@ -536,7 +720,10 @@ fn map_composition_access_error(error: HostAccessError) -> CompositionError {
         }
         HostAccessError::NotFound => CompositionError::NotFound,
         HostAccessError::UnsupportedContent => CompositionError::UnsupportedContent,
-        HostAccessError::InvalidPermission
+        HostAccessError::InvalidAsset
+        | HostAccessError::InvalidWorldId
+        | HostAccessError::QueueFull
+        | HostAccessError::InvalidPermission
         | HostAccessError::InvalidPreference
         | HostAccessError::PreferenceQuotaExceeded
         | HostAccessError::Rejected => CompositionError::Rejected,

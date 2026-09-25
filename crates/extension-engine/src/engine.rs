@@ -40,8 +40,8 @@ use crate::{
     errors::{ComponentStopFailure, EngineError, EngineResult},
     execution_targets::{ExecutionTargetDependency, ExecutionTargetRegistry},
     host_access::{
-        ArtifactStoreAccess, CompositionAccess, HostAccessServices, PreferenceAccess,
-        RuntimePolicyAccess,
+        ArtifactStoreAccess, AssetStoreAccess, CompositionAccess, HostAccessServices,
+        PreferenceAccess, RuntimePolicyAccess, WorldSessionAccess,
     },
     runtime::WasmRuntimeEngine,
     runtime_effects::RuntimeEffectRegistry,
@@ -284,11 +284,13 @@ impl ExtensionEngine {
         Self::default()
     }
 
-    /// Creates an engine with generic host artifact/composition capabilities attached.
+    /// Creates an engine with generic host artifact/asset/world-session/composition capabilities attached.
     ///
     /// Guest access remains separately permission-gated per concrete component principal.
     pub fn with_host_access(
         artifact_store_access: Arc<dyn ArtifactStoreAccess>,
+        asset_store_access: Arc<dyn AssetStoreAccess>,
+        world_session_access: Arc<dyn WorldSessionAccess>,
         composition_access: Arc<dyn CompositionAccess>,
         preference_access: Arc<dyn PreferenceAccess>,
         runtime_policy_access: Arc<dyn RuntimePolicyAccess>,
@@ -296,6 +298,8 @@ impl ExtensionEngine {
         Self {
             host_access: HostAccessServices::new(
                 artifact_store_access,
+                asset_store_access,
+                world_session_access,
                 composition_access,
                 preference_access,
                 runtime_policy_access,

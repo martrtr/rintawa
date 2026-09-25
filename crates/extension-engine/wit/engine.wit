@@ -267,6 +267,65 @@ interface artifact-store {
 }
 
 
+/// Generic access to the immutable raw asset store.
+interface asset-store {
+    /// Immutable identity returned after bytes enter the asset CAS.
+    record asset-ref {
+        digest: string,
+        size: u64,
+        media-type: string,
+    }
+
+    /// Failure while importing one raw asset.
+    variant error {
+        access-not-active,
+        permission-denied,
+        message-too-large,
+        invalid-asset,
+        rejected,
+        unavailable,
+    }
+
+    /// Imports exact bytes under a canonical media type and returns an AssetRef.
+    import-asset: func(bytes: list<u8>, media-type: string) -> result<asset-ref, error>;
+}
+
+/// Generic persistent-world catalog and deferred runtime lifecycle control.
+interface world-sessions {
+    /// One persistent world plus host runtime lifecycle status.
+    record summary {
+        world-id: string,
+        commit-position: u64,
+        active: bool,
+        pending-active: option<bool>,
+        last-error: option<string>,
+    }
+
+    /// Failure while reading or mutating world-session lifecycle state.
+    variant error {
+        access-not-active,
+        permission-denied,
+        invalid-world-id,
+        not-found,
+        queue-full,
+        limit-exceeded,
+        message-too-large,
+        rejected,
+        unavailable,
+    }
+
+    /// Lists persistent worlds. Requires `world-session-read`.
+    list-worlds: func() -> result<list<summary>, error>;
+
+    /// Creates one empty persistent world. Requires `world-session-write`.
+    create: func() -> result<summary, error>;
+
+    /// Requests active/inactive runtime state. Requires `world-session-write`.
+    /// The request is applied after the current guest callback unwinds, during a
+    /// later host runtime pump; `pending-active` exposes the accepted desired state.
+    set-active: func(world-id: string, active: bool) -> result<_, error>;
+}
+
 /// Owner-scoped non-authoritative persistent preferences.
 interface preferences {
     /// Failure while accessing one bounded preference value.
@@ -694,6 +753,8 @@ world plugin {
     import network;
     import http-fetch;
     import artifact-store;
+    import asset-store;
+    import world-sessions;
     import preferences;
     import composition;
     import scoped-composition;
@@ -728,6 +789,8 @@ world task-runtime-plugin {
     import network;
     import http-fetch;
     import artifact-store;
+    import asset-store;
+    import world-sessions;
     import preferences;
     import composition;
     import scoped-composition;
@@ -752,6 +815,8 @@ world runtime-provider-plugin {
     import network;
     import http-fetch;
     import artifact-store;
+    import asset-store;
+    import world-sessions;
     import preferences;
     import composition;
     import scoped-composition;
@@ -776,6 +841,8 @@ world runtime-provider-task-plugin {
     import network;
     import http-fetch;
     import artifact-store;
+    import asset-store;
+    import world-sessions;
     import preferences;
     import composition;
     import scoped-composition;

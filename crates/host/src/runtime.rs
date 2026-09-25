@@ -3,16 +3,17 @@
 use std::{
     collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rintawa_artifacts::{ArtifactDigest, ContentType, RtwArchive, RtwLimits};
 use rintawa_extension_engine::{
-    ActivationPlanError, ArtifactStoreAccess, CompositionAccess, CompositionActivation,
-    EngineError, ExtensionEngine, HostAccessError, HostAccessResult, ImportedArtifact,
-    PreferenceAccess, RtwExtensionLoadOutcome, RtwExtensionLoader, RuntimeArtifactPolicy,
-    RuntimePolicyAccess, RuntimePolicyComponent, RuntimePolicyRequest, UnresolvedContractReason,
+    ActivationPlanError, ArtifactStoreAccess, AssetStoreAccess, CompositionAccess,
+    CompositionActivation, EngineError, ExtensionEngine, HostAccessError, HostAccessResult,
+    ImportedArtifact, ImportedAsset, PreferenceAccess, RtwExtensionLoadOutcome, RtwExtensionLoader,
+    RuntimeArtifactPolicy, RuntimePolicyAccess, RuntimePolicyComponent, RuntimePolicyRequest,
+    UnresolvedContractReason, WorldSessionAccess, WorldSessionSummary,
 };
 use rintawa_sdk::{
     content::{
@@ -43,7 +44,7 @@ use crate::{
     BootstrapBlockedActivation, BootstrapDeferredActivation, BootstrapRollback, BootstrapStall,
     CompositionProfile, HOST_SCOPE, HostCleanupFailure, HostCleanupOperation, HostError, HostHome,
     HostResult, HostShutdownFailures, UserContentEntry, UserContentId, WorldRuntimeCleanupFailure,
-    runtime_signal::RuntimeSignalQueue, world_runtime_scope_id,
+    WorldSummary, runtime_signal::RuntimeSignalQueue, world_runtime_scope_id,
 };
 
 /// Maximum durable effect jobs processed for one world in one cooperative pump.
@@ -54,15 +55,100 @@ pub const EFFECT_JOB_LEASE_MILLIS: i64 = 30_000;
 pub const EFFECT_RETRY_BASE_MILLIS: i64 = 1_000;
 /// Maximum host-owned retry delay regardless of attempt count.
 pub const EFFECT_RETRY_MAX_MILLIS: i64 = 60_000;
+/// Maximum distinct world lifecycle requests accepted before a host pump drains them.
+const MAX_PENDING_WORLD_SESSION_REQUESTS: usize = 64;
+/// Maximum diagnostic bytes retained for one failed deferred world lifecycle request.
+const MAX_WORLD_SESSION_DIAGNOSTIC_BYTES: usize = 2 * 1024;
+
+#[derive(Default)]
+struct WorldSessionRuntimeState {
+    active: HashSet<WorldId>,
+    pending: BTreeMap<WorldId, bool>,
+    last_errors: BTreeMap<WorldId, String>,
+}
+
+#[derive(Clone, Default)]
+struct WorldSessionRuntimeControl {
+    state: Arc<Mutex<WorldSessionRuntimeState>>,
+}
+
+impl WorldSessionRuntimeControl {
+    fn summary(&self, world: WorldSummary) -> HostAccessResult<WorldSessionSummary> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| HostAccessError::Unavailable)?;
+        Ok(WorldSessionSummary {
+            world_id: world.id.to_string(),
+            commit_position: world.commit_position,
+            active: state.active.contains(&world.id),
+            pending_active: state.pending.get(&world.id).copied(),
+            last_error: state.last_errors.get(&world.id).cloned(),
+        })
+    }
+
+    fn request(&self, world_id: WorldId, active: bool) -> HostAccessResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| HostAccessError::Unavailable)?;
+        if !state.pending.contains_key(&world_id)
+            && state.pending.len() >= MAX_PENDING_WORLD_SESSION_REQUESTS
+        {
+            return Err(HostAccessError::QueueFull);
+        }
+        state.pending.insert(world_id, active);
+        state.last_errors.remove(&world_id);
+        Ok(())
+    }
+
+    fn drain_pending(&self) -> HostResult<Vec<(WorldId, bool)>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| HostError::WorldSessionControlUnavailable)?;
+        Ok(std::mem::take(&mut state.pending).into_iter().collect())
+    }
+
+    fn record_outcome(
+        &self,
+        world_id: WorldId,
+        actual_active: bool,
+        diagnostic: Option<&str>,
+    ) -> HostResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| HostError::WorldSessionControlUnavailable)?;
+        // `drain_pending` removed the request being completed. Never remove a
+        // newer request for this world that may have arrived while the lifecycle
+        // transition was running.
+        if actual_active {
+            state.active.insert(world_id);
+        } else {
+            state.active.remove(&world_id);
+        }
+        if let Some(diagnostic) = diagnostic {
+            state
+                .last_errors
+                .insert(world_id, bounded_world_session_diagnostic(diagnostic));
+        } else {
+            state.last_errors.remove(&world_id);
+        }
+        Ok(())
+    }
+}
 
 struct LocalHostAccess {
     home_root: PathBuf,
+    world_sessions: WorldSessionRuntimeControl,
 }
 
 impl LocalHostAccess {
-    fn new(home_root: &Path) -> Self {
+    fn new(home_root: &Path, world_sessions: WorldSessionRuntimeControl) -> Self {
         Self {
             home_root: home_root.to_path_buf(),
+            world_sessions,
         }
     }
 
@@ -85,6 +171,48 @@ impl ArtifactStoreAccess for LocalHostAccess {
             digest: imported.digest().to_string(),
             content: archive.manifest().content.to_string(),
         })
+    }
+}
+
+impl AssetStoreAccess for LocalHostAccess {
+    fn import_asset(&self, bytes: &[u8], media_type: &str) -> HostAccessResult<ImportedAsset> {
+        let home = self.home()?;
+        let imported = home
+            .asset_store()
+            .import_bytes(bytes, media_type.to_string())
+            .map_err(map_asset_import_error)?;
+        let reference = imported.asset_ref();
+        Ok(ImportedAsset {
+            digest: reference.digest.to_string(),
+            size: reference.size,
+            media_type: reference.media_type.to_string(),
+        })
+    }
+}
+
+impl WorldSessionAccess for LocalHostAccess {
+    fn list_worlds(&self) -> HostAccessResult<Vec<WorldSessionSummary>> {
+        self.home()?
+            .list_worlds()
+            .map_err(map_host_access_error)?
+            .into_iter()
+            .map(|world| self.world_sessions.summary(world))
+            .collect()
+    }
+
+    fn create_world(&self) -> HostAccessResult<WorldSessionSummary> {
+        let world = self.home()?.create_world().map_err(map_host_access_error)?;
+        self.world_sessions.summary(world)
+    }
+
+    fn set_active(&self, world_id: &str, active: bool) -> HostAccessResult<()> {
+        let world_id = world_id
+            .parse::<WorldId>()
+            .map_err(|_| HostAccessError::InvalidWorldId)?;
+        self.home()?
+            .load_world_state(world_id)
+            .map_err(map_host_access_error)?;
+        self.world_sessions.request(world_id, active)
     }
 }
 
@@ -371,9 +499,23 @@ fn map_artifact_import_error(error: HostError) -> HostAccessError {
     }
 }
 
+fn map_asset_import_error(error: rintawa_artifacts::AssetError) -> HostAccessError {
+    match error {
+        rintawa_artifacts::AssetError::InvalidDigest(_)
+        | rintawa_artifacts::AssetError::InvalidMediaType { .. }
+        | rintawa_artifacts::AssetError::UnsupportedSource(_)
+        | rintawa_artifacts::AssetError::AssetTooLarge { .. } => HostAccessError::InvalidAsset,
+        rintawa_artifacts::AssetError::Io(_)
+        | rintawa_artifacts::AssetError::StoredAssetNotFound(_)
+        | rintawa_artifacts::AssetError::StoreCorruption(_)
+        | rintawa_artifacts::AssetError::SizeMismatch { .. }
+        | rintawa_artifacts::AssetError::InvalidStoreEntry { .. } => HostAccessError::Unavailable,
+    }
+}
+
 fn map_host_access_error(error: HostError) -> HostAccessError {
     match error {
-        HostError::ActivationNotFound(_) => HostAccessError::NotFound,
+        HostError::ActivationNotFound(_) | HostError::WorldNotFound(_) => HostAccessError::NotFound,
         HostError::UnsupportedContent(_) => HostAccessError::UnsupportedContent,
         HostError::Io(_)
         | HostError::ProfileDecode(_)
@@ -438,6 +580,7 @@ pub struct HostRuntime {
     started_instances: Vec<ExtensionInstanceId>,
     host_shell_provider: Option<ComponentRef>,
     ui_layer_provider: Option<ComponentRef>,
+    host_access: Option<Arc<LocalHostAccess>>,
 }
 
 impl HostRuntime {
@@ -451,13 +594,18 @@ impl HostRuntime {
     /// deterministic full-topology activation plan.
     pub fn start(home: &HostHome) -> HostResult<Self> {
         let profile = home.load_profile()?;
-        let access = Arc::new(LocalHostAccess::new(home.root()));
+        let world_sessions = WorldSessionRuntimeControl::default();
+        let access = Arc::new(LocalHostAccess::new(home.root(), world_sessions));
         let artifact_store_access: Arc<dyn ArtifactStoreAccess> = access.clone();
+        let asset_store_access: Arc<dyn AssetStoreAccess> = access.clone();
+        let world_session_access: Arc<dyn WorldSessionAccess> = access.clone();
         let composition_access: Arc<dyn CompositionAccess> = access.clone();
         let preference_access: Arc<dyn PreferenceAccess> = access.clone();
-        let runtime_policy_access: Arc<dyn RuntimePolicyAccess> = access;
+        let runtime_policy_access: Arc<dyn RuntimePolicyAccess> = access.clone();
         let mut engine = ExtensionEngine::with_host_access(
             artifact_store_access,
+            asset_store_access,
+            world_session_access,
             composition_access,
             preference_access,
             runtime_policy_access,
@@ -543,6 +691,7 @@ impl HostRuntime {
             started_instances: started,
             host_shell_provider,
             ui_layer_provider,
+            host_access: Some(access),
         })
     }
 
@@ -681,6 +830,15 @@ impl HostRuntime {
     /// Returns WorldAlreadyActive for duplicate activation, world/storage errors,
     /// contract reservation errors, or World Runtime startup errors.
     pub fn activate_world(&mut self, home: &HostHome, world_id: WorldId) -> HostResult<()> {
+        let result = self.activate_world_inner(home, world_id);
+        let status_result = self.record_world_session_result(world_id, &result);
+        match result {
+            Err(error) => Err(error),
+            Ok(()) => status_result,
+        }
+    }
+
+    fn activate_world_inner(&mut self, home: &HostHome, world_id: WorldId) -> HostResult<()> {
         if self.active_worlds.contains_key(&world_id) {
             return Err(HostError::WorldAlreadyActive(world_id));
         }
@@ -788,6 +946,15 @@ impl HostRuntime {
     /// Returns WorldNotActive when the world is not running, or the runtime
     /// shutdown failure after the world has been removed from the active set.
     pub fn deactivate_world(&mut self, world_id: WorldId) -> HostResult<()> {
+        let result = self.deactivate_world_inner(world_id);
+        let status_result = self.record_world_session_result(world_id, &result);
+        match result {
+            Err(error) => Err(error),
+            Ok(()) => status_result,
+        }
+    }
+
+    fn deactivate_world_inner(&mut self, world_id: WorldId) -> HostResult<()> {
         let active = self
             .active_worlds
             .remove(&world_id)
@@ -1211,14 +1378,66 @@ impl HostRuntime {
         Ok(earliest)
     }
 
+    fn record_world_session_result(
+        &self,
+        world_id: WorldId,
+        result: &HostResult<()>,
+    ) -> HostResult<()> {
+        let Some(access) = &self.host_access else {
+            return Ok(());
+        };
+        let diagnostic = result.as_ref().err().map(ToString::to_string);
+        access.world_sessions.record_outcome(
+            world_id,
+            self.is_world_active(world_id),
+            diagnostic.as_deref(),
+        )
+    }
+
+    fn pump_world_session_requests(&mut self) -> HostResult<usize> {
+        let Some(access) = self.host_access.clone() else {
+            return Ok(0);
+        };
+        let requests = access.world_sessions.drain_pending()?;
+        if requests.is_empty() {
+            return Ok(0);
+        }
+        let home = access
+            .home()
+            .map_err(|_| HostError::WorldSessionControlUnavailable)?;
+        let mut handled = 0_usize;
+        for (world_id, desired_active) in requests {
+            if desired_active == self.is_world_active(world_id) {
+                access
+                    .world_sessions
+                    .record_outcome(world_id, desired_active, None)?;
+                handled += 1;
+                continue;
+            }
+            // Apply the transition without re-entering the public wrapper so the
+            // package-domain failure can be contained while control-state failures
+            // still terminate the host pump.
+            let lifecycle_result = if desired_active {
+                self.activate_world_inner(&home, world_id)
+            } else {
+                self.deactivate_world_inner(world_id)
+            };
+            self.record_world_session_result(world_id, &lifecycle_result)?;
+            handled += 1;
+        }
+        Ok(handled)
+    }
+
     /// Executes one cooperative runtime pump for active baseline and world components.
     ///
     /// The returned duration is the earliest requested next wake-up. `None` means
     /// no active component currently owns scheduled cooperative work.
     pub fn poll_runtime(&mut self) -> HostResult<Option<Duration>> {
+        self.pump_world_session_requests()?;
         self.pump_all_runtime_signals()?;
         self.pump_all_effect_outboxes()?;
         let engine_delay = self.engine.poll_runtime()?;
+        self.pump_world_session_requests()?;
         let effect_delay = self.next_effect_wakeup_delay(current_unix_time_millis())?;
         Ok(min_optional_duration(engine_delay, effect_delay))
     }
@@ -1241,6 +1460,17 @@ impl HostRuntime {
             })))
         }
     }
+}
+
+fn bounded_world_session_diagnostic(value: &str) -> String {
+    if value.len() <= MAX_WORLD_SESSION_DIAGNOSTIC_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_WORLD_SESSION_DIAGNOSTIC_BYTES;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value[..end].to_string()
 }
 
 fn current_unix_time_millis() -> UnixTimeMillis {
@@ -2262,6 +2492,29 @@ mod tests {
     }
 
     #[test]
+    fn test_should_import_raw_asset_through_generic_host_access() -> anyhow::Result<()> {
+        let root = tempfile::TempDir::new()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let access = LocalHostAccess::new(home.root(), WorldSessionRuntimeControl::default());
+        let imported = AssetStoreAccess::import_asset(&access, b"portrait", "Image/PNG")
+            .map_err(|error| anyhow::anyhow!("asset host access failed: {error:?}"))?;
+
+        assert_eq!(imported.size, 8);
+        assert_eq!(imported.media_type, "image/png");
+        let reference = rintawa_artifacts::AssetRef::new(
+            rintawa_artifacts::AssetDigest::parse(&imported.digest)?,
+            imported.size,
+            imported.media_type,
+        )?;
+        home.asset_store().verify(&reference)?;
+        assert_eq!(
+            AssetStoreAccess::import_asset(&access, b"portrait", "invalid media type"),
+            Err(HostAccessError::InvalidAsset)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_should_not_publish_user_content_without_active_handler() -> anyhow::Result<()> {
         let root = tempfile::TempDir::new()?;
         let home = HostHome::open(root.path().join("home"))?;
@@ -2281,6 +2534,156 @@ mod tests {
         ));
         assert!(home.list_user_content()?.is_empty());
         assert!(home.artifact_store().open_artifact(&digest).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_bound_and_coalesce_world_session_request_queue() {
+        let control = WorldSessionRuntimeControl::default();
+        let mut ids = Vec::new();
+        for _ in 0..MAX_PENDING_WORLD_SESSION_REQUESTS {
+            let world_id = WorldId::new();
+            control
+                .request(world_id, true)
+                .expect("request within queue capacity must succeed");
+            ids.push(world_id);
+        }
+        assert_eq!(
+            control.request(WorldId::new(), true),
+            Err(HostAccessError::QueueFull)
+        );
+        control
+            .request(ids[0], false)
+            .expect("coalescing an existing world must not consume extra capacity");
+        let drained = control
+            .drain_pending()
+            .expect("bounded queue must remain healthy");
+        assert_eq!(drained.len(), MAX_PENDING_WORLD_SESSION_REQUESTS);
+        assert!(drained.contains(&(ids[0], false)));
+    }
+
+    #[test]
+    fn test_should_preserve_newer_world_session_request_after_older_completion()
+    -> anyhow::Result<()> {
+        let control = WorldSessionRuntimeControl::default();
+        let world_id = WorldId::new();
+        let summary = WorldSummary {
+            id: world_id,
+            commit_position: 0,
+        };
+
+        control
+            .request(world_id, true)
+            .expect("initial activation request must fit queue");
+        assert_eq!(control.drain_pending()?, vec![(world_id, true)]);
+
+        control
+            .request(world_id, false)
+            .expect("newer deactivation request must fit queue");
+        control.record_outcome(world_id, true, None)?;
+
+        let observed = control
+            .summary(summary)
+            .expect("world-session state must remain readable");
+        assert!(observed.active);
+        assert_eq!(observed.pending_active, Some(false));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_report_actual_world_state_separately_from_lifecycle_error() -> anyhow::Result<()>
+    {
+        let control = WorldSessionRuntimeControl::default();
+        let world_id = WorldId::new();
+        control.record_outcome(world_id, true, None)?;
+        control.record_outcome(world_id, false, Some("cleanup failed after stop"))?;
+
+        let observed = control
+            .summary(WorldSummary {
+                id: world_id,
+                commit_position: 3,
+            })
+            .expect("world-session status must remain readable");
+        assert!(!observed.active);
+        assert_eq!(observed.pending_active, None);
+        assert_eq!(
+            observed.last_error.as_deref(),
+            Some("cleanup failed after stop")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_apply_deferred_world_session_lifecycle_requests_on_host_pump()
+    -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let mut host = HostRuntime::start(&home)?;
+        let access = host
+            .host_access
+            .as_ref()
+            .expect("production HostRuntime must retain host access")
+            .clone();
+
+        assert_eq!(
+            WorldSessionAccess::set_active(access.as_ref(), "not-a-world-id", true),
+            Err(HostAccessError::InvalidWorldId)
+        );
+        assert_eq!(
+            WorldSessionAccess::set_active(access.as_ref(), &WorldId::new().to_string(), true),
+            Err(HostAccessError::NotFound)
+        );
+
+        let created = WorldSessionAccess::create_world(access.as_ref())
+            .expect("world-session access must create an empty world");
+        let world_id: WorldId = created.world_id.parse()?;
+        assert_eq!(created.commit_position, 0);
+        assert!(!created.active);
+        assert_eq!(created.pending_active, None);
+        assert!(!host.is_world_active(world_id));
+
+        WorldSessionAccess::set_active(access.as_ref(), &created.world_id, true)
+            .expect("world-session access must queue activation");
+        let pending = WorldSessionAccess::list_worlds(access.as_ref())
+            .expect("world-session access must list pending activation");
+        let pending = pending
+            .into_iter()
+            .find(|world| world.world_id == created.world_id)
+            .expect("created world must remain listed");
+        assert!(!pending.active);
+        assert_eq!(pending.pending_active, Some(true));
+
+        host.poll_runtime()?;
+        assert!(host.is_world_active(world_id));
+        let active = WorldSessionAccess::list_worlds(access.as_ref())
+            .expect("world-session access must list active world")
+            .into_iter()
+            .find(|world| world.world_id == created.world_id)
+            .expect("active world must remain listed");
+        assert!(active.active);
+        assert_eq!(active.pending_active, None);
+        assert_eq!(active.last_error, None);
+
+        WorldSessionAccess::set_active(access.as_ref(), &created.world_id, false)
+            .expect("world-session access must queue deactivation");
+        let pending = WorldSessionAccess::list_worlds(access.as_ref())
+            .expect("world-session access must list pending deactivation")
+            .into_iter()
+            .find(|world| world.world_id == created.world_id)
+            .expect("pending world must remain listed");
+        assert!(pending.active);
+        assert_eq!(pending.pending_active, Some(false));
+
+        host.poll_runtime()?;
+        assert!(!host.is_world_active(world_id));
+        let inactive = WorldSessionAccess::list_worlds(access.as_ref())
+            .expect("world-session access must list inactive world")
+            .into_iter()
+            .find(|world| world.world_id == created.world_id)
+            .expect("inactive world must remain listed");
+        assert!(!inactive.active);
+        assert_eq!(inactive.pending_active, None);
+        assert_eq!(inactive.last_error, None);
         Ok(())
     }
 
@@ -2424,6 +2827,7 @@ mod tests {
             started_instances: Vec::new(),
             host_shell_provider: None,
             ui_layer_provider: None,
+            host_access: None,
         };
         let system = host.bind_world_system(world_id, command_schema.clone(), owner)?;
         let contract = world_system_service_contract_key(&command_schema);
@@ -2512,6 +2916,7 @@ mod tests {
             started_instances: Vec::new(),
             host_shell_provider: None,
             ui_layer_provider: None,
+            host_access: None,
         };
         let projection =
             host.bind_world_projection(world_id, projection_schema.clone(), owner.clone())?;
@@ -2967,6 +3372,7 @@ mod tests {
             started_instances: Vec::new(),
             host_shell_provider: None,
             ui_layer_provider: None,
+            host_access: None,
         };
 
         let correlation = CorrelationId::new();
@@ -3090,6 +3496,7 @@ mod tests {
             started_instances: vec![instance],
             host_shell_provider: None,
             ui_layer_provider: None,
+            host_access: None,
         };
 
         let mut foreign_event = event.clone();
