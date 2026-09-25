@@ -41,6 +41,14 @@ enum Commands {
     Enable { id: String },
     /// Disable one baseline activation by extension ID.
     Disable { id: String },
+    /// Set whether one baseline activation is inherited by newly created worlds.
+    WorldDefault {
+        /// Baseline activation subject, normally the extension ID.
+        id: String,
+        /// Stop inheriting this activation into newly created worlds.
+        #[arg(long)]
+        disabled: bool,
+    },
     /// Approve one manifest-requested runtime capability for an exact component.
     GrantRuntime {
         /// Concrete baseline runtime instance.
@@ -110,6 +118,7 @@ fn main() -> Result<()> {
         Commands::List => list(&home),
         Commands::Enable { id } => set_enabled(&home, id, true),
         Commands::Disable { id } => set_enabled(&home, id, false),
+        Commands::WorldDefault { id, disabled } => set_world_default(&home, id, !disabled),
         Commands::GrantRuntime {
             instance,
             component,
@@ -186,6 +195,12 @@ fn list(home: &HostHome) -> Result<()> {
 fn set_enabled(home: &HostHome, id: String, enabled: bool) -> Result<()> {
     home.set_enabled(&id, enabled)?;
     println!("{id}: {}", if enabled { "enabled" } else { "disabled" });
+    Ok(())
+}
+
+fn set_world_default(home: &HostHome, id: String, enabled: bool) -> Result<()> {
+    home.set_world_default(&id, enabled)?;
+    println!("{id}: world-default = {enabled}");
     Ok(())
 }
 
@@ -397,6 +412,21 @@ mod tests {
         assert!(matches!(
             content_import.command,
             Commands::ContentImport { path } if path == std::path::Path::new("/tmp/content.rtw")
+        ));
+
+        let world_default = Cli::try_parse_from(["rintawa", "world-default", "example.runtime"])
+            .expect("world-default command should parse");
+        assert!(matches!(
+            world_default.command,
+            Commands::WorldDefault { id, disabled: false } if id == "example.runtime"
+        ));
+
+        let world_default_disabled =
+            Cli::try_parse_from(["rintawa", "world-default", "example.runtime", "--disabled"])
+                .expect("world-default --disabled command should parse");
+        assert!(matches!(
+            world_default_disabled.command,
+            Commands::WorldDefault { id, disabled: true } if id == "example.runtime"
         ));
 
         let revoke = Cli::try_parse_from([
