@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::File,
-    io::{Read, Seek},
+    io::{Cursor, Read, Seek},
     path::Path,
 };
 
@@ -77,28 +77,14 @@ impl RtwArchive {
 
     pub(crate) fn from_file(file: File, limits: RtwLimits) -> RtwResult<Self> {
         let archive_bytes = file.metadata()?.len();
-        if archive_bytes > limits.max_archive_bytes {
-            return Err(RtwError::ArchiveTooLarge {
-                actual: archive_bytes,
-                maximum: limits.max_archive_bytes,
-            });
-        }
-
         let source_file = file.try_clone()?;
-        let mut archive = ZipArchive::new(file)?;
-        let (entries, entry_indices) = validate_entries(&mut archive, limits)?;
-        let manifest = read_manifest(&mut archive, &entry_indices, limits)?;
-        manifest.validate()?;
-        if !entries.contains_key(&manifest.entry) {
-            return Err(RtwError::MissingContentEntry(manifest.entry.to_string()));
-        }
-
+        let validated = validate_reader(file, archive_bytes, limits)?;
         Ok(Self {
             source_file,
-            archive,
-            manifest,
-            entries,
-            entry_indices,
+            archive: validated.archive,
+            manifest: validated.manifest,
+            entries: validated.entries,
+            entry_indices: validated.entry_indices,
             limits,
         })
     }
@@ -176,8 +162,48 @@ impl RtwArchive {
         )
     }
 }
-fn validate_entries(
-    archive: &mut ZipArchive<File>,
+
+struct ValidatedArchive<R> {
+    archive: ZipArchive<R>,
+    manifest: RtwManifest,
+    entries: BTreeMap<ArtifactPath, ArtifactEntry>,
+    entry_indices: HashMap<ArtifactPath, usize>,
+}
+
+pub(crate) fn validate_bytes(bytes: &[u8], limits: RtwLimits) -> RtwResult<()> {
+    let archive_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let _validated = validate_reader(Cursor::new(bytes), archive_bytes, limits)?;
+    Ok(())
+}
+
+fn validate_reader<R: Read + Seek>(
+    reader: R,
+    archive_bytes: u64,
+    limits: RtwLimits,
+) -> RtwResult<ValidatedArchive<R>> {
+    if archive_bytes > limits.max_archive_bytes {
+        return Err(RtwError::ArchiveTooLarge {
+            actual: archive_bytes,
+            maximum: limits.max_archive_bytes,
+        });
+    }
+    let mut archive = ZipArchive::new(reader)?;
+    let (entries, entry_indices) = validate_entries(&mut archive, limits)?;
+    let manifest = read_manifest(&mut archive, &entry_indices, limits)?;
+    manifest.validate()?;
+    if !entries.contains_key(&manifest.entry) {
+        return Err(RtwError::MissingContentEntry(manifest.entry.to_string()));
+    }
+    Ok(ValidatedArchive {
+        archive,
+        manifest,
+        entries,
+        entry_indices,
+    })
+}
+
+fn validate_entries<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
     limits: RtwLimits,
 ) -> RtwResult<(
     BTreeMap<ArtifactPath, ArtifactEntry>,
@@ -300,8 +326,8 @@ fn validate_zip_entry_type<R: Read + Seek>(
     }
     Ok(())
 }
-fn read_manifest(
-    archive: &mut ZipArchive<File>,
+fn read_manifest<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
     entry_indices: &HashMap<ArtifactPath, usize>,
     limits: RtwLimits,
 ) -> RtwResult<RtwManifest> {
@@ -329,8 +355,8 @@ fn read_manifest(
     Ok(manifest)
 }
 
-fn read_zip_entry(
-    archive: &mut ZipArchive<File>,
+fn read_zip_entry<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
     index: usize,
     path: &str,
     declared_size: u64,

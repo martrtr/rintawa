@@ -16,6 +16,9 @@ pub enum RtwError {
     /// The root RTW manifest is not valid TOML.
     #[error("invalid rtw.toml: {0}")]
     ManifestParse(#[from] toml::de::Error),
+    /// The root RTW manifest could not be encoded as canonical TOML.
+    #[error("failed to encode rtw.toml: {0}")]
+    ManifestEncode(#[from] toml::ser::Error),
     /// The artifact uses an unsupported RTW container format version.
     #[error("unsupported RTW format {found}; this runtime supports format {supported}")]
     UnsupportedFormat {
