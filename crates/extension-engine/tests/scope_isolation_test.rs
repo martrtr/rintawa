@@ -1,3 +1,5 @@
+//! Integration tests for runtime-scope isolation.
+
 use anyhow::Result;
 use rintawa_extension_engine::{ExtensionEngine, ExtensionState};
 use rintawa_sdk::prelude::*;

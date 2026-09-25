@@ -1,3 +1,5 @@
+//! Guest fixture that provides a routed test service.
+
 wit_bindgen::generate!({
     path: "wit",
     world: "plugin",

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::contracts::ContractKey;
 
-use super::{
+use crate::ui::{
     PORTABLE_UI_PROTOCOL_MAJOR, UiActivityId, UiCapabilityId, UiIconSlotId, UiSurfaceId,
     UiSurfaceTraitId,
 };

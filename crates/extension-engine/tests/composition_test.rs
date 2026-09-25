@@ -1,3 +1,5 @@
+//! Integration tests for extension composition and activation behavior.
+
 use rintawa_extension_engine::{
     ActivationPlanError, EngineError, ExtensionEngine, ExtensionState, UnresolvedContractReason,
 };

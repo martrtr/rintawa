@@ -1,3 +1,5 @@
+//! Integration tests for extension event publication.
+
 use rintawa_extension_engine::{EngineResult, WasmRuntimeEngine};
 use rintawa_sdk::{
     api::{LogLevel, LoggerApi},

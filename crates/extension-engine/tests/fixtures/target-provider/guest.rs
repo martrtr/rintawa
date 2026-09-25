@@ -1,3 +1,5 @@
+//! Guest fixture for execution-target provider integration tests.
+
 wit_bindgen::generate!({
     path: "wit",
     world: "runtime-provider-plugin",

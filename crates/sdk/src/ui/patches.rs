@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{UiNode, UiNodeId, UiSurfaceId};
+use crate::ui::{UiNode, UiNodeId, UiSurfaceId};
 
 /// Full presentation snapshot for one mounted surface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

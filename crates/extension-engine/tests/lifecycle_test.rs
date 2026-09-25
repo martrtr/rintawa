@@ -1,3 +1,5 @@
+//! Integration tests for extension lifecycle transitions.
+
 use rintawa_extension_engine::{EngineResult, ExtensionEngine, ExtensionState};
 use rintawa_sdk::prelude::*;
 

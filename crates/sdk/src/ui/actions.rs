@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::ExtensionInstanceId;
 
-use super::{UiActionId, UiNodeId, UiSurfaceId};
+use crate::ui::{UiActionId, UiNodeId, UiSurfaceId};
 
 /// Typed payload carried by a portable UI action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

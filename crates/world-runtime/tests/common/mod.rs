@@ -1,3 +1,7 @@
+//! Shared fixtures and helpers for World Runtime integration tests.
+//!
+//! Individual integration-test binaries intentionally use different subsets of these helpers.
+
 #![allow(dead_code)]
 
 use std::sync::{

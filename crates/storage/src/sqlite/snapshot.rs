@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 use crate::StorageResult;
 
-use super::{codec, query};
+use crate::sqlite::{codec, query};
 
 /// Consistent read-only view pinned to one SQLite WAL snapshot.
 ///

@@ -1,3 +1,5 @@
+//! Integration tests for extension manifest and component loading.
+
 use rintawa_extension_engine::{
     EngineError, EngineResult, ExtensionEngine, ExtensionLoader, ExtensionState,
     ExtensionsStateConfig, STATE_FILE_NAME,

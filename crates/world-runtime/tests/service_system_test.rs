@@ -1,3 +1,5 @@
+//! Integration tests for extension-provided World System services.
+
 mod common;
 
 use std::sync::{

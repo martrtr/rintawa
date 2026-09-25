@@ -1,3 +1,5 @@
+//! Integration tests for World Runtime authority enforcement.
+
 mod common;
 
 use anyhow::Result;

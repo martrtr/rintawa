@@ -327,6 +327,7 @@ fn test_state_transaction() {
 Before committing:
 
 - [ ] `bash scripts/scan-secrets.sh` passes
+- [ ] `python3 scripts/check-coding-style.py` passes (module docs and production import discipline)
 - [ ] `cargo fmt --all` has been run
 - [ ] `cargo clippy` passes with no warnings
 - [ ] All public items have doc comments

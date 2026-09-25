@@ -1,3 +1,5 @@
+//! Tests for SQLite world storage, recovery, and durable outbox behavior.
+
 use std::{
     collections::BTreeSet,
     sync::{Arc, Barrier},

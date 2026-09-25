@@ -1,3 +1,5 @@
+//! Integration tests for bounded World Runtime command queues.
+
 mod common;
 
 use std::sync::{

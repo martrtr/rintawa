@@ -1,3 +1,5 @@
+//! Integration tests for Host-managed world lifecycle behavior.
+
 use rintawa_host::{HostError, HostHome};
 use rintawa_sdk::world::WorldId;
 

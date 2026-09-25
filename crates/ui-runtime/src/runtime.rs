@@ -1,3 +1,5 @@
+//! Portable UI runtime state, presentation mounting, and action dispatch.
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, RwLock},

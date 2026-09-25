@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::{ClaimedEffectJob, StorageError, StorageResult};
 
-use super::{codec::effect_job_id_from_blob, query};
+use crate::sqlite::{codec::effect_job_id_from_blob, query};
 
 const STATUS_PENDING: i64 = 0;
 const STATUS_RUNNING: i64 = 1;

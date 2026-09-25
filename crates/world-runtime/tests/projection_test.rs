@@ -1,3 +1,5 @@
+//! Integration tests for policy-filtered world projections.
+
 mod common;
 
 use std::sync::{

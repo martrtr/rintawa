@@ -1,3 +1,5 @@
+//! Integration tests for loading RTW artifacts into the extension engine.
+
 use std::{
     fs,
     path::Path,

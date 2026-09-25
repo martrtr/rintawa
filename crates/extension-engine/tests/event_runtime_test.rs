@@ -1,3 +1,5 @@
+//! Integration tests for runtime event delivery across extension boundaries.
+
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;

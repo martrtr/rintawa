@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::{StorageError, StorageResult};
 
-use super::codec::{
+use crate::sqlite::codec::{
     command_id_from_blob, correlation_id_from_blob, decode_schema_key, effect_job_id_from_blob,
     entity_id_from_blob, event_id_from_blob, principal_id_from_blob, relation_id_from_blob,
 };

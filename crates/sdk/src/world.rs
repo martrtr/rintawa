@@ -189,7 +189,7 @@ impl SchemaIdentifierError {
 
 /// Canonical unversioned identifier of one world schema.
 ///
-/// Schema IDs are lowercase ASCII namespaces such as rintawa.character.identity.
+/// Schema IDs are lowercase ASCII namespaces such as example.entity.identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SchemaId(String);
@@ -385,8 +385,8 @@ mod tests {
 
     #[test]
     fn test_should_accept_namespaced_schema_id() -> Result<(), SchemaIdentifierError> {
-        let id = SchemaId::parse("rintawa.character.identity")?;
-        assert_eq!(id.as_str(), "rintawa.character.identity");
+        let id = SchemaId::parse("example.entity.identity")?;
+        assert_eq!(id.as_str(), "example.entity.identity");
         Ok(())
     }
 
@@ -398,16 +398,16 @@ mod tests {
 
     #[test]
     fn test_should_round_trip_schema_key() -> Result<(), Box<dyn std::error::Error>> {
-        let key: SchemaKey = "rintawa.character.identity@1".parse()?;
+        let key: SchemaKey = "example.entity.identity@1".parse()?;
 
-        assert_eq!(key.to_string(), "rintawa.character.identity@1");
+        assert_eq!(key.to_string(), "example.entity.identity@1");
         assert_eq!(key.version().get(), 1);
         Ok(())
     }
 
     #[test]
     fn test_should_reject_zero_schema_version() {
-        let error = "rintawa.character.identity@0"
+        let error = "example.entity.identity@0"
             .parse::<SchemaKey>()
             .unwrap_err();
         assert!(matches!(error, SchemaKeyParseError::Version(_)));

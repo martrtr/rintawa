@@ -63,6 +63,7 @@ use crate::runtime::wasm::network::{
 const TARGET_PROVIDER_EXPORT_NAME: &str = "rintawa:engine/target-provider@0.0.1";
 const TASK_HANDLER_EXPORT_NAME: &str = "rintawa:engine/task-handler@0.0.1";
 
+// Generated WIT bindings expose protocol names verbatim and are not hand-documented.
 #[allow(missing_docs)]
 mod bindings {
     wasmtime::component::bindgen!({
@@ -76,6 +77,7 @@ mod bindings {
     });
 }
 
+// Generated target-provider bindings are documented by the source WIT contract.
 #[allow(missing_docs)]
 mod target_provider_bindings {
     wasmtime::component::bindgen!({
@@ -89,6 +91,7 @@ mod target_provider_bindings {
     });
 }
 
+// Generated task bindings are documented by the source WIT contract.
 #[allow(missing_docs)]
 mod task_bindings {
     wasmtime::component::bindgen!({

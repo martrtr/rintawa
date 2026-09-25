@@ -1,3 +1,5 @@
+//! Integration tests for bounded RTW container packing and validation.
+
 use std::{fs, io::Write};
 
 use anyhow::Result;

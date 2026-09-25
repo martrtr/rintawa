@@ -1,3 +1,5 @@
+//! Guest fixture for task-runtime integration tests.
+
 wit_bindgen::generate!({
     path: "wit",
     world: "task-runtime-plugin",

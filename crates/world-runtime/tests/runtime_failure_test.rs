@@ -1,3 +1,5 @@
+//! Integration tests for fail-closed World Runtime behavior.
+
 mod common;
 
 use std::sync::{

@@ -1,3 +1,5 @@
+//! Integration tests for extension service registration and calls.
+
 use anyhow::Result;
 use rintawa_extension_engine::ExtensionEngine;
 use rintawa_sdk::prelude::*;
