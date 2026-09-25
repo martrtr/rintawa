@@ -27,7 +27,11 @@ macro_rules! opaque_world_id {
         pub struct $name(Uuid);
 
         impl $name {
-            /// Generates a new time-ordered UUIDv7 identifier.
+            /// Generates a new time-ordered UUIDv7 identifier on host-capable targets.
+            ///
+            /// Rintawa Component Model guests receive authoritative identifiers from
+            /// host contracts instead of depending on ambient randomness.
+            #[cfg(not(target_arch = "wasm32"))]
             pub fn new() -> Self {
                 Self(Uuid::now_v7())
             }
@@ -53,6 +57,7 @@ macro_rules! opaque_world_id {
             }
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         impl Default for $name {
             fn default() -> Self {
                 Self::new()
