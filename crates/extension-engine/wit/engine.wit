@@ -290,6 +290,42 @@ interface asset-store {
     import-asset: func(bytes: list<u8>, media-type: string) -> result<asset-ref, error>;
 }
 
+/// Generic persistent user-content library reads.
+interface user-content {
+    /// One logical library item pointing at an immutable RTW revision.
+    record entry {
+        id: string,
+        content: string,
+        revision: string,
+    }
+
+    /// One item plus its bounded root content descriptor.
+    record document {
+        metadata: entry,
+        descriptor: list<u8>,
+    }
+
+    /// Failure while reading generic user content.
+    variant error {
+        access-not-active,
+        permission-denied,
+        invalid-id,
+        invalid-content,
+        not-found,
+        message-too-large,
+        rejected,
+        unavailable,
+    }
+
+    /// Lists logical items, optionally restricted to one exact versioned content type.
+    /// Requires `user-content-read`.
+    list-items: func(content: option<string>) -> result<list<entry>, error>;
+
+    /// Reads one bounded root descriptor by logical library identity.
+    /// Requires `user-content-read`.
+    read: func(id: string) -> result<document, error>;
+}
+
 /// Generic persistent-world catalog and deferred runtime lifecycle control.
 interface world-sessions {
     /// One persistent world plus host runtime lifecycle status.
@@ -754,6 +790,7 @@ world plugin {
     import http-fetch;
     import artifact-store;
     import asset-store;
+    import user-content;
     import world-sessions;
     import preferences;
     import composition;
@@ -790,6 +827,7 @@ world task-runtime-plugin {
     import http-fetch;
     import artifact-store;
     import asset-store;
+    import user-content;
     import world-sessions;
     import preferences;
     import composition;
@@ -816,6 +854,7 @@ world runtime-provider-plugin {
     import http-fetch;
     import artifact-store;
     import asset-store;
+    import user-content;
     import world-sessions;
     import preferences;
     import composition;
@@ -842,6 +881,7 @@ world runtime-provider-task-plugin {
     import http-fetch;
     import artifact-store;
     import asset-store;
+    import user-content;
     import world-sessions;
     import preferences;
     import composition;

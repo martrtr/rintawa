@@ -5,8 +5,8 @@ use crate::{
     host_access::{
         ArtifactStoreAccess, AssetStoreAccess, CompositionAccess, CompositionActivation,
         HostAccessError, HostAccessResult, ImportedArtifact, ImportedAsset, PreferenceAccess,
-        RuntimeArtifactPolicy, RuntimePolicyAccess, RuntimePolicyComponent, WorldSessionAccess,
-        WorldSessionSummary,
+        RuntimeArtifactPolicy, RuntimePolicyAccess, RuntimePolicyComponent, UserContentAccess,
+        UserContentDocument, UserContentSummary, WorldSessionAccess, WorldSessionSummary,
     },
     secrets::InMemorySecretVault,
 };
@@ -59,6 +59,40 @@ impl AssetStoreAccess for RecordingScopedHostAccess {
             ),
             size: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
             media_type: media_type.to_ascii_lowercase(),
+        })
+    }
+}
+
+impl UserContentAccess for RecordingScopedHostAccess {
+    fn list_user_content(
+        &self,
+        content: Option<&str>,
+    ) -> HostAccessResult<Vec<UserContentSummary>> {
+        if content.is_some_and(|content| content != "example.content@1") {
+            return Ok(Vec::new());
+        }
+        Ok(vec![UserContentSummary {
+            id: String::from("018f0000-0000-7000-8000-000000000010"),
+            content: String::from("example.content@1"),
+            revision: String::from(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        }])
+    }
+
+    fn read_user_content(&self, id: &str) -> HostAccessResult<UserContentDocument> {
+        if id != "018f0000-0000-7000-8000-000000000010" {
+            return Err(HostAccessError::NotFound);
+        }
+        Ok(UserContentDocument {
+            metadata: UserContentSummary {
+                id: id.to_string(),
+                content: String::from("example.content@1"),
+                revision: String::from(
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ),
+            },
+            descriptor: br#"{"name":"Example"}"#.to_vec(),
         })
     }
 }
@@ -971,6 +1005,67 @@ fn test_should_gate_and_bound_generic_asset_import() {
     assert_eq!(imported.size, 3);
     assert_eq!(imported.media_type, "image/png");
     assert!(imported.digest.starts_with("sha256:"));
+}
+
+#[test]
+fn test_should_gate_and_bound_generic_user_content_reads() {
+    let access = Arc::new(RecordingScopedHostAccess::default());
+    let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
+    let mut services = WasmHostServices::standalone(secrets);
+    services.host_access = HostAccessServices::new(
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+    )
+    .with_user_content_access(access);
+    let budget = WasmExecutionBudget {
+        max_host_message_bytes: 256,
+        ..WasmExecutionBudget::default()
+    };
+    let mut state = WasmHostState::with_host_services_and_budget(
+        ComponentId::new("runtime"),
+        services,
+        false,
+        &budget,
+    );
+    begin_test_registration(&mut state, ExtensionId::new("content.library"));
+    state.finish_registration().unwrap();
+
+    assert!(matches!(
+        UserContentHost::list_items(&mut state, Some(String::from("example.content@1"))),
+        Err(UserContentError::AccessNotActive)
+    ));
+    state.begin_guest_execution();
+    assert!(matches!(
+        UserContentHost::list_items(&mut state, Some(String::from("example.content@1"))),
+        Err(UserContentError::PermissionDenied)
+    ));
+
+    let owner = state.registered_owner().unwrap();
+    state
+        .runtime_permissions
+        .grant(owner, RuntimePermission::UserContentRead)
+        .unwrap();
+    let entries =
+        UserContentHost::list_items(&mut state, Some(String::from("example.content@1"))).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].content, "example.content@1");
+
+    let document = UserContentHost::read(&mut state, entries[0].id.clone()).unwrap();
+    assert_eq!(document.metadata.id, entries[0].id);
+    assert_eq!(document.descriptor, br#"{"name":"Example"}"#);
+
+    assert!(matches!(
+        UserContentHost::list_items(&mut state, Some("x".repeat(257))),
+        Err(UserContentError::MessageTooLarge)
+    ));
+    assert!(matches!(
+        UserContentHost::read(&mut state, String::from("missing")),
+        Err(UserContentError::NotFound)
+    ));
 }
 
 #[test]

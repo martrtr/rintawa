@@ -23,6 +23,8 @@ pub enum RuntimePermission {
     ArtifactImport,
     /// Allows importing bounded immutable raw assets into the local asset store.
     AssetImport,
+    /// Allows reading the persistent generic user-content library and descriptors.
+    UserContentRead,
     /// Allows reading the persistent world catalog and runtime lifecycle status.
     WorldSessionRead,
     /// Allows creating worlds and requesting active/inactive world lifecycle transitions.
@@ -46,6 +48,7 @@ impl fmt::Display for RuntimePermission {
             Self::HttpFetch => formatter.write_str("http-fetch"),
             Self::ArtifactImport => formatter.write_str("artifact-import"),
             Self::AssetImport => formatter.write_str("asset-import"),
+            Self::UserContentRead => formatter.write_str("user-content-read"),
             Self::WorldSessionRead => formatter.write_str("world-session-read"),
             Self::WorldSessionWrite => formatter.write_str("world-session-write"),
             Self::CompositionRead => formatter.write_str("composition-read"),
@@ -79,6 +82,7 @@ impl FromStr for RuntimePermission {
             "http-fetch" => Ok(Self::HttpFetch),
             "artifact-import" => Ok(Self::ArtifactImport),
             "asset-import" => Ok(Self::AssetImport),
+            "user-content-read" => Ok(Self::UserContentRead),
             "world-session-read" => Ok(Self::WorldSessionRead),
             "world-session-write" => Ok(Self::WorldSessionWrite),
             "composition-read" => Ok(Self::CompositionRead),
@@ -100,6 +104,18 @@ mod tests {
         assert_eq!(
             "asset-import".parse::<RuntimePermission>(),
             Ok(RuntimePermission::AssetImport)
+        );
+    }
+
+    #[test]
+    fn test_should_round_trip_user_content_read_permission() {
+        assert_eq!(
+            RuntimePermission::UserContentRead.to_string(),
+            "user-content-read"
+        );
+        assert_eq!(
+            "user-content-read".parse::<RuntimePermission>(),
+            Ok(RuntimePermission::UserContentRead)
         );
     }
 

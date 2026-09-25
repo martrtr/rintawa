@@ -41,7 +41,7 @@ use crate::{
     execution_targets::{ExecutionTargetDependency, ExecutionTargetRegistry},
     host_access::{
         ArtifactStoreAccess, AssetStoreAccess, CompositionAccess, HostAccessServices,
-        PreferenceAccess, RuntimePolicyAccess, WorldSessionAccess,
+        PreferenceAccess, RuntimePolicyAccess, UserContentAccess, WorldSessionAccess,
     },
     runtime::WasmRuntimeEngine,
     runtime_effects::RuntimeEffectRegistry,
@@ -306,6 +306,14 @@ impl ExtensionEngine {
             ),
             ..Self::default()
         }
+    }
+
+    /// Attaches generic read-only user-content library access.
+    ///
+    /// Embedded hosts that do not call this method remain fail-closed with an
+    /// unavailable capability. Guest access is still permission-gated per component.
+    pub fn attach_user_content_access(&mut self, access: Arc<dyn UserContentAccess>) {
+        self.host_access = self.host_access.clone().with_user_content_access(access);
     }
 
     /// Creates an engine using a host-configured secret manager.

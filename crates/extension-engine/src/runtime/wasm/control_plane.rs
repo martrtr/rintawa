@@ -1,4 +1,4 @@
-//! WASM adapters for host-owned artifact, preference, runtime-policy, and composition control.
+//! WASM adapters for host-owned artifact, user-content, preference, policy, and composition access.
 
 use rintawa_sdk::{
     contracts::ComponentRef, runtime_permissions::RuntimePermission, types::RuntimeScopeId,
@@ -6,15 +6,17 @@ use rintawa_sdk::{
 
 use crate::{
     host_access::{
-        CompositionActivation, HostAccessError, RuntimePolicyComponent, WorldSessionSummary,
+        CompositionActivation, HostAccessError, RuntimePolicyComponent, UserContentDocument,
+        UserContentSummary, WorldSessionSummary,
     },
     runtime::wasm::{
         ArtifactStoreError, ArtifactStoreHost, AssetStoreError, AssetStoreHost, CompositionError,
         CompositionHost, PreferenceError, PreferencesHost, RuntimePermissionCheck,
         RuntimePolicyError, RuntimePolicyHost, ScopedCompositionHost, ScopedRuntimePolicyHost,
-        WasmHostState, WitAssetRef, WitCompositionActivation, WitImportedArtifact,
-        WitRuntimeArtifactPolicy, WitRuntimePolicyComponent, WitRuntimePolicyRequest,
-        WitWorldSummary, WorldSessionError, WorldSessionsHost,
+        UserContentError, UserContentHost, WasmHostState, WitAssetRef, WitCompositionActivation,
+        WitImportedArtifact, WitRuntimeArtifactPolicy, WitRuntimePolicyComponent,
+        WitRuntimePolicyRequest, WitUserContentDocument, WitUserContentEntry, WitWorldSummary,
+        WorldSessionError, WorldSessionsHost,
     },
 };
 
@@ -74,6 +76,40 @@ impl AssetStoreHost for WasmHostState {
             size: imported.size,
             media_type: imported.media_type,
         })
+    }
+}
+
+impl UserContentHost for WasmHostState {
+    fn list_items(
+        &mut self,
+        content: Option<String>,
+    ) -> Result<Vec<WitUserContentEntry>, UserContentError> {
+        self.require_user_content_read()?;
+        if content
+            .as_ref()
+            .is_some_and(|content| content.len() > self.max_host_message_bytes)
+        {
+            return Err(UserContentError::MessageTooLarge);
+        }
+        let entries = self
+            .host_access
+            .user_content
+            .list_user_content(content.as_deref())
+            .map_err(map_user_content_access_error)?;
+        self.bound_user_content_entries(entries)
+    }
+
+    fn read(&mut self, id: String) -> Result<WitUserContentDocument, UserContentError> {
+        self.require_user_content_read()?;
+        if id.len() > self.max_host_message_bytes {
+            return Err(UserContentError::MessageTooLarge);
+        }
+        let document = self
+            .host_access
+            .user_content
+            .read_user_content(&id)
+            .map_err(map_user_content_access_error)?;
+        self.bound_user_content_document(document)
     }
 }
 
@@ -493,6 +529,54 @@ impl ScopedCompositionHost for WasmHostState {
 }
 
 impl WasmHostState {
+    fn require_user_content_read(&self) -> Result<(), UserContentError> {
+        if !self.host_access_active {
+            return Err(UserContentError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::UserContentRead)
+            .map(|_| ())
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => UserContentError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => UserContentError::Unavailable,
+            })
+    }
+
+    fn bound_user_content_entries(
+        &self,
+        entries: Vec<UserContentSummary>,
+    ) -> Result<Vec<WitUserContentEntry>, UserContentError> {
+        let message_bytes = entries.iter().fold(0_usize, |total, entry| {
+            total
+                .saturating_add(entry.id.len())
+                .saturating_add(entry.content.len())
+                .saturating_add(entry.revision.len())
+        });
+        if message_bytes > self.max_host_message_bytes {
+            return Err(UserContentError::MessageTooLarge);
+        }
+        Ok(entries.into_iter().map(to_wit_user_content_entry).collect())
+    }
+
+    fn bound_user_content_document(
+        &self,
+        document: UserContentDocument,
+    ) -> Result<WitUserContentDocument, UserContentError> {
+        let message_bytes = document
+            .metadata
+            .id
+            .len()
+            .saturating_add(document.metadata.content.len())
+            .saturating_add(document.metadata.revision.len())
+            .saturating_add(document.descriptor.len());
+        if message_bytes > self.max_host_message_bytes {
+            return Err(UserContentError::MessageTooLarge);
+        }
+        Ok(WitUserContentDocument {
+            metadata: to_wit_user_content_entry(document.metadata),
+            descriptor: document.descriptor,
+        })
+    }
+
     fn require_world_session_permission(
         &self,
         permission: RuntimePermission,
@@ -626,6 +710,33 @@ fn to_wit_composition_activation(activation: CompositionActivation) -> WitCompos
     }
 }
 
+fn to_wit_user_content_entry(entry: UserContentSummary) -> WitUserContentEntry {
+    WitUserContentEntry {
+        id: entry.id,
+        content: entry.content,
+        revision: entry.revision,
+    }
+}
+
+fn map_user_content_access_error(error: HostAccessError) -> UserContentError {
+    match error {
+        HostAccessError::InvalidUserContentId => UserContentError::InvalidId,
+        HostAccessError::InvalidContentType => UserContentError::InvalidContent,
+        HostAccessError::NotFound => UserContentError::NotFound,
+        HostAccessError::Unavailable => UserContentError::Unavailable,
+        HostAccessError::Rejected
+        | HostAccessError::InvalidArtifact
+        | HostAccessError::InvalidAsset
+        | HostAccessError::InvalidDigest
+        | HostAccessError::InvalidWorldId
+        | HostAccessError::QueueFull
+        | HostAccessError::UnsupportedContent
+        | HostAccessError::InvalidPermission
+        | HostAccessError::InvalidPreference
+        | HostAccessError::PreferenceQuotaExceeded => UserContentError::Rejected,
+    }
+}
+
 fn map_world_session_access_error(error: HostAccessError) -> WorldSessionError {
     match error {
         HostAccessError::InvalidWorldId => WorldSessionError::InvalidWorldId,
@@ -635,6 +746,8 @@ fn map_world_session_access_error(error: HostAccessError) -> WorldSessionError {
         HostAccessError::InvalidArtifact
         | HostAccessError::InvalidAsset
         | HostAccessError::InvalidDigest
+        | HostAccessError::InvalidUserContentId
+        | HostAccessError::InvalidContentType
         | HostAccessError::UnsupportedContent
         | HostAccessError::InvalidPermission
         | HostAccessError::InvalidPreference
@@ -651,6 +764,8 @@ fn map_artifact_store_access_error(error: HostAccessError) -> ArtifactStoreError
         HostAccessError::Unavailable => ArtifactStoreError::Unavailable,
         HostAccessError::NotFound
         | HostAccessError::InvalidWorldId
+        | HostAccessError::InvalidUserContentId
+        | HostAccessError::InvalidContentType
         | HostAccessError::QueueFull
         | HostAccessError::InvalidAsset
         | HostAccessError::UnsupportedContent
@@ -669,6 +784,8 @@ fn map_asset_store_access_error(error: HostAccessError) -> AssetStoreError {
         HostAccessError::Unavailable => AssetStoreError::Unavailable,
         HostAccessError::InvalidArtifact
         | HostAccessError::InvalidWorldId
+        | HostAccessError::InvalidUserContentId
+        | HostAccessError::InvalidContentType
         | HostAccessError::QueueFull
         | HostAccessError::NotFound
         | HostAccessError::UnsupportedContent
@@ -688,6 +805,8 @@ fn map_preference_access_error(error: HostAccessError) -> PreferenceError {
         | HostAccessError::InvalidAsset
         | HostAccessError::InvalidDigest
         | HostAccessError::InvalidWorldId
+        | HostAccessError::InvalidUserContentId
+        | HostAccessError::InvalidContentType
         | HostAccessError::QueueFull
         | HostAccessError::NotFound
         | HostAccessError::UnsupportedContent
@@ -705,6 +824,8 @@ fn map_runtime_policy_access_error(error: HostAccessError) -> RuntimePolicyError
         | HostAccessError::InvalidAsset
         | HostAccessError::InvalidDigest
         | HostAccessError::InvalidWorldId
+        | HostAccessError::InvalidUserContentId
+        | HostAccessError::InvalidContentType
         | HostAccessError::QueueFull
         | HostAccessError::UnsupportedContent
         | HostAccessError::InvalidPreference
@@ -722,6 +843,8 @@ fn map_composition_access_error(error: HostAccessError) -> CompositionError {
         HostAccessError::UnsupportedContent => CompositionError::UnsupportedContent,
         HostAccessError::InvalidAsset
         | HostAccessError::InvalidWorldId
+        | HostAccessError::InvalidUserContentId
+        | HostAccessError::InvalidContentType
         | HostAccessError::QueueFull
         | HostAccessError::InvalidPermission
         | HostAccessError::InvalidPreference

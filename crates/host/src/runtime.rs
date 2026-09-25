@@ -13,7 +13,8 @@ use rintawa_extension_engine::{
     CompositionActivation, EngineError, ExtensionEngine, HostAccessError, HostAccessResult,
     ImportedArtifact, ImportedAsset, PreferenceAccess, RtwExtensionLoadOutcome, RtwExtensionLoader,
     RuntimeArtifactPolicy, RuntimePolicyAccess, RuntimePolicyComponent, RuntimePolicyRequest,
-    UnresolvedContractReason, WorldSessionAccess, WorldSessionSummary,
+    UnresolvedContractReason, UserContentAccess, UserContentDocument, UserContentSummary,
+    WorldSessionAccess, WorldSessionSummary,
 };
 use rintawa_sdk::{
     content::{
@@ -187,6 +188,65 @@ impl AssetStoreAccess for LocalHostAccess {
             size: reference.size,
             media_type: reference.media_type.to_string(),
         })
+    }
+}
+
+impl UserContentAccess for LocalHostAccess {
+    fn list_user_content(
+        &self,
+        content: Option<&str>,
+    ) -> HostAccessResult<Vec<UserContentSummary>> {
+        let content = content
+            .map(ContentType::parse)
+            .transpose()
+            .map_err(|_| HostAccessError::InvalidContentType)?;
+        Ok(self
+            .home()?
+            .list_user_content()
+            .map_err(map_host_access_error)?
+            .into_iter()
+            .filter(|entry| {
+                content
+                    .as_ref()
+                    .is_none_or(|content| &entry.content == content)
+            })
+            .map(to_user_content_summary)
+            .collect())
+    }
+
+    fn read_user_content(&self, id: &str) -> HostAccessResult<UserContentDocument> {
+        let id = id
+            .parse::<UserContentId>()
+            .map_err(|_| HostAccessError::InvalidUserContentId)?;
+        let home = self.home()?;
+        let entry = home
+            .indexed_user_content(id)
+            .map_err(map_host_access_error)?;
+        let mut archive = home
+            .artifact_store()
+            .open_artifact(&entry.revision)
+            .map_err(|_| HostAccessError::Unavailable)?;
+        if archive.manifest().content != entry.content {
+            return Err(HostAccessError::Rejected);
+        }
+        let entry_path = archive.manifest().entry.clone();
+        let maximum_entry_bytes = u64::try_from(MAX_CONTENT_HANDLER_ENTRY_BYTES)
+            .map_err(|_| HostAccessError::Rejected)?;
+        let descriptor = archive
+            .read_with_limit(&entry_path, maximum_entry_bytes)
+            .map_err(|_| HostAccessError::Rejected)?;
+        Ok(UserContentDocument {
+            metadata: to_user_content_summary(entry),
+            descriptor,
+        })
+    }
+}
+
+fn to_user_content_summary(entry: UserContentEntry) -> UserContentSummary {
+    UserContentSummary {
+        id: entry.id.to_string(),
+        content: entry.content.to_string(),
+        revision: entry.revision.to_string(),
     }
 }
 
@@ -515,7 +575,9 @@ fn map_asset_import_error(error: rintawa_artifacts::AssetError) -> HostAccessErr
 
 fn map_host_access_error(error: HostError) -> HostAccessError {
     match error {
-        HostError::ActivationNotFound(_) | HostError::WorldNotFound(_) => HostAccessError::NotFound,
+        HostError::ActivationNotFound(_)
+        | HostError::WorldNotFound(_)
+        | HostError::UserContentNotFound(_) => HostAccessError::NotFound,
         HostError::UnsupportedContent(_) => HostAccessError::UnsupportedContent,
         HostError::Io(_)
         | HostError::ProfileDecode(_)
@@ -598,6 +660,7 @@ impl HostRuntime {
         let access = Arc::new(LocalHostAccess::new(home.root(), world_sessions));
         let artifact_store_access: Arc<dyn ArtifactStoreAccess> = access.clone();
         let asset_store_access: Arc<dyn AssetStoreAccess> = access.clone();
+        let user_content_access: Arc<dyn UserContentAccess> = access.clone();
         let world_session_access: Arc<dyn WorldSessionAccess> = access.clone();
         let composition_access: Arc<dyn CompositionAccess> = access.clone();
         let preference_access: Arc<dyn PreferenceAccess> = access.clone();
@@ -610,6 +673,7 @@ impl HostRuntime {
             preference_access,
             runtime_policy_access,
         );
+        engine.attach_user_content_access(user_content_access);
         let host_scope = RuntimeScopeId::new(HOST_SCOPE);
         let host_shell_contract = host_shell_contract_key();
         let ui_layer_contract = ui_layer_contract_key();
@@ -2684,6 +2748,72 @@ mod tests {
         assert!(!inactive.active);
         assert_eq!(inactive.pending_active, None);
         assert_eq!(inactive.last_error, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_expose_persisted_user_content_through_generic_read_access() -> anyhow::Result<()>
+    {
+        let root = tempfile::TempDir::new()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let mut host = HostRuntime::start(&home)?;
+        let content = ContentType::parse("rintawa.test-content@1")?;
+        let contract = content_handler_service_contract_key(content.id(), content.major());
+        let provider_instance = ExtensionInstanceId::new("content-handler-provider");
+
+        host.engine.register_extension_instance(
+            provider_instance.clone(),
+            RuntimeScopeId::new(HOST_SCOPE),
+            test_manifest("rintawa.test-content-handler"),
+            vec![Box::new(ContentHandlerProvider {
+                id: ComponentId::new("runtime"),
+                contract,
+                observed: Arc::new(Mutex::new(Vec::new())),
+            })],
+        )?;
+        host.engine.start_extension_instance(&provider_instance)?;
+
+        let descriptor = br#"{"name":"Example"}"#;
+        let source = write_test_content_rtw(
+            root.path(),
+            "generic-read-content",
+            &content.to_string(),
+            descriptor,
+        )?;
+        let imported = host.import_user_content_rtw(&home, source)?;
+        let access = host
+            .host_access
+            .as_ref()
+            .expect("production HostRuntime must retain host access")
+            .clone();
+
+        assert_eq!(
+            UserContentAccess::list_user_content(access.as_ref(), Some("not-versioned")),
+            Err(HostAccessError::InvalidContentType)
+        );
+        assert!(
+            UserContentAccess::list_user_content(access.as_ref(), Some("rintawa.other-content@1"))
+                .expect("valid content filter should remain readable")
+                .is_empty()
+        );
+
+        let listed =
+            UserContentAccess::list_user_content(access.as_ref(), Some("rintawa.test-content@1"))
+                .expect("persisted user content should remain readable");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, imported.id.to_string());
+        assert_eq!(listed[0].content, content.to_string());
+        assert_eq!(listed[0].revision, imported.revision.to_string());
+
+        assert_eq!(
+            UserContentAccess::read_user_content(access.as_ref(), "not-an-id"),
+            Err(HostAccessError::InvalidUserContentId)
+        );
+        let document =
+            UserContentAccess::read_user_content(access.as_ref(), &imported.id.to_string())
+                .expect("persisted user-content descriptor should remain readable");
+        assert_eq!(document.metadata, listed[0]);
+        assert_eq!(document.descriptor, descriptor);
         Ok(())
     }
 

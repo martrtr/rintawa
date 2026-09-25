@@ -142,6 +142,10 @@ use bindings::rintawa::engine::{
     secrets::{Error as SecretError, Host as SecretsHost},
     services::{Error as ServiceTransportError, Host as ServicesHost},
     ui_layer::{Error as UiLayerError, Host as UiLayerHost},
+    user_content::{
+        Document as WitUserContentDocument, Entry as WitUserContentEntry,
+        Error as UserContentError, Host as UserContentHost,
+    },
     world_registration::{
         Error as WorldRegistrationError, Host as WorldRegistrationHost, SchemaKind as WitSchemaKind,
     },

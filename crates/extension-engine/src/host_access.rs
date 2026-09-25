@@ -1,4 +1,4 @@
-//! Generic host-owned local artifact, asset, and composition access for sandboxed extensions.
+//! Generic host-owned local artifact, asset, user-content, and composition access.
 //!
 //! These traits deliberately contain no repository, update, marketplace, package-manager,
 //! or network-source semantics. The production host can expose them to any explicitly
@@ -41,6 +41,26 @@ pub struct ImportedArtifact {
     pub content: String,
 }
 
+/// One logical item in the persistent generic user-content library.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserContentSummary {
+    /// Stable host-local logical content identity.
+    pub id: String,
+    /// Exact versioned RTW content type.
+    pub content: String,
+    /// Exact immutable RTW revision digest.
+    pub revision: String,
+}
+
+/// One generic user-content item plus its bounded root descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserContentDocument {
+    /// Logical item metadata.
+    pub metadata: UserContentSummary,
+    /// Exact bounded bytes stored at the RTW root entry path.
+    pub descriptor: Vec<u8>,
+}
+
 /// One exact activation selected by the host composition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompositionActivation {
@@ -75,6 +95,10 @@ pub enum HostAccessError {
     InvalidDigest,
     /// A world identifier is malformed.
     InvalidWorldId,
+    /// A user-content logical identifier is malformed.
+    InvalidUserContentId,
+    /// A user-content type filter is malformed.
+    InvalidContentType,
     /// A bounded host-owned request queue has no remaining capacity.
     QueueFull,
     /// The requested selection does not exist.
@@ -106,6 +130,16 @@ pub trait ArtifactStoreAccess: Send + Sync {
 pub trait AssetStoreAccess: Send + Sync {
     /// Imports exact bytes and returns their immutable digest/size/media reference.
     fn import_asset(&self, bytes: &[u8], media_type: &str) -> HostAccessResult<ImportedAsset>;
+}
+
+/// Generic read-only access to the persistent user-content library.
+pub trait UserContentAccess: Send + Sync {
+    /// Lists logical items, optionally restricted to one exact versioned content type.
+    fn list_user_content(&self, content: Option<&str>)
+    -> HostAccessResult<Vec<UserContentSummary>>;
+
+    /// Reads one bounded root content descriptor by logical identity.
+    fn read_user_content(&self, id: &str) -> HostAccessResult<UserContentDocument>;
 }
 
 /// Generic persistent-world catalog and lifecycle request operations.
@@ -306,6 +340,22 @@ impl AssetStoreAccess for UnavailableAssetStoreAccess {
 }
 
 #[derive(Default)]
+struct UnavailableUserContentAccess;
+
+impl UserContentAccess for UnavailableUserContentAccess {
+    fn list_user_content(
+        &self,
+        _content: Option<&str>,
+    ) -> HostAccessResult<Vec<UserContentSummary>> {
+        Err(HostAccessError::Unavailable)
+    }
+
+    fn read_user_content(&self, _id: &str) -> HostAccessResult<UserContentDocument> {
+        Err(HostAccessError::Unavailable)
+    }
+}
+
+#[derive(Default)]
 struct UnavailableWorldSessionAccess;
 
 impl WorldSessionAccess for UnavailableWorldSessionAccess {
@@ -424,6 +474,7 @@ impl CompositionAccess for UnavailableCompositionAccess {
 pub(crate) struct HostAccessServices {
     pub(crate) artifact_store: Arc<dyn ArtifactStoreAccess>,
     pub(crate) asset_store: Arc<dyn AssetStoreAccess>,
+    pub(crate) user_content: Arc<dyn UserContentAccess>,
     pub(crate) world_sessions: Arc<dyn WorldSessionAccess>,
     pub(crate) composition: Arc<dyn CompositionAccess>,
     pub(crate) preferences: Arc<dyn PreferenceAccess>,
@@ -442,6 +493,7 @@ impl HostAccessServices {
         Self {
             artifact_store,
             asset_store,
+            user_content: Arc::new(UnavailableUserContentAccess),
             world_sessions,
             composition,
             preferences,
@@ -449,10 +501,19 @@ impl HostAccessServices {
         }
     }
 
+    pub(crate) fn with_user_content_access(
+        mut self,
+        user_content: Arc<dyn UserContentAccess>,
+    ) -> Self {
+        self.user_content = user_content;
+        self
+    }
+
     pub(crate) fn unavailable() -> Self {
         Self {
             artifact_store: Arc::new(UnavailableArtifactStoreAccess),
             asset_store: Arc::new(UnavailableAssetStoreAccess),
+            user_content: Arc::new(UnavailableUserContentAccess),
             world_sessions: Arc::new(UnavailableWorldSessionAccess),
             composition: Arc::new(UnavailableCompositionAccess),
             preferences: Arc::new(UnavailablePreferenceAccess),
