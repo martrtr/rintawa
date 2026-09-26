@@ -10,14 +10,16 @@ use std::{
 
 use rintawa_artifacts::{ArtifactDigest, ContentType, RtwArchive, RtwLimits};
 use rintawa_extension_engine::{
-    AcceptedUserContentWrite, AcceptedWorldCommand, ActivationPlanError, ArtifactStoreAccess,
-    AssetStoreAccess, CompositionAccess, CompositionActivation, EngineError, ExtensionEngine,
-    HostAccessError, HostAccessResult, ImportedArtifact, ImportedAsset, PreferenceAccess,
-    RtwExtensionLoadOutcome, RtwExtensionLoader, RuntimeArtifactPolicy, RuntimePolicyAccess,
-    RuntimePolicyComponent, RuntimePolicyRequest, UnresolvedContractReason, UserContentAccess,
-    UserContentDocument, UserContentSummary, UserContentWriteAccess, UserContentWriteStatus,
-    WorldCommandAccess, WorldCommandAccessError, WorldCommandAccessResult, WorldCommandActor,
-    WorldCommandRequest, WorldSessionAccess, WorldSessionSummary,
+    AcceptedUserContentWrite, AcceptedWorldCommand, AcceptedWorldProjectionRead,
+    ActivationPlanError, ArtifactStoreAccess, AssetStoreAccess, CompositionAccess,
+    CompositionActivation, EngineError, ExtensionEngine, HostAccessError, HostAccessResult,
+    ImportedArtifact, ImportedAsset, PreferenceAccess, RtwExtensionLoadOutcome, RtwExtensionLoader,
+    RuntimeArtifactPolicy, RuntimePolicyAccess, RuntimePolicyComponent, RuntimePolicyRequest,
+    UnresolvedContractReason, UserContentAccess, UserContentDocument, UserContentSummary,
+    UserContentWriteAccess, UserContentWriteStatus, WorldCommandAccess, WorldCommandAccessError,
+    WorldCommandAccessResult, WorldCommandActor, WorldCommandRequest, WorldProjectionAccess,
+    WorldProjectionAccessError, WorldProjectionAccessResult, WorldProjectionReadStatus,
+    WorldProjectionReadView, WorldProjectionRequest, WorldSessionAccess, WorldSessionSummary,
 };
 use rintawa_sdk::{
     content::{
@@ -32,6 +34,7 @@ use rintawa_sdk::{
     runtime_signals::RuntimeSignal,
     types::{ExtensionId, ExtensionInstanceId, RuntimeScopeId},
     world::{EntityId, PrincipalId, SchemaKey, UnixTimeMillis, WorldId},
+    world_projection::MAX_WORLD_PROJECTION_INPUT_BYTES,
 };
 use rintawa_storage::SqliteWorldStorage;
 use rintawa_world::{
@@ -75,6 +78,14 @@ const MAX_USER_CONTENT_WRITE_DIAGNOSTIC_BYTES: usize = 2 * 1024;
 const MAX_PENDING_WORLD_SESSION_REQUESTS: usize = 64;
 /// Maximum deferred authoritative commands accepted before a host pump drains them.
 const MAX_PENDING_WORLD_COMMAND_REQUESTS: usize = 128;
+/// Maximum deferred policy-filtered projection reads accepted before a host pump drains them.
+const MAX_PENDING_WORLD_PROJECTION_REQUESTS: usize = 64;
+/// Maximum completed/pending projection statuses retained for owner-scoped inspection.
+const MAX_RETAINED_WORLD_PROJECTION_STATUSES: usize = 256;
+/// Maximum serialized projection view retained for one completed operation.
+const MAX_WORLD_PROJECTION_VIEW_BYTES: usize = 1024 * 1024;
+/// Maximum diagnostic bytes retained for one failed deferred projection read.
+const MAX_WORLD_PROJECTION_STATUS_DIAGNOSTIC_BYTES: usize = 2 * 1024;
 /// Maximum diagnostic bytes retained for one failed deferred world lifecycle request.
 const MAX_WORLD_SESSION_DIAGNOSTIC_BYTES: usize = 2 * 1024;
 
@@ -120,7 +131,7 @@ impl WorldSessionRuntimeControl {
         Ok(())
     }
 
-    fn accepts_commands(&self, world_id: WorldId) -> HostAccessResult<bool> {
+    fn accepts_deferred_world_access(&self, world_id: WorldId) -> HostAccessResult<bool> {
         let state = self
             .state
             .lock()
@@ -331,12 +342,132 @@ impl WorldCommandRuntimeControl {
     }
 }
 
+struct DeferredWorldProjectionRead {
+    operation_id: String,
+    world_id: WorldId,
+    projection_schema: SchemaKey,
+    principal: PrincipalId,
+    input: serde_json::Value,
+}
+
+#[derive(Clone)]
+struct OwnedWorldProjectionStatus {
+    owner: ComponentRef,
+    status: WorldProjectionReadStatus,
+}
+
+#[derive(Default)]
+struct WorldProjectionRuntimeState {
+    queue: VecDeque<DeferredWorldProjectionRead>,
+    statuses: BTreeMap<String, OwnedWorldProjectionStatus>,
+    completed: VecDeque<String>,
+}
+
+#[derive(Clone, Default)]
+struct WorldProjectionRuntimeControl {
+    state: Arc<Mutex<WorldProjectionRuntimeState>>,
+}
+
+impl WorldProjectionRuntimeControl {
+    fn request(
+        &self,
+        owner: ComponentRef,
+        world_id: WorldId,
+        projection_schema: SchemaKey,
+        principal: PrincipalId,
+        input: serde_json::Value,
+    ) -> WorldProjectionAccessResult<AcceptedWorldProjectionRead> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| WorldProjectionAccessError::Unavailable)?;
+        if state.queue.len() >= MAX_PENDING_WORLD_PROJECTION_REQUESTS {
+            return Err(WorldProjectionAccessError::QueueFull);
+        }
+        while state.statuses.len() >= MAX_RETAINED_WORLD_PROJECTION_STATUSES {
+            let Some(expired) = state.completed.pop_front() else {
+                return Err(WorldProjectionAccessError::QueueFull);
+            };
+            state.statuses.remove(&expired);
+        }
+        let operation_id = Uuid::now_v7().to_string();
+        if state.statuses.contains_key(&operation_id) {
+            return Err(WorldProjectionAccessError::Rejected);
+        }
+        state.statuses.insert(
+            operation_id.clone(),
+            OwnedWorldProjectionStatus {
+                owner,
+                status: WorldProjectionReadStatus::Pending,
+            },
+        );
+        state.queue.push_back(DeferredWorldProjectionRead {
+            operation_id: operation_id.clone(),
+            world_id,
+            projection_schema,
+            principal,
+            input,
+        });
+        Ok(AcceptedWorldProjectionRead { operation_id })
+    }
+
+    fn status(
+        &self,
+        owner: &ComponentRef,
+        operation_id: &str,
+    ) -> WorldProjectionAccessResult<WorldProjectionReadStatus> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| WorldProjectionAccessError::Unavailable)?;
+        let Some(operation) = state.statuses.get(operation_id) else {
+            return Err(WorldProjectionAccessError::NotFound);
+        };
+        if &operation.owner != owner {
+            return Err(WorldProjectionAccessError::NotFound);
+        }
+        Ok(operation.status.clone())
+    }
+
+    fn drain_pending(&self) -> HostResult<Vec<DeferredWorldProjectionRead>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| HostError::WorldProjectionControlUnavailable)?;
+        Ok(state.queue.drain(..).collect())
+    }
+
+    fn record_outcome(
+        &self,
+        operation_id: &str,
+        status: WorldProjectionReadStatus,
+    ) -> HostResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| HostError::WorldProjectionControlUnavailable)?;
+        let Some(operation) = state.statuses.get_mut(operation_id) else {
+            return Err(HostError::WorldProjectionControlUnavailable);
+        };
+        operation.status = status;
+        state.completed.push_back(operation_id.to_string());
+        while state.statuses.len() > MAX_RETAINED_WORLD_PROJECTION_STATUSES {
+            let Some(expired) = state.completed.pop_front() else {
+                return Err(HostError::WorldProjectionControlUnavailable);
+            };
+            state.statuses.remove(&expired);
+        }
+        Ok(())
+    }
+}
+
 struct LocalHostAccess {
     home_root: PathBuf,
     local_principal: PrincipalId,
     user_content_writes: UserContentWriteRuntimeControl,
     world_sessions: WorldSessionRuntimeControl,
     world_commands: WorldCommandRuntimeControl,
+    world_projections: WorldProjectionRuntimeControl,
 }
 
 impl LocalHostAccess {
@@ -346,6 +477,7 @@ impl LocalHostAccess {
         user_content_writes: UserContentWriteRuntimeControl,
         world_sessions: WorldSessionRuntimeControl,
         world_commands: WorldCommandRuntimeControl,
+        world_projections: WorldProjectionRuntimeControl,
     ) -> Self {
         Self {
             home_root: home_root.to_path_buf(),
@@ -353,6 +485,7 @@ impl LocalHostAccess {
             user_content_writes,
             world_sessions,
             world_commands,
+            world_projections,
         }
     }
 
@@ -549,7 +682,7 @@ impl WorldCommandAccess for LocalHostAccess {
             .map_err(map_world_command_host_error)?;
         if !self
             .world_sessions
-            .accepts_commands(world_id)
+            .accepts_deferred_world_access(world_id)
             .map_err(|_| WorldCommandAccessError::Unavailable)?
         {
             return Err(WorldCommandAccessError::WorldNotActive);
@@ -560,6 +693,62 @@ impl WorldCommandAccess for LocalHostAccess {
             command = command.expecting_position(expected_position);
         }
         self.world_commands.request(world_id, command)
+    }
+}
+
+impl WorldProjectionAccess for LocalHostAccess {
+    fn request_projection(
+        &self,
+        owner: &ComponentRef,
+        request: WorldProjectionRequest,
+    ) -> WorldProjectionAccessResult<AcceptedWorldProjectionRead> {
+        let world_id = request
+            .world_id
+            .parse::<WorldId>()
+            .map_err(|_| WorldProjectionAccessError::InvalidWorldId)?;
+        let projection_schema = request
+            .schema
+            .parse::<SchemaKey>()
+            .map_err(|_| WorldProjectionAccessError::InvalidSchema)?;
+        if request.input_json.len() > MAX_WORLD_PROJECTION_INPUT_BYTES {
+            return Err(WorldProjectionAccessError::InvalidInput);
+        }
+        let input = serde_json::from_slice(&request.input_json)
+            .map_err(|_| WorldProjectionAccessError::InvalidInput)?;
+        self.home()
+            .map_err(|_| WorldProjectionAccessError::Unavailable)?
+            .load_world_state(world_id)
+            .map_err(map_world_projection_host_error)?;
+        if !self
+            .world_sessions
+            .accepts_deferred_world_access(world_id)
+            .map_err(|_| WorldProjectionAccessError::Unavailable)?
+        {
+            return Err(WorldProjectionAccessError::WorldNotActive);
+        }
+        self.world_projections.request(
+            owner.clone(),
+            world_id,
+            projection_schema,
+            self.local_principal,
+            input,
+        )
+    }
+
+    fn projection_status(
+        &self,
+        owner: &ComponentRef,
+        operation_id: &str,
+    ) -> WorldProjectionAccessResult<WorldProjectionReadStatus> {
+        self.world_projections.status(owner, operation_id)
+    }
+}
+
+fn map_world_projection_host_error(error: HostError) -> WorldProjectionAccessError {
+    match error {
+        HostError::WorldNotFound(_) => WorldProjectionAccessError::NotFound,
+        HostError::Io(_) | HostError::Storage(_) => WorldProjectionAccessError::Unavailable,
+        _ => WorldProjectionAccessError::Rejected,
     }
 }
 
@@ -954,12 +1143,14 @@ impl HostRuntime {
         let user_content_writes = UserContentWriteRuntimeControl::default();
         let world_sessions = WorldSessionRuntimeControl::default();
         let world_commands = WorldCommandRuntimeControl::default();
+        let world_projections = WorldProjectionRuntimeControl::default();
         let access = Arc::new(LocalHostAccess::new(
             home.root(),
             home.local_principal(),
             user_content_writes,
             world_sessions,
             world_commands,
+            world_projections,
         ));
         let artifact_store_access: Arc<dyn ArtifactStoreAccess> = access.clone();
         let asset_store_access: Arc<dyn AssetStoreAccess> = access.clone();
@@ -967,6 +1158,7 @@ impl HostRuntime {
         let user_content_write_access: Arc<dyn UserContentWriteAccess> = access.clone();
         let world_session_access: Arc<dyn WorldSessionAccess> = access.clone();
         let world_command_access: Arc<dyn WorldCommandAccess> = access.clone();
+        let world_projection_access: Arc<dyn WorldProjectionAccess> = access.clone();
         let composition_access: Arc<dyn CompositionAccess> = access.clone();
         let preference_access: Arc<dyn PreferenceAccess> = access.clone();
         let runtime_policy_access: Arc<dyn RuntimePolicyAccess> = access.clone();
@@ -981,6 +1173,7 @@ impl HostRuntime {
         engine.attach_user_content_access(user_content_access);
         engine.attach_user_content_write_access(user_content_write_access);
         engine.attach_world_command_access(world_command_access);
+        engine.attach_world_projection_access(world_projection_access);
         let host_scope = RuntimeScopeId::new(HOST_SCOPE);
         let host_shell_contract = host_shell_contract_key();
         let ui_layer_contract = ui_layer_contract_key();
@@ -1871,6 +2064,47 @@ impl HostRuntime {
         Ok(handled)
     }
 
+    fn pump_world_projection_requests(&mut self) -> HostResult<usize> {
+        let Some(access) = self.host_access.clone() else {
+            return Ok(0);
+        };
+        let requests = access.world_projections.drain_pending()?;
+        let mut handled = 0_usize;
+        for request in requests {
+            let status = match self.project_world(
+                request.world_id,
+                request.principal,
+                &request.projection_schema,
+                request.input,
+            ) {
+                Ok(view) => match serde_json::to_vec(view.value()) {
+                    Ok(value_json) if value_json.len() <= MAX_WORLD_PROJECTION_VIEW_BYTES => {
+                        WorldProjectionReadStatus::Succeeded(WorldProjectionReadView {
+                            world_id: view.world_id().to_string(),
+                            snapshot_position: view.snapshot_position(),
+                            schema: view.schema().to_string(),
+                            value_json,
+                        })
+                    }
+                    Ok(_) => WorldProjectionReadStatus::Failed(String::from(
+                        "projection view exceeds host retention bound",
+                    )),
+                    Err(_) => WorldProjectionReadStatus::Failed(String::from(
+                        "projection view serialization failed",
+                    )),
+                },
+                Err(error) => WorldProjectionReadStatus::Failed(
+                    bounded_world_projection_diagnostic(&error.to_string()),
+                ),
+            };
+            access
+                .world_projections
+                .record_outcome(&request.operation_id, status)?;
+            handled = handled.saturating_add(1);
+        }
+        Ok(handled)
+    }
+
     /// Executes one cooperative runtime pump for active baseline and world components.
     ///
     /// The returned duration is the earliest requested next wake-up. `None` means
@@ -1879,12 +2113,14 @@ impl HostRuntime {
         self.pump_world_session_requests()?;
         self.pump_user_content_write_requests()?;
         self.pump_world_command_requests()?;
+        self.pump_world_projection_requests()?;
         self.pump_all_runtime_signals()?;
         self.pump_all_effect_outboxes()?;
         let engine_delay = self.engine.poll_runtime()?;
         self.pump_world_session_requests()?;
         self.pump_user_content_write_requests()?;
         self.pump_world_command_requests()?;
+        self.pump_world_projection_requests()?;
         let effect_delay = self.next_effect_wakeup_delay(current_unix_time_millis())?;
         Ok(min_optional_duration(engine_delay, effect_delay))
     }
@@ -1914,6 +2150,17 @@ fn bounded_user_content_write_diagnostic(value: &str) -> String {
         return value.to_string();
     }
     let mut end = MAX_USER_CONTENT_WRITE_DIAGNOSTIC_BYTES.min(value.len());
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value[..end].to_string()
+}
+
+fn bounded_world_projection_diagnostic(value: &str) -> String {
+    if value.len() <= MAX_WORLD_PROJECTION_STATUS_DIAGNOSTIC_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_WORLD_PROJECTION_STATUS_DIAGNOSTIC_BYTES.min(value.len());
     while !value.is_char_boundary(end) {
         end = end.saturating_sub(1);
     }
@@ -2993,6 +3240,7 @@ mod tests {
             UserContentWriteRuntimeControl::default(),
             WorldSessionRuntimeControl::default(),
             WorldCommandRuntimeControl::default(),
+            WorldProjectionRuntimeControl::default(),
         );
         let imported = AssetStoreAccess::import_asset(&access, b"portrait", "Image/PNG")
             .map_err(|error| anyhow::anyhow!("asset host access failed: {error:?}"))?;
@@ -3551,6 +3799,200 @@ mod tests {
     }
 
     #[test]
+    fn test_should_bound_and_isolate_deferred_world_projection_queue() -> anyhow::Result<()> {
+        let control = WorldProjectionRuntimeControl::default();
+        let owner_a = ComponentRef::new("instance-a", "runtime");
+        let owner_b = ComponentRef::new("instance-b", "runtime");
+        let schema: SchemaKey = "example.view@1".parse()?;
+        let world_id = WorldId::new();
+        let principal = PrincipalId::new();
+        let accepted = control
+            .request(
+                owner_a.clone(),
+                world_id,
+                schema.clone(),
+                principal,
+                serde_json::json!({ "kind": "test" }),
+            )
+            .map_err(|error| anyhow::anyhow!("projection queue request failed: {error:?}"))?;
+        assert_eq!(
+            control.status(&owner_a, &accepted.operation_id),
+            Ok(WorldProjectionReadStatus::Pending)
+        );
+        assert_eq!(
+            control.status(&owner_b, &accepted.operation_id),
+            Err(WorldProjectionAccessError::NotFound)
+        );
+        let drained = control.drain_pending()?;
+        assert_eq!(drained.len(), 1);
+        control.record_outcome(
+            &accepted.operation_id,
+            WorldProjectionReadStatus::Failed(String::from("rejected")),
+        )?;
+        assert_eq!(
+            control.status(&owner_a, &accepted.operation_id),
+            Ok(WorldProjectionReadStatus::Failed(String::from("rejected")))
+        );
+
+        for _ in 0..MAX_PENDING_WORLD_PROJECTION_REQUESTS {
+            control
+                .request(
+                    owner_a.clone(),
+                    world_id,
+                    schema.clone(),
+                    principal,
+                    serde_json::Value::Null,
+                )
+                .map_err(|error| anyhow::anyhow!("projection queue fill failed: {error:?}"))?;
+        }
+        assert_eq!(
+            control.request(
+                owner_a,
+                world_id,
+                schema,
+                principal,
+                serde_json::Value::Null,
+            ),
+            Err(WorldProjectionAccessError::QueueFull)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_defer_world_projection_with_host_authenticated_principal() -> anyhow::Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let world = home.create_world()?;
+        let world_id = world.id;
+        let projection_schema: SchemaKey = "rintawa.test.deferred-view@1".parse()?;
+        let owner = ExtensionId::new("rintawa.test-deferred-projection");
+        let storage = home.open_world_storage(world_id)?;
+        storage.register_schema(&SchemaDefinition::new(
+            projection_schema.clone(),
+            SchemaKind::Projection,
+            owner.clone(),
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "provider": { "const": "owner" },
+                    "principal": { "type": "string" }
+                },
+                "required": ["provider", "principal"],
+                "additionalProperties": false
+            }),
+        ))?;
+        let outbox = home.open_world_storage(world_id)?;
+
+        let world_sessions = WorldSessionRuntimeControl::default();
+        world_sessions.record_outcome(world_id, true, None)?;
+        let world_projections = WorldProjectionRuntimeControl::default();
+        let access = Arc::new(LocalHostAccess::new(
+            home.root(),
+            home.local_principal(),
+            UserContentWriteRuntimeControl::default(),
+            world_sessions,
+            WorldCommandRuntimeControl::default(),
+            world_projections,
+        ));
+        let mut host = HostRuntime {
+            active_worlds: BTreeMap::new(),
+            engine: ExtensionEngine::new(),
+            started_instances: Vec::new(),
+            host_shell_provider: None,
+            ui_layer_provider: None,
+            host_access: Some(access.clone()),
+        };
+        let projection =
+            host.bind_world_projection(world_id, projection_schema.clone(), owner.clone())?;
+        let contract = world_projection_service_contract_key(&projection_schema);
+        let scope = world_runtime_scope_id(world_id);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let provider_instance = ExtensionInstanceId::new("deferred-projection-owner");
+        host.engine.register_extension_instance(
+            provider_instance.clone(),
+            scope,
+            test_manifest(owner.as_str()),
+            vec![Box::new(WorldProjectionProvider {
+                id: ComponentId::new("runtime"),
+                contract,
+                reject: false,
+                observed: Arc::clone(&observed),
+            })],
+        )?;
+        host.engine.start_extension_instance(&provider_instance)?;
+
+        let runtime = WorldRuntimeBuilder::new(storage).start()?;
+        host.active_worlds.insert(
+            world_id,
+            ActiveWorld {
+                runtime,
+                outbox,
+                effect_handlers: BTreeMap::new(),
+                projections: BTreeMap::from([(projection_schema.clone(), projection)]),
+                signals: RuntimeSignalQueue::default(),
+                registered_instances: vec![provider_instance.clone()],
+                started_instances: vec![provider_instance],
+            },
+        );
+
+        let requester = ComponentRef::new("consumer-instance", "runtime");
+        let other = ComponentRef::new("other-instance", "runtime");
+        let accepted = WorldProjectionAccess::request_projection(
+            access.as_ref(),
+            &requester,
+            WorldProjectionRequest {
+                world_id: world_id.to_string(),
+                schema: projection_schema.to_string(),
+                input_json: br#"{"kind":"test"}"#.to_vec(),
+            },
+        )
+        .map_err(|error| anyhow::anyhow!("projection access failed: {error:?}"))?;
+        assert_eq!(
+            WorldProjectionAccess::projection_status(
+                access.as_ref(),
+                &requester,
+                &accepted.operation_id,
+            ),
+            Ok(WorldProjectionReadStatus::Pending)
+        );
+        assert_eq!(
+            WorldProjectionAccess::projection_status(
+                access.as_ref(),
+                &other,
+                &accepted.operation_id,
+            ),
+            Err(WorldProjectionAccessError::NotFound)
+        );
+
+        host.poll_runtime()?;
+        let status = WorldProjectionAccess::projection_status(
+            access.as_ref(),
+            &requester,
+            &accepted.operation_id,
+        )
+        .map_err(|error| anyhow::anyhow!("projection status failed: {error:?}"))?;
+        let WorldProjectionReadStatus::Succeeded(view) = status else {
+            return Err(anyhow::anyhow!("projection did not succeed: {status:?}"));
+        };
+        assert_eq!(view.world_id, world_id.to_string());
+        assert_eq!(view.schema, projection_schema.to_string());
+        let value: serde_json::Value = serde_json::from_slice(&view.value_json)?;
+        assert_eq!(value["provider"], "owner");
+        assert_eq!(value["principal"], home.local_principal().to_string());
+        let observed = observed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("projection observer lock poisoned"))?;
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].principal(), home.local_principal());
+        drop(observed);
+
+        host.deactivate_world(world_id)?;
+        host.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
     fn test_should_bind_deferred_world_command_to_stable_local_principal() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let home = HostHome::open(root.path().join("home"))?;
@@ -3566,6 +4008,7 @@ mod tests {
             UserContentWriteRuntimeControl::default(),
             world_sessions.clone(),
             world_commands.clone(),
+            WorldProjectionRuntimeControl::default(),
         );
         assert_eq!(
             WorldCommandAccess::submit_world_command(

@@ -11,6 +11,7 @@ use anyhow::Result;
 use rintawa_sdk::{
     types::ExtensionId,
     world::{EntityId, PrincipalId, SchemaKey},
+    world_system::WorldSystemFacetTarget,
 };
 use rintawa_world::{
     ControlGrant, ControlScope, EntityRecord, FacetRecord, FacetTarget, SchemaDefinition,
@@ -135,11 +136,11 @@ fn test_should_build_principal_filtered_projection_from_owner_scoped_reads() -> 
                     WorldProjectionServiceResponse::Read {
                         requests: vec![
                             WorldProjectionReadRequest::Facet {
-                                target: FacetTarget::Entity(entity_id),
+                                target: WorldSystemFacetTarget::Entity(entity_id),
                                 schema: expected_own_facet.clone(),
                             },
                             WorldProjectionReadRequest::Facet {
-                                target: FacetTarget::Entity(entity_id),
+                                target: WorldSystemFacetTarget::Entity(entity_id),
                                 schema: expected_foreign_facet.clone(),
                             },
                             WorldProjectionReadRequest::CanControl {

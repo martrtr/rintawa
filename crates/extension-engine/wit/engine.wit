@@ -435,6 +435,60 @@ interface world-commands {
     submit: func(request: request) -> result<accepted, error>;
 }
 
+/// Deferred policy-filtered reads from active authoritative Worlds.
+interface world-projections {
+    /// One bounded projection request. Principal is always Host-owned.
+    record request {
+        world-id: string,
+        schema: string,
+        input-json: list<u8>,
+    }
+
+    /// Host-generated identity for one accepted owner-scoped projection operation.
+    record accepted {
+        operation-id: string,
+    }
+
+    /// One immutable schema-validated projection view.
+    record view {
+        world-id: string,
+        snapshot-position: u64,
+        schema: string,
+        value-json: list<u8>,
+    }
+
+    /// Current state of one owner-scoped deferred projection operation.
+    variant read-state {
+        pending,
+        succeeded(view),
+        failed(string),
+    }
+
+    /// Failure while validating or inspecting a projection read.
+    variant error {
+        access-not-active,
+        permission-denied,
+        invalid-world-id,
+        invalid-schema,
+        invalid-input,
+        not-found,
+        world-not-active,
+        queue-full,
+        limit-exceeded,
+        message-too-large,
+        rejected,
+        unavailable,
+    }
+
+    /// Queues one Principal-filtered Projection evaluation after the callback unwinds.
+    /// Requires `world-projection-read`.
+    request-read: func(request: request) -> result<accepted, error>;
+
+    /// Reads owner-scoped status for one accepted Projection evaluation.
+    /// Requires `world-projection-read`.
+    read-status: func(operation-id: string) -> result<read-state, error>;
+}
+
 /// Owner-scoped non-authoritative persistent preferences.
 interface preferences {
     /// Failure while accessing one bounded preference value.
@@ -866,6 +920,7 @@ world plugin {
     import user-content;
     import world-sessions;
     import world-commands;
+    import world-projections;
     import preferences;
     import composition;
     import scoped-composition;
@@ -904,6 +959,7 @@ world task-runtime-plugin {
     import user-content;
     import world-sessions;
     import world-commands;
+    import world-projections;
     import preferences;
     import composition;
     import scoped-composition;
@@ -932,6 +988,7 @@ world runtime-provider-plugin {
     import user-content;
     import world-sessions;
     import world-commands;
+    import world-projections;
     import preferences;
     import composition;
     import scoped-composition;
@@ -960,6 +1017,7 @@ world runtime-provider-task-plugin {
     import user-content;
     import world-sessions;
     import world-commands;
+    import world-projections;
     import preferences;
     import composition;
     import scoped-composition;

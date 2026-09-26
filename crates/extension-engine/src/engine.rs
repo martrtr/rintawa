@@ -42,7 +42,7 @@ use crate::{
     host_access::{
         ArtifactStoreAccess, AssetStoreAccess, CompositionAccess, HostAccessServices,
         PreferenceAccess, RuntimePolicyAccess, UserContentAccess, UserContentWriteAccess,
-        WorldCommandAccess, WorldSessionAccess,
+        WorldCommandAccess, WorldProjectionAccess, WorldSessionAccess,
     },
     runtime::WasmRuntimeEngine,
     runtime_effects::RuntimeEffectRegistry,
@@ -334,6 +334,17 @@ impl ExtensionEngine {
     /// is still permission-gated per exact component principal.
     pub fn attach_world_command_access(&mut self, access: Arc<dyn WorldCommandAccess>) {
         self.host_access = self.host_access.clone().with_world_command_access(access);
+    }
+
+    /// Attaches generic deferred policy-filtered World Projection reads.
+    ///
+    /// Embedded hosts that do not call this method remain fail-closed. Guest access
+    /// remains permission-gated and owner-scoped per exact component principal.
+    pub fn attach_world_projection_access(&mut self, access: Arc<dyn WorldProjectionAccess>) {
+        self.host_access = self
+            .host_access
+            .clone()
+            .with_world_projection_access(access);
     }
 
     /// Creates an engine using a host-configured secret manager.

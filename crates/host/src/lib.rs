@@ -347,6 +347,9 @@ pub enum HostError {
     /// Shared deferred world-command control state became unavailable.
     #[error("world-command deferred control is unavailable")]
     WorldCommandControlUnavailable,
+    /// Shared deferred world-projection control state became unavailable.
+    #[error("world-projection deferred control is unavailable")]
+    WorldProjectionControlUnavailable,
     /// An active world's bounded ephemeral signal queue has no remaining capacity.
     #[error("runtime signal queue for world `{0}` is full")]
     RuntimeSignalQueueFull(WorldId),

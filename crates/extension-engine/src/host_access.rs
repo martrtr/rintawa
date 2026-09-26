@@ -273,6 +273,92 @@ pub trait WorldCommandAccess: Send + Sync {
     ) -> WorldCommandAccessResult<AcceptedWorldCommand>;
 }
 
+/// One bounded policy-filtered projection request accepted from an ordinary extension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorldProjectionRequest {
+    /// Target authoritative World in canonical textual form.
+    pub world_id: String,
+    /// Exact versioned Projection schema.
+    pub schema: String,
+    /// Extension-owned JSON input bytes.
+    pub input_json: Vec<u8>,
+}
+
+/// Host-generated identity for one accepted deferred projection read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedWorldProjectionRead {
+    /// Opaque operation identity scoped to the exact requesting component.
+    pub operation_id: String,
+}
+
+/// One immutable policy-filtered view returned by an authoritative World Projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorldProjectionReadView {
+    /// Authoritative World represented by the view.
+    pub world_id: String,
+    /// Exact pinned World position used to construct the view.
+    pub snapshot_position: u64,
+    /// Exact versioned Projection schema.
+    pub schema: String,
+    /// Schema-validated feature-owned JSON view bytes.
+    pub value_json: Vec<u8>,
+}
+
+/// Current state of one owner-scoped deferred projection read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorldProjectionReadStatus {
+    /// The request is accepted but has not yet been evaluated by the Host.
+    Pending,
+    /// Projection policy completed with one validated immutable view.
+    Succeeded(WorldProjectionReadView),
+    /// Projection evaluation failed after admission.
+    Failed(String),
+}
+
+/// Failure returned while validating or inspecting a deferred projection read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorldProjectionAccessError {
+    /// Target WorldId is malformed.
+    InvalidWorldId,
+    /// Versioned Projection schema is malformed.
+    InvalidSchema,
+    /// Projection input is not valid JSON or exceeds the protocol bound.
+    InvalidInput,
+    /// Target persistent World does not exist.
+    NotFound,
+    /// Target World is neither active nor accepted for deferred activation.
+    WorldNotActive,
+    /// Host-owned deferred projection queue has no remaining capacity.
+    QueueFull,
+    /// Host policy rejected the operation or owner-scoped status lookup.
+    Rejected,
+    /// Projection access is unavailable in the current Host.
+    Unavailable,
+}
+
+/// Result used by generic deferred policy-filtered World Projection reads.
+pub type WorldProjectionAccessResult<T> = Result<T, WorldProjectionAccessError>;
+
+/// Generic deferred read boundary for Principal-filtered authoritative World Projections.
+///
+/// The guest never supplies a PrincipalId. Implementations bind evaluation to the already
+/// authenticated Host principal and keep operation status scoped to the exact component owner.
+pub trait WorldProjectionAccess: Send + Sync {
+    /// Validates and queues one projection request after the current guest callback unwinds.
+    fn request_projection(
+        &self,
+        owner: &ComponentRef,
+        request: WorldProjectionRequest,
+    ) -> WorldProjectionAccessResult<AcceptedWorldProjectionRead>;
+
+    /// Reads status only when the operation belongs to the exact requesting component.
+    fn projection_status(
+        &self,
+        owner: &ComponentRef,
+        operation_id: &str,
+    ) -> WorldProjectionAccessResult<WorldProjectionReadStatus>;
+}
+
 /// Owner-scoped non-authoritative preference storage for ordinary extensions.
 ///
 /// Values are isolated by runtime scope + exact component principal. This is not world
@@ -532,6 +618,27 @@ impl WorldCommandAccess for UnavailableWorldCommandAccess {
     }
 }
 
+#[derive(Default)]
+struct UnavailableWorldProjectionAccess;
+
+impl WorldProjectionAccess for UnavailableWorldProjectionAccess {
+    fn request_projection(
+        &self,
+        _owner: &ComponentRef,
+        _request: WorldProjectionRequest,
+    ) -> WorldProjectionAccessResult<AcceptedWorldProjectionRead> {
+        Err(WorldProjectionAccessError::Unavailable)
+    }
+
+    fn projection_status(
+        &self,
+        _owner: &ComponentRef,
+        _operation_id: &str,
+    ) -> WorldProjectionAccessResult<WorldProjectionReadStatus> {
+        Err(WorldProjectionAccessError::Unavailable)
+    }
+}
+
 struct UnavailablePreferenceAccess;
 
 impl PreferenceAccess for UnavailablePreferenceAccess {
@@ -637,6 +744,7 @@ pub(crate) struct HostAccessServices {
     pub(crate) user_content_write: Arc<dyn UserContentWriteAccess>,
     pub(crate) world_sessions: Arc<dyn WorldSessionAccess>,
     pub(crate) world_commands: Arc<dyn WorldCommandAccess>,
+    pub(crate) world_projections: Arc<dyn WorldProjectionAccess>,
     pub(crate) composition: Arc<dyn CompositionAccess>,
     pub(crate) preferences: Arc<dyn PreferenceAccess>,
     pub(crate) runtime_policy: Arc<dyn RuntimePolicyAccess>,
@@ -658,6 +766,7 @@ impl HostAccessServices {
             user_content_write: Arc::new(UnavailableUserContentWriteAccess),
             world_sessions,
             world_commands: Arc::new(UnavailableWorldCommandAccess),
+            world_projections: Arc::new(UnavailableWorldProjectionAccess),
             composition,
             preferences,
             runtime_policy,
@@ -688,6 +797,14 @@ impl HostAccessServices {
         self
     }
 
+    pub(crate) fn with_world_projection_access(
+        mut self,
+        world_projections: Arc<dyn WorldProjectionAccess>,
+    ) -> Self {
+        self.world_projections = world_projections;
+        self
+    }
+
     pub(crate) fn unavailable() -> Self {
         Self {
             artifact_store: Arc::new(UnavailableArtifactStoreAccess),
@@ -696,6 +813,7 @@ impl HostAccessServices {
             user_content_write: Arc::new(UnavailableUserContentWriteAccess),
             world_sessions: Arc::new(UnavailableWorldSessionAccess),
             world_commands: Arc::new(UnavailableWorldCommandAccess),
+            world_projections: Arc::new(UnavailableWorldProjectionAccess),
             composition: Arc::new(UnavailableCompositionAccess),
             preferences: Arc::new(UnavailablePreferenceAccess),
             runtime_policy: Arc::new(UnavailableRuntimePolicyAccess),

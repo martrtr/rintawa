@@ -33,6 +33,8 @@ pub enum RuntimePermission {
     WorldSessionWrite,
     /// Allows submitting bounded authoritative commands as the host-authenticated principal.
     WorldCommandSubmit,
+    /// Allows requesting Principal-filtered views from active authoritative Worlds.
+    WorldProjectionRead,
     /// Allows reading the selected host composition without mutating it.
     CompositionRead,
     /// Allows changing exact artifact selections and enabled state in host composition.
@@ -57,6 +59,7 @@ impl fmt::Display for RuntimePermission {
             Self::WorldSessionRead => formatter.write_str("world-session-read"),
             Self::WorldSessionWrite => formatter.write_str("world-session-write"),
             Self::WorldCommandSubmit => formatter.write_str("world-command-submit"),
+            Self::WorldProjectionRead => formatter.write_str("world-projection-read"),
             Self::CompositionRead => formatter.write_str("composition-read"),
             Self::CompositionWrite => formatter.write_str("composition-write"),
             Self::RuntimePolicyRead => formatter.write_str("runtime-policy-read"),
@@ -93,6 +96,7 @@ impl FromStr for RuntimePermission {
             "world-session-read" => Ok(Self::WorldSessionRead),
             "world-session-write" => Ok(Self::WorldSessionWrite),
             "world-command-submit" => Ok(Self::WorldCommandSubmit),
+            "world-projection-read" => Ok(Self::WorldProjectionRead),
             "composition-read" => Ok(Self::CompositionRead),
             "composition-write" => Ok(Self::CompositionWrite),
             "runtime-policy-read" => Ok(Self::RuntimePolicyRead),
@@ -135,6 +139,18 @@ mod tests {
             let text = permission.to_string();
             assert_eq!(text.parse::<RuntimePermission>(), Ok(permission));
         }
+    }
+
+    #[test]
+    fn test_should_round_trip_world_projection_read_permission() {
+        assert_eq!(
+            RuntimePermission::WorldProjectionRead.to_string(),
+            "world-projection-read"
+        );
+        assert_eq!(
+            "world-projection-read".parse::<RuntimePermission>(),
+            Ok(RuntimePermission::WorldProjectionRead)
+        );
     }
 
     #[test]

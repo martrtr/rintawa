@@ -3,12 +3,14 @@
 use super::*;
 use crate::{
     host_access::{
-        AcceptedUserContentWrite, AcceptedWorldCommand, ArtifactStoreAccess, AssetStoreAccess,
-        CompositionAccess, CompositionActivation, HostAccessError, HostAccessResult,
-        ImportedArtifact, ImportedAsset, PreferenceAccess, RuntimeArtifactPolicy,
-        RuntimePolicyAccess, RuntimePolicyComponent, UserContentAccess, UserContentDocument,
-        UserContentSummary, UserContentWriteAccess, UserContentWriteStatus, WorldCommandAccess,
-        WorldCommandAccessResult, WorldCommandRequest, WorldSessionAccess, WorldSessionSummary,
+        AcceptedUserContentWrite, AcceptedWorldCommand, AcceptedWorldProjectionRead,
+        ArtifactStoreAccess, AssetStoreAccess, CompositionAccess, CompositionActivation,
+        HostAccessError, HostAccessResult, ImportedArtifact, ImportedAsset, PreferenceAccess,
+        RuntimeArtifactPolicy, RuntimePolicyAccess, RuntimePolicyComponent, UserContentAccess,
+        UserContentDocument, UserContentSummary, UserContentWriteAccess, UserContentWriteStatus,
+        WorldCommandAccess, WorldCommandAccessResult, WorldCommandRequest, WorldProjectionAccess,
+        WorldProjectionAccessError, WorldProjectionAccessResult, WorldProjectionReadStatus,
+        WorldProjectionReadView, WorldProjectionRequest, WorldSessionAccess, WorldSessionSummary,
     },
     secrets::InMemorySecretVault,
 };
@@ -48,6 +50,7 @@ struct RecordingScopedHostAccess {
     user_content_writes: Mutex<Vec<Vec<u8>>>,
     world_session_writes: Mutex<Vec<(String, bool)>>,
     world_command_writes: Mutex<Vec<WorldCommandRequest>>,
+    world_projection_reads: Mutex<Vec<WorldProjectionRequest>>,
 }
 
 impl ArtifactStoreAccess for RecordingScopedHostAccess {
@@ -187,6 +190,40 @@ impl WorldCommandAccess for RecordingScopedHostAccess {
             command_id: String::from("018f0000-0000-7000-8000-000000000020"),
             correlation_id: String::from("018f0000-0000-7000-8000-000000000021"),
         })
+    }
+}
+
+impl WorldProjectionAccess for RecordingScopedHostAccess {
+    fn request_projection(
+        &self,
+        _owner: &ComponentRef,
+        request: WorldProjectionRequest,
+    ) -> WorldProjectionAccessResult<AcceptedWorldProjectionRead> {
+        self.world_projection_reads
+            .lock()
+            .expect("test world-projection lock must stay healthy")
+            .push(request);
+        Ok(AcceptedWorldProjectionRead {
+            operation_id: String::from("018f0000-0000-7000-8000-000000000040"),
+        })
+    }
+
+    fn projection_status(
+        &self,
+        _owner: &ComponentRef,
+        operation_id: &str,
+    ) -> WorldProjectionAccessResult<WorldProjectionReadStatus> {
+        if operation_id != "018f0000-0000-7000-8000-000000000040" {
+            return Err(WorldProjectionAccessError::NotFound);
+        }
+        Ok(WorldProjectionReadStatus::Succeeded(
+            WorldProjectionReadView {
+                world_id: String::from("018f0000-0000-7000-8000-000000000001"),
+                snapshot_position: 9,
+                schema: String::from("example.view@1"),
+                value_json: br#"{"messages":[]}"#.to_vec(),
+            },
+        ))
     }
 }
 
@@ -1347,6 +1384,87 @@ fn test_should_gate_bound_and_budget_world_command_submission() {
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0].expected_position, Some(7));
     assert_eq!(writes[0].payload_json, br#"{"value":1}"#);
+}
+
+#[test]
+fn test_should_gate_bound_and_budget_world_projection_reads() {
+    let access = Arc::new(RecordingScopedHostAccess::default());
+    let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
+    let mut services = WasmHostServices::standalone(secrets);
+    services.host_access = HostAccessServices::new(
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+    )
+    .with_world_projection_access(access.clone());
+    let budget = WasmExecutionBudget {
+        max_host_message_bytes: 128,
+        max_world_projection_reads_per_execution: 1,
+        ..WasmExecutionBudget::default()
+    };
+    let mut state = WasmHostState::with_host_services_and_budget(
+        ComponentId::new("runtime"),
+        services,
+        false,
+        &budget,
+    );
+    begin_test_registration(&mut state, ExtensionId::new("projection.consumer"));
+    state.finish_registration().unwrap();
+
+    let request = || WitWorldProjectionRequest {
+        world_id: String::from("018f0000-0000-7000-8000-000000000001"),
+        schema: String::from("example.view@1"),
+        input_json: br#"{"conversation":"main"}"#.to_vec(),
+    };
+    assert!(matches!(
+        WorldProjectionsHost::request_read(&mut state, request()),
+        Err(WorldProjectionError::AccessNotActive)
+    ));
+
+    state.begin_guest_execution();
+    assert!(matches!(
+        WorldProjectionsHost::request_read(&mut state, request()),
+        Err(WorldProjectionError::PermissionDenied)
+    ));
+    let owner = state.registered_owner().unwrap();
+    state
+        .runtime_permissions
+        .grant(owner, RuntimePermission::WorldProjectionRead)
+        .unwrap();
+
+    let mut oversized = request();
+    oversized.input_json = vec![b'x'; 256];
+    assert!(matches!(
+        WorldProjectionsHost::request_read(&mut state, oversized),
+        Err(WorldProjectionError::MessageTooLarge)
+    ));
+    let accepted = WorldProjectionsHost::request_read(&mut state, request()).unwrap();
+    assert_eq!(
+        accepted.operation_id,
+        "018f0000-0000-7000-8000-000000000040"
+    );
+    assert!(matches!(
+        WorldProjectionsHost::request_read(&mut state, request()),
+        Err(WorldProjectionError::LimitExceeded)
+    ));
+    let status = WorldProjectionsHost::read_status(&mut state, accepted.operation_id).unwrap();
+    match status {
+        WitWorldProjectionReadState::Succeeded(view) => {
+            assert_eq!(view.snapshot_position, 9);
+            assert_eq!(view.schema, "example.view@1");
+            assert_eq!(view.value_json, br#"{"messages":[]}"#);
+        }
+        other => panic!("unexpected projection status: {other:?}"),
+    }
+    let reads = access
+        .world_projection_reads
+        .lock()
+        .expect("test world-projection lock must stay healthy");
+    assert_eq!(reads.len(), 1);
+    assert_eq!(reads[0].schema, "example.view@1");
 }
 
 #[test]

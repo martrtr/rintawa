@@ -8,18 +8,22 @@ use crate::{
     host_access::{
         CompositionActivation, HostAccessError, RuntimePolicyComponent, UserContentDocument,
         UserContentSummary, UserContentWriteStatus, WorldCommandAccessError,
-        WorldCommandActor as HostWorldCommandActor, WorldCommandRequest, WorldSessionSummary,
+        WorldCommandActor as HostWorldCommandActor, WorldCommandRequest,
+        WorldProjectionAccessError, WorldProjectionReadStatus, WorldProjectionRequest,
+        WorldSessionSummary,
     },
     runtime::wasm::{
         ArtifactStoreError, ArtifactStoreHost, AssetStoreError, AssetStoreHost, CompositionError,
         CompositionHost, PreferenceError, PreferencesHost, RuntimePermissionCheck,
         RuntimePolicyError, RuntimePolicyHost, ScopedCompositionHost, ScopedRuntimePolicyHost,
         UserContentError, UserContentHost, WasmHostState, WitAcceptedUserContentWrite,
-        WitAcceptedWorldCommand, WitAssetRef, WitCompositionActivation, WitImportedArtifact,
-        WitRuntimeArtifactPolicy, WitRuntimePolicyComponent, WitRuntimePolicyRequest,
-        WitUserContentDocument, WitUserContentEntry, WitUserContentWriteState,
-        WitWorldCommandActor, WitWorldCommandRequest, WitWorldSummary, WorldCommandError,
-        WorldCommandsHost, WorldSessionError, WorldSessionsHost,
+        WitAcceptedWorldCommand, WitAcceptedWorldProjectionRead, WitAssetRef,
+        WitCompositionActivation, WitImportedArtifact, WitRuntimeArtifactPolicy,
+        WitRuntimePolicyComponent, WitRuntimePolicyRequest, WitUserContentDocument,
+        WitUserContentEntry, WitUserContentWriteState, WitWorldCommandActor,
+        WitWorldCommandRequest, WitWorldProjectionReadState, WitWorldProjectionRequest,
+        WitWorldProjectionView, WitWorldSummary, WorldCommandError, WorldCommandsHost,
+        WorldProjectionError, WorldProjectionsHost, WorldSessionError, WorldSessionsHost,
     },
 };
 
@@ -246,6 +250,81 @@ impl WorldCommandsHost for WasmHostState {
             command_id: accepted.command_id,
             correlation_id: accepted.correlation_id,
         })
+    }
+}
+
+impl WorldProjectionsHost for WasmHostState {
+    fn request_read(
+        &mut self,
+        request: WitWorldProjectionRequest,
+    ) -> Result<WitAcceptedWorldProjectionRead, WorldProjectionError> {
+        let owner = self.require_world_projection_read()?;
+        let message_bytes = request
+            .world_id
+            .len()
+            .saturating_add(request.schema.len())
+            .saturating_add(request.input_json.len());
+        if message_bytes > self.max_host_message_bytes {
+            return Err(WorldProjectionError::MessageTooLarge);
+        }
+        self.consume_world_projection_read_budget()?;
+        let accepted = self
+            .host_access
+            .world_projections
+            .request_projection(
+                &owner,
+                WorldProjectionRequest {
+                    world_id: request.world_id,
+                    schema: request.schema,
+                    input_json: request.input_json,
+                },
+            )
+            .map_err(map_world_projection_access_error)?;
+        Ok(WitAcceptedWorldProjectionRead {
+            operation_id: accepted.operation_id,
+        })
+    }
+
+    fn read_status(
+        &mut self,
+        operation_id: String,
+    ) -> Result<WitWorldProjectionReadState, WorldProjectionError> {
+        let owner = self.require_world_projection_read()?;
+        if operation_id.len() > self.max_host_message_bytes {
+            return Err(WorldProjectionError::MessageTooLarge);
+        }
+        let status = self
+            .host_access
+            .world_projections
+            .projection_status(&owner, &operation_id)
+            .map_err(map_world_projection_access_error)?;
+        match status {
+            WorldProjectionReadStatus::Pending => Ok(WitWorldProjectionReadState::Pending),
+            WorldProjectionReadStatus::Succeeded(view) => {
+                let message_bytes = view
+                    .world_id
+                    .len()
+                    .saturating_add(view.schema.len())
+                    .saturating_add(view.value_json.len());
+                if message_bytes > self.max_host_message_bytes {
+                    return Err(WorldProjectionError::MessageTooLarge);
+                }
+                Ok(WitWorldProjectionReadState::Succeeded(
+                    WitWorldProjectionView {
+                        world_id: view.world_id,
+                        snapshot_position: view.snapshot_position,
+                        schema: view.schema,
+                        value_json: view.value_json,
+                    },
+                ))
+            }
+            WorldProjectionReadStatus::Failed(reason) => {
+                if reason.len() > self.max_host_message_bytes {
+                    return Err(WorldProjectionError::MessageTooLarge);
+                }
+                Ok(WitWorldProjectionReadState::Failed(reason))
+            }
+        }
     }
 }
 
@@ -718,6 +797,28 @@ impl WasmHostState {
         }
     }
 
+    fn require_world_projection_read(&self) -> Result<ComponentRef, WorldProjectionError> {
+        if !self.host_access_active {
+            return Err(WorldProjectionError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::WorldProjectionRead)
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => WorldProjectionError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => WorldProjectionError::Unavailable,
+            })
+    }
+
+    fn consume_world_projection_read_budget(&mut self) -> Result<(), WorldProjectionError> {
+        if self.world_projection_reads_this_execution
+            >= self.max_world_projection_reads_per_execution
+        {
+            return Err(WorldProjectionError::LimitExceeded);
+        }
+        self.world_projection_reads_this_execution =
+            self.world_projection_reads_this_execution.saturating_add(1);
+        Ok(())
+    }
+
     fn require_world_command_submit(&self) -> Result<(), WorldCommandError> {
         if !self.host_access_active {
             return Err(WorldCommandError::AccessNotActive);
@@ -880,6 +981,19 @@ fn to_wit_user_content_entry(entry: UserContentSummary) -> WitUserContentEntry {
         id: entry.id,
         content: entry.content,
         revision: entry.revision,
+    }
+}
+
+fn map_world_projection_access_error(error: WorldProjectionAccessError) -> WorldProjectionError {
+    match error {
+        WorldProjectionAccessError::InvalidWorldId => WorldProjectionError::InvalidWorldId,
+        WorldProjectionAccessError::InvalidSchema => WorldProjectionError::InvalidSchema,
+        WorldProjectionAccessError::InvalidInput => WorldProjectionError::InvalidInput,
+        WorldProjectionAccessError::NotFound => WorldProjectionError::NotFound,
+        WorldProjectionAccessError::WorldNotActive => WorldProjectionError::WorldNotActive,
+        WorldProjectionAccessError::QueueFull => WorldProjectionError::QueueFull,
+        WorldProjectionAccessError::Rejected => WorldProjectionError::Rejected,
+        WorldProjectionAccessError::Unavailable => WorldProjectionError::Unavailable,
     }
 }
 

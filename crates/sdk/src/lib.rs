@@ -26,6 +26,7 @@
 //! - [`runtime_permissions`] — explicitly requested host runtime capabilities
 //! - [`world`] — feature-neutral world identifiers and schema keys
 //! - [`world_system`] — public ordinary World System service transport
+//! - [`world_projection`] — public policy-filtered World Projection service transport
 //! - [`prelude`] — commonly used imports
 
 #![forbid(unsafe_code)]
@@ -47,6 +48,7 @@ pub mod traits;
 pub mod types;
 pub mod ui;
 pub mod world;
+pub mod world_projection;
 pub mod world_system;
 
 pub mod prelude;

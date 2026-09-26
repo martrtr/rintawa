@@ -3,199 +3,33 @@
 use std::{collections::HashSet, sync::Arc};
 
 use rintawa_sdk::{
-    contracts::{ContractKey, ContractVersion},
+    contracts::ContractKey,
     services::{ServiceCallError, ServiceCallResult},
     types::ExtensionId,
-    world::{EntityId, PrincipalId, RelationId, SchemaKey, WorldId},
+    world::{PrincipalId, SchemaKey, WorldId},
+    world_system::{
+        WorldSystemEntityRecord, WorldSystemFacetRecord, WorldSystemFacetTarget,
+        WorldSystemRelationRecord,
+    },
 };
 use rintawa_world::{
     EntityRecord, FacetRecord, FacetTarget, RelationRecord, SchemaKind, SchemaRegistry, WorldError,
 };
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{WorldReadError, WorldSnapshot};
 
-/// Major version of the platform World Projection service protocol.
-pub const WORLD_PROJECTION_SERVICE_PROTOCOL_VERSION: ContractVersion = ContractVersion::new(1);
+pub use rintawa_sdk::world_projection::{
+    MAX_WORLD_PROJECTION_DIAGNOSTIC_BYTES, MAX_WORLD_PROJECTION_INPUT_BYTES,
+    WORLD_PROJECTION_SERVICE_PROTOCOL_VERSION, WorldProjectionReadRequest,
+    WorldProjectionReadResult, WorldProjectionServiceRequest, WorldProjectionServiceResponse,
+    WorldProjectionView, world_projection_service_contract_key,
+};
+
 /// Maximum continuation rounds permitted for one projection evaluation.
 pub const MAX_WORLD_PROJECTION_SERVICE_ROUNDS: usize = 8;
 /// Maximum distinct authoritative reads permitted for one projection evaluation.
 pub const MAX_WORLD_PROJECTION_SERVICE_READS: usize = 256;
-/// Maximum serialized feature input accepted before invoking a projection provider.
-pub const MAX_WORLD_PROJECTION_INPUT_BYTES: usize = 64 * 1024;
-/// Maximum provider diagnostic size accepted by the projection protocol.
-pub const MAX_WORLD_PROJECTION_DIAGNOSTIC_BYTES: usize = 8 * 1024;
-
-/// Returns the platform service contract for one exact projection schema.
-pub fn world_projection_service_contract_key(projection_schema: &SchemaKey) -> ContractKey {
-    ContractKey::new(
-        format!(
-            "rintawa.world.projection.{}.v{}",
-            projection_schema.id(),
-            projection_schema.version().get()
-        ),
-        WORLD_PROJECTION_SERVICE_PROTOCOL_VERSION,
-    )
-}
-
-/// One bounded authoritative read requested while building a filtered projection.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", tag = "kind")]
-pub enum WorldProjectionReadRequest {
-    /// Loads one entity only when its exact schema is owned by the projection extension.
-    Entity {
-        /// Entity to read.
-        entity_id: EntityId,
-    },
-    /// Loads one relation only when its exact schema is owned by the projection extension.
-    Relation {
-        /// Relation to read.
-        relation_id: RelationId,
-    },
-    /// Loads one facet only when its exact schema is owned by the projection extension.
-    Facet {
-        /// Target carrying the facet.
-        target: FacetTarget,
-        /// Exact versioned facet schema.
-        schema: SchemaKey,
-    },
-    /// Checks whether the fixed projection Principal controls one entity for one command.
-    ///
-    /// The command schema must be owned by the projection extension. The Principal is
-    /// never supplied by the provider and therefore cannot be substituted in a read request.
-    CanControl {
-        /// Entity actor whose current grant should be checked.
-        actor_entity: EntityId,
-        /// Exact command schema whose grant scope is required.
-        command_schema: SchemaKey,
-    },
-}
-
-/// One host-resolved read result returned to the projection provider.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", tag = "kind")]
-pub enum WorldProjectionReadResult {
-    /// Result of an owner-filtered entity read.
-    Entity {
-        /// Requested entity identity.
-        entity_id: EntityId,
-        /// Entity value, or `None` when absent or owned by another extension.
-        value: Option<EntityRecord>,
-    },
-    /// Result of an owner-filtered relation read.
-    Relation {
-        /// Requested relation identity.
-        relation_id: RelationId,
-        /// Relation value, or `None` when absent or owned by another extension.
-        value: Option<RelationRecord>,
-    },
-    /// Result of an owner-filtered facet read.
-    Facet {
-        /// Requested state target.
-        target: FacetTarget,
-        /// Requested exact facet schema.
-        schema: SchemaKey,
-        /// Facet value, or `None` when absent or owned by another extension.
-        value: Option<FacetRecord>,
-    },
-    /// Result of an authoritative ControlGrant check for the fixed Principal.
-    CanControl {
-        /// Entity actor checked by the host.
-        actor_entity: EntityId,
-        /// Exact command schema checked by the host.
-        command_schema: SchemaKey,
-        /// Whether a non-expired matching ControlGrant exists at the pinned position.
-        allowed: bool,
-    },
-}
-
-/// Stateless continuation envelope sent to one extension-owned projection provider.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WorldProjectionServiceRequest {
-    world_id: WorldId,
-    snapshot_position: u64,
-    projection_schema: SchemaKey,
-    principal: PrincipalId,
-    input: serde_json::Value,
-    reads: Vec<WorldProjectionReadResult>,
-}
-
-impl WorldProjectionServiceRequest {
-    fn new(
-        world_id: WorldId,
-        snapshot_position: u64,
-        projection_schema: SchemaKey,
-        principal: PrincipalId,
-        input: serde_json::Value,
-        reads: Vec<WorldProjectionReadResult>,
-    ) -> Self {
-        Self {
-            world_id,
-            snapshot_position,
-            projection_schema,
-            principal,
-            input,
-            reads,
-        }
-    }
-
-    /// Returns the authoritative world being projected.
-    pub const fn world_id(&self) -> WorldId {
-        self.world_id
-    }
-
-    /// Returns the exact pinned position used for every read in this evaluation.
-    pub const fn snapshot_position(&self) -> u64 {
-        self.snapshot_position
-    }
-
-    /// Returns the exact projection schema requested by the caller.
-    pub const fn projection_schema(&self) -> &SchemaKey {
-        &self.projection_schema
-    }
-
-    /// Returns the authenticated audience Principal fixed by the host caller.
-    pub const fn principal(&self) -> PrincipalId {
-        self.principal
-    }
-
-    /// Returns extension-defined bounded projection input.
-    pub const fn input(&self) -> &serde_json::Value {
-        &self.input
-    }
-
-    /// Returns every host-resolved read from earlier continuation rounds.
-    pub fn reads(&self) -> &[WorldProjectionReadResult] {
-        &self.reads
-    }
-}
-
-/// Response produced by one projection service invocation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", tag = "kind")]
-pub enum WorldProjectionServiceResponse {
-    /// Projection evaluation finished with a policy-filtered view model.
-    Complete {
-        /// View payload that must validate against the registered Projection schema.
-        value: serde_json::Value,
-    },
-    /// Evaluation needs additional owner-filtered reads from the same pinned snapshot.
-    Read {
-        /// New reads required before the provider can complete the view.
-        requests: Vec<WorldProjectionReadRequest>,
-    },
-    /// Projection policy deliberately denies this request.
-    Rejected {
-        /// Sanitized, bounded diagnostic suitable for caller-visible failure.
-        reason: String,
-    },
-    /// The provider could not build a projection.
-    Failed {
-        /// Sanitized, bounded diagnostic suitable for host logs.
-        reason: String,
-    },
-}
 
 /// Transport used by one service-backed projection implementation.
 pub trait WorldProjectionServiceClient: Send + Sync + 'static {
@@ -209,59 +43,6 @@ where
 {
     fn call(&self, contract: &ContractKey, request: &[u8]) -> ServiceCallResult<Vec<u8>> {
         self(contract, request)
-    }
-}
-
-/// One immutable policy-filtered view produced at an authoritative world position.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WorldProjectionView {
-    world_id: WorldId,
-    snapshot_position: u64,
-    schema: SchemaKey,
-    principal: PrincipalId,
-    value: serde_json::Value,
-}
-
-impl WorldProjectionView {
-    fn new(
-        world_id: WorldId,
-        snapshot_position: u64,
-        schema: SchemaKey,
-        principal: PrincipalId,
-        value: serde_json::Value,
-    ) -> Self {
-        Self {
-            world_id,
-            snapshot_position,
-            schema,
-            principal,
-            value,
-        }
-    }
-
-    /// Returns the authoritative world represented by this view.
-    pub const fn world_id(&self) -> WorldId {
-        self.world_id
-    }
-
-    /// Returns the exact world position used to build this view.
-    pub const fn snapshot_position(&self) -> u64 {
-        self.snapshot_position
-    }
-
-    /// Returns the exact versioned projection schema.
-    pub const fn schema(&self) -> &SchemaKey {
-        &self.schema
-    }
-
-    /// Returns the authenticated audience Principal used by projection policy.
-    pub const fn principal(&self) -> PrincipalId {
-        self.principal
-    }
-
-    /// Returns the schema-validated feature-owned view payload.
-    pub const fn value(&self) -> &serde_json::Value {
-        &self.value
     }
 }
 
@@ -429,14 +210,14 @@ impl ServiceWorldProjection {
         let mut seen_reads = HashSet::new();
 
         for _ in 0..MAX_WORLD_PROJECTION_SERVICE_ROUNDS {
-            let envelope = WorldProjectionServiceRequest::new(
-                snapshot.world_id(),
-                snapshot.position(),
-                self.projection_schema.clone(),
+            let envelope = WorldProjectionServiceRequest {
+                world_id: snapshot.world_id(),
+                snapshot_position: snapshot.position(),
+                projection_schema: self.projection_schema.clone(),
                 principal,
-                input.clone(),
-                reads.clone(),
-            );
+                input: input.clone(),
+                reads: reads.clone(),
+            };
             let request =
                 serde_json::to_vec(&envelope).map_err(WorldProjectionError::RequestEncode)?;
             let response = self.client.call(&self.contract, &request)?;
@@ -507,7 +288,7 @@ fn resolve_read(
                         SchemaKind::Entity,
                     )? =>
                 {
-                    Some(entity)
+                    Some(encode_entity(entity))
                 }
                 _ => None,
             };
@@ -523,16 +304,19 @@ fn resolve_read(
                         SchemaKind::Relation,
                     )? =>
                 {
-                    Some(relation)
+                    Some(encode_relation(relation))
                 }
                 _ => None,
             };
             Ok(WorldProjectionReadResult::Relation { relation_id, value })
         }
         WorldProjectionReadRequest::Facet { target, schema } => {
+            let internal_target = decode_facet_target(target);
             let value = if schema_owned_by(snapshot, &schema, projection_owner, SchemaKind::Facet)?
             {
-                snapshot.load_facet(target, &schema)?
+                snapshot
+                    .load_facet(internal_target, &schema)?
+                    .map(encode_facet)
             } else {
                 None
             };
@@ -562,6 +346,46 @@ fn resolve_read(
                 allowed,
             })
         }
+    }
+}
+
+fn encode_entity(entity: EntityRecord) -> WorldSystemEntityRecord {
+    WorldSystemEntityRecord {
+        id: entity.id(),
+        schema: entity.schema().clone(),
+    }
+}
+
+fn encode_relation(relation: RelationRecord) -> WorldSystemRelationRecord {
+    WorldSystemRelationRecord {
+        id: relation.id(),
+        schema: relation.schema().clone(),
+        from: relation.from(),
+        to: relation.to(),
+    }
+}
+
+fn encode_facet(facet: FacetRecord) -> WorldSystemFacetRecord {
+    WorldSystemFacetRecord {
+        target: encode_facet_target(facet.target()),
+        schema: facet.schema().clone(),
+        payload: facet.payload().clone(),
+    }
+}
+
+fn encode_facet_target(target: FacetTarget) -> WorldSystemFacetTarget {
+    match target {
+        FacetTarget::World => WorldSystemFacetTarget::World,
+        FacetTarget::Entity(entity) => WorldSystemFacetTarget::Entity(entity),
+        FacetTarget::Relation(relation) => WorldSystemFacetTarget::Relation(relation),
+    }
+}
+
+fn decode_facet_target(target: WorldSystemFacetTarget) -> FacetTarget {
+    match target {
+        WorldSystemFacetTarget::World => FacetTarget::World,
+        WorldSystemFacetTarget::Entity(entity) => FacetTarget::Entity(entity),
+        WorldSystemFacetTarget::Relation(relation) => FacetTarget::Relation(relation),
     }
 }
 

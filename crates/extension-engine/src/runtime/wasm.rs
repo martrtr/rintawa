@@ -151,6 +151,11 @@ use bindings::rintawa::engine::{
         Accepted as WitAcceptedWorldCommand, Actor as WitWorldCommandActor,
         Error as WorldCommandError, Host as WorldCommandsHost, Request as WitWorldCommandRequest,
     },
+    world_projections::{
+        Accepted as WitAcceptedWorldProjectionRead, Error as WorldProjectionError,
+        Host as WorldProjectionsHost, ReadState as WitWorldProjectionReadState,
+        Request as WitWorldProjectionRequest, View as WitWorldProjectionView,
+    },
     world_registration::{
         Error as WorldRegistrationError, Host as WorldRegistrationHost, SchemaKind as WitSchemaKind,
     },
@@ -208,6 +213,8 @@ pub struct WasmHostState {
     world_session_mutations_this_execution: usize,
     max_world_command_submissions_per_execution: usize,
     world_command_submissions_this_execution: usize,
+    max_world_projection_reads_per_execution: usize,
+    world_projection_reads_this_execution: usize,
     execution_target_registration_active: bool,
     pending_execution_targets: Vec<String>,
     resource_limits: StoreLimits,
@@ -378,6 +385,9 @@ impl WasmHostState {
             max_world_command_submissions_per_execution: budget
                 .max_world_command_submissions_per_execution,
             world_command_submissions_this_execution: 0,
+            max_world_projection_reads_per_execution: budget
+                .max_world_projection_reads_per_execution,
+            world_projection_reads_this_execution: 0,
             execution_target_registration_active: false,
             pending_execution_targets: Vec::new(),
             resource_limits: budget.store_limits(),
@@ -529,6 +539,7 @@ impl WasmHostState {
         self.user_content_writes_this_execution = 0;
         self.world_session_mutations_this_execution = 0;
         self.world_command_submissions_this_execution = 0;
+        self.world_projection_reads_this_execution = 0;
         self.pending_effects.clear();
         self.pending_revocations.clear();
         self.secret_access_active = false;
@@ -754,6 +765,7 @@ impl WasmHostState {
         self.user_content_writes_this_execution = 0;
         self.world_session_mutations_this_execution = 0;
         self.world_command_submissions_this_execution = 0;
+        self.world_projection_reads_this_execution = 0;
         self.secret_access_active = true;
         self.service_access_active = true;
         self.ui_access_active = true;
@@ -769,6 +781,7 @@ impl WasmHostState {
         self.user_content_writes_this_execution = 0;
         self.world_session_mutations_this_execution = 0;
         self.world_command_submissions_this_execution = 0;
+        self.world_projection_reads_this_execution = 0;
         self.secret_access_active = true;
         self.service_access_active = true;
         self.ui_access_active = true;
@@ -787,6 +800,7 @@ impl WasmHostState {
         self.user_content_writes_this_execution = 0;
         self.world_session_mutations_this_execution = 0;
         self.world_command_submissions_this_execution = 0;
+        self.world_projection_reads_this_execution = 0;
         self.secret_access_active = true;
         self.service_access_active = true;
         self.ui_access_active = true;

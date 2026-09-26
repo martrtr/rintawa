@@ -44,6 +44,8 @@ pub struct WasmExecutionBudget {
     pub max_world_session_mutations_per_execution: usize,
     /// Maximum authoritative world commands accepted during one guest callback.
     pub max_world_command_submissions_per_execution: usize,
+    /// Maximum policy-filtered World Projection reads accepted during one guest callback.
+    pub max_world_projection_reads_per_execution: usize,
     /// Maximum cooperative background tasks owned by one WASM component.
     pub max_background_tasks: usize,
     /// Smallest periodic task interval accepted from a guest.
@@ -80,6 +82,7 @@ impl Default for WasmExecutionBudget {
             max_user_content_writes_per_execution: 4,
             max_world_session_mutations_per_execution: 8,
             max_world_command_submissions_per_execution: 8,
+            max_world_projection_reads_per_execution: 8,
             max_background_tasks: 8,
             min_background_task_interval_ms: 10,
             max_network_handles: 64,
