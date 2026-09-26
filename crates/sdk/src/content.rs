@@ -7,7 +7,10 @@ use crate::contracts::{ContractKey, ContractVersion};
 /// Major version of the platform-owned RTW content-handler service protocol.
 pub const CONTENT_HANDLER_SERVICE_PROTOCOL_VERSION: ContractVersion = ContractVersion::new(1);
 /// Maximum content descriptor bytes passed to one handler validation call.
-pub const MAX_CONTENT_HANDLER_ENTRY_BYTES: usize = 64 * 1024;
+///
+/// This remains below the generic service-message budget even after worst-case
+/// JSON serialization of the byte sequence used by the v1 handler transport.
+pub const MAX_CONTENT_HANDLER_ENTRY_BYTES: usize = 128 * 1024;
 /// Maximum human-readable rejection diagnostic accepted from a content handler.
 pub const MAX_CONTENT_HANDLER_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 
