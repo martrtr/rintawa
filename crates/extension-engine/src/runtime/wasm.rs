@@ -1766,6 +1766,14 @@ impl WasmComponent {
         Self::set_fuel(store, budget.fuel_per_callback, operation)
     }
 
+    fn set_service_request_fuel(
+        store: &mut Store<WasmHostState>,
+        budget: &WasmExecutionBudget,
+        operation: &'static str,
+    ) -> ExtensionResult<()> {
+        Self::set_fuel(store, budget.fuel_per_service_request, operation)
+    }
+
     fn set_ui_action_fuel(
         store: &mut Store<WasmHostState>,
         budget: &WasmExecutionBudget,
@@ -2168,7 +2176,7 @@ impl Component for WasmComponent {
         let instance = self.ensure_instance(&mut runtime)?;
 
         instance.store.data().validate_execution_owner(ctx)?;
-        Self::set_callback_fuel(&mut instance.store, &budget, "service request")?;
+        Self::set_service_request_fuel(&mut instance.store, &budget, "service request")?;
         instance.store.data_mut().begin_service_execution();
 
         let response = instance

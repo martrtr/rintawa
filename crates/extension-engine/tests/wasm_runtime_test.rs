@@ -164,6 +164,56 @@ fn test_should_dispatch_service_request_to_wasm_guest() -> EngineResult<()> {
 }
 
 #[test]
+fn test_should_use_dedicated_fuel_budget_for_service_requests() -> EngineResult<()> {
+    let low_service_budget = WasmExecutionBudget {
+        fuel_per_service_request: 1,
+        ..WasmExecutionBudget::default()
+    };
+    let runtime = WasmRuntimeEngine::with_execution_budget(low_service_budget)?;
+    let mut component = runtime.load_component_from_bytes(
+        ComponentId::new("stateful-component"),
+        STATEFUL_WASM_COMPONENT.as_bytes(),
+    )?;
+    let mut context = TestComponentContext::new();
+    component.register(&mut context)?;
+    component.start(&mut context)?;
+    assert!(matches!(
+        component.handle_service(
+            &mut context,
+            &ContractKey::new("example.service", ContractVersion::new(1)),
+            b"payload",
+        ),
+        Err(ExtensionError::ExecutionBudgetExceeded {
+            resource: "fuel",
+            operation: "service request",
+        })
+    ));
+
+    let larger_service_budget = WasmExecutionBudget {
+        fuel_per_service_request: 10_000_000,
+        ..WasmExecutionBudget::default()
+    };
+    let runtime = WasmRuntimeEngine::with_execution_budget(larger_service_budget)?;
+    let mut component = runtime.load_component_from_bytes(
+        ComponentId::new("stateful-component"),
+        STATEFUL_WASM_COMPONENT.as_bytes(),
+    )?;
+    let mut context = TestComponentContext::new();
+    component.register(&mut context)?;
+    component.start(&mut context)?;
+    assert!(
+        component
+            .handle_service(
+                &mut context,
+                &ContractKey::new("example.service", ContractVersion::new(1)),
+                b"payload",
+            )?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
 fn test_should_reject_oversized_wasm_service_request() -> EngineResult<()> {
     let budget = WasmExecutionBudget {
         max_host_message_bytes: 32,
