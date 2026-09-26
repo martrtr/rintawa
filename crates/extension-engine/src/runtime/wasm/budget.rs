@@ -4,9 +4,9 @@ use wasmtime::{StoreLimits, StoreLimitsBuilder};
 
 /// Host-owned resource limits for one WASM component instance.
 ///
-/// Lifecycle, event, and task callbacks receive a fresh `fuel_per_callback`
-/// allowance. Service callbacks and interactive Portable UI actions receive
-/// dedicated larger allowances because they may legitimately process bounded
+/// Lifecycle and event callbacks receive a fresh `fuel_per_callback` allowance.
+/// Cooperative runtime tasks, service callbacks, and interactive Portable UI actions
+/// receive dedicated larger allowances because they may legitimately process bounded
 /// payloads while still remaining finite.
 ///
 /// Memory and table limits are enforced by Wasmtime for the lifetime of the
@@ -26,8 +26,10 @@ pub struct WasmExecutionBudget {
     pub max_tables: usize,
     /// Maximum linear memories allocated by one component store.
     pub max_memories: usize,
-    /// Fuel made available before lifecycle, event, and task callbacks.
+    /// Fuel made available before lifecycle and event callbacks.
     pub fuel_per_callback: u64,
+    /// Fuel made available before a cooperative runtime task callback.
+    pub fuel_per_runtime_task: u64,
     /// Fuel made available before a bounded service request callback.
     pub fuel_per_service_request: u64,
     /// Fuel made available before an interactive Portable UI action.
@@ -76,6 +78,7 @@ impl Default for WasmExecutionBudget {
             max_tables: 16,
             max_memories: 8,
             fuel_per_callback: 10_000_000,
+            fuel_per_runtime_task: 50_000_000,
             fuel_per_service_request: 50_000_000,
             fuel_per_ui_action: 50_000_000,
             max_host_message_bytes: 1024 * 1024,

@@ -1766,6 +1766,14 @@ impl WasmComponent {
         Self::set_fuel(store, budget.fuel_per_callback, operation)
     }
 
+    fn set_runtime_task_fuel(
+        store: &mut Store<WasmHostState>,
+        budget: &WasmExecutionBudget,
+        operation: &'static str,
+    ) -> ExtensionResult<()> {
+        Self::set_fuel(store, budget.fuel_per_runtime_task, operation)
+    }
+
     fn set_service_request_fuel(
         store: &mut Store<WasmHostState>,
         budget: &WasmExecutionBudget,
@@ -2054,7 +2062,7 @@ impl Component for WasmComponent {
                     {
                         continue;
                     }
-                    Self::set_callback_fuel(&mut instance.store, &budget, "runtime task")?;
+                    Self::set_runtime_task_fuel(&mut instance.store, &budget, "runtime task")?;
                     let is_root_owner = task_owner == root_owner;
                     if is_root_owner {
                         instance.store.data_mut().begin_guest_execution();
