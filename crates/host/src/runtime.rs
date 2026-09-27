@@ -27,8 +27,8 @@ use rintawa_sdk::{
         MAX_CONTENT_HANDLER_ENTRY_BYTES, content_handler_service_contract_key,
     },
     contracts::{
-        ComponentRef, ContractKey, ContractResolutionPolicy, host_shell_contract_key,
-        ui_layer_contract_key,
+        ComponentRef, ContractKey, ContractResolutionPolicy, ContractVersion,
+        host_shell_contract_key, ui_layer_contract_key,
     },
     runtime_permissions::RuntimePermission,
     runtime_signals::RuntimeSignal,
@@ -1006,6 +1006,48 @@ impl CompositionAccess for LocalHostAccess {
     ) -> HostAccessResult<()> {
         self.home()?
             .set_enabled_in_scope(&RuntimeScopeId::new(scope_id), subject, enabled)
+            .map_err(map_host_access_error)
+    }
+
+    fn set_preferred_provider_in_scope(
+        &self,
+        scope_id: &str,
+        contract_id: &str,
+        contract_version: u32,
+        provider_instance_id: &str,
+        provider_component_id: &str,
+    ) -> HostAccessResult<()> {
+        if scope_id.is_empty()
+            || contract_id.is_empty()
+            || contract_version == 0
+            || provider_instance_id.is_empty()
+            || provider_component_id.is_empty()
+        {
+            return Err(HostAccessError::Rejected);
+        }
+        self.home()?
+            .set_preferred_provider(
+                RuntimeScopeId::new(scope_id),
+                ContractKey::new(contract_id, ContractVersion::new(contract_version)),
+                ComponentRef::new(provider_instance_id, provider_component_id),
+            )
+            .map_err(map_host_access_error)
+    }
+
+    fn clear_preferred_provider_in_scope(
+        &self,
+        scope_id: &str,
+        contract_id: &str,
+        contract_version: u32,
+    ) -> HostAccessResult<()> {
+        if scope_id.is_empty() || contract_id.is_empty() || contract_version == 0 {
+            return Err(HostAccessError::Rejected);
+        }
+        self.home()?
+            .clear_preferred_provider(
+                &RuntimeScopeId::new(scope_id),
+                &ContractKey::new(contract_id, ContractVersion::new(contract_version)),
+            )
             .map_err(map_host_access_error)
     }
 

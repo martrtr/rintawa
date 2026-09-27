@@ -41,10 +41,28 @@ fn begin_test_registration(state: &mut WasmHostState, extension_id: ExtensionId)
         .unwrap();
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreferredProviderWrite {
+    scope_id: String,
+    contract_id: String,
+    contract_version: u32,
+    provider_instance_id: String,
+    provider_component_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreferredProviderClear {
+    scope_id: String,
+    contract_id: String,
+    contract_version: u32,
+}
+
 #[derive(Default)]
 struct RecordingScopedHostAccess {
     composition_reads: Mutex<Vec<String>>,
     composition_writes: Mutex<Vec<String>>,
+    preferred_provider_writes: Mutex<Vec<PreferredProviderWrite>>,
+    preferred_provider_clears: Mutex<Vec<PreferredProviderClear>>,
     world_default_writes: Mutex<Vec<(String, bool)>>,
     runtime_policy_reads: Mutex<Vec<String>>,
     user_content_writes: Mutex<Vec<Vec<u8>>>,
@@ -331,6 +349,44 @@ impl CompositionAccess for RecordingScopedHostAccess {
             enabled: true,
             world_default: false,
         })
+    }
+
+    fn set_preferred_provider_in_scope(
+        &self,
+        scope_id: &str,
+        contract_id: &str,
+        contract_version: u32,
+        provider_instance_id: &str,
+        provider_component_id: &str,
+    ) -> HostAccessResult<()> {
+        self.preferred_provider_writes
+            .lock()
+            .expect("test preferred-provider write lock must stay healthy")
+            .push(PreferredProviderWrite {
+                scope_id: scope_id.to_string(),
+                contract_id: contract_id.to_string(),
+                contract_version,
+                provider_instance_id: provider_instance_id.to_string(),
+                provider_component_id: provider_component_id.to_string(),
+            });
+        Ok(())
+    }
+
+    fn clear_preferred_provider_in_scope(
+        &self,
+        scope_id: &str,
+        contract_id: &str,
+        contract_version: u32,
+    ) -> HostAccessResult<()> {
+        self.preferred_provider_clears
+            .lock()
+            .expect("test preferred-provider clear lock must stay healthy")
+            .push(PreferredProviderClear {
+                scope_id: scope_id.to_string(),
+                contract_id: contract_id.to_string(),
+                contract_version,
+            });
+        Ok(())
     }
 }
 
@@ -1509,6 +1565,17 @@ fn test_should_route_scoped_composition_and_runtime_policy_access() {
         Err(RuntimePolicyError::PermissionDenied)
     ));
     assert!(matches!(
+        ScopedCompositionHost::set_preferred_provider(
+            &mut state,
+            scope.clone(),
+            String::from("example.contract"),
+            1,
+            String::from("instance"),
+            String::from("runtime"),
+        ),
+        Err(CompositionError::PermissionDenied)
+    ));
+    assert!(matches!(
         CompositionHost::set_world_default(&mut state, String::from("example.extension"), true,),
         Err(CompositionError::PermissionDenied)
     ));
@@ -1534,6 +1601,33 @@ fn test_should_route_scoped_composition_and_runtime_policy_access() {
     )
     .unwrap();
     assert_eq!(selected.scope_id, scope);
+    ScopedCompositionHost::set_preferred_provider(
+        &mut state,
+        scope.clone(),
+        String::from("example.contract"),
+        1,
+        String::from("instance"),
+        String::from("runtime"),
+    )
+    .unwrap();
+    ScopedCompositionHost::clear_preferred_provider(
+        &mut state,
+        scope.clone(),
+        String::from("example.contract"),
+        1,
+    )
+    .unwrap();
+    assert!(matches!(
+        ScopedCompositionHost::set_preferred_provider(
+            &mut state,
+            scope.clone(),
+            String::from("example.contract"),
+            0,
+            String::from("instance"),
+            String::from("runtime"),
+        ),
+        Err(CompositionError::Rejected)
+    ));
     CompositionHost::set_world_default(&mut state, String::from("example.extension"), true)
         .unwrap();
 
@@ -1560,6 +1654,32 @@ fn test_should_route_scoped_composition_and_runtime_policy_access() {
             .expect("test composition-write lock must stay healthy")
             .as_slice(),
         std::slice::from_ref(&scope)
+    );
+    assert_eq!(
+        access
+            .preferred_provider_writes
+            .lock()
+            .expect("test preferred-provider write lock must stay healthy")
+            .as_slice(),
+        [PreferredProviderWrite {
+            scope_id: scope.clone(),
+            contract_id: String::from("example.contract"),
+            contract_version: 1,
+            provider_instance_id: String::from("instance"),
+            provider_component_id: String::from("runtime"),
+        }]
+    );
+    assert_eq!(
+        access
+            .preferred_provider_clears
+            .lock()
+            .expect("test preferred-provider clear lock must stay healthy")
+            .as_slice(),
+        [PreferredProviderClear {
+            scope_id: scope.clone(),
+            contract_id: String::from("example.contract"),
+            contract_version: 1,
+        }]
     );
     assert_eq!(
         access

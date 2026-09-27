@@ -482,7 +482,8 @@ pub trait CompositionAccess: Send + Sync {
     /// Changes persisted enabled state for an exact selection.
     fn set_enabled(&self, subject: &str, enabled: bool) -> HostAccessResult<()>;
 
-    /// Marks whether one baseline selection is inherited by newly created worlds.
+    /// Compatibility helper for selecting one baseline artifact in the independent
+    /// default-World recipe used only by future World creation.
     fn set_world_default(&self, _subject: &str, _world_default: bool) -> HostAccessResult<()> {
         Err(HostAccessError::Rejected)
     }
@@ -516,6 +517,28 @@ pub trait CompositionAccess: Send + Sync {
         _scope_id: &str,
         _subject: &str,
         _enabled: bool,
+    ) -> HostAccessResult<()> {
+        Err(HostAccessError::Rejected)
+    }
+
+    /// Selects one exact provider component for a versioned contract in one scope.
+    fn set_preferred_provider_in_scope(
+        &self,
+        _scope_id: &str,
+        _contract_id: &str,
+        _contract_version: u32,
+        _provider_instance_id: &str,
+        _provider_component_id: &str,
+    ) -> HostAccessResult<()> {
+        Err(HostAccessError::Rejected)
+    }
+
+    /// Clears one explicit provider choice for a versioned contract in one scope.
+    fn clear_preferred_provider_in_scope(
+        &self,
+        _scope_id: &str,
+        _contract_id: &str,
+        _contract_version: u32,
     ) -> HostAccessResult<()> {
         Err(HostAccessError::Rejected)
     }

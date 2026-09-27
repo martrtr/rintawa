@@ -692,6 +692,61 @@ impl ScopedCompositionHost for WasmHostState {
             .map_err(map_composition_access_error)
     }
 
+    fn set_preferred_provider(
+        &mut self,
+        scope_id: String,
+        contract_id: String,
+        contract_version: u32,
+        provider_instance_id: String,
+        provider_component_id: String,
+    ) -> Result<(), CompositionError> {
+        self.require_composition_write()?;
+        let message_bytes = scope_id
+            .len()
+            .saturating_add(contract_id.len())
+            .saturating_add(provider_instance_id.len())
+            .saturating_add(provider_component_id.len());
+        if message_bytes > self.max_host_message_bytes
+            || scope_id.is_empty()
+            || contract_id.is_empty()
+            || contract_version == 0
+            || provider_instance_id.is_empty()
+            || provider_component_id.is_empty()
+        {
+            return Err(CompositionError::Rejected);
+        }
+        self.host_access
+            .composition
+            .set_preferred_provider_in_scope(
+                &scope_id,
+                &contract_id,
+                contract_version,
+                &provider_instance_id,
+                &provider_component_id,
+            )
+            .map_err(map_composition_access_error)
+    }
+
+    fn clear_preferred_provider(
+        &mut self,
+        scope_id: String,
+        contract_id: String,
+        contract_version: u32,
+    ) -> Result<(), CompositionError> {
+        self.require_composition_write()?;
+        if scope_id.len().saturating_add(contract_id.len()) > self.max_host_message_bytes
+            || scope_id.is_empty()
+            || contract_id.is_empty()
+            || contract_version == 0
+        {
+            return Err(CompositionError::Rejected);
+        }
+        self.host_access
+            .composition
+            .clear_preferred_provider_in_scope(&scope_id, &contract_id, contract_version)
+            .map_err(map_composition_access_error)
+    }
+
     fn remove_activation(
         &mut self,
         scope_id: String,
