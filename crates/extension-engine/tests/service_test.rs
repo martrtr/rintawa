@@ -924,3 +924,291 @@ fn test_service_routes_are_isolated_by_runtime_scope() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_multiple_service_enumerates_targets_and_invalidates_stale_handles() -> Result<()> {
+    let contract = contract("example.multiple");
+    let definition =
+        ContractDefinition::service(contract.clone(), ContractResolutionPolicy::Multiple);
+    let mut engine = ExtensionEngine::new();
+
+    for (id, response) in [("a-provider", b"a".to_vec()), ("b-provider", b"b".to_vec())] {
+        engine.register_extension(
+            manifest(id),
+            vec![Box::new(
+                ServiceComponent::new("runtime")
+                    .defining(definition.clone())
+                    .providing(ContractProvider::new(contract.clone()))
+                    .responding(response),
+            )],
+        )?;
+    }
+    for id in ["consumer-a", "consumer-b"] {
+        engine.register_extension(
+            manifest(id),
+            vec![Box::new(
+                ServiceComponent::new("runtime")
+                    .consuming(ContractConsumer::new(contract.clone(), true)),
+            )],
+        )?;
+    }
+    start(
+        &mut engine,
+        &["a-provider", "b-provider", "consumer-a", "consumer-b"],
+    )?;
+
+    let consumer_a = ComponentRef::new("consumer-a", "runtime");
+    let consumer_b = ComponentRef::new("consumer-b", "runtime");
+    assert_eq!(
+        engine.call_service(&consumer_a, &contract, b"ping"),
+        Err(ServiceCallError::UnsupportedResolution)
+    );
+
+    let caller_a = engine.bound_service_caller(consumer_a);
+    let caller_b = engine.bound_service_caller(consumer_b);
+    let handles = caller_a.list_providers(&contract)?;
+    assert_eq!(handles.len(), 2);
+
+    let mut responses = handles
+        .iter()
+        .map(|handle| caller_a.call_provider(*handle, b"ping"))
+        .collect::<ServiceCallResult<Vec<_>>>()?;
+    responses.sort();
+    assert_eq!(responses, vec![b"a".to_vec(), b"b".to_vec()]);
+
+    assert_eq!(
+        caller_b.call_provider(handles[0], b"ping"),
+        Err(ServiceCallError::Unavailable)
+    );
+    assert_eq!(
+        caller_a.call_provider(ServiceProviderHandle::from_raw(u64::MAX), b"ping"),
+        Err(ServiceCallError::Unavailable)
+    );
+
+    engine.stop_extension(&ExtensionId::new("b-provider"))?;
+    for handle in handles {
+        assert_eq!(
+            caller_a.call_provider(handle, b"ping"),
+            Err(ServiceCallError::Unavailable)
+        );
+    }
+
+    let fresh = caller_a.list_providers(&contract)?;
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(caller_a.call_provider(fresh[0], b"ping")?, b"a");
+    Ok(())
+}
+
+#[test]
+fn test_multiple_service_provider_handles_are_isolated_by_runtime_scope() -> Result<()> {
+    let contract = contract("example.multiple-scoped");
+    let definition =
+        ContractDefinition::service(contract.clone(), ContractResolutionPolicy::Multiple);
+    let mut engine = ExtensionEngine::new();
+    let scope_a = RuntimeScopeId::new("world:a");
+    let scope_b = RuntimeScopeId::new("world:b");
+    let provider_a = ExtensionInstanceId::new("provider@a");
+    let provider_b = ExtensionInstanceId::new("provider@b");
+    let consumer_a = ExtensionInstanceId::new("consumer@a");
+    let consumer_b = ExtensionInstanceId::new("consumer@b");
+
+    for (instance, scope, response) in [
+        (provider_a.clone(), scope_a.clone(), b"a".to_vec()),
+        (provider_b.clone(), scope_b.clone(), b"b".to_vec()),
+    ] {
+        engine.register_extension_instance(
+            instance,
+            scope,
+            manifest("provider"),
+            vec![Box::new(
+                ServiceComponent::new("runtime")
+                    .defining(definition.clone())
+                    .providing(ContractProvider::new(contract.clone()))
+                    .responding(response),
+            )],
+        )?;
+    }
+    for (instance, scope) in [(consumer_a.clone(), scope_a), (consumer_b.clone(), scope_b)] {
+        engine.register_extension_instance(
+            instance,
+            scope,
+            manifest("consumer"),
+            vec![Box::new(
+                ServiceComponent::new("runtime")
+                    .consuming(ContractConsumer::new(contract.clone(), true)),
+            )],
+        )?;
+    }
+    for instance in [&provider_a, &provider_b, &consumer_a, &consumer_b] {
+        engine.start_extension_instance(instance)?;
+    }
+
+    let caller_a = engine.bound_service_caller(ComponentRef::new(consumer_a, "runtime"));
+    let caller_b = engine.bound_service_caller(ComponentRef::new(consumer_b, "runtime"));
+    let handles_a = caller_a.list_providers(&contract)?;
+    let handles_b = caller_b.list_providers(&contract)?;
+    assert_eq!(handles_a.len(), 1);
+    assert_eq!(handles_b.len(), 1);
+    assert_eq!(caller_a.call_provider(handles_a[0], b"ping")?, b"a");
+    assert_eq!(caller_b.call_provider(handles_b[0], b"ping")?, b"b");
+    assert_eq!(
+        caller_a.call_provider(handles_b[0], b"ping"),
+        Err(ServiceCallError::Unavailable)
+    );
+    assert_eq!(
+        caller_b.call_provider(handles_a[0], b"ping"),
+        Err(ServiceCallError::Unavailable)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_multiple_provider_listing_rejects_single_service_contract() -> Result<()> {
+    let contract = contract("example.single-list");
+    let definition =
+        ContractDefinition::service(contract.clone(), ContractResolutionPolicy::Single);
+    let mut engine = ExtensionEngine::new();
+    engine.register_extension(
+        manifest("provider"),
+        vec![Box::new(
+            ServiceComponent::new("runtime")
+                .defining(definition)
+                .providing(ContractProvider::new(contract.clone()))
+                .responding(b"pong".to_vec()),
+        )],
+    )?;
+    engine.register_extension(
+        manifest("consumer"),
+        vec![Box::new(
+            ServiceComponent::new("runtime")
+                .consuming(ContractConsumer::new(contract.clone(), true)),
+        )],
+    )?;
+    start(&mut engine, &["provider", "consumer"])?;
+
+    let caller = engine.bound_service_caller(ComponentRef::new("consumer", "runtime"));
+    assert_eq!(
+        caller.list_providers(&contract),
+        Err(ServiceCallError::UnsupportedResolution)
+    );
+    assert_eq!(caller.call(&contract, b"ping")?, b"pong");
+    Ok(())
+}
+
+#[test]
+fn test_multiple_provider_listing_enforces_provider_count_bound() -> Result<()> {
+    let contract = contract("example.many-providers");
+    let definition =
+        ContractDefinition::service(contract.clone(), ContractResolutionPolicy::Multiple);
+    let mut engine = ExtensionEngine::new();
+
+    for index in 0..65 {
+        let id = format!("provider-{index:02}");
+        engine.register_extension(
+            manifest(&id),
+            vec![Box::new(
+                ServiceComponent::new("runtime")
+                    .defining(definition.clone())
+                    .providing(ContractProvider::new(contract.clone()))
+                    .responding(index.to_string().into_bytes()),
+            )],
+        )?;
+        engine.start_extension(&ExtensionId::new(&id))?;
+    }
+    engine.register_extension(
+        manifest("consumer"),
+        vec![Box::new(
+            ServiceComponent::new("runtime")
+                .consuming(ContractConsumer::new(contract.clone(), true)),
+        )],
+    )?;
+    engine.start_extension(&ExtensionId::new("consumer"))?;
+
+    let caller = engine.bound_service_caller(ComponentRef::new("consumer", "runtime"));
+    assert_eq!(
+        caller.list_providers(&contract),
+        Err(ServiceCallError::ResponseTooLarge)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_multiple_service_handles_are_invalidated_by_secret_policy_changes() -> Result<()> {
+    let contract = contract("example.multiple-secured");
+    let pattern = SecretPathPattern::parse("service.keys.multiple")?;
+    let definition =
+        ContractDefinition::service(contract.clone(), ContractResolutionPolicy::Multiple);
+    let provider_manifest = ExtensionManifest {
+        id: ExtensionId::new("secured-multiple-provider"),
+        name: String::from("Secured Multiple Provider"),
+        version: String::from("0.0.1"),
+        sdk: String::from("^0.0"),
+        components: vec![ComponentDescriptor {
+            id: ComponentId::new("runtime"),
+            kind: ComponentKind::Runtime,
+            target: ComponentTarget::new("example.runtime.native@1"),
+            entry: None,
+            required: true,
+            permissions: ComponentPermissions {
+                secret_read: vec![pattern.clone()],
+                runtime: Vec::new(),
+            },
+        }],
+    };
+    let required_grant = ContractGrantRequirement::SecretRead {
+        pattern: pattern.clone(),
+    };
+    let mut engine = ExtensionEngine::new();
+
+    engine.register_extension(
+        provider_manifest,
+        vec![Box::new(
+            ServiceComponent::new("runtime")
+                .defining(definition)
+                .providing(ContractProvider::new(contract.clone()).requiring(required_grant))
+                .responding(b"secure".to_vec()),
+        )],
+    )?;
+    engine.register_extension(
+        manifest("consumer"),
+        vec![Box::new(
+            ServiceComponent::new("runtime")
+                .consuming(ContractConsumer::new(contract.clone(), true)),
+        )],
+    )?;
+    engine.start_extension(&ExtensionId::new("secured-multiple-provider"))?;
+    engine.grant_requested_secret_read(
+        &ExtensionId::new("secured-multiple-provider"),
+        &ComponentId::new("runtime"),
+        pattern.clone(),
+    )?;
+    engine.start_extension(&ExtensionId::new("consumer"))?;
+
+    let caller = engine.bound_service_caller(ComponentRef::new("consumer", "runtime"));
+    let handles = caller.list_providers(&contract)?;
+    assert_eq!(handles.len(), 1);
+    assert_eq!(caller.call_provider(handles[0], b"ping")?, b"secure");
+
+    engine
+        .secret_manager()
+        .revoke_component(&ComponentRef::new("secured-multiple-provider", "runtime"));
+    assert_eq!(
+        caller.call_provider(handles[0], b"ping"),
+        Err(ServiceCallError::Unavailable)
+    );
+    assert_eq!(
+        caller.list_providers(&contract),
+        Err(ServiceCallError::Unavailable)
+    );
+
+    engine.grant_requested_secret_read(
+        &ExtensionId::new("secured-multiple-provider"),
+        &ComponentId::new("runtime"),
+        pattern,
+    )?;
+    let fresh = caller.list_providers(&contract)?;
+    assert_eq!(fresh.len(), 1);
+    assert_ne!(fresh[0], handles[0]);
+    assert_eq!(caller.call_provider(fresh[0], b"ping")?, b"secure");
+    Ok(())
+}

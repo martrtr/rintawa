@@ -31,3 +31,19 @@ The checked-in components must be regenerated whenever the plugin WIT ABI
 changes. They intentionally use only generic registration/service contracts;
 they must not gain Chat-, AI-provider-, Web-, filesystem-, or product-specific
 host APIs.
+
+## Multiple-provider fixture
+
+`multiple-provider.wasm` and `multiple-consumer.wasm` exercise the targeted
+`Multiple` service ABI added to `rintawa:engine/services`. Their auditable Rust
+sources are `multiple_provider.rs` and `multiple_consumer.rs`.
+
+The integration test starts two independent instances of the provider component.
+The consumer declares `example.multiple-echo@1`, enumerates the two providers with
+`list-providers`, then invokes each opaque handle through `call-provider`. The
+consumer traps during `start` if enumeration or either targeted call is wrong.
+
+These binaries were built against the current `engine.wit` with `wit-bindgen
+0.57.1` and componentized through the repository `rintawa-dev` Rust-component
+pipeline. As with the unary fixtures, regenerate them whenever the plugin WIT ABI
+changes.
