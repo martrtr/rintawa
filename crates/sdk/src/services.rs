@@ -2,6 +2,31 @@
 
 use thiserror::Error;
 
+/// Opaque host-issued selection for one provider of a `Multiple` service contract.
+///
+/// The numeric value is transport identity only. Constructing or guessing a value
+/// grants no authority: the Extension Engine binds every live handle to the exact
+/// consumer principal, contract, scope, provider, and current topology/policy state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ServiceProviderHandle(u64);
+
+impl ServiceProviderHandle {
+    /// Reconstructs an opaque handle received through a host transport.
+    ///
+    /// This does not validate or grant access. The host must validate the handle
+    /// again when it is used.
+    #[doc(hidden)]
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the transport representation of this opaque handle.
+    #[doc(hidden)]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 /// Transport-level failure while routing a service request.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ServiceCallError {

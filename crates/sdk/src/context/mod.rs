@@ -11,7 +11,7 @@ use crate::{
     errors::ExtensionResult,
     runtime_effects::RuntimeEffect,
     secrets::{SecretPath, SecretValue},
-    services::{ServiceCallError, ServiceCallResult},
+    services::{ServiceCallError, ServiceCallResult, ServiceProviderHandle},
     types::{ComponentId, ExtensionId, ExtensionInstanceId, RuntimeEffectId, RuntimeScopeId},
     ui::{
         UiLayerDescriptor, UiPatchBatch, UiResult, UiSurfaceContribution, UiSurfaceId,
@@ -93,6 +93,37 @@ pub trait ComponentContext {
     fn call_service(
         &mut self,
         _contract: &crate::contracts::ContractKey,
+        _request: &[u8],
+    ) -> ServiceCallResult<Vec<u8>> {
+        Err(ServiceCallError::Unavailable)
+    }
+
+    /// Lists eligible providers for one `Multiple` service contract.
+    ///
+    /// Returned handles are opaque, caller-bound, and lifecycle-sensitive. A
+    /// topology or provider-policy change may invalidate them immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport-level [`ServiceCallError`] when the caller is not a
+    /// declared consumer, the contract is not a `Multiple` service, no provider
+    /// is available, or the bounded provider list cannot be represented.
+    fn list_service_providers(
+        &mut self,
+        _contract: &crate::contracts::ContractKey,
+    ) -> ServiceCallResult<Vec<ServiceProviderHandle>> {
+        Err(ServiceCallError::Unavailable)
+    }
+
+    /// Calls one provider previously selected from a `Multiple` service contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport-level [`ServiceCallError`] when the handle is stale,
+    /// belongs to another caller, or provider execution fails.
+    fn call_service_provider(
+        &mut self,
+        _provider: ServiceProviderHandle,
         _request: &[u8],
     ) -> ServiceCallResult<Vec<u8>> {
         Err(ServiceCallError::Unavailable)

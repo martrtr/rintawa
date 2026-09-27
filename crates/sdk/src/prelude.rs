@@ -36,7 +36,7 @@ pub use crate::runtime_signals::RuntimeSignal;
 
 pub use crate::secrets::{SecretAccessError, SecretPath, SecretPathPattern, SecretValue};
 
-pub use crate::services::{ServiceCallError, ServiceCallResult};
+pub use crate::services::{ServiceCallError, ServiceCallResult, ServiceProviderHandle};
 
 pub use crate::traits::Component;
 
