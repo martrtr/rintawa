@@ -4333,6 +4333,34 @@ mod tests {
     }
 
     #[test]
+    fn test_should_keep_multiple_worlds_active_independently() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let world_a = home.create_world()?.id;
+        let world_b = home.create_world()?.id;
+        let mut host = HostRuntime::start(&home)?;
+
+        host.activate_world(&home, world_a)?;
+        host.activate_world(&home, world_b)?;
+
+        assert!(host.is_world_active(world_a));
+        assert!(host.is_world_active(world_b));
+        assert_eq!(host.active_worlds.len(), 2);
+
+        host.poll_runtime()?;
+        assert!(host.is_world_active(world_a));
+        assert!(host.is_world_active(world_b));
+
+        host.deactivate_world(world_a)?;
+        assert!(!host.is_world_active(world_a));
+        assert!(host.is_world_active(world_b));
+        assert_eq!(host.active_worlds.len(), 1);
+
+        host.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
     fn test_should_supervise_world_commit_delivery_replay_and_deactivation() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let home = HostHome::open(root.path().join("home"))?;
