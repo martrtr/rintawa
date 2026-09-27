@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::contracts::ContractKey;
+use crate::{contracts::ContractKey, world::WorldId};
 
 use crate::ui::{
     PORTABLE_UI_PROTOCOL_MAJOR, UiActivityId, UiCapabilityId, UiIconSlotId, UiSurfaceId,
@@ -55,6 +55,19 @@ impl UiActivityContribution {
         self.icon_slot = Some(icon_slot.into());
         self
     }
+}
+
+/// Host-normalized presentation context assigned to a surface for one UI Layer session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum UiPresentationContext {
+    /// Surface belongs to the active UI Layer's own runtime scope.
+    LayerLocal,
+    /// Surface belongs to the World explicitly focused by this presentation session.
+    FocusedWorld {
+        /// Authoritative World whose runtime scope is imported into the presentation.
+        world_id: WorldId,
+    },
 }
 
 /// Declares one portable UI surface owned by a component.

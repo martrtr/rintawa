@@ -14,8 +14,10 @@ use rintawa_sdk::{
     types::{ExtensionInstanceId, RuntimeScopeId},
     ui::{
         PORTABLE_UI_PROTOCOL_MAJOR, UiActionEvent, UiError, UiLayerDescriptor, UiPatch,
-        UiPatchBatch, UiResult, UiSurfaceContribution, UiSurfaceId, UiSurfaceSnapshot,
+        UiPatchBatch, UiPresentationContext, UiResult, UiSurfaceContribution, UiSurfaceId,
+        UiSurfaceSnapshot,
     },
+    world::WorldId,
 };
 
 use crate::validation::{
@@ -45,6 +47,12 @@ pub struct OwnedUiLayerDescriptor {
 pub struct UiPresentationSurface {
     /// Component that owns and updates the surface.
     pub owner: ComponentRef,
+    /// Host-normalized context for one layer-specific presentation session.
+    ///
+    /// Host-wide inspection snapshots leave this unset because they are not attached
+    /// to one renderer session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<UiPresentationContext>,
     /// Static surface metadata.
     pub contribution: UiSurfaceContribution,
     /// Current validated presentation snapshot.
@@ -92,10 +100,17 @@ struct UiExtensionInstance {
 }
 
 #[derive(Clone)]
+struct FocusedPresentationScope {
+    scope_id: RuntimeScopeId,
+    world_id: WorldId,
+}
+
+#[derive(Clone)]
 struct ActiveUiLayer {
     owner: ComponentRef,
     descriptor: UiLayerDescriptor,
     capabilities: HashSet<rintawa_sdk::ui::UiCapabilityId>,
+    focused_scope: Option<FocusedPresentationScope>,
 }
 
 #[derive(Default)]
@@ -111,8 +126,8 @@ struct UiRuntimeState {
 /// Shared renderer-neutral runtime for portable surfaces and semantic actions.
 ///
 /// The runtime isolates registrations and mounted surfaces by extension instance.
-/// UI layers currently see only instances in their exact runtime scope. A future
-/// scope-visibility policy can widen that relation without changing surface ownership.
+/// An active UI Layer sees its own runtime scope plus at most one explicit focused-World
+/// scope imported by host presentation policy; surface ownership is never widened.
 #[derive(Clone, Default)]
 pub struct UiRuntime {
     state: Arc<RwLock<UiRuntimeState>>,
@@ -329,12 +344,20 @@ impl UiRuntime {
             return Err(UiError::LayerAlreadyAttached);
         }
 
+        let focused_scope = state
+            .layers
+            .get(&scope_id)
+            .and_then(|layer| layer.focused_scope.clone());
         let capabilities: HashSet<_> = descriptor.capabilities.iter().cloned().collect();
         for (key, snapshot) in &state.mounted_surfaces {
             let Some(surface_instance) = state.instances.get(&key.instance_id) else {
                 continue;
             };
-            if surface_instance.scope_id != scope_id || !surface_instance.is_active {
+            let is_visible = surface_instance.scope_id == scope_id
+                || focused_scope
+                    .as_ref()
+                    .is_some_and(|focused| focused.scope_id == surface_instance.scope_id);
+            if !is_visible || !surface_instance.is_active {
                 continue;
             }
             let registered = state
@@ -350,6 +373,7 @@ impl UiRuntime {
                 owner,
                 descriptor,
                 capabilities,
+                focused_scope,
             },
         );
         Ok(())
@@ -394,6 +418,97 @@ impl UiRuntime {
         })
     }
 
+    /// Imports one explicit focused-World scope into an active UI Layer session.
+    ///
+    /// The imported scope supplements, but never replaces, the layer's own runtime
+    /// scope. Switching focus only changes presentation visibility and does not mutate
+    /// extension or World lifecycle state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the caller is not an active layer or a mounted surface
+    /// in the focused scope requires a capability unsupported by that layer.
+    pub fn set_focused_world_scope(
+        &self,
+        layer_owner: &ComponentRef,
+        world_id: WorldId,
+        scope_id: RuntimeScopeId,
+    ) -> UiResult<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        let layer_scope = state
+            .layers
+            .iter()
+            .find_map(|(candidate_scope, layer)| {
+                (&layer.owner == layer_owner).then_some(candidate_scope.clone())
+            })
+            .ok_or(UiError::LayerNotOwner)?;
+        if layer_scope == scope_id {
+            return Err(UiError::ScopeNotVisible);
+        }
+        let capabilities = state
+            .layers
+            .get(&layer_scope)
+            .ok_or(UiError::LayerNotOwner)?
+            .capabilities
+            .clone();
+        for (key, snapshot) in &state.mounted_surfaces {
+            let Some(instance) = state.instances.get(&key.instance_id) else {
+                continue;
+            };
+            if !instance.is_active || instance.scope_id != scope_id {
+                continue;
+            }
+            let registered = state
+                .registered_surfaces
+                .get(key)
+                .ok_or_else(|| UiError::SurfaceNotRegistered(key.surface_id.to_string()))?;
+            ensure_surface_supported(&capabilities, &registered.contribution, snapshot)?;
+        }
+        let layer = state
+            .layers
+            .get_mut(&layer_scope)
+            .ok_or(UiError::LayerNotOwner)?;
+        layer.focused_scope = Some(FocusedPresentationScope { scope_id, world_id });
+        Ok(())
+    }
+
+    /// Clears the focused-World scope imported by one active UI Layer session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError::LayerNotOwner`] when the caller is not an active layer.
+    pub fn clear_focused_world_scope(&self, layer_owner: &ComponentRef) -> UiResult<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        let layer = state
+            .layers
+            .values_mut()
+            .find(|layer| &layer.owner == layer_owner)
+            .ok_or(UiError::LayerNotOwner)?;
+        layer.focused_scope = None;
+        Ok(())
+    }
+
+    /// Returns the World focused by one active UI Layer presentation session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError::LayerNotOwner`] when the caller is not an active layer.
+    pub fn focused_world_for_layer(&self, layer_owner: &ComponentRef) -> UiResult<Option<WorldId>> {
+        let state = self.state.read().map_err(|_| UiError::RuntimeUnavailable)?;
+        let layer = state
+            .layers
+            .values()
+            .find(|layer| &layer.owner == layer_owner)
+            .ok_or(UiError::LayerNotOwner)?;
+        Ok(layer.focused_scope.as_ref().map(|focused| focused.world_id))
+    }
+
     /// Mounts an initial snapshot for a statically registered surface.
     ///
     /// A surface can be mounted while no layer is attached. If a layer exists in
@@ -428,8 +543,15 @@ impl UiRuntime {
             .ok_or_else(|| UiError::InstanceNotRegistered(owner.instance_id.to_string()))?
             .scope_id
             .clone();
-        if let Some(layer) = state.layers.get(&scope_id) {
-            ensure_surface_supported(&layer.capabilities, &registered.contribution, &snapshot)?;
+        for (layer_scope, layer) in &state.layers {
+            let is_visible = layer_scope == &scope_id
+                || layer
+                    .focused_scope
+                    .as_ref()
+                    .is_some_and(|focused| focused.scope_id == scope_id);
+            if is_visible {
+                ensure_surface_supported(&layer.capabilities, &registered.contribution, &snapshot)?;
+            }
         }
         state.mounted_surfaces.insert(key, snapshot);
         Ok(())
@@ -488,8 +610,15 @@ impl UiRuntime {
             .ok_or_else(|| UiError::InstanceNotRegistered(owner.instance_id.to_string()))?
             .scope_id
             .clone();
-        if let Some(layer) = state.layers.get(&scope_id) {
-            ensure_surface_supported(&layer.capabilities, &registered.contribution, &next)?;
+        for (layer_scope, layer) in &state.layers {
+            let is_visible = layer_scope == &scope_id
+                || layer
+                    .focused_scope
+                    .as_ref()
+                    .is_some_and(|focused| focused.scope_id == scope_id);
+            if is_visible {
+                ensure_surface_supported(&layer.capabilities, &registered.contribution, &next)?;
+            }
         }
         state.mounted_surfaces.insert(key, next);
         Ok(())
@@ -528,7 +657,10 @@ impl UiRuntime {
         collect_presentations(&state, None)
     }
 
-    /// Returns surfaces visible to the active UI Layer in its exact runtime scope.
+    /// Returns surfaces visible to one active UI Layer presentation session.
+    ///
+    /// The result contains the layer-local scope plus its optional explicit focused-World
+    /// scope, each tagged with host-normalized presentation context.
     ///
     /// # Errors
     ///
@@ -539,12 +671,21 @@ impl UiRuntime {
         layer_owner: &ComponentRef,
     ) -> UiResult<Vec<UiPresentationSurface>> {
         let state = self.state.read().map_err(|_| UiError::RuntimeUnavailable)?;
-        let scope_id = state
+        let (scope_id, layer) = state
             .layers
             .iter()
-            .find_map(|(scope_id, layer)| (&layer.owner == layer_owner).then_some(scope_id.clone()))
+            .find(|(_, layer)| &layer.owner == layer_owner)
             .ok_or(UiError::LayerNotOwner)?;
-        Ok(collect_presentations(&state, Some(&scope_id)))
+        let mut contexts = HashMap::from([(scope_id.clone(), UiPresentationContext::LayerLocal)]);
+        if let Some(focused) = &layer.focused_scope {
+            contexts.insert(
+                focused.scope_id.clone(),
+                UiPresentationContext::FocusedWorld {
+                    world_id: focused.world_id,
+                },
+            );
+        }
+        Ok(collect_presentations(&state, Some(&contexts)))
     }
 
     /// Validates and queues one renderer action for later Engine dispatch.
@@ -587,9 +728,9 @@ impl UiRuntime {
 
     /// Validates an input event from an active UI Layer and resolves its owner.
     ///
-    /// Current scope policy is intentionally conservative: a layer may route input
-    /// only to surfaces in its exact runtime scope. Future scope imports can widen
-    /// visibility without weakening instance ownership.
+    /// A layer may route input only to its own runtime scope or the one explicit
+    /// focused-World scope imported into that presentation session. Instance ownership,
+    /// surface revision, node binding, enabled state, and payload checks remain unchanged.
     ///
     /// # Errors
     ///
@@ -602,17 +743,22 @@ impl UiRuntime {
         event: UiActionEvent,
     ) -> UiResult<UiActionDispatch> {
         let state = self.state.read().map_err(|_| UiError::RuntimeUnavailable)?;
-        let layer_scope = state
+        let (layer_scope, layer) = state
             .layers
             .iter()
-            .find_map(|(scope_id, layer)| (&layer.owner == layer_owner).then_some(scope_id.clone()))
+            .find(|(_, layer)| &layer.owner == layer_owner)
             .ok_or(UiError::LayerNotOwner)?;
 
         let target_instance = state
             .instances
             .get(&event.owner_instance_id)
             .ok_or_else(|| UiError::InstanceNotRegistered(event.owner_instance_id.to_string()))?;
-        if target_instance.scope_id != layer_scope {
+        let is_visible = target_instance.scope_id == *layer_scope
+            || layer
+                .focused_scope
+                .as_ref()
+                .is_some_and(|focused| focused.scope_id == target_instance.scope_id);
+        if !is_visible {
             return Err(UiError::ScopeNotVisible);
         }
         if !target_instance.is_active {
@@ -671,7 +817,7 @@ impl UiRuntime {
 
 fn collect_presentations(
     state: &UiRuntimeState,
-    scope_filter: Option<&RuntimeScopeId>,
+    visible_contexts: Option<&HashMap<RuntimeScopeId, UiPresentationContext>>,
 ) -> Vec<UiPresentationSurface> {
     let mut surfaces: Vec<_> = state
         .mounted_surfaces
@@ -679,12 +825,16 @@ fn collect_presentations(
         .filter_map(|(key, snapshot)| {
             let registered = state.registered_surfaces.get(key)?;
             let instance = state.instances.get(&key.instance_id)?;
-            if !instance.is_active || scope_filter.is_some_and(|scope| scope != &instance.scope_id)
-            {
+            if !instance.is_active {
                 return None;
             }
+            let context = match visible_contexts {
+                Some(contexts) => Some(contexts.get(&instance.scope_id)?.clone()),
+                None => None,
+            };
             Some(UiPresentationSurface {
                 owner: registered.owner.clone(),
+                context,
                 contribution: registered.contribution.clone(),
                 snapshot: snapshot.clone(),
             })

@@ -8,9 +8,10 @@ use rintawa_sdk::{
         UI_CAPABILITY_BUTTON, UI_CAPABILITY_COLUMN, UI_CAPABILITY_TEXT, UI_CAPABILITY_TEXT_INPUT,
         UiActionEvent, UiActionId, UiActionPayload, UiButtonAppearance, UiButtonNode,
         UiCapabilityId, UiContainerNode, UiError, UiLayerDescriptor, UiNode, UiNodeId, UiNodeKind,
-        UiPatch, UiPatchBatch, UiPlacementHint, UiSurfaceContribution, UiSurfaceId,
-        UiSurfaceSnapshot, UiTextInputNode, UiTextNode,
+        UiPatch, UiPatchBatch, UiPlacementHint, UiPresentationContext, UiSurfaceContribution,
+        UiSurfaceId, UiSurfaceSnapshot, UiTextInputNode, UiTextNode,
     },
+    world::WorldId,
 };
 use rintawa_ui_runtime::{OwnedUiLayerDescriptor, OwnedUiSurfaceContribution, UiRuntime};
 
@@ -365,6 +366,106 @@ fn test_should_reject_invalid_surface_tree() -> Result<()> {
         runtime.mount_surface(&owner("feature"), invalid),
         Err(UiError::RootHasParent(_)) | Err(UiError::CycleDetected(_))
     ));
+    Ok(())
+}
+
+#[test]
+fn test_should_import_only_focused_world_scope_into_layer_session() -> Result<()> {
+    let runtime = UiRuntime::new();
+    register_feature(&runtime, surface())?;
+    runtime.set_instance_active(&instance("feature"), true)?;
+    runtime.mount_surface(&owner("feature"), base_snapshot())?;
+    attach_layer(&runtime, compatible_layer())?;
+
+    let world_a = WorldId::new();
+    let world_b = WorldId::new();
+    let scope_a = RuntimeScopeId::new("world:a");
+    let scope_b = RuntimeScopeId::new("world:b");
+    for (instance_id, scope_id) in [("world-a", scope_a.clone()), ("world-b", scope_b.clone())] {
+        runtime.register_instance(
+            instance(instance_id),
+            scope_id,
+            vec![OwnedUiSurfaceContribution {
+                owner: owner(instance_id),
+                contribution: surface(),
+            }],
+            Vec::new(),
+        )?;
+        runtime.set_instance_active(&instance(instance_id), true)?;
+        runtime.mount_surface(&owner(instance_id), base_snapshot())?;
+    }
+
+    let layer_owner = owner("layer");
+    let local = runtime.presentation_surfaces_for_layer(&layer_owner)?;
+    assert_eq!(local.len(), 1);
+    assert_eq!(local[0].owner, owner("feature"));
+    assert_eq!(local[0].context, Some(UiPresentationContext::LayerLocal));
+
+    let world_action = |instance_id: &str| UiActionEvent {
+        owner_instance_id: instance(instance_id),
+        surface_id: UiSurfaceId::new("example.main"),
+        node_id: "send".into(),
+        action_id: UiActionId::new("example.send"),
+        surface_revision: 1,
+        payload: UiActionPayload::None,
+    };
+    assert_eq!(
+        runtime.route_action(&layer_owner, world_action("world-a")),
+        Err(UiError::ScopeNotVisible)
+    );
+
+    runtime.set_focused_world_scope(&layer_owner, world_a, scope_a)?;
+    assert_eq!(
+        runtime.focused_world_for_layer(&layer_owner)?,
+        Some(world_a)
+    );
+    let focused_a = runtime.presentation_surfaces_for_layer(&layer_owner)?;
+    assert_eq!(focused_a.len(), 2);
+    assert!(focused_a.iter().any(|surface| {
+        surface.owner == owner("feature")
+            && surface.context == Some(UiPresentationContext::LayerLocal)
+    }));
+    assert!(focused_a.iter().any(|surface| {
+        surface.owner == owner("world-a")
+            && surface.context == Some(UiPresentationContext::FocusedWorld { world_id: world_a })
+    }));
+    assert!(
+        !focused_a
+            .iter()
+            .any(|surface| surface.owner == owner("world-b"))
+    );
+    assert!(
+        runtime
+            .route_action(&layer_owner, world_action("world-a"))
+            .is_ok()
+    );
+
+    runtime.set_focused_world_scope(&layer_owner, world_b, scope_b)?;
+    assert_eq!(
+        runtime.focused_world_for_layer(&layer_owner)?,
+        Some(world_b)
+    );
+    assert_eq!(
+        runtime.route_action(&layer_owner, world_action("world-a")),
+        Err(UiError::ScopeNotVisible)
+    );
+    assert!(
+        runtime
+            .route_action(&layer_owner, world_action("world-b"))
+            .is_ok()
+    );
+    assert_eq!(runtime.presentation_surfaces().len(), 3);
+
+    runtime.clear_focused_world_scope(&layer_owner)?;
+    assert_eq!(runtime.focused_world_for_layer(&layer_owner)?, None);
+    assert_eq!(
+        runtime.presentation_surfaces_for_layer(&layer_owner)?.len(),
+        1
+    );
+    assert_eq!(
+        runtime.route_action(&layer_owner, world_action("world-b")),
+        Err(UiError::ScopeNotVisible)
+    );
     Ok(())
 }
 
