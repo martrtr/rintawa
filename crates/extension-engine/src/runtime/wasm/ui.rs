@@ -9,6 +9,7 @@ use rintawa_sdk::{
         UiLayerDescriptor, UiPatchBatch, UiPlacementHint, UiSurfaceContribution, UiSurfaceId,
         UiSurfaceSnapshot, UiSurfaceTraitId, WorldPresentationDescriptor,
     },
+    world::WorldId,
 };
 use tracing::warn;
 
@@ -332,6 +333,15 @@ impl PortableUiHost for WasmHostState {
     }
 }
 
+fn map_ui_layer_error(error: UiError) -> UiLayerError {
+    match error {
+        UiError::LayerNotOwner | UiError::LayerNotRegistered => UiLayerError::NotActiveLayer,
+        UiError::WorldFocusQueueFull => UiLayerError::QueueFull,
+        UiError::RuntimeUnavailable => UiLayerError::Unavailable,
+        _ => UiLayerError::Rejected,
+    }
+}
+
 impl UiLayerHost for WasmHostState {
     fn presentation_surfaces(&mut self) -> Result<Vec<u8>, UiLayerError> {
         if !self.ui_access_active {
@@ -341,22 +351,55 @@ impl UiLayerHost for WasmHostState {
             .current_execution_owner()
             .cloned()
             .ok_or(UiLayerError::AccessNotActive)?;
-        let surfaces =
-            self.ui
-                .presentation_surfaces_for_layer(&owner)
-                .map_err(|error| match error {
-                    UiError::LayerNotOwner | UiError::LayerNotRegistered => {
-                        UiLayerError::NotActiveLayer
-                    }
-                    UiError::RuntimeUnavailable => UiLayerError::Unavailable,
-                    _ => UiLayerError::Rejected,
-                })?;
+        let surfaces = self
+            .ui
+            .presentation_surfaces_for_layer(&owner)
+            .map_err(map_ui_layer_error)?;
         let mut counter = JsonSizeCounter::default();
         serde_json::to_writer(&mut counter, &surfaces).map_err(|_| UiLayerError::Unavailable)?;
         if counter.bytes > self.max_host_message_bytes {
             return Err(UiLayerError::MessageTooLarge);
         }
         serde_json::to_vec(&surfaces).map_err(|_| UiLayerError::Unavailable)
+    }
+
+    fn presentation_state(&mut self) -> Result<Vec<u8>, UiLayerError> {
+        if !self.ui_access_active {
+            return Err(UiLayerError::AccessNotActive);
+        }
+        let owner = self
+            .current_execution_owner()
+            .cloned()
+            .ok_or(UiLayerError::AccessNotActive)?;
+        let state = self
+            .ui
+            .presentation_state_for_layer(&owner)
+            .map_err(map_ui_layer_error)?;
+        let mut counter = JsonSizeCounter::default();
+        serde_json::to_writer(&mut counter, &state).map_err(|_| UiLayerError::Unavailable)?;
+        if counter.bytes > self.max_host_message_bytes {
+            return Err(UiLayerError::MessageTooLarge);
+        }
+        serde_json::to_vec(&state).map_err(|_| UiLayerError::Unavailable)
+    }
+
+    fn request_world_focus(&mut self, world_id: String) -> Result<(), UiLayerError> {
+        if !self.ui_access_active {
+            return Err(UiLayerError::AccessNotActive);
+        }
+        if world_id.len() > self.max_host_message_bytes {
+            return Err(UiLayerError::MessageTooLarge);
+        }
+        let world_id = world_id
+            .parse::<WorldId>()
+            .map_err(|_| UiLayerError::InvalidPayload)?;
+        let owner = self
+            .current_execution_owner()
+            .cloned()
+            .ok_or(UiLayerError::AccessNotActive)?;
+        self.ui
+            .queue_world_focus_request(&owner, world_id)
+            .map_err(map_ui_layer_error)
     }
 
     fn dispatch_action(&mut self, action_json: Vec<u8>) -> Result<(), UiLayerError> {
@@ -374,12 +417,6 @@ impl UiLayerHost for WasmHostState {
             .ok_or(UiLayerError::AccessNotActive)?;
         self.ui
             .queue_action(&owner, event)
-            .map_err(|error| match error {
-                UiError::LayerNotOwner | UiError::LayerNotRegistered => {
-                    UiLayerError::NotActiveLayer
-                }
-                UiError::RuntimeUnavailable => UiLayerError::Unavailable,
-                _ => UiLayerError::Rejected,
-            })
+            .map_err(map_ui_layer_error)
     }
 }

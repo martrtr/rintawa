@@ -841,12 +841,20 @@ interface ui-layer {
         not-active-layer,
         invalid-payload,
         message-too-large,
+        queue-full,
         unavailable,
         rejected,
     }
 
     /// Returns the current visible presentation as serialized JSON.
     presentation-surfaces: func() -> result<list<u8>, error>;
+
+    /// Returns renderer-session World focus state as serialized JSON.
+    presentation-state: func() -> result<list<u8>, error>;
+
+    /// Queues one World as the desired focus of this exact UI Layer session.
+    /// The Host resolves lifecycle/composition only after the current callback unwinds.
+    request-world-focus: func(world-id: string) -> result<_, error>;
 
     /// Queues one serialized `UiActionEvent` for Engine validation and dispatch.
     dispatch-action: func(action-json: list<u8>) -> result<_, error>;
