@@ -856,6 +856,10 @@ interface ui-layer {
     /// The Host resolves lifecycle/composition only after the current callback unwinds.
     request-world-focus: func(world-id: string) -> result<_, error>;
 
+    /// Clears the focused-World scope of this exact UI Layer session.
+    /// World lifecycle state is not changed.
+    clear-world-focus: func() -> result<_, error>;
+
     /// Queues one serialized `UiActionEvent` for Engine validation and dispatch.
     dispatch-action: func(action-json: list<u8>) -> result<_, error>;
 }

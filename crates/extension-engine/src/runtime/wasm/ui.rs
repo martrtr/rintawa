@@ -402,6 +402,19 @@ impl UiLayerHost for WasmHostState {
             .map_err(map_ui_layer_error)
     }
 
+    fn clear_world_focus(&mut self) -> Result<(), UiLayerError> {
+        if !self.ui_access_active {
+            return Err(UiLayerError::AccessNotActive);
+        }
+        let owner = self
+            .current_execution_owner()
+            .cloned()
+            .ok_or(UiLayerError::AccessNotActive)?;
+        self.ui
+            .clear_focused_world_scope(&owner)
+            .map_err(map_ui_layer_error)
+    }
+
     fn dispatch_action(&mut self, action_json: Vec<u8>) -> Result<(), UiLayerError> {
         if !self.ui_access_active {
             return Err(UiLayerError::AccessNotActive);
