@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use rintawa_extension_engine::ExtensionEngine;
 use rintawa_sdk::prelude::*;
-use rintawa_sdk::ui::{UI_CAPABILITY_BUTTON, UI_CAPABILITY_COLUMN};
+use rintawa_sdk::ui::{UI_CAPABILITY_BUTTON, UI_CAPABILITY_COLUMN, WorldPresentationDescriptor};
 
 struct FeatureComponent {
     id: ComponentId,
@@ -97,6 +97,36 @@ impl Component for LayerComponent {
     }
 }
 
+struct PresentationComponent {
+    id: ComponentId,
+    entry_surface_id: UiSurfaceId,
+}
+
+impl PresentationComponent {
+    fn new(entry_surface_id: &str) -> Self {
+        Self {
+            id: ComponentId::new("runtime"),
+            entry_surface_id: UiSurfaceId::new(entry_surface_id),
+        }
+    }
+}
+
+impl Component for PresentationComponent {
+    fn id(&self) -> &ComponentId {
+        &self.id
+    }
+
+    fn register(&mut self, ctx: &mut dyn RegistrationContext) -> ExtensionResult<()> {
+        ctx.register_ui_surface(UiSurfaceContribution::new(
+            "example.main",
+            UiPlacementHint::Primary,
+        ))?;
+        ctx.register_world_presentation(WorldPresentationDescriptor::new(
+            self.entry_surface_id.clone(),
+        ))
+    }
+}
+
 fn manifest(id: &str) -> ExtensionManifest {
     ExtensionManifest {
         id: ExtensionId::new(id),
@@ -112,6 +142,44 @@ fn layer_descriptor() -> UiLayerDescriptor {
         UiCapabilityId::new(UI_CAPABILITY_COLUMN),
         UiCapabilityId::new(UI_CAPABILITY_BUTTON),
     ])
+}
+
+#[test]
+fn test_should_commit_world_presentation_registration_atomically() -> Result<()> {
+    let mut engine = ExtensionEngine::new();
+
+    engine.register_extension(
+        manifest("presentation"),
+        vec![Box::new(PresentationComponent::new("example.main"))],
+    )?;
+    let owner = ComponentRef::new("presentation", "runtime");
+    assert_eq!(
+        engine
+            .registered_world_presentation_descriptor(&owner)?
+            .entry_surface_id,
+        UiSurfaceId::new("example.main")
+    );
+
+    assert!(
+        engine
+            .register_extension(
+                manifest("retry-presentation"),
+                vec![Box::new(PresentationComponent::new("missing.surface"))],
+            )
+            .is_err()
+    );
+    engine.register_extension(
+        manifest("retry-presentation"),
+        vec![Box::new(PresentationComponent::new("example.main"))],
+    )?;
+    let retried_owner = ComponentRef::new("retry-presentation", "runtime");
+    assert_eq!(
+        engine
+            .registered_world_presentation_descriptor(&retried_owner)?
+            .entry_surface_id,
+        UiSurfaceId::new("example.main")
+    );
+    Ok(())
 }
 
 #[test]

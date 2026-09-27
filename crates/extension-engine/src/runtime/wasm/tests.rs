@@ -838,9 +838,38 @@ fn test_should_stage_and_apply_wasm_portable_ui_operations() {
         vec![String::from(rintawa_sdk::ui::UI_CAPABILITY_TEXT)],
     )
     .unwrap();
+    PortableUiHost::register_world_presentation(
+        &mut state,
+        String::from("example.main"),
+        Some(String::from("example.presentation")),
+        Some(1),
+    )
+    .unwrap();
+    assert!(matches!(
+        PortableUiHost::register_world_presentation(
+            &mut state,
+            String::from("example.main"),
+            None,
+            None,
+        ),
+        Err(PortableUiError::DuplicateWorldPresentation)
+    ));
     let registrations = state.finish_registration().unwrap();
     assert_eq!(registrations.ui_surfaces.len(), 1);
     assert_eq!(registrations.ui_surfaces[0].id.as_str(), "example.main");
+    let presentation = registrations
+        .world_presentation
+        .as_ref()
+        .expect("World presentation descriptor should be staged");
+    assert_eq!(presentation.entry_surface_id.as_str(), "example.main");
+    assert_eq!(
+        presentation
+            .presentation_intent
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("example.presentation@1")
+    );
 
     let owner =
         rintawa_sdk::contracts::ComponentRef::new(test_instance_id(), ComponentId::new("runtime"));

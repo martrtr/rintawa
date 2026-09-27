@@ -780,6 +780,7 @@ interface portable-ui {
         registration-not-active,
         duplicate-surface,
         duplicate-layer,
+        duplicate-world-presentation,
         invalid-payload,
         message-too-large,
         unsupported-capability(string),
@@ -811,6 +812,15 @@ interface portable-ui {
     register-layer: func(
         protocol-major: u32,
         capabilities: list<string>,
+    ) -> result<_, error>;
+
+    /// Registers the initial portable surface for this component when selected as a
+    /// World presentation provider. Optional semantic intent is a versioned contract key;
+    /// both intent fields must be present together or absent together.
+    register-world-presentation: func(
+        entry-surface-id: string,
+        intent-contract: option<string>,
+        intent-version: option<u32>,
     ) -> result<_, error>;
 
     /// Mounts a serialized `UiSurfaceSnapshot` during active guest execution.

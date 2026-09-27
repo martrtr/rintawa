@@ -21,7 +21,7 @@ use rintawa_sdk::{
         ComponentId, ContributionId, ExtensionId, ExtensionInstanceId, RuntimeEffectId,
         RuntimeScopeId,
     },
-    ui::{UiActionEvent, UiError, UiLayerDescriptor},
+    ui::{UiActionEvent, UiError, UiLayerDescriptor, WorldPresentationDescriptor},
 };
 use rintawa_ui_runtime::{UiPresentationSurface, UiRuntime};
 use tracing::warn;
@@ -720,6 +720,7 @@ impl ExtensionEngine {
         let mut contract_consumers = Vec::new();
         let mut ui_surfaces = Vec::new();
         let mut ui_layers = Vec::new();
+        let mut world_presentations = Vec::new();
 
         for comp in &mut components {
             let first_contribution = registered_descriptors.len();
@@ -731,6 +732,7 @@ impl ExtensionEngine {
                 contract_consumers: &mut contract_consumers,
                 ui_surfaces: &mut ui_surfaces,
                 ui_layers: &mut ui_layers,
+                world_presentations: &mut world_presentations,
             };
             let identity = ComponentIdentity::new(
                 manifest.id.clone(),
@@ -796,6 +798,13 @@ impl ExtensionEngine {
         ) {
             self.services.unregister_instance(&instance_id);
             return Err(error.into());
+        }
+        for presentation in world_presentations {
+            if let Err(error) = self.ui.register_world_presentation(presentation) {
+                self.ui.unregister_instance(&instance_id);
+                self.services.unregister_instance(&instance_id);
+                return Err(error.into());
+            }
         }
 
         for contrib in &extension_contributions {
@@ -1733,6 +1742,19 @@ impl ExtensionEngine {
             }
         }
         Ok(delivered)
+    }
+
+    /// Returns the owner-scoped World presentation descriptor registered by a component.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Ui`] when the component registered no descriptor or UI
+    /// runtime state is unavailable.
+    pub fn registered_world_presentation_descriptor(
+        &self,
+        owner: &ComponentRef,
+    ) -> EngineResult<WorldPresentationDescriptor> {
+        Ok(self.ui.registered_world_presentation_descriptor(owner)?)
     }
 
     /// Attaches the statically registered descriptor for the selected UI Layer provider.

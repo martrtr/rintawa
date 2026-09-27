@@ -7,7 +7,7 @@ use rintawa_sdk::{
     ui::{
         UiActionEvent, UiActivityContribution, UiActivityId, UiCapabilityId, UiError, UiIconSlotId,
         UiLayerDescriptor, UiPatchBatch, UiPlacementHint, UiSurfaceContribution, UiSurfaceId,
-        UiSurfaceSnapshot, UiSurfaceTraitId,
+        UiSurfaceSnapshot, UiSurfaceTraitId, WorldPresentationDescriptor,
     },
 };
 use tracing::warn;
@@ -139,6 +139,46 @@ impl WasmHostState {
         Ok(())
     }
 
+    fn queue_world_presentation(
+        &mut self,
+        entry_surface_id: String,
+        intent_contract: Option<String>,
+        intent_version: Option<u32>,
+    ) -> Result<(), PortableUiError> {
+        let mut counter = JsonSizeCounter::default();
+        serde_json::to_writer(
+            &mut counter,
+            &(
+                entry_surface_id.as_str(),
+                intent_contract.as_deref(),
+                intent_version,
+            ),
+        )
+        .map_err(|_| PortableUiError::InvalidPayload)?;
+        self.validate_ui_message_size(counter.bytes)?;
+        if entry_surface_id.trim().is_empty() {
+            return Err(PortableUiError::InvalidPayload);
+        }
+        let presentation_intent = match (intent_contract, intent_version) {
+            (Some(contract), Some(version)) if !contract.trim().is_empty() => {
+                Some(ContractKey::new(contract, ContractVersion::new(version)))
+            }
+            (None, None) => None,
+            _ => return Err(PortableUiError::InvalidPayload),
+        };
+        let Some(scope) = self.registration_scope.as_mut() else {
+            return Err(PortableUiError::RegistrationNotActive);
+        };
+        if scope.world_presentation.is_some() {
+            return Err(PortableUiError::DuplicateWorldPresentation);
+        }
+        scope.world_presentation = Some(WorldPresentationDescriptor {
+            entry_surface_id: UiSurfaceId::new(entry_surface_id),
+            presentation_intent,
+        });
+        Ok(())
+    }
+
     fn ui_owner(&self) -> Result<rintawa_sdk::contracts::ComponentRef, PortableUiError> {
         self.current_execution_owner()
             .cloned()
@@ -230,6 +270,15 @@ impl PortableUiHost for WasmHostState {
         capabilities: Vec<String>,
     ) -> Result<(), PortableUiError> {
         self.queue_ui_layer(protocol_major, capabilities)
+    }
+
+    fn register_world_presentation(
+        &mut self,
+        entry_surface_id: String,
+        intent_contract: Option<String>,
+        intent_version: Option<u32>,
+    ) -> Result<(), PortableUiError> {
+        self.queue_world_presentation(entry_surface_id, intent_contract, intent_version)
     }
 
     fn mount_surface(&mut self, snapshot_json: Vec<u8>) -> Result<(), PortableUiError> {

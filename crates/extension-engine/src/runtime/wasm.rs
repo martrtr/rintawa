@@ -25,7 +25,10 @@ use rintawa_sdk::{
     services::{ServiceCallError, ServiceProviderHandle},
     traits::Component,
     types::{ComponentId, ExtensionId, ExtensionInstanceId, RuntimeEffectId, RuntimeScopeId},
-    ui::{UiActionEvent, UiLayerDescriptor, UiSurfaceContribution, UiSurfaceId},
+    ui::{
+        UiActionEvent, UiLayerDescriptor, UiSurfaceContribution, UiSurfaceId,
+        WorldPresentationDescriptor,
+    },
     world::{SchemaKey, SchemaKind},
 };
 use rintawa_ui_runtime::UiRuntime;
@@ -237,6 +240,7 @@ struct WasmRegistrationScope {
     ui_surfaces: Vec<UiSurfaceContribution>,
     ui_surface_ids: HashSet<UiSurfaceId>,
     ui_layer: Option<UiLayerDescriptor>,
+    world_presentation: Option<WorldPresentationDescriptor>,
 }
 
 struct WasmRegistrations {
@@ -247,6 +251,7 @@ struct WasmRegistrations {
     consumers: Vec<ContractConsumer>,
     ui_surfaces: Vec<UiSurfaceContribution>,
     ui_layer: Option<UiLayerDescriptor>,
+    world_presentation: Option<WorldPresentationDescriptor>,
 }
 
 /// A guest request that is committed through the Engine-owned effect registry.
@@ -427,6 +432,7 @@ impl WasmHostState {
             ui_surfaces: Vec::new(),
             ui_surface_ids: HashSet::new(),
             ui_layer: None,
+            world_presentation: None,
         });
         self.extension_id = Some(extension_id);
         self.instance_id = Some(instance_id);
@@ -463,6 +469,7 @@ impl WasmHostState {
             ui_surfaces: Vec::new(),
             ui_surface_ids: HashSet::new(),
             ui_layer: None,
+            world_presentation: None,
         });
         Ok(())
     }
@@ -484,6 +491,7 @@ impl WasmHostState {
             consumers: scope.consumers,
             ui_surfaces: scope.ui_surfaces,
             ui_layer: scope.ui_layer,
+            world_presentation: scope.world_presentation,
         })
     }
 
@@ -1731,6 +1739,9 @@ fn apply_wasm_registrations(
     }
     if let Some(layer) = registrations.ui_layer {
         ctx.register_ui_layer(layer)?;
+    }
+    if let Some(presentation) = registrations.world_presentation {
+        ctx.register_world_presentation(presentation)?;
     }
     Ok(())
 }

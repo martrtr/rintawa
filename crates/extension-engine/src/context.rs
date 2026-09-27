@@ -15,13 +15,15 @@ use rintawa_sdk::{
     },
     ui::{
         UiLayerDescriptor, UiPatchBatch, UiResult, UiSurfaceContribution, UiSurfaceId,
-        UiSurfaceSnapshot,
+        UiSurfaceSnapshot, WorldPresentationDescriptor,
     },
 };
 use std::collections::HashSet;
 use tracing::{debug, error, info, trace, warn};
 
-use rintawa_ui_runtime::{OwnedUiLayerDescriptor, OwnedUiSurfaceContribution, UiRuntime};
+use rintawa_ui_runtime::{
+    OwnedUiLayerDescriptor, OwnedUiSurfaceContribution, OwnedWorldPresentationDescriptor, UiRuntime,
+};
 
 use crate::{
     composition::{OwnedContractConsumer, OwnedContractDefinition, OwnedContractProvider},
@@ -108,6 +110,7 @@ pub(crate) struct RegistrationBuffers<'a> {
     pub(crate) contract_consumers: &'a mut Vec<OwnedContractConsumer>,
     pub(crate) ui_surfaces: &'a mut Vec<OwnedUiSurfaceContribution>,
     pub(crate) ui_layers: &'a mut Vec<OwnedUiLayerDescriptor>,
+    pub(crate) world_presentations: &'a mut Vec<OwnedWorldPresentationDescriptor>,
 }
 
 /// Registration context provided to components during initialization.
@@ -273,6 +276,25 @@ impl<'a> RegistrationContext for EngineRegistrationContext<'a> {
         self.buffers
             .ui_layers
             .push(OwnedUiLayerDescriptor { owner, descriptor });
+        Ok(())
+    }
+
+    fn register_world_presentation(
+        &mut self,
+        descriptor: WorldPresentationDescriptor,
+    ) -> ExtensionResult<()> {
+        let owner = self.identity.owner();
+        if self
+            .buffers
+            .world_presentations
+            .iter()
+            .any(|registered| registered.owner == owner)
+        {
+            return Err(ExtensionError::DuplicateWorldPresentationDescriptor);
+        }
+        self.buffers
+            .world_presentations
+            .push(OwnedWorldPresentationDescriptor { owner, descriptor });
         Ok(())
     }
 }
