@@ -19,11 +19,12 @@ use uuid::Uuid;
 use crate::{HostError, HostResult};
 
 /// Current host composition profile schema.
-pub const PROFILE_SCHEMA: u32 = 5;
+pub const PROFILE_SCHEMA: u32 = 6;
 const LEGACY_PROFILE_SCHEMA_V1: u32 = 1;
 const LEGACY_PROFILE_SCHEMA_V2: u32 = 2;
 const LEGACY_PROFILE_SCHEMA_V3: u32 = 3;
 const LEGACY_PROFILE_SCHEMA_V4: u32 = 4;
+const LEGACY_PROFILE_SCHEMA_V5: u32 = 5;
 
 const MAX_PREFERENCE_ENTRIES_PER_COMPONENT: usize = 256;
 const MAX_PREFERENCE_KEY_BYTES: usize = 128;
@@ -50,10 +51,9 @@ pub struct ActivationRecord {
     pub scope_id: RuntimeScopeId,
     /// Whether the activation starts automatically in this profile.
     pub enabled: bool,
-    /// Whether a baseline activation is materialized into newly created worlds.
+    /// Legacy schema-5 marker migrated once into the independent default-World recipe.
     ///
-    /// World-scoped records always clear this flag because they are already explicit,
-    /// compatibility-pinned overlay selections rather than inheritance templates.
+    /// New writes keep this false; the field remains decodable for crash-safe migration.
     #[serde(default)]
     pub world_default: bool,
 }
@@ -212,7 +212,8 @@ impl CompositionProfile {
             LEGACY_PROFILE_SCHEMA_V1
             | LEGACY_PROFILE_SCHEMA_V2
             | LEGACY_PROFILE_SCHEMA_V3
-            | LEGACY_PROFILE_SCHEMA_V4 => {
+            | LEGACY_PROFILE_SCHEMA_V4
+            | LEGACY_PROFILE_SCHEMA_V5 => {
                 profile.schema = PROFILE_SCHEMA;
             }
             unsupported => return Err(HostError::UnsupportedProfileSchema(unsupported)),
@@ -492,12 +493,24 @@ impl CompositionProfile {
         });
     }
 
-    pub(crate) fn materialize_world_defaults(&self, scope_id: RuntimeScopeId) -> Self {
+    pub(crate) fn materialize_legacy_world_defaults(&self, scope_id: RuntimeScopeId) -> Self {
+        self.materialize_matching(scope_id, |activation| activation.world_default)
+    }
+
+    pub(crate) fn materialize_all(&self, scope_id: RuntimeScopeId) -> Self {
+        self.materialize_matching(scope_id, |_| true)
+    }
+
+    fn materialize_matching(
+        &self,
+        scope_id: RuntimeScopeId,
+        include: impl Fn(&ActivationRecord) -> bool,
+    ) -> Self {
         let mut instance_map = HashMap::new();
         let activations = self
             .activations
             .iter()
-            .filter(|activation| activation.world_default)
+            .filter(|activation| include(activation))
             .map(|activation| {
                 let instance_id = ExtensionInstanceId::new(Uuid::now_v7().to_string());
                 instance_map.insert(activation.instance_id.clone(), instance_id.clone());
@@ -567,6 +580,12 @@ impl CompositionProfile {
         }
     }
 
+    pub(crate) fn clear_legacy_world_defaults(&mut self) {
+        for activation in &mut self.activations {
+            activation.world_default = false;
+        }
+    }
+
     pub(crate) fn upsert(
         &mut self,
         activation: ActivationRecord,
@@ -602,20 +621,6 @@ impl CompositionProfile {
         Ok(())
     }
 
-    pub(crate) fn set_world_default(
-        &mut self,
-        subject: &str,
-        world_default: bool,
-    ) -> HostResult<()> {
-        let activation = self
-            .activations
-            .iter_mut()
-            .find(|activation| activation.subject == subject)
-            .ok_or_else(|| HostError::ActivationNotFound(subject.to_string()))?;
-        activation.world_default = world_default;
-        Ok(())
-    }
-
     pub(crate) fn remove_activation(&mut self, subject: &str) -> HostResult<()> {
         let index = self
             .activations
@@ -630,6 +635,9 @@ impl CompositionProfile {
         self.preferred_providers.retain(|selection| {
             selection.scope_id != removed.scope_id
                 || selection.provider_instance_id != removed.instance_id
+        });
+        self.preferences.retain(|preference| {
+            preference.scope_id != removed.scope_id || preference.instance_id != removed.instance_id
         });
         Ok(())
     }

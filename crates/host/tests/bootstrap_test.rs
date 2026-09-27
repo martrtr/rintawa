@@ -4,7 +4,10 @@ use std::{fs, time::Duration};
 
 use rintawa_artifacts::{ImportDisposition, RtwLimits, pack_directory};
 use rintawa_extension_engine::UnresolvedContractReason;
-use rintawa_host::{HOST_SCOPE, HostError, HostHome, HostRuntime, world_runtime_scope_id};
+use rintawa_host::{
+    DEFAULT_WORLD_PROFILE_FILE, DEFAULT_WORLD_SCOPE, HOST_SCOPE, HostError, HostHome, HostRuntime,
+    world_runtime_scope_id,
+};
 use rintawa_sdk::{
     contracts::{ComponentRef, host_shell_contract_key, ui_layer_contract_key},
     runtime_permissions::RuntimePermission,
@@ -194,35 +197,77 @@ fn test_should_persist_local_install_enable_disable_and_restart() -> anyhow::Res
 }
 
 #[test]
-fn test_should_materialize_selected_baseline_defaults_into_new_worlds() -> anyhow::Result<()> {
+fn test_should_materialize_cas_only_default_without_baseline_activation() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let artifact = build_service_provider(root.path())?;
+    let home = HostHome::open(root.path().join("home"))?;
+    let imported = home.import_rtw_bytes(&fs::read(&artifact)?)?;
+
+    assert!(home.list_activations()?.is_empty());
+    let recipe_activation = home.select_default_world_stored_rtw(imported.digest(), Some(true))?;
+    assert_eq!(recipe_activation.scope_id.as_str(), DEFAULT_WORLD_SCOPE);
+    assert!(recipe_activation.enabled);
+    assert!(home.list_activations()?.is_empty());
+
+    let world_id = home.create_world()?.id;
+    let world_activations = home.list_world_activations(world_id)?;
+    assert_eq!(world_activations.len(), 1);
+    assert_eq!(world_activations[0].digest, *imported.digest());
+    assert_eq!(world_activations[0].subject, recipe_activation.subject);
+    assert!(world_activations[0].enabled);
+    assert_ne!(
+        world_activations[0].instance_id,
+        recipe_activation.instance_id
+    );
+    assert_eq!(
+        world_activations[0].scope_id,
+        world_runtime_scope_id(world_id)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_materialize_independent_default_world_recipe_into_new_worlds() -> anyhow::Result<()>
+{
     let root = tempfile::tempdir()?;
     let task_artifact = build_task_runtime(root.path(), true)?;
     let provider_artifact = build_extension(root.path(), "0.0.1", "Bootstrap")?;
     let home = HostHome::open(root.path().join("home"))?;
-    let task = home.install_local_rtw(&task_artifact, Some(true))?;
+    let task = home.install_local_rtw(&task_artifact, Some(false))?;
     let provider = home.install_local_rtw(&provider_artifact, Some(true))?;
-    let baseline_owner = ComponentRef::new(task.activation.instance_id.clone(), "runtime");
-    let baseline_scope = RuntimeScopeId::new(HOST_SCOPE);
+    let default_scope = RuntimeScopeId::new(DEFAULT_WORLD_SCOPE);
     let contract = host_shell_contract_key();
 
-    home.set_world_default(&task.activation.subject, true)?;
-    home.set_world_default(&provider.activation.subject, true)?;
+    let default_task = home.select_default_world_stored_rtw(&task.activation.digest, Some(true))?;
+    let default_provider =
+        home.select_default_world_stored_rtw(&provider.activation.digest, Some(true))?;
+    let default_owner = ComponentRef::new(default_task.instance_id.clone(), "runtime");
     home.grant_runtime_permission(
-        baseline_scope.clone(),
-        baseline_owner.clone(),
+        default_scope.clone(),
+        default_owner.clone(),
         RuntimePermission::BackgroundTask,
     )?;
     home.set_preference(
-        baseline_scope.clone(),
-        baseline_owner,
+        default_scope.clone(),
+        default_owner,
         "mode".to_string(),
-        "inherited".to_string(),
+        "default-world".to_string(),
     )?;
     home.set_preferred_provider(
-        baseline_scope,
+        default_scope,
         contract.clone(),
-        ComponentRef::new(provider.activation.instance_id.clone(), "shell"),
+        ComponentRef::new(default_provider.instance_id.clone(), "shell"),
     )?;
+
+    let baseline = home.list_activations()?;
+    let baseline_task = baseline
+        .iter()
+        .find(|activation| activation.subject == task.activation.subject)
+        .expect("baseline task must remain selected");
+    assert!(!baseline_task.enabled);
+    assert!(baseline_task.world_default);
+    assert_ne!(default_task.instance_id, task.activation.instance_id);
+    assert_eq!(default_task.scope_id.as_str(), DEFAULT_WORLD_SCOPE);
 
     let world_a = home.create_world()?.id;
     let inherited = home.list_world_activations(world_a)?;
@@ -230,21 +275,17 @@ fn test_should_materialize_selected_baseline_defaults_into_new_worlds() -> anyho
     let inherited_task = inherited
         .iter()
         .find(|activation| activation.subject == task.activation.subject)
-        .expect("task default must materialize");
+        .expect("task recipe entry must materialize");
     let inherited_provider = inherited
         .iter()
         .find(|activation| activation.subject == provider.activation.subject)
-        .expect("provider default must materialize");
+        .expect("provider recipe entry must materialize");
+    assert!(inherited_task.enabled);
     assert_eq!(inherited_task.digest, task.activation.digest);
-    assert_ne!(inherited_task.instance_id, task.activation.instance_id);
+    assert_ne!(inherited_task.instance_id, default_task.instance_id);
     assert_eq!(inherited_task.scope_id, world_runtime_scope_id(world_a));
     assert!(!inherited_task.world_default);
-    assert_ne!(
-        inherited_provider.instance_id,
-        provider.activation.instance_id
-    );
-    assert_eq!(inherited_provider.scope_id, world_runtime_scope_id(world_a));
-    assert!(!inherited_provider.world_default);
+    assert_ne!(inherited_provider.instance_id, default_provider.instance_id);
 
     let world_profile = home.load_world_composition(world_a)?;
     assert_eq!(world_profile.runtime_permissions.len(), 1);
@@ -266,31 +307,180 @@ fn test_should_materialize_selected_baseline_defaults_into_new_worlds() -> anyho
         world_profile.preferences[0].scope_id,
         inherited_task.scope_id
     );
+    assert_eq!(world_profile.preferences[0].value, "default-world");
     assert_eq!(world_profile.preferred_providers[0].contract(), contract);
     assert_eq!(
         world_profile.preferred_providers[0].provider(),
         ComponentRef::new(inherited_provider.instance_id.clone(), "shell")
     );
-    assert_eq!(
-        world_profile.preferred_providers[0].scope_id,
-        inherited_provider.scope_id
-    );
 
-    home.set_world_enabled(world_a, &inherited_task.subject, false)?;
+    // Baseline lifecycle changes are independent from the future-World recipe.
+    home.set_enabled(&task.activation.subject, true)?;
+    let recipe_after_baseline_change = home.list_default_world_activations()?;
     assert!(
-        !home
-            .list_world_activations(world_a)?
+        recipe_after_baseline_change
             .iter()
             .find(|activation| activation.subject == task.activation.subject)
-            .expect("existing inherited task must remain selected")
+            .expect("recipe task must remain selected")
             .enabled
     );
 
-    home.set_world_default(&task.activation.subject, false)?;
-    home.set_world_default(&provider.activation.subject, false)?;
+    // Recipe edits only affect subsequently created Worlds.
+    home.set_default_world_enabled(&task.activation.subject, false)?;
+    home.remove_default_world_activation(&provider.activation.subject)?;
     let world_b = home.create_world()?.id;
-    assert!(home.list_world_activations(world_b)?.is_empty());
-    assert_eq!(home.list_world_activations(world_a)?.len(), 2);
+    let world_b_activations = home.list_world_activations(world_b)?;
+    assert_eq!(world_b_activations.len(), 1);
+    assert_eq!(world_b_activations[0].subject, task.activation.subject);
+    assert!(!world_b_activations[0].enabled);
+
+    let world_a_after_recipe_change = home.list_world_activations(world_a)?;
+    assert_eq!(world_a_after_recipe_change.len(), 2);
+    assert!(
+        world_a_after_recipe_change
+            .iter()
+            .find(|activation| activation.subject == task.activation.subject)
+            .expect("existing World must retain its task")
+            .enabled
+    );
+    assert!(
+        !home
+            .list_activations()?
+            .iter()
+            .find(|activation| activation.subject == task.activation.subject)
+            .expect("baseline task must remain selected")
+            .world_default
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_migrate_legacy_world_defaults_into_independent_recipe() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let home_path = root.path().join("home");
+    let task_artifact = build_task_runtime(root.path(), true)?;
+    let provider_artifact = build_extension(root.path(), "0.0.1", "Bootstrap")?;
+    let home = HostHome::open(&home_path)?;
+    let task = home.install_local_rtw(&task_artifact, Some(false))?;
+    let provider = home.install_local_rtw(&provider_artifact, Some(true))?;
+    let host_scope = RuntimeScopeId::new(HOST_SCOPE);
+    let host_owner = ComponentRef::new(task.activation.instance_id.clone(), "runtime");
+    let contract = host_shell_contract_key();
+
+    home.grant_runtime_permission(
+        host_scope.clone(),
+        host_owner.clone(),
+        RuntimePermission::BackgroundTask,
+    )?;
+    home.set_preference(
+        host_scope.clone(),
+        host_owner,
+        "mode".to_string(),
+        "legacy".to_string(),
+    )?;
+    home.set_preferred_provider(
+        host_scope,
+        contract.clone(),
+        ComponentRef::new(provider.activation.instance_id.clone(), "shell"),
+    )?;
+    drop(home);
+
+    let baseline_path = home_path
+        .join("profiles")
+        .join(rintawa_host::BASELINE_PROFILE_FILE);
+    let mut legacy = fs::read_to_string(&baseline_path)?;
+    assert!(legacy.contains("schema = 6"));
+    assert_eq!(legacy.matches("world-default = false").count(), 2);
+    legacy = legacy.replacen("schema = 6", "schema = 5", 1);
+    legacy = legacy.replace("world-default = false", "world-default = true");
+    fs::write(&baseline_path, legacy)?;
+    assert!(
+        !home_path
+            .join("profiles")
+            .join(DEFAULT_WORLD_PROFILE_FILE)
+            .exists()
+    );
+
+    let migrated = HostHome::open(&home_path)?;
+    assert!(
+        migrated
+            .load_profile()?
+            .activations
+            .iter()
+            .all(|activation| !activation.world_default)
+    );
+    let recipe = migrated.load_default_world_recipe()?;
+    assert_eq!(recipe.activations.len(), 2);
+    assert_eq!(recipe.runtime_permissions.len(), 1);
+    assert_eq!(recipe.preferences.len(), 1);
+    assert_eq!(recipe.preferred_providers.len(), 1);
+    assert!(
+        recipe
+            .activations
+            .iter()
+            .all(|activation| activation.scope_id.as_str() == DEFAULT_WORLD_SCOPE)
+    );
+    let recipe_task = recipe
+        .activations
+        .iter()
+        .find(|activation| activation.subject == task.activation.subject)
+        .expect("legacy task must migrate");
+    let recipe_provider = recipe
+        .activations
+        .iter()
+        .find(|activation| activation.subject == provider.activation.subject)
+        .expect("legacy provider must migrate");
+    assert!(!recipe_task.enabled);
+    assert!(recipe_provider.enabled);
+    assert_ne!(recipe_task.instance_id, task.activation.instance_id);
+    assert_eq!(
+        recipe.runtime_permissions[0].instance_id,
+        recipe_task.instance_id
+    );
+    assert_eq!(recipe.preferences[0].instance_id, recipe_task.instance_id);
+    assert_eq!(recipe.preferences[0].value, "legacy");
+    assert_eq!(recipe.preferred_providers[0].contract(), contract);
+    assert_eq!(
+        recipe.preferred_providers[0].provider(),
+        ComponentRef::new(recipe_provider.instance_id.clone(), "shell")
+    );
+    assert_eq!(recipe.schema, rintawa_host::PROFILE_SCHEMA);
+    assert!(
+        fs::read_to_string(&baseline_path)?.contains("schema = 6"),
+        "migrated baseline must persist the current schema"
+    );
+    let recipe_path = home_path.join("profiles").join(DEFAULT_WORLD_PROFILE_FILE);
+    assert!(fs::read_to_string(&recipe_path)?.contains("schema = 6"));
+    let reopened = HostHome::open(&home_path)?;
+    assert_eq!(reopened.load_default_world_recipe()?, recipe);
+
+    let baseline_view = migrated.list_activations()?;
+    assert!(
+        !baseline_view
+            .iter()
+            .find(|activation| activation.subject == task.activation.subject)
+            .expect("baseline task must remain selected")
+            .world_default,
+        "disabled recipe entries are not reported as active defaults"
+    );
+    assert!(
+        baseline_view
+            .iter()
+            .find(|activation| activation.subject == provider.activation.subject)
+            .expect("baseline provider must remain selected")
+            .world_default
+    );
+
+    let world = migrated.create_world()?.id;
+    let world_activations = migrated.list_world_activations(world)?;
+    assert_eq!(world_activations.len(), 2);
+    assert!(
+        !world_activations
+            .iter()
+            .find(|activation| activation.subject == task.activation.subject)
+            .expect("migrated disabled task must materialize")
+            .enabled
+    );
     Ok(())
 }
 
@@ -332,6 +522,46 @@ fn test_should_activate_same_exact_rtw_in_independent_world_overlays() -> anyhow
 
     runtime.deactivate_world(world_b)?;
     runtime.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_cross_world_preferred_provider_identity() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let artifact = build_service_provider(root.path())?;
+    let home = HostHome::open(root.path().join("home"))?;
+    let imported = home.import_rtw_bytes(&fs::read(&artifact)?)?;
+    let world_a = home.create_world()?.id;
+    let world_b = home.create_world()?.id;
+    let activation_a = home.select_world_stored_rtw(world_a, imported.digest(), Some(true))?;
+    let activation_b = home.select_world_stored_rtw(world_b, imported.digest(), Some(true))?;
+    let contract = host_shell_contract_key();
+    let scope_a = world_runtime_scope_id(world_a);
+
+    assert!(matches!(
+        home.set_preferred_provider(
+            scope_a.clone(),
+            contract.clone(),
+            ComponentRef::new(activation_b.instance_id.clone(), "runtime"),
+        ),
+        Err(HostError::PreferredProviderActivationNotFound(instance_id))
+            if instance_id == activation_b.instance_id.to_string()
+    ));
+
+    let provider_a = ComponentRef::new(activation_a.instance_id.clone(), "runtime");
+    home.set_preferred_provider(scope_a.clone(), contract.clone(), provider_a.clone())?;
+    let world_profile = home.load_world_composition(world_a)?;
+    assert_eq!(world_profile.preferred_providers.len(), 1);
+    assert_eq!(world_profile.preferred_providers[0].scope_id, scope_a);
+    assert_eq!(world_profile.preferred_providers[0].contract(), contract);
+    assert_eq!(world_profile.preferred_providers[0].provider(), provider_a);
+
+    home.clear_preferred_provider(&world_runtime_scope_id(world_a), &host_shell_contract_key())?;
+    assert!(
+        home.load_world_composition(world_a)?
+            .preferred_providers
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -480,12 +710,18 @@ fn test_should_clean_profile_policy_on_removal_and_keep_cas_bytes() -> anyhow::R
     let installed = home.install_local_rtw(&artifact, None)?;
     let scope = RuntimeScopeId::new(HOST_SCOPE);
     let owner = ComponentRef::new("bootstrap.task-runtime", "runtime");
-    home.grant_runtime_permission(scope, owner, RuntimePermission::BackgroundTask)?;
+    home.grant_runtime_permission(
+        scope.clone(),
+        owner.clone(),
+        RuntimePermission::BackgroundTask,
+    )?;
+    home.set_preference(scope, owner, "mode".to_string(), "cleanup".to_string())?;
 
     home.remove_activation("bootstrap.task-runtime")?;
     let profile = home.load_profile()?;
     assert!(profile.activations.is_empty());
     assert!(profile.runtime_permissions.is_empty());
+    assert!(profile.preferences.is_empty());
     assert!(
         home.artifact_store()
             .open_artifact(&installed.activation.digest)
@@ -671,7 +907,7 @@ fn test_should_persist_runtime_permission_and_apply_it_during_bootstrap() -> any
             .join("profiles")
             .join(rintawa_host::BASELINE_PROFILE_FILE),
     )?;
-    assert!(profile_source.contains("schema = 5"));
+    assert!(profile_source.contains("schema = 6"));
     assert!(profile_source.contains("[[runtime_permissions]]"));
     assert!(profile_source.contains("permission = \"background-task\""));
 
@@ -775,9 +1011,8 @@ permission = "background-task"
 "#,
     )?;
 
-    let home = HostHome::open(&home_path)?;
     assert!(matches!(
-        home.load_profile(),
+        HostHome::open(&home_path),
         Err(HostError::DuplicateRuntimePermissionGrant { .. })
     ));
     Ok(())

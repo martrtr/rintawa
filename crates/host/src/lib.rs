@@ -54,6 +54,10 @@ pub use user_content::{USER_CONTENT_LIBRARY_SCHEMA, UserContentEntry, UserConten
 
 /// Stable runtime scope used by the pre-world/bootstrap composition.
 pub const HOST_SCOPE: &str = "host";
+/// Host-owned template scope materialized into newly created Worlds.
+///
+/// This scope is persisted composition policy only and is never activated as a runtime.
+pub const DEFAULT_WORLD_SCOPE: &str = "default-world";
 /// Prefix used for host-owned per-world runtime composition scopes.
 pub const WORLD_SCOPE_PREFIX: &str = "world:";
 
@@ -64,6 +68,8 @@ pub fn world_runtime_scope_id(world_id: WorldId) -> RuntimeScopeId {
 
 /// File name of the current baseline host profile.
 pub const BASELINE_PROFILE_FILE: &str = "baseline.toml";
+/// File name of the composition recipe materialized into newly created Worlds.
+pub const DEFAULT_WORLD_PROFILE_FILE: &str = "default-world.toml";
 const EXTENSION_CONTENT_V1: &str = "rintawa.extension@1";
 const HOST_IDENTITY_FILE: &str = "identity.toml";
 const WORLD_DATABASE_FILE: &str = "world.sqlite";
@@ -619,7 +625,8 @@ pub struct InstalledActivation {
     pub scope_id: RuntimeScopeId,
     /// Whether the selected composition activation should start automatically.
     pub enabled: bool,
-    /// Whether this baseline activation is inherited by newly created worlds.
+    /// Compatibility view indicating that this exact enabled baseline artifact is selected
+    /// in the independent default-World recipe. Always false outside the baseline view.
     pub world_default: bool,
 }
 
@@ -647,6 +654,13 @@ pub struct InstallResult {
     pub disposition: ImportDisposition,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistedCompositionScope {
+    Baseline,
+    DefaultWorld,
+    World(WorldId),
+}
+
 /// Summary of one persistent authoritative world available in the local host home.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorldSummary {
@@ -663,6 +677,7 @@ pub struct HostHome {
     asset_store: AssetStore,
     local_principal: PrincipalId,
     profile_path: PathBuf,
+    default_world_profile_path: PathBuf,
     user_content_path: PathBuf,
     worlds_directory: PathBuf,
 }
@@ -677,21 +692,27 @@ impl HostHome {
         let asset_store = AssetStore::open(root.join("assets"), MAX_ASSET_BYTES)?;
         let local_principal =
             identity::load_or_create_local_principal(&root.join(HOST_IDENTITY_FILE))?;
-        let profile_path = root.join("profiles").join(BASELINE_PROFILE_FILE);
+        let profiles_directory = root.join("profiles");
+        ensure_real_directory(&profiles_directory)?;
+        let profile_path = profiles_directory.join(BASELINE_PROFILE_FILE);
+        let default_world_profile_path = profiles_directory.join(DEFAULT_WORLD_PROFILE_FILE);
         let content_directory = root.join("content");
         ensure_real_directory(&content_directory)?;
         let user_content_path = content_directory.join("library.toml");
         let worlds_directory = root.join("worlds");
         ensure_real_directory(&worlds_directory)?;
-        Ok(Self {
+        let home = Self {
             root,
             store,
             asset_store,
             local_principal,
             profile_path,
+            default_world_profile_path,
             user_content_path,
             worlds_directory,
-        })
+        };
+        home.migrate_legacy_world_defaults()?;
+        Ok(home)
     }
 
     /// Returns the canonical local Rintawa home path.
@@ -721,7 +742,7 @@ impl HostHome {
     /// Returns a filesystem or storage error if the world directory/database
     /// cannot be created safely.
     pub fn create_world(&self) -> HostResult<WorldSummary> {
-        let baseline = self.load_profile()?;
+        let default_world = self.load_default_world_recipe()?;
         for _ in 0..WORLD_ID_CREATION_ATTEMPTS {
             let world_id = WorldId::new();
             let directory = self.worlds_directory.join(world_id.to_string());
@@ -738,7 +759,7 @@ impl HostHome {
                         let state = storage.load_session()?;
                         drop(storage);
                         let scope_id = world_runtime_scope_id(world_id);
-                        let profile = baseline.materialize_world_defaults(scope_id);
+                        let profile = default_world.materialize_all(scope_id);
                         self.save_world_composition(world_id, &profile)?;
                         Ok(world_summary(&state))
                     })(),
@@ -828,6 +849,43 @@ impl HostHome {
         Ok(profile)
     }
 
+    /// Loads the host-owned composition recipe used only for future World creation.
+    pub fn load_default_world_recipe(&self) -> HostResult<CompositionProfile> {
+        let profile = CompositionProfile::load(&self.default_world_profile_path)?;
+        profile.validate_scope(&RuntimeScopeId::new(DEFAULT_WORLD_SCOPE))?;
+        Ok(profile)
+    }
+
+    fn save_default_world_recipe(&self, profile: &CompositionProfile) -> HostResult<()> {
+        profile.validate_scope(&RuntimeScopeId::new(DEFAULT_WORLD_SCOPE))?;
+        profile.save(&self.default_world_profile_path)
+    }
+
+    fn migrate_legacy_world_defaults(&self) -> HostResult<()> {
+        let host_scope = RuntimeScopeId::new(HOST_SCOPE);
+        let default_scope = RuntimeScopeId::new(DEFAULT_WORLD_SCOPE);
+        let mut baseline = BaselineProfile::load(&self.profile_path)?;
+        baseline.validate_scope(&host_scope)?;
+        if !baseline
+            .activations
+            .iter()
+            .any(|activation| activation.world_default)
+        {
+            return Ok(());
+        }
+
+        if self.default_world_profile_path.exists() {
+            let recipe = CompositionProfile::load(&self.default_world_profile_path)?;
+            recipe.validate_scope(&default_scope)?;
+        } else {
+            let recipe = baseline.materialize_legacy_world_defaults(default_scope);
+            recipe.save(&self.default_world_profile_path)?;
+        }
+
+        baseline.clear_legacy_world_defaults();
+        baseline.save(&self.profile_path)
+    }
+
     /// Loads the exact composition overlay persisted with one world.
     pub fn load_world_composition(&self, world_id: WorldId) -> HostResult<CompositionProfile> {
         let path = self.world_composition_path(world_id)?;
@@ -854,12 +912,15 @@ impl HostHome {
             .join(WORLD_COMPOSITION_FILE))
     }
 
-    fn world_id_for_composition_scope(
+    fn persisted_composition_scope(
         &self,
         scope_id: &RuntimeScopeId,
-    ) -> HostResult<Option<WorldId>> {
+    ) -> HostResult<PersistedCompositionScope> {
         if scope_id.as_str() == HOST_SCOPE {
-            return Ok(None);
+            return Ok(PersistedCompositionScope::Baseline);
+        }
+        if scope_id.as_str() == DEFAULT_WORLD_SCOPE {
+            return Ok(PersistedCompositionScope::DefaultWorld);
         }
         let Some(raw) = scope_id.as_str().strip_prefix(WORLD_SCOPE_PREFIX) else {
             return Err(HostError::UnsupportedCompositionScope(scope_id.to_string()));
@@ -870,16 +931,17 @@ impl HostHome {
         if world_runtime_scope_id(world_id) != *scope_id {
             return Err(HostError::UnsupportedCompositionScope(scope_id.to_string()));
         }
-        Ok(Some(world_id))
+        Ok(PersistedCompositionScope::World(world_id))
     }
 
     fn load_composition_for_scope(
         &self,
         scope_id: &RuntimeScopeId,
     ) -> HostResult<CompositionProfile> {
-        match self.world_id_for_composition_scope(scope_id)? {
-            None => self.load_profile(),
-            Some(world_id) => self.load_world_composition(world_id),
+        match self.persisted_composition_scope(scope_id)? {
+            PersistedCompositionScope::Baseline => self.load_profile(),
+            PersistedCompositionScope::DefaultWorld => self.load_default_world_recipe(),
+            PersistedCompositionScope::World(world_id) => self.load_world_composition(world_id),
         }
     }
 
@@ -889,9 +951,12 @@ impl HostHome {
         profile: &CompositionProfile,
     ) -> HostResult<()> {
         profile.validate_scope(scope_id)?;
-        match self.world_id_for_composition_scope(scope_id)? {
-            None => profile.save(&self.profile_path),
-            Some(world_id) => self.save_world_composition(world_id, profile),
+        match self.persisted_composition_scope(scope_id)? {
+            PersistedCompositionScope::Baseline => profile.save(&self.profile_path),
+            PersistedCompositionScope::DefaultWorld => self.save_default_world_recipe(profile),
+            PersistedCompositionScope::World(world_id) => {
+                self.save_world_composition(world_id, profile)
+            }
         }
     }
 
@@ -972,17 +1037,21 @@ impl HostHome {
         let engine = ExtensionEngine::new();
         let manifest =
             RtwExtensionLoader::new().read_stored_manifest(&engine, &self.store, digest)?;
-        let world_id = self.world_id_for_composition_scope(&scope_id)?;
+        let composition_scope = self.persisted_composition_scope(&scope_id)?;
         let mut profile = self.load_composition_for_scope(&scope_id)?;
         let subject = manifest.id.to_string();
-        let instance_id = match world_id {
-            Some(_) => profile
-                .activations
-                .iter()
-                .find(|activation| activation.subject == subject && activation.scope_id == scope_id)
-                .map(|activation| activation.instance_id.clone())
-                .unwrap_or_else(|| ExtensionInstanceId::new(Uuid::now_v7().to_string())),
-            None => ExtensionInstanceId::new(subject.clone()),
+        let instance_id = match composition_scope {
+            PersistedCompositionScope::Baseline => ExtensionInstanceId::new(subject.clone()),
+            PersistedCompositionScope::DefaultWorld | PersistedCompositionScope::World(_) => {
+                profile
+                    .activations
+                    .iter()
+                    .find(|activation| {
+                        activation.subject == subject && activation.scope_id == scope_id
+                    })
+                    .map(|activation| activation.instance_id.clone())
+                    .unwrap_or_else(|| ExtensionInstanceId::new(Uuid::now_v7().to_string()))
+            }
         };
         let enabled = profile.upsert(
             ActivationRecord {
@@ -1006,11 +1075,8 @@ impl HostHome {
             })
         });
         self.save_composition_for_scope(&scope_id, &profile)?;
-        let world_default = profile
-            .activations
-            .iter()
-            .find(|activation| activation.subject == subject)
-            .is_some_and(|activation| activation.world_default);
+        let world_default = matches!(composition_scope, PersistedCompositionScope::Baseline)
+            && self.is_exact_default_world_activation(&subject, digest)?;
 
         Ok(InstalledActivation {
             subject,
@@ -1045,14 +1111,102 @@ impl HostHome {
         self.set_enabled_in_scope(&RuntimeScopeId::new(HOST_SCOPE), subject, enabled)
     }
 
-    /// Marks whether one exact baseline activation is copied into newly created worlds.
+    /// Compatibility helper that adds or removes the current baseline artifact from the
+    /// independent default-World recipe.
     ///
-    /// Existing worlds are compatibility-pinned and are never rewritten by this policy.
+    /// Existing Worlds and later baseline policy changes are never propagated implicitly.
     pub fn set_world_default(&self, subject: &str, world_default: bool) -> HostResult<()> {
-        let scope_id = RuntimeScopeId::new(HOST_SCOPE);
-        let mut profile = self.load_profile()?;
-        profile.set_world_default(subject, world_default)?;
-        self.save_composition_for_scope(&scope_id, &profile)
+        let baseline = self.load_profile()?;
+        let activation = baseline
+            .activations
+            .iter()
+            .find(|activation| activation.subject == subject)
+            .ok_or_else(|| HostError::ActivationNotFound(subject.to_string()))?;
+        let default_scope = RuntimeScopeId::new(DEFAULT_WORLD_SCOPE);
+        let recipe = self.load_default_world_recipe()?;
+        let has_recipe_activation = recipe
+            .activations
+            .iter()
+            .any(|candidate| candidate.subject == subject);
+
+        if !world_default {
+            if has_recipe_activation {
+                self.remove_activation_in_scope(&default_scope, subject)?;
+            }
+            return Ok(());
+        }
+
+        let selected = self.select_stored_rtw_in_scope(
+            default_scope.clone(),
+            &activation.artifact,
+            Some(true),
+        )?;
+        if has_recipe_activation {
+            return Ok(());
+        }
+
+        let mut recipe = self.load_default_world_recipe()?;
+        for grant in baseline
+            .runtime_permissions
+            .iter()
+            .filter(|grant| grant.instance_id == activation.instance_id)
+        {
+            recipe.grant_runtime_permission(RuntimePermissionGrant {
+                scope_id: default_scope.clone(),
+                instance_id: selected.instance_id.clone(),
+                component_id: grant.component_id.clone(),
+                permission: grant.permission,
+            });
+        }
+        for preference in baseline
+            .preferences
+            .iter()
+            .filter(|preference| preference.instance_id == activation.instance_id)
+        {
+            recipe.set_preference(
+                default_scope.clone(),
+                ComponentRef::new(
+                    selected.instance_id.clone(),
+                    preference.component_id.clone(),
+                ),
+                preference.key.clone(),
+                preference.value.clone(),
+            )?;
+        }
+        for selection in baseline
+            .preferred_providers
+            .iter()
+            .filter(|selection| selection.provider_instance_id == activation.instance_id)
+        {
+            recipe.set_preferred_provider(PreferredProviderSelection::new(
+                default_scope.clone(),
+                selection.contract(),
+                ComponentRef::new(
+                    selected.instance_id.clone(),
+                    selection.provider_component_id.clone(),
+                ),
+            ));
+        }
+        self.save_default_world_recipe(&recipe)
+    }
+
+    /// Selects one already-stored exact artifact in the future-World recipe.
+    pub fn select_default_world_stored_rtw(
+        &self,
+        digest: &ArtifactDigest,
+        enabled: Option<bool>,
+    ) -> HostResult<InstalledActivation> {
+        self.select_stored_rtw_in_scope(RuntimeScopeId::new(DEFAULT_WORLD_SCOPE), digest, enabled)
+    }
+
+    /// Changes enabled state for one future-World recipe activation.
+    pub fn set_default_world_enabled(&self, subject: &str, enabled: bool) -> HostResult<()> {
+        self.set_enabled_in_scope(&RuntimeScopeId::new(DEFAULT_WORLD_SCOPE), subject, enabled)
+    }
+
+    /// Removes one activation and its policy from the future-World recipe.
+    pub fn remove_default_world_activation(&self, subject: &str) -> HostResult<()> {
+        self.remove_activation_in_scope(&RuntimeScopeId::new(DEFAULT_WORLD_SCOPE), subject)
     }
 
     fn set_enabled_in_scope(
@@ -1293,6 +1447,27 @@ impl HostHome {
         self.save_composition_for_scope(scope_id, &profile)
     }
 
+    fn is_exact_default_world_activation(
+        &self,
+        subject: &str,
+        digest: &ArtifactDigest,
+    ) -> HostResult<bool> {
+        Ok(self
+            .load_default_world_recipe()?
+            .activations
+            .iter()
+            .any(|activation| {
+                activation.subject == subject
+                    && activation.artifact == *digest
+                    && activation.enabled
+            }))
+    }
+
+    /// Lists RTW activations selected by the future-World recipe.
+    pub fn list_default_world_activations(&self) -> HostResult<Vec<InstalledActivation>> {
+        self.list_activations_in_scope(&RuntimeScopeId::new(DEFAULT_WORLD_SCOPE))
+    }
+
     /// Lists RTW activations selected by one world composition overlay.
     pub fn list_world_activations(
         &self,
@@ -1312,6 +1487,15 @@ impl HostHome {
     ) -> HostResult<Vec<InstalledActivation>> {
         let engine = ExtensionEngine::new();
         let loader = RtwExtensionLoader::new();
+        let is_baseline = matches!(
+            self.persisted_composition_scope(scope_id)?,
+            PersistedCompositionScope::Baseline
+        );
+        let default_world = if is_baseline {
+            Some(self.load_default_world_recipe()?)
+        } else {
+            None
+        };
         self.load_composition_for_scope(scope_id)?
             .activations
             .into_iter()
@@ -1323,6 +1507,13 @@ impl HostHome {
                 }
                 let manifest =
                     loader.read_stored_manifest(&engine, &self.store, &activation.artifact)?;
+                let is_world_default = default_world.as_ref().is_some_and(|recipe| {
+                    recipe.activations.iter().any(|candidate| {
+                        candidate.subject == activation.subject
+                            && candidate.artifact == activation.artifact
+                            && candidate.enabled
+                    })
+                });
                 Ok(InstalledActivation {
                     subject: manifest.id.to_string(),
                     content: activation.content,
@@ -1332,7 +1523,7 @@ impl HostHome {
                     instance_id: activation.instance_id,
                     scope_id: activation.scope_id,
                     enabled: activation.enabled,
-                    world_default: activation.world_default,
+                    world_default: is_world_default,
                 })
             })
             .collect()
