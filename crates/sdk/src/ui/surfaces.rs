@@ -70,6 +70,31 @@ pub enum UiPresentationContext {
     },
 }
 
+/// Declares the initial presentation entry point owned by one World-local component.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldPresentationDescriptor {
+    /// Exact portable surface to focus when this provider is selected.
+    pub entry_surface_id: UiSurfaceId,
+    /// Optional versioned semantic intent for shells that can refine presentation.
+    pub presentation_intent: Option<ContractKey>,
+}
+
+impl WorldPresentationDescriptor {
+    /// Creates a descriptor with one exact entry surface and no optional intent.
+    pub fn new(entry_surface_id: impl Into<UiSurfaceId>) -> Self {
+        Self {
+            entry_surface_id: entry_surface_id.into(),
+            presentation_intent: None,
+        }
+    }
+
+    /// Adds one optional versioned semantic presentation intent.
+    pub fn with_intent(mut self, intent: ContractKey) -> Self {
+        self.presentation_intent = Some(intent);
+        self
+    }
+}
+
 /// Declares one portable UI surface owned by a component.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiSurfaceContribution {

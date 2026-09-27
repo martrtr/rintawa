@@ -18,7 +18,8 @@ pub use crate::contracts::{
     ComponentRef, ContractConsumer, ContractDefinition, ContractGrantRequirement, ContractKey,
     ContractProtocol, ContractProvider, ContractResolutionPolicy, ContractVersion,
     HOST_SHELL_CONTRACT_ID, HOST_SHELL_CONTRACT_VERSION, UI_LAYER_CONTRACT_ID,
-    UI_LAYER_CONTRACT_VERSION, host_shell_contract_key, ui_layer_contract_key,
+    UI_LAYER_CONTRACT_VERSION, WORLD_PRESENTATION_CONTRACT_ID, WORLD_PRESENTATION_CONTRACT_VERSION,
+    host_shell_contract_key, ui_layer_contract_key, world_presentation_contract_key,
 };
 pub use crate::contributions::{ContributionDescriptor, ContributionKind};
 

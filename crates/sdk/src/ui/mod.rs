@@ -26,5 +26,5 @@ pub use nodes::{
 pub use patches::{UiPatch, UiPatchBatch, UiSurfaceSnapshot};
 pub use surfaces::{
     UiActivityContribution, UiLayerDescriptor, UiPlacementHint, UiPresentationContext,
-    UiSurfaceContribution,
+    UiSurfaceContribution, WorldPresentationDescriptor,
 };

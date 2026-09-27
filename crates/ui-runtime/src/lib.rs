@@ -7,6 +7,6 @@ mod runtime;
 mod validation;
 
 pub use runtime::{
-    OwnedUiLayerDescriptor, OwnedUiSurfaceContribution, QueuedUiAction, UiActionDispatch,
-    UiPresentationSurface, UiRuntime,
+    OwnedUiLayerDescriptor, OwnedUiSurfaceContribution, OwnedWorldPresentationDescriptor,
+    QueuedUiAction, UiActionDispatch, UiPresentationSurface, UiRuntime,
 };

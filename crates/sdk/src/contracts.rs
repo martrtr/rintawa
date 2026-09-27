@@ -87,6 +87,23 @@ pub fn ui_layer_contract_key() -> ContractKey {
     ContractKey::new(UI_LAYER_CONTRACT_ID, UI_LAYER_CONTRACT_VERSION)
 }
 
+/// Stable identifier of the platform-owned World presentation role.
+pub const WORLD_PRESENTATION_CONTRACT_ID: &str = "rintawa.world.presentation";
+
+/// Major version of the platform-owned World presentation role.
+pub const WORLD_PRESENTATION_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1);
+
+/// Returns the versioned Binding used to select one World presentation provider.
+///
+/// A provider separately registers an owner-scoped
+/// [`crate::ui::WorldPresentationDescriptor`] naming its initial portable surface.
+pub fn world_presentation_contract_key() -> ContractKey {
+    ContractKey::new(
+        WORLD_PRESENTATION_CONTRACT_ID,
+        WORLD_PRESENTATION_CONTRACT_VERSION,
+    )
+}
+
 /// Identifies one component within one concrete extension runtime instance.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ComponentRef {

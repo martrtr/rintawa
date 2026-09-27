@@ -114,6 +114,10 @@ pub enum ExtensionError {
     #[error("duplicate UI Layer descriptor")]
     DuplicateUiLayerDescriptor,
 
+    /// The component registered more than one World presentation descriptor.
+    #[error("duplicate World presentation descriptor")]
+    DuplicateWorldPresentationDescriptor,
+
     /// The host cannot register portable UI metadata in the current context.
     #[error("UI registration is unavailable in this component context")]
     UiRegistrationUnavailable,

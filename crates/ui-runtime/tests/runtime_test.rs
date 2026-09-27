@@ -9,11 +9,13 @@ use rintawa_sdk::{
         UiActionEvent, UiActionId, UiActionPayload, UiButtonAppearance, UiButtonNode,
         UiCapabilityId, UiContainerNode, UiError, UiLayerDescriptor, UiNode, UiNodeId, UiNodeKind,
         UiPatch, UiPatchBatch, UiPlacementHint, UiPresentationContext, UiSurfaceContribution,
-        UiSurfaceId, UiSurfaceSnapshot, UiTextInputNode, UiTextNode,
+        UiSurfaceId, UiSurfaceSnapshot, UiTextInputNode, UiTextNode, WorldPresentationDescriptor,
     },
     world::WorldId,
 };
-use rintawa_ui_runtime::{OwnedUiLayerDescriptor, OwnedUiSurfaceContribution, UiRuntime};
+use rintawa_ui_runtime::{
+    OwnedUiLayerDescriptor, OwnedUiSurfaceContribution, OwnedWorldPresentationDescriptor, UiRuntime,
+};
 
 fn instance(id: &str) -> ExtensionInstanceId {
     ExtensionInstanceId::new(id)
@@ -465,6 +467,64 @@ fn test_should_import_only_focused_world_scope_into_layer_session() -> Result<()
     assert_eq!(
         runtime.route_action(&layer_owner, world_action("world-b")),
         Err(UiError::ScopeNotVisible)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_bind_world_presentation_descriptor_to_same_component_surface() -> Result<()> {
+    let runtime = UiRuntime::new();
+    runtime.register_instance(
+        instance("world-feature"),
+        RuntimeScopeId::new("world:test"),
+        vec![
+            OwnedUiSurfaceContribution {
+                owner: owner("world-feature"),
+                contribution: surface(),
+            },
+            OwnedUiSurfaceContribution {
+                owner: ComponentRef::new("world-feature", "other"),
+                contribution: UiSurfaceContribution::new(
+                    "example.other",
+                    UiPlacementHint::Secondary,
+                ),
+            },
+        ],
+        Vec::new(),
+    )?;
+
+    let descriptor = WorldPresentationDescriptor::new("example.main");
+    runtime.register_world_presentation(OwnedWorldPresentationDescriptor {
+        owner: owner("world-feature"),
+        descriptor: descriptor.clone(),
+    })?;
+    assert_eq!(
+        runtime.registered_world_presentation_descriptor(&owner("world-feature"))?,
+        descriptor
+    );
+    assert_eq!(
+        runtime.register_world_presentation(OwnedWorldPresentationDescriptor {
+            owner: owner("world-feature"),
+            descriptor: WorldPresentationDescriptor::new("example.main"),
+        }),
+        Err(UiError::WorldPresentationAlreadyRegistered)
+    );
+
+    assert_eq!(
+        runtime.register_world_presentation(OwnedWorldPresentationDescriptor {
+            owner: ComponentRef::new("world-feature", "missing-owner"),
+            descriptor: WorldPresentationDescriptor::new("example.main"),
+        }),
+        Err(UiError::SurfaceNotOwned(String::from("example.main")))
+    );
+    assert_eq!(
+        runtime.register_world_presentation(OwnedWorldPresentationDescriptor {
+            owner: ComponentRef::new("world-feature", "other"),
+            descriptor: WorldPresentationDescriptor::new("missing.surface"),
+        }),
+        Err(UiError::SurfaceNotRegistered(String::from(
+            "missing.surface"
+        )))
     );
     Ok(())
 }

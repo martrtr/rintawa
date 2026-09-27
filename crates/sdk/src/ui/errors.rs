@@ -26,6 +26,12 @@ pub enum UiError {
     /// The selected component did not register a UI Layer descriptor.
     #[error("component did not register a UI Layer descriptor")]
     LayerNotRegistered,
+    /// The component already registered one World presentation descriptor.
+    #[error("World presentation descriptor is already registered for this component")]
+    WorldPresentationAlreadyRegistered,
+    /// The selected component did not register a World presentation descriptor.
+    #[error("component did not register a World presentation descriptor")]
+    WorldPresentationNotRegistered,
     /// Another UI Layer is already attached.
     #[error("a different UI Layer is already attached")]
     LayerAlreadyAttached,

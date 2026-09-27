@@ -15,7 +15,7 @@ use crate::{
     types::{ComponentId, ExtensionId, ExtensionInstanceId, RuntimeEffectId, RuntimeScopeId},
     ui::{
         UiLayerDescriptor, UiPatchBatch, UiResult, UiSurfaceContribution, UiSurfaceId,
-        UiSurfaceSnapshot,
+        UiSurfaceSnapshot, WorldPresentationDescriptor,
     },
 };
 
@@ -232,6 +232,22 @@ pub trait RegistrationContext: ComponentContext {
     ///
     /// Returns an error when the current host context cannot register UI metadata.
     fn register_ui_layer(&mut self, _descriptor: UiLayerDescriptor) -> ExtensionResult<()> {
+        Err(crate::errors::ExtensionError::UiRegistrationUnavailable)
+    }
+
+    /// Registers the initial World presentation entry point owned by this component.
+    ///
+    /// The component must separately provide the platform-owned
+    /// `rintawa.world.presentation@1` Binding. The host validates that the declared
+    /// entry surface is statically registered by the same owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current host context cannot register UI metadata.
+    fn register_world_presentation(
+        &mut self,
+        _descriptor: WorldPresentationDescriptor,
+    ) -> ExtensionResult<()> {
         Err(crate::errors::ExtensionError::UiRegistrationUnavailable)
     }
 }

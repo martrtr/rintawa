@@ -15,7 +15,7 @@ use rintawa_sdk::{
     ui::{
         PORTABLE_UI_PROTOCOL_MAJOR, UiActionEvent, UiError, UiLayerDescriptor, UiPatch,
         UiPatchBatch, UiPresentationContext, UiResult, UiSurfaceContribution, UiSurfaceId,
-        UiSurfaceSnapshot,
+        UiSurfaceSnapshot, WorldPresentationDescriptor,
     },
     world::WorldId,
 };
@@ -40,6 +40,15 @@ pub struct OwnedUiLayerDescriptor {
     pub owner: ComponentRef,
     /// Renderer capabilities offered by the component.
     pub descriptor: UiLayerDescriptor,
+}
+
+/// World presentation descriptor paired with its host-authenticated component owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedWorldPresentationDescriptor {
+    /// Component that registered the World presentation entry point.
+    pub owner: ComponentRef,
+    /// Owner-scoped initial presentation metadata.
+    pub descriptor: WorldPresentationDescriptor,
 }
 
 /// Mounted presentation exposed to an eligible UI Layer.
@@ -118,6 +127,7 @@ struct UiRuntimeState {
     instances: HashMap<ExtensionInstanceId, UiExtensionInstance>,
     registered_surfaces: HashMap<UiSurfaceKey, OwnedUiSurfaceContribution>,
     registered_layers: HashMap<ComponentRef, UiLayerDescriptor>,
+    registered_world_presentations: HashMap<ComponentRef, WorldPresentationDescriptor>,
     mounted_surfaces: HashMap<UiSurfaceKey, UiSurfaceSnapshot>,
     layers: HashMap<RuntimeScopeId, ActiveUiLayer>,
     queued_actions: VecDeque<QueuedUiAction>,
@@ -205,6 +215,70 @@ impl UiRuntime {
         Ok(())
     }
 
+    /// Registers one owner-scoped World presentation descriptor.
+    ///
+    /// Registration succeeds only when the referenced entry surface was already
+    /// registered by the same component owner inside this extension instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown instance, duplicate descriptor, missing entry
+    /// surface, or an entry surface owned by another component.
+    pub fn register_world_presentation(
+        &self,
+        owned: OwnedWorldPresentationDescriptor,
+    ) -> UiResult<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        if !state.instances.contains_key(&owned.owner.instance_id) {
+            return Err(UiError::InstanceNotRegistered(
+                owned.owner.instance_id.to_string(),
+            ));
+        }
+        if state
+            .registered_world_presentations
+            .contains_key(&owned.owner)
+        {
+            return Err(UiError::WorldPresentationAlreadyRegistered);
+        }
+        let key = UiSurfaceKey::new(
+            owned.owner.instance_id.clone(),
+            owned.descriptor.entry_surface_id.clone(),
+        );
+        let surface = state.registered_surfaces.get(&key).ok_or_else(|| {
+            UiError::SurfaceNotRegistered(owned.descriptor.entry_surface_id.to_string())
+        })?;
+        if surface.owner != owned.owner {
+            return Err(UiError::SurfaceNotOwned(
+                owned.descriptor.entry_surface_id.to_string(),
+            ));
+        }
+        state
+            .registered_world_presentations
+            .insert(owned.owner, owned.descriptor);
+        Ok(())
+    }
+
+    /// Returns the World presentation descriptor registered by one component owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError::WorldPresentationNotRegistered`] when no descriptor exists.
+    pub fn registered_world_presentation_descriptor(
+        &self,
+        owner: &ComponentRef,
+    ) -> UiResult<WorldPresentationDescriptor> {
+        self.state
+            .read()
+            .map_err(|_| UiError::RuntimeUnavailable)?
+            .registered_world_presentations
+            .get(owner)
+            .cloned()
+            .ok_or(UiError::WorldPresentationNotRegistered)
+    }
+
     /// Removes one extension instance and all of its UI state.
     pub fn unregister_instance(&self, instance_id: &ExtensionInstanceId) {
         let mut state = match self.state.write() {
@@ -221,6 +295,9 @@ impl UiRuntime {
         }
         state
             .registered_layers
+            .retain(|owner, _| &owner.instance_id != instance_id);
+        state
+            .registered_world_presentations
             .retain(|owner, _| &owner.instance_id != instance_id);
         state.queued_actions.retain(|queued| {
             &queued.layer_owner.instance_id != instance_id
