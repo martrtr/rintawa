@@ -8,5 +8,6 @@ mod validation;
 
 pub use runtime::{
     OwnedUiLayerDescriptor, OwnedUiSurfaceContribution, OwnedWorldPresentationDescriptor,
-    QueuedUiAction, UiActionDispatch, UiPresentationSurface, UiRuntime,
+    QueuedUiAction, QueuedWorldFocusRequest, UiActionDispatch, UiFocusedWorldPresentation,
+    UiLayerPresentationState, UiPresentationSurface, UiRuntime,
 };

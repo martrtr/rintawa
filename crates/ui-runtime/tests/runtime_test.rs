@@ -335,8 +335,10 @@ fn test_should_remove_surfaces_and_layer_on_extension_deactivation() -> Result<(
     assert!(runtime.presentation_surfaces().is_empty());
     assert!(runtime.active_layer(&scope()).is_some());
 
+    runtime.queue_world_focus_request(&owner("layer"), WorldId::new())?;
     runtime.set_instance_active(&instance("layer"), false)?;
     assert!(runtime.active_layer(&scope()).is_none());
+    assert!(runtime.drain_world_focus_requests()?.is_empty());
     Ok(())
 }
 
@@ -416,7 +418,12 @@ fn test_should_import_only_focused_world_scope_into_layer_session() -> Result<()
         Err(UiError::ScopeNotVisible)
     );
 
-    runtime.set_focused_world_scope(&layer_owner, world_a, scope_a)?;
+    runtime.set_focused_world_scope(
+        &layer_owner,
+        world_a,
+        scope_a,
+        WorldPresentationDescriptor::new("example.main"),
+    )?;
     assert_eq!(
         runtime.focused_world_for_layer(&layer_owner)?,
         Some(world_a)
@@ -442,7 +449,12 @@ fn test_should_import_only_focused_world_scope_into_layer_session() -> Result<()
             .is_ok()
     );
 
-    runtime.set_focused_world_scope(&layer_owner, world_b, scope_b)?;
+    runtime.set_focused_world_scope(
+        &layer_owner,
+        world_b,
+        scope_b,
+        WorldPresentationDescriptor::new("example.main"),
+    )?;
     assert_eq!(
         runtime.focused_world_for_layer(&layer_owner)?,
         Some(world_b)
@@ -468,6 +480,57 @@ fn test_should_import_only_focused_world_scope_into_layer_session() -> Result<()
         runtime.route_action(&layer_owner, world_action("world-b")),
         Err(UiError::ScopeNotVisible)
     );
+    Ok(())
+}
+
+#[test]
+fn test_should_coalesce_deferred_world_focus_requests_per_layer() -> Result<()> {
+    let runtime = UiRuntime::new();
+    register_feature(&runtime, surface())?;
+    runtime.set_instance_active(&instance("feature"), true)?;
+    attach_layer(&runtime, compatible_layer())?;
+
+    let layer_owner = owner("layer");
+    let world_a = WorldId::new();
+    let world_b = WorldId::new();
+
+    runtime.queue_world_focus_request(&layer_owner, world_a)?;
+    runtime.queue_world_focus_request(&layer_owner, world_b)?;
+
+    let state = runtime.presentation_state_for_layer(&layer_owner)?;
+    assert!(state.focused_world.is_none());
+    assert_eq!(state.pending_world_id, Some(world_b));
+    assert!(state.last_focus_error.is_none());
+
+    let requests = runtime.drain_world_focus_requests()?;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].layer_owner, layer_owner);
+    assert_eq!(requests[0].world_id, world_b);
+
+    runtime.record_world_focus_failure(&layer_owner, world_a, "stale failure")?;
+    let state = runtime.presentation_state_for_layer(&layer_owner)?;
+    assert_eq!(state.pending_world_id, Some(world_b));
+    assert!(state.last_focus_error.is_none());
+
+    runtime.record_world_focus_failure(&layer_owner, world_b, &"é".repeat(2_048))?;
+    let state = runtime.presentation_state_for_layer(&layer_owner)?;
+    assert!(state.pending_world_id.is_none());
+    let diagnostic = state
+        .last_focus_error
+        .expect("matching focus failure should be retained");
+    assert!(diagnostic.len() <= 2 * 1_024);
+
+    runtime.queue_world_focus_request(&layer_owner, world_a)?;
+    runtime.clear_focused_world_scope(&layer_owner)?;
+    assert!(runtime.drain_world_focus_requests()?.is_empty());
+    let state = runtime.presentation_state_for_layer(&layer_owner)?;
+    assert!(state.focused_world.is_none());
+    assert!(state.pending_world_id.is_none());
+    assert!(state.last_focus_error.is_none());
+
+    runtime.queue_world_focus_request(&layer_owner, world_b)?;
+    runtime.detach_layer(&layer_owner)?;
+    assert!(runtime.drain_world_focus_requests()?.is_empty());
     Ok(())
 }
 

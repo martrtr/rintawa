@@ -20,6 +20,9 @@ pub enum UiError {
     /// The host-owned semantic action queue reached its bounded capacity.
     #[error("UI action queue is full")]
     ActionQueueFull,
+    /// The host-owned UI Layer World-focus queue reached its bounded capacity.
+    #[error("UI Layer World-focus queue is full")]
+    WorldFocusQueueFull,
     /// A component registered more than one UI Layer descriptor.
     #[error("UI Layer descriptor is already registered for this component")]
     LayerAlreadyRegistered,

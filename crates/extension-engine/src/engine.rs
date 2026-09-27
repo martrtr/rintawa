@@ -24,7 +24,9 @@ use rintawa_sdk::{
     ui::{UiActionEvent, UiError, UiLayerDescriptor, WorldPresentationDescriptor},
     world::WorldId,
 };
-use rintawa_ui_runtime::{UiPresentationSurface, UiRuntime};
+use rintawa_ui_runtime::{
+    QueuedWorldFocusRequest, UiLayerPresentationState, UiPresentationSurface, UiRuntime,
+};
 use tracing::warn;
 
 use crate::{
@@ -1772,10 +1774,63 @@ impl ExtensionEngine {
         layer_owner: &ComponentRef,
         world_id: WorldId,
         scope_id: RuntimeScopeId,
+        descriptor: WorldPresentationDescriptor,
     ) -> EngineResult<()> {
         self.ui
-            .set_focused_world_scope(layer_owner, world_id, scope_id)?;
+            .set_focused_world_scope(layer_owner, world_id, scope_id, descriptor)?;
         Ok(())
+    }
+
+    /// Queues a deferred World-focus request for one exact UI Layer session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Ui`] when `layer_owner` is not an active layer or the
+    /// bounded deferred focus queue cannot accept another layer request.
+    pub fn request_world_focus_for_ui_layer(
+        &self,
+        layer_owner: &ComponentRef,
+        world_id: WorldId,
+    ) -> EngineResult<()> {
+        self.ui.queue_world_focus_request(layer_owner, world_id)?;
+        Ok(())
+    }
+
+    /// Drains deferred UI Layer World-focus requests for Host orchestration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Ui`] when shared UI state is unavailable.
+    pub fn drain_world_focus_requests(&self) -> EngineResult<Vec<QueuedWorldFocusRequest>> {
+        Ok(self.ui.drain_world_focus_requests()?)
+    }
+
+    /// Records one bounded failure for a completed deferred focus request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Ui`] when the requesting UI Layer session no longer exists.
+    pub fn record_world_focus_failure(
+        &self,
+        layer_owner: &ComponentRef,
+        world_id: WorldId,
+        diagnostic: &str,
+    ) -> EngineResult<()> {
+        self.ui
+            .record_world_focus_failure(layer_owner, world_id, diagnostic)?;
+        Ok(())
+    }
+
+    /// Returns renderer-facing focus state for one exact UI Layer session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Ui`] when `layer_owner` is not an active UI Layer.
+    pub fn ui_layer_presentation_state(
+        &self,
+        layer_owner: &ComponentRef,
+    ) -> EngineResult<UiLayerPresentationState> {
+        Ok(self.ui.presentation_state_for_layer(layer_owner)?)
     }
 
     /// Clears the focused World imported into one UI Layer presentation session.

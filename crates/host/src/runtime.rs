@@ -1369,8 +1369,12 @@ impl HostRuntime {
             });
         }
 
-        self.engine
-            .set_focused_world_for_ui_layer(layer_owner, world_id, scope_id)?;
+        self.engine.set_focused_world_for_ui_layer(
+            layer_owner,
+            world_id,
+            scope_id,
+            descriptor.clone(),
+        )?;
         Ok(WorldPresentationTarget {
             world_id,
             provider,
@@ -2132,6 +2136,36 @@ impl HostRuntime {
         Ok(handled)
     }
 
+    fn pump_world_focus_requests(&mut self) -> HostResult<usize> {
+        let requests = self.engine.drain_world_focus_requests()?;
+        let mut handled = 0_usize;
+        for request in requests {
+            if let Err(error) =
+                self.focus_world_for_ui_layer(&request.layer_owner, request.world_id)
+            {
+                let diagnostic = error.to_string();
+                if let Err(record_error) = self.engine.record_world_focus_failure(
+                    &request.layer_owner,
+                    request.world_id,
+                    &diagnostic,
+                ) {
+                    warn!(
+                        world_id = %request.world_id,
+                        error = %record_error,
+                        "deferred World focus result could not be recorded for stale UI Layer session"
+                    );
+                }
+                warn!(
+                    world_id = %request.world_id,
+                    error = %error,
+                    "deferred World focus request failed"
+                );
+            }
+            handled = handled.saturating_add(1);
+        }
+        Ok(handled)
+    }
+
     fn pump_user_content_write_requests(&mut self) -> HostResult<usize> {
         let Some(access) = self.host_access.clone() else {
             return Ok(0);
@@ -2251,6 +2285,7 @@ impl HostRuntime {
     /// no active component currently owns scheduled cooperative work.
     pub fn poll_runtime(&mut self) -> HostResult<Option<Duration>> {
         self.pump_world_session_requests()?;
+        self.pump_world_focus_requests()?;
         self.pump_user_content_write_requests()?;
         self.pump_world_command_requests()?;
         self.pump_world_projection_requests()?;
@@ -2258,6 +2293,7 @@ impl HostRuntime {
         self.pump_all_effect_outboxes()?;
         let engine_delay = self.engine.poll_runtime()?;
         self.pump_world_session_requests()?;
+        self.pump_world_focus_requests()?;
         self.pump_user_content_write_requests()?;
         self.pump_world_command_requests()?;
         self.pump_world_projection_requests()?;
@@ -4723,6 +4759,41 @@ mod tests {
         ));
         assert!(host.is_world_active(unmounted_world));
         assert_eq!(host.focused_world_for_ui_layer(&layer_owner)?, None);
+
+        host.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_apply_deferred_world_activation_before_deferred_focus() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let world_id = home.create_world()?.id;
+        let mut host = HostRuntime::start(&home)?;
+        let layer_owner = register_test_host_ui_layer(&mut host)?;
+        let access = host
+            .host_access
+            .as_ref()
+            .expect("started HostRuntime should expose local host access")
+            .clone();
+
+        access
+            .world_sessions
+            .request(world_id, true)
+            .map_err(|error| anyhow::anyhow!("world activation request failed: {error:?}"))?;
+        host.engine
+            .request_world_focus_for_ui_layer(&layer_owner, world_id)?;
+        host.poll_runtime()?;
+
+        assert!(host.is_world_active(world_id));
+        let presentation = host.engine.ui_layer_presentation_state(&layer_owner)?;
+        assert!(presentation.focused_world.is_none());
+        assert!(presentation.pending_world_id.is_none());
+        let diagnostic = presentation
+            .last_focus_error
+            .expect("headless World focus should report a contained presentation error");
+        assert!(!diagnostic.contains("not active"));
+        assert!(diagnostic.contains("presentation") || diagnostic.contains("contract"));
 
         host.shutdown()?;
         Ok(())

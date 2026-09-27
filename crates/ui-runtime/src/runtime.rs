@@ -8,6 +8,8 @@ use std::{
 use serde::Serialize;
 
 const MAX_QUEUED_ACTIONS: usize = 64;
+const MAX_QUEUED_WORLD_FOCUS_REQUESTS: usize = 64;
+const MAX_WORLD_FOCUS_DIAGNOSTIC_BYTES: usize = 2 * 1024;
 
 use rintawa_sdk::{
     contracts::ComponentRef,
@@ -86,6 +88,35 @@ pub struct QueuedUiAction {
     pub event: UiActionEvent,
 }
 
+/// Deferred request by one concrete UI Layer session to focus an authoritative World.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedWorldFocusRequest {
+    /// Active UI Layer that owns the presentation session.
+    pub layer_owner: ComponentRef,
+    /// World requested as that session's presentation focus.
+    pub world_id: WorldId,
+}
+
+/// Resolved World presentation exposed to one UI Layer session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UiFocusedWorldPresentation {
+    /// Authoritative World whose scope is imported into this presentation session.
+    pub world_id: WorldId,
+    /// Composition-selected owner descriptor for the World's initial presentation.
+    pub descriptor: WorldPresentationDescriptor,
+}
+
+/// Renderer-facing World-focus state for one concrete UI Layer session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UiLayerPresentationState {
+    /// Successfully resolved current World focus, if any.
+    pub focused_world: Option<UiFocusedWorldPresentation>,
+    /// Most recently accepted deferred focus request not yet completed by the Host.
+    pub pending_world_id: Option<WorldId>,
+    /// Bounded diagnostic for the most recent failed focus request.
+    pub last_focus_error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct UiSurfaceKey {
     instance_id: ExtensionInstanceId,
@@ -112,6 +143,7 @@ struct UiExtensionInstance {
 struct FocusedPresentationScope {
     scope_id: RuntimeScopeId,
     world_id: WorldId,
+    descriptor: WorldPresentationDescriptor,
 }
 
 #[derive(Clone)]
@@ -120,6 +152,8 @@ struct ActiveUiLayer {
     descriptor: UiLayerDescriptor,
     capabilities: HashSet<rintawa_sdk::ui::UiCapabilityId>,
     focused_scope: Option<FocusedPresentationScope>,
+    pending_world_id: Option<WorldId>,
+    last_focus_error: Option<String>,
 }
 
 #[derive(Default)]
@@ -131,6 +165,7 @@ struct UiRuntimeState {
     mounted_surfaces: HashMap<UiSurfaceKey, UiSurfaceSnapshot>,
     layers: HashMap<RuntimeScopeId, ActiveUiLayer>,
     queued_actions: VecDeque<QueuedUiAction>,
+    queued_world_focus_requests: VecDeque<QueuedWorldFocusRequest>,
 }
 
 /// Shared renderer-neutral runtime for portable surfaces and semantic actions.
@@ -303,6 +338,9 @@ impl UiRuntime {
             &queued.layer_owner.instance_id != instance_id
                 && &queued.event.owner_instance_id != instance_id
         });
+        state
+            .queued_world_focus_requests
+            .retain(|queued| &queued.layer_owner.instance_id != instance_id);
         if state
             .layers
             .get(&instance.scope_id)
@@ -346,6 +384,9 @@ impl UiRuntime {
                 &queued.layer_owner.instance_id != instance_id
                     && &queued.event.owner_instance_id != instance_id
             });
+            state
+                .queued_world_focus_requests
+                .retain(|queued| &queued.layer_owner.instance_id != instance_id);
             if state
                 .layers
                 .get(&scope_id)
@@ -425,6 +466,14 @@ impl UiRuntime {
             .layers
             .get(&scope_id)
             .and_then(|layer| layer.focused_scope.clone());
+        let pending_world_id = state
+            .layers
+            .get(&scope_id)
+            .and_then(|layer| layer.pending_world_id);
+        let last_focus_error = state
+            .layers
+            .get(&scope_id)
+            .and_then(|layer| layer.last_focus_error.clone());
         let capabilities: HashSet<_> = descriptor.capabilities.iter().cloned().collect();
         for (key, snapshot) in &state.mounted_surfaces {
             let Some(surface_instance) = state.instances.get(&key.instance_id) else {
@@ -451,6 +500,8 @@ impl UiRuntime {
                 descriptor,
                 capabilities,
                 focused_scope,
+                pending_world_id,
+                last_focus_error,
             },
         );
         Ok(())
@@ -479,6 +530,9 @@ impl UiRuntime {
             }
             state.layers.remove(&scope_id);
         }
+        state
+            .queued_world_focus_requests
+            .retain(|queued| &queued.layer_owner != owner);
         Ok(())
     }
 
@@ -492,6 +546,127 @@ impl UiRuntime {
                 .layers
                 .get(scope_id)
                 .map(|layer| (layer.owner.clone(), layer.descriptor.clone()))
+        })
+    }
+
+    /// Queues one deferred World-focus request for an exact active UI Layer session.
+    ///
+    /// Repeated requests from the same layer coalesce to the newest World. This API only
+    /// records presentation intent; Host orchestration resolves composition and lifecycle
+    /// after the current component callback unwinds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError::LayerNotOwner`] when the caller is not an active layer or
+    /// [`UiError::WorldFocusQueueFull`] when the bounded cross-layer queue is full.
+    pub fn queue_world_focus_request(
+        &self,
+        layer_owner: &ComponentRef,
+        world_id: WorldId,
+    ) -> UiResult<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        let layer_scope = state
+            .layers
+            .iter()
+            .find_map(|(scope_id, layer)| (&layer.owner == layer_owner).then_some(scope_id.clone()))
+            .ok_or(UiError::LayerNotOwner)?;
+
+        if let Some(request) = state
+            .queued_world_focus_requests
+            .iter_mut()
+            .find(|request| request.layer_owner == *layer_owner)
+        {
+            request.world_id = world_id;
+        } else {
+            if state.queued_world_focus_requests.len() >= MAX_QUEUED_WORLD_FOCUS_REQUESTS {
+                return Err(UiError::WorldFocusQueueFull);
+            }
+            state
+                .queued_world_focus_requests
+                .push_back(QueuedWorldFocusRequest {
+                    layer_owner: layer_owner.clone(),
+                    world_id,
+                });
+        }
+        let layer = state
+            .layers
+            .get_mut(&layer_scope)
+            .ok_or(UiError::LayerNotOwner)?;
+        layer.pending_world_id = Some(world_id);
+        layer.last_focus_error = None;
+        Ok(())
+    }
+
+    /// Drains deferred focus requests for Host orchestration after guest callbacks unwind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError::RuntimeUnavailable`] when shared state cannot be accessed.
+    pub fn drain_world_focus_requests(&self) -> UiResult<Vec<QueuedWorldFocusRequest>> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        Ok(state.queued_world_focus_requests.drain(..).collect())
+    }
+
+    /// Records a bounded failure for one completed deferred World-focus request.
+    ///
+    /// A stale failure never overwrites a newer pending request from the same layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError::LayerNotOwner`] when the presentation session no longer exists.
+    pub fn record_world_focus_failure(
+        &self,
+        layer_owner: &ComponentRef,
+        world_id: WorldId,
+        diagnostic: &str,
+    ) -> UiResult<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        let layer = state
+            .layers
+            .values_mut()
+            .find(|layer| &layer.owner == layer_owner)
+            .ok_or(UiError::LayerNotOwner)?;
+        if layer.pending_world_id == Some(world_id) {
+            layer.pending_world_id = None;
+            layer.last_focus_error = Some(bounded_world_focus_diagnostic(diagnostic));
+        }
+        Ok(())
+    }
+
+    /// Returns renderer-facing World-focus state for one active UI Layer session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError::LayerNotOwner`] when the caller is not an active layer.
+    pub fn presentation_state_for_layer(
+        &self,
+        layer_owner: &ComponentRef,
+    ) -> UiResult<UiLayerPresentationState> {
+        let state = self.state.read().map_err(|_| UiError::RuntimeUnavailable)?;
+        let layer = state
+            .layers
+            .values()
+            .find(|layer| &layer.owner == layer_owner)
+            .ok_or(UiError::LayerNotOwner)?;
+        Ok(UiLayerPresentationState {
+            focused_world: layer
+                .focused_scope
+                .as_ref()
+                .map(|focused| UiFocusedWorldPresentation {
+                    world_id: focused.world_id,
+                    descriptor: focused.descriptor.clone(),
+                }),
+            pending_world_id: layer.pending_world_id,
+            last_focus_error: layer.last_focus_error.clone(),
         })
     }
 
@@ -510,6 +685,7 @@ impl UiRuntime {
         layer_owner: &ComponentRef,
         world_id: WorldId,
         scope_id: RuntimeScopeId,
+        descriptor: WorldPresentationDescriptor,
     ) -> UiResult<()> {
         let mut state = self
             .state
@@ -548,7 +724,15 @@ impl UiRuntime {
             .layers
             .get_mut(&layer_scope)
             .ok_or(UiError::LayerNotOwner)?;
-        layer.focused_scope = Some(FocusedPresentationScope { scope_id, world_id });
+        layer.focused_scope = Some(FocusedPresentationScope {
+            scope_id,
+            world_id,
+            descriptor,
+        });
+        if layer.pending_world_id == Some(world_id) {
+            layer.pending_world_id = None;
+        }
+        layer.last_focus_error = None;
         Ok(())
     }
 
@@ -562,12 +746,21 @@ impl UiRuntime {
             .state
             .write()
             .map_err(|_| UiError::RuntimeUnavailable)?;
+        let layer_scope = state
+            .layers
+            .iter()
+            .find_map(|(scope_id, layer)| (&layer.owner == layer_owner).then_some(scope_id.clone()))
+            .ok_or(UiError::LayerNotOwner)?;
         let layer = state
             .layers
-            .values_mut()
-            .find(|layer| &layer.owner == layer_owner)
+            .get_mut(&layer_scope)
             .ok_or(UiError::LayerNotOwner)?;
         layer.focused_scope = None;
+        layer.pending_world_id = None;
+        layer.last_focus_error = None;
+        state
+            .queued_world_focus_requests
+            .retain(|request| request.layer_owner != *layer_owner);
         Ok(())
     }
 
@@ -951,6 +1144,14 @@ fn collect_presentations(
             })
     });
     surfaces
+}
+
+fn bounded_world_focus_diagnostic(diagnostic: &str) -> String {
+    let mut end = diagnostic.len().min(MAX_WORLD_FOCUS_DIAGNOSTIC_BYTES);
+    while !diagnostic.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    diagnostic[..end].to_string()
 }
 
 fn ensure_surface_supported(
