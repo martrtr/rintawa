@@ -705,7 +705,7 @@ interface secrets {
 }
 
 
-/// Generic unary service transport available while guest code is executing.
+/// Generic service transport available while guest code is executing.
 interface services {
     /// Transport-level routing failure.
     variant error {
@@ -720,10 +720,25 @@ interface services {
         response-too-large,
     }
 
-    /// Calls the provider selected for a versioned contract.
+    /// Opaque caller-bound selection of one provider for a `multiple` service contract.
+    type provider-handle = u64;
+
+    /// Calls the provider selected for a versioned `single` service contract.
     call: func(
         contract: string,
         version: u32,
+        payload: list<u8>,
+    ) -> result<list<u8>, error>;
+
+    /// Lists eligible providers for a versioned `multiple` service contract.
+    list-providers: func(
+        contract: string,
+        version: u32,
+    ) -> result<list<provider-handle>, error>;
+
+    /// Calls one provider previously returned by `list-providers`.
+    call-provider: func(
+        provider: provider-handle,
         payload: list<u8>,
     ) -> result<list<u8>, error>;
 }

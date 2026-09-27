@@ -8,10 +8,12 @@ use std::{
 use rintawa_sdk::{
     api::LoggerApi,
     context::ComponentContext,
-    contracts::{ComponentRef, ContractDefinition, ContractKey, ContractProtocol},
+    contracts::{
+        ComponentRef, ContractDefinition, ContractKey, ContractProtocol, ContractResolutionPolicy,
+    },
     errors::{ExtensionError, ExtensionResult},
     secrets::{SecretPath, SecretValue},
-    services::{ServiceCallError, ServiceCallResult},
+    services::{ServiceCallError, ServiceCallResult, ServiceProviderHandle},
     traits::Component,
     types::{ComponentId, ExtensionId, ExtensionInstanceId, RuntimeScopeId},
 };
@@ -27,6 +29,7 @@ use crate::{
 };
 
 pub(crate) const DEFAULT_MAX_SERVICE_MESSAGE_BYTES: usize = 1024 * 1024;
+const DEFAULT_MAX_SERVICE_PROVIDERS_PER_CONTRACT: usize = 64;
 
 pub(crate) type ComponentHandle = Arc<Mutex<Box<dyn Component>>>;
 
@@ -66,6 +69,24 @@ struct CachedRoute {
     result: ServiceCallResult<ComponentRef>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProviderHandleKey {
+    caller: ComponentRef,
+    contract: ContractKey,
+    provider: ComponentRef,
+    allow_inactive_caller: bool,
+}
+
+#[derive(Clone)]
+struct ProviderHandleBinding {
+    key: ProviderHandleKey,
+}
+
+struct ResolvedServiceBinding {
+    resolution: ContractResolutionPolicy,
+    providers: Vec<ComponentRef>,
+}
+
 #[derive(Default)]
 struct ServiceRuntimeState {
     instances: HashMap<ExtensionInstanceId, ServiceExtensionInstance>,
@@ -73,12 +94,45 @@ struct ServiceRuntimeState {
     preferred_providers: HashMap<RuntimeScopeId, HashMap<ContractKey, ComponentRef>>,
     topology_revision: u64,
     route_cache: HashMap<RouteKey, CachedRoute>,
+    next_provider_handle: u64,
+    provider_handle_policy_revision: u64,
+    provider_handles: HashMap<ServiceProviderHandle, ProviderHandleBinding>,
+    provider_handle_cache: HashMap<ProviderHandleKey, ServiceProviderHandle>,
 }
 
 impl ServiceRuntimeState {
     fn topology_changed(&mut self) {
         self.topology_revision = self.topology_revision.wrapping_add(1);
         self.route_cache.clear();
+        self.provider_handles.clear();
+        self.provider_handle_cache.clear();
+    }
+
+    fn sync_provider_handle_policy(&mut self, policy_revision: u64) {
+        if self.provider_handle_policy_revision != policy_revision {
+            self.provider_handle_policy_revision = policy_revision;
+            self.provider_handles.clear();
+            self.provider_handle_cache.clear();
+        }
+    }
+
+    fn issue_provider_handle(
+        &mut self,
+        key: ProviderHandleKey,
+    ) -> ServiceCallResult<ServiceProviderHandle> {
+        if let Some(handle) = self.provider_handle_cache.get(&key) {
+            return Ok(*handle);
+        }
+        let raw = self
+            .next_provider_handle
+            .checked_add(1)
+            .ok_or(ServiceCallError::Unavailable)?;
+        self.next_provider_handle = raw;
+        let handle = ServiceProviderHandle::from_raw(raw);
+        self.provider_handles
+            .insert(handle, ProviderHandleBinding { key: key.clone() });
+        self.provider_handle_cache.insert(key, handle);
+        Ok(handle)
     }
 
     fn component(&self, owner: &ComponentRef) -> Option<ComponentHandle> {
@@ -104,7 +158,7 @@ impl ServiceRuntimeState {
     }
 }
 
-/// Shared runtime used by native and WASM components for unary service calls.
+/// Shared runtime used by native and WASM components for routed service calls.
 ///
 /// Providers are currently visible only inside the caller's exact runtime scope.
 /// A future scope-import policy can widen visibility without changing component
@@ -143,6 +197,24 @@ impl BoundServiceCaller {
     /// Calls one versioned unary service as the bound component principal.
     pub fn call(&self, contract: &ContractKey, request: &[u8]) -> ServiceCallResult<Vec<u8>> {
         self.services.call(&self.consumer, contract, request)
+    }
+
+    /// Lists eligible providers for one bound `Multiple` service contract.
+    pub fn list_providers(
+        &self,
+        contract: &ContractKey,
+    ) -> ServiceCallResult<Vec<ServiceProviderHandle>> {
+        self.services.list_providers(&self.consumer, contract)
+    }
+
+    /// Calls one provider previously returned by [`Self::list_providers`].
+    pub fn call_provider(
+        &self,
+        provider: ServiceProviderHandle,
+        request: &[u8],
+    ) -> ServiceCallResult<Vec<u8>> {
+        self.services
+            .call_provider(&self.consumer, provider, request)
     }
 
     /// Returns the immutable component principal represented by this handle.
@@ -349,6 +421,40 @@ impl ServiceRuntime {
         self.call_with_stack(caller, contract, request, true, &[])
     }
 
+    pub(crate) fn list_providers(
+        &self,
+        caller: &ComponentRef,
+        contract: &ContractKey,
+    ) -> ServiceCallResult<Vec<ServiceProviderHandle>> {
+        self.list_providers_with_mode(caller, contract, false)
+    }
+
+    pub(crate) fn list_providers_from_execution(
+        &self,
+        caller: &ComponentRef,
+        contract: &ContractKey,
+    ) -> ServiceCallResult<Vec<ServiceProviderHandle>> {
+        self.list_providers_with_mode(caller, contract, true)
+    }
+
+    pub(crate) fn call_provider(
+        &self,
+        caller: &ComponentRef,
+        provider: ServiceProviderHandle,
+        request: &[u8],
+    ) -> ServiceCallResult<Vec<u8>> {
+        self.call_provider_with_stack(caller, provider, request, false, &[])
+    }
+
+    pub(crate) fn call_provider_from_execution(
+        &self,
+        caller: &ComponentRef,
+        provider: ServiceProviderHandle,
+        request: &[u8],
+    ) -> ServiceCallResult<Vec<u8>> {
+        self.call_provider_with_stack(caller, provider, request, true, &[])
+    }
+
     pub(crate) fn call_platform(
         &self,
         scope_id: &RuntimeScopeId,
@@ -369,6 +475,106 @@ impl ServiceRuntime {
             request,
             &[],
         )
+    }
+
+    fn list_providers_with_mode(
+        &self,
+        caller: &ComponentRef,
+        contract: &ContractKey,
+        allow_inactive_caller: bool,
+    ) -> ServiceCallResult<Vec<ServiceProviderHandle>> {
+        loop {
+            let policy_revision = self.secrets.policy_revision();
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| ServiceCallError::Unavailable)?;
+            state.sync_provider_handle_policy(policy_revision);
+            let binding =
+                self.resolve_binding_uncached(&state, caller, contract, allow_inactive_caller)?;
+            if binding.resolution != ContractResolutionPolicy::Multiple {
+                return Err(ServiceCallError::UnsupportedResolution);
+            }
+            if binding.providers.len() > DEFAULT_MAX_SERVICE_PROVIDERS_PER_CONTRACT {
+                return Err(ServiceCallError::ResponseTooLarge);
+            }
+            if self.secrets.policy_revision() != policy_revision {
+                drop(state);
+                continue;
+            }
+
+            let mut handles = Vec::with_capacity(binding.providers.len());
+            for provider in binding.providers {
+                handles.push(state.issue_provider_handle(ProviderHandleKey {
+                    caller: caller.clone(),
+                    contract: contract.clone(),
+                    provider,
+                    allow_inactive_caller,
+                })?);
+            }
+            return Ok(handles);
+        }
+    }
+
+    fn call_provider_with_stack(
+        &self,
+        caller: &ComponentRef,
+        provider_handle: ServiceProviderHandle,
+        request: &[u8],
+        allow_inactive_caller: bool,
+        call_stack: &[ComponentRef],
+    ) -> ServiceCallResult<Vec<u8>> {
+        if request.len() > self.max_message_bytes {
+            return Err(ServiceCallError::RequestTooLarge);
+        }
+        let (contract, provider, component, provider_identity) =
+            self.resolve_provider_handle(caller, provider_handle, allow_inactive_caller)?;
+        self.invoke_provider(
+            provider,
+            component,
+            provider_identity,
+            &contract,
+            request,
+            call_stack,
+        )
+    }
+
+    fn resolve_provider_handle(
+        &self,
+        caller: &ComponentRef,
+        provider_handle: ServiceProviderHandle,
+        allow_inactive_caller: bool,
+    ) -> ServiceCallResult<(
+        ContractKey,
+        ComponentRef,
+        ComponentHandle,
+        ComponentIdentity,
+    )> {
+        let policy_revision = self.secrets.policy_revision();
+        let state = self
+            .state
+            .read()
+            .map_err(|_| ServiceCallError::Unavailable)?;
+        if state.provider_handle_policy_revision != policy_revision {
+            return Err(ServiceCallError::Unavailable);
+        }
+        let binding = state
+            .provider_handles
+            .get(&provider_handle)
+            .ok_or(ServiceCallError::Unavailable)?;
+        if binding.key.caller != *caller
+            || binding.key.allow_inactive_caller != allow_inactive_caller
+        {
+            return Err(ServiceCallError::Unavailable);
+        }
+        let provider = binding.key.provider.clone();
+        let component = state
+            .component(&provider)
+            .ok_or(ServiceCallError::Unavailable)?;
+        let identity = state
+            .component_identity(&provider)
+            .ok_or(ServiceCallError::Unavailable)?;
+        Ok((binding.key.contract.clone(), provider, component, identity))
     }
 
     fn call_with_stack(
@@ -606,6 +812,21 @@ impl ServiceRuntime {
         contract: &ContractKey,
         allow_inactive_caller: bool,
     ) -> ServiceCallResult<ComponentRef> {
+        let binding =
+            self.resolve_binding_uncached(state, caller, contract, allow_inactive_caller)?;
+        if binding.providers.len() != 1 {
+            return Err(ServiceCallError::UnsupportedResolution);
+        }
+        Ok(binding.providers[0].clone())
+    }
+
+    fn resolve_binding_uncached(
+        &self,
+        state: &ServiceRuntimeState,
+        caller: &ComponentRef,
+        contract: &ContractKey,
+        allow_inactive_caller: bool,
+    ) -> ServiceCallResult<ResolvedServiceBinding> {
         let caller_instance = state
             .instances
             .get(&caller.instance_id)
@@ -658,11 +879,11 @@ impl ServiceRuntime {
             return Err(ServiceCallError::NotConsumer);
         }
 
-        if definitions
+        let definition = definitions
             .iter()
             .find(|entry| entry.contract == *contract)
-            .is_some_and(|entry| entry.protocol != ContractProtocol::Service)
-        {
+            .ok_or(ServiceCallError::Unavailable)?;
+        if definition.protocol != ContractProtocol::Service {
             return Err(ServiceCallError::NotServiceContract);
         }
 
@@ -683,10 +904,10 @@ impl ServiceRuntime {
             .iter()
             .find(|entry| entry.consumer == *caller && entry.contract == *contract)
             .ok_or(ServiceCallError::Unavailable)?;
-        if binding.providers.len() != 1 {
-            return Err(ServiceCallError::UnsupportedResolution);
-        }
-        Ok(binding.providers[0].clone())
+        Ok(ResolvedServiceBinding {
+            resolution: definition.resolution,
+            providers: binding.providers.clone(),
+        })
     }
 }
 
@@ -752,6 +973,28 @@ impl ComponentContext for ServiceComponentContext {
     ) -> ServiceCallResult<Vec<u8>> {
         self.services
             .call_with_stack(&self.owner, contract, request, true, &self.call_stack)
+    }
+
+    fn list_service_providers(
+        &mut self,
+        contract: &ContractKey,
+    ) -> ServiceCallResult<Vec<ServiceProviderHandle>> {
+        self.services
+            .list_providers_from_execution(&self.owner, contract)
+    }
+
+    fn call_service_provider(
+        &mut self,
+        provider: ServiceProviderHandle,
+        request: &[u8],
+    ) -> ServiceCallResult<Vec<u8>> {
+        self.services.call_provider_with_stack(
+            &self.owner,
+            provider,
+            request,
+            true,
+            &self.call_stack,
+        )
     }
 }
 

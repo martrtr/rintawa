@@ -22,7 +22,7 @@ use rintawa_sdk::{
     runtime_effects::RuntimeEffect,
     runtime_permissions::RuntimePermission,
     secrets::{SecretAccessError, SecretPath, SecretPathPattern},
-    services::ServiceCallError,
+    services::{ServiceCallError, ServiceProviderHandle},
     traits::Component,
     types::{ComponentId, ExtensionId, ExtensionInstanceId, RuntimeEffectId, RuntimeScopeId},
     ui::{UiActionEvent, UiLayerDescriptor, UiSurfaceContribution, UiSurfaceId},
@@ -1400,19 +1400,66 @@ impl ServicesHost for WasmHostState {
         let contract = ContractKey::new(contract, ContractVersion::new(version));
         self.services
             .call_from_execution(&caller, &contract, &payload)
-            .map_err(|error| match error {
-                ServiceCallError::Unavailable => ServiceTransportError::Unavailable,
-                ServiceCallError::NotConsumer => ServiceTransportError::NotConsumer,
-                ServiceCallError::NotServiceContract => ServiceTransportError::NotServiceContract,
-                ServiceCallError::UnsupportedResolution => {
-                    ServiceTransportError::UnsupportedResolution
-                }
-                ServiceCallError::CyclicCall => ServiceTransportError::CyclicCall,
-                ServiceCallError::ProviderBusy => ServiceTransportError::ProviderBusy,
-                ServiceCallError::ProviderFailed => ServiceTransportError::ProviderFailed,
-                ServiceCallError::RequestTooLarge => ServiceTransportError::RequestTooLarge,
-                ServiceCallError::ResponseTooLarge => ServiceTransportError::ResponseTooLarge,
+            .map_err(map_service_transport_error)
+    }
+
+    fn list_providers(
+        &mut self,
+        contract: String,
+        version: u32,
+    ) -> Result<Vec<u64>, ServiceTransportError> {
+        if !self.service_access_active {
+            return Err(ServiceTransportError::Unavailable);
+        }
+        let caller = self
+            .current_execution_owner()
+            .cloned()
+            .ok_or(ServiceTransportError::Unavailable)?;
+        let contract = ContractKey::new(contract, ContractVersion::new(version));
+        self.services
+            .list_providers_from_execution(&caller, &contract)
+            .map(|providers| {
+                providers
+                    .into_iter()
+                    .map(ServiceProviderHandle::raw)
+                    .collect()
             })
+            .map_err(map_service_transport_error)
+    }
+
+    fn call_provider(
+        &mut self,
+        provider: u64,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, ServiceTransportError> {
+        if !self.service_access_active {
+            return Err(ServiceTransportError::Unavailable);
+        }
+        let caller = self
+            .current_execution_owner()
+            .cloned()
+            .ok_or(ServiceTransportError::Unavailable)?;
+        self.services
+            .call_provider_from_execution(
+                &caller,
+                ServiceProviderHandle::from_raw(provider),
+                &payload,
+            )
+            .map_err(map_service_transport_error)
+    }
+}
+
+fn map_service_transport_error(error: ServiceCallError) -> ServiceTransportError {
+    match error {
+        ServiceCallError::Unavailable => ServiceTransportError::Unavailable,
+        ServiceCallError::NotConsumer => ServiceTransportError::NotConsumer,
+        ServiceCallError::NotServiceContract => ServiceTransportError::NotServiceContract,
+        ServiceCallError::UnsupportedResolution => ServiceTransportError::UnsupportedResolution,
+        ServiceCallError::CyclicCall => ServiceTransportError::CyclicCall,
+        ServiceCallError::ProviderBusy => ServiceTransportError::ProviderBusy,
+        ServiceCallError::ProviderFailed => ServiceTransportError::ProviderFailed,
+        ServiceCallError::RequestTooLarge => ServiceTransportError::RequestTooLarge,
+        ServiceCallError::ResponseTooLarge => ServiceTransportError::ResponseTooLarge,
     }
 }
 
