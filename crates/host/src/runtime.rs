@@ -28,7 +28,7 @@ use rintawa_sdk::{
     },
     contracts::{
         ComponentRef, ContractKey, ContractResolutionPolicy, ContractVersion,
-        host_shell_contract_key, ui_layer_contract_key,
+        host_shell_contract_key, ui_layer_contract_key, world_presentation_contract_key,
     },
     runtime_permissions::RuntimePermission,
     runtime_signals::RuntimeSignal,
@@ -54,8 +54,9 @@ use uuid::Uuid;
 use crate::{
     BootstrapBlockedActivation, BootstrapDeferredActivation, BootstrapRollback, BootstrapStall,
     CompositionProfile, HOST_SCOPE, HostCleanupFailure, HostCleanupOperation, HostError, HostHome,
-    HostResult, HostShutdownFailures, UserContentEntry, UserContentId, WorldRuntimeCleanupFailure,
-    WorldSummary, runtime_signal::RuntimeSignalQueue, world_runtime_scope_id,
+    HostResult, HostShutdownFailures, UserContentEntry, UserContentId, WorldPresentationTarget,
+    WorldRuntimeCleanupFailure, WorldSummary, runtime_signal::RuntimeSignalQueue,
+    world_runtime_scope_id,
 };
 
 /// Maximum durable effect jobs processed for one world in one cooperative pump.
@@ -1316,6 +1317,92 @@ impl HostRuntime {
         self.ui_layer_provider.as_ref()
     }
 
+    /// Resolves and focuses one active World's composition-defined presentation entry point.
+    ///
+    /// Focus is presentation-session state owned by `layer_owner`; it never changes
+    /// authoritative World lifecycle. The selected provider is resolved only inside the
+    /// exact `world:<WorldId>` scope using ordinary Single-provider composition policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::WorldNotActive`] when the World is not running,
+    /// [`HostError::ContractRoleUnavailable`] when its presentation Binding cannot resolve,
+    /// [`HostError::WorldPresentationEntryUnavailable`] when the selected owner has no
+    /// currently mounted entry surface, or an Engine/UI error when the layer cannot present
+    /// the focused World scope.
+    pub fn focus_world_for_ui_layer(
+        &self,
+        layer_owner: &ComponentRef,
+        world_id: WorldId,
+    ) -> HostResult<WorldPresentationTarget> {
+        if !self.active_worlds.contains_key(&world_id) {
+            return Err(HostError::WorldNotActive(world_id));
+        }
+
+        let scope_id = world_runtime_scope_id(world_id);
+        let contract = world_presentation_contract_key();
+        let provider = self
+            .engine
+            .resolve_active_contract_providers_in_scope(&scope_id, &contract)
+            .map_err(|reason| HostError::ContractRoleUnavailable {
+                scope_id: scope_id.to_string(),
+                contract: contract.to_string(),
+                reason,
+            })?
+            .into_iter()
+            .next()
+            .ok_or_else(|| HostError::ContractRoleUnavailable {
+                scope_id: scope_id.to_string(),
+                contract: contract.to_string(),
+                reason: UnresolvedContractReason::NoProvider,
+            })?;
+        let descriptor = self
+            .engine
+            .registered_world_presentation_descriptor(&provider)?;
+        let is_entry_mounted = self.engine.portable_ui_surfaces().iter().any(|surface| {
+            surface.owner == provider && surface.contribution.id == descriptor.entry_surface_id
+        });
+        if !is_entry_mounted {
+            return Err(HostError::WorldPresentationEntryUnavailable {
+                world_id,
+                surface_id: descriptor.entry_surface_id.to_string(),
+            });
+        }
+
+        self.engine
+            .set_focused_world_for_ui_layer(layer_owner, world_id, scope_id)?;
+        Ok(WorldPresentationTarget {
+            world_id,
+            provider,
+            descriptor,
+        })
+    }
+
+    /// Clears the focused World from one UI Layer presentation session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an Engine/UI error when `layer_owner` is not the active UI Layer.
+    pub fn clear_world_focus_for_ui_layer(&self, layer_owner: &ComponentRef) -> HostResult<()> {
+        self.engine
+            .clear_focused_world_for_ui_layer(layer_owner)
+            .map_err(HostError::from)
+    }
+
+    /// Returns the World currently focused by one UI Layer presentation session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an Engine/UI error when `layer_owner` is not the active UI Layer.
+    pub fn focused_world_for_ui_layer(
+        &self,
+        layer_owner: &ComponentRef,
+    ) -> HostResult<Option<WorldId>> {
+        self.engine
+            .focused_world_for_ui_layer(layer_owner)
+            .map_err(HostError::from)
+    }
+
     /// Imports one extension-validated RTW artifact into the generic user-content library.
     ///
     /// The root container and bounded descriptor are validated before CAS publication.
@@ -1451,7 +1538,18 @@ impl HostRuntime {
 
         let profile = home.load_world_composition(world_id)?;
         let scope_id = world_runtime_scope_id(world_id);
-        let overlay = activate_composition(&mut self.engine, home, &profile, &scope_id)?;
+        self.engine.define_platform_binding_contract_in_scope(
+            scope_id.clone(),
+            world_presentation_contract_key(),
+            ContractResolutionPolicy::Single,
+        )?;
+        let overlay = match activate_composition(&mut self.engine, home, &profile, &scope_id) {
+            Ok(overlay) => overlay,
+            Err(error) => {
+                clear_world_scope_topology(&mut self.engine, &scope_id);
+                return Err(error);
+            }
+        };
         let runtime_result: HostResult<ActiveWorldRuntimeParts> = (|| {
             let storage = home.open_world_storage(world_id)?;
             register_world_schema_contributions(
@@ -2504,6 +2602,7 @@ fn cleanup_active_world(
 }
 
 fn clear_world_scope_topology(engine: &mut ExtensionEngine, scope_id: &RuntimeScopeId) {
+    engine.clear_focused_world_scope_for_all_ui_layers(scope_id);
     engine.clear_preferred_contract_provider_policies_in_scope(scope_id);
     engine.clear_platform_contract_definitions_in_scope(scope_id);
 }
@@ -2635,6 +2734,11 @@ fn bootstrap_batch_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rintawa_sdk::ui::{
+        UI_CAPABILITY_TEXT, UiCapabilityId, UiLayerDescriptor, UiNode, UiNodeId, UiNodeKind,
+        UiPlacementHint, UiSurfaceContribution, UiSurfaceId, UiSurfaceSnapshot, UiTextNode,
+        WorldPresentationDescriptor,
+    };
     use rintawa_sdk::{
         context::{ComponentContext, RegistrationContext},
         contracts::{
@@ -4374,6 +4478,95 @@ mod tests {
         Ok(())
     }
 
+    struct TestWorldPresentationComponent {
+        id: ComponentId,
+        surface_id: UiSurfaceId,
+        should_mount_entry: bool,
+    }
+
+    impl Component for TestWorldPresentationComponent {
+        fn id(&self) -> &ComponentId {
+            &self.id
+        }
+
+        fn register(&mut self, ctx: &mut dyn RegistrationContext) -> ExtensionResult<()> {
+            ctx.provide_contract(ContractProvider::new(world_presentation_contract_key()))?;
+            ctx.register_ui_surface(UiSurfaceContribution::new(
+                self.surface_id.clone(),
+                UiPlacementHint::Primary,
+            ))?;
+            ctx.register_world_presentation(WorldPresentationDescriptor::new(
+                self.surface_id.clone(),
+            ))
+        }
+
+        fn start(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
+            if !self.should_mount_entry {
+                return Ok(());
+            }
+            ctx.mount_ui_surface(UiSurfaceSnapshot {
+                surface_id: self.surface_id.clone(),
+                revision: 1,
+                root: UiNodeId::new("root"),
+                nodes: vec![UiNode::new(
+                    "root",
+                    UiNodeKind::Text(UiTextNode {
+                        text: String::from("World presentation entry"),
+                    }),
+                )],
+            })
+            .map_err(|error| ExtensionError::Message(error.to_string()))
+        }
+    }
+
+    fn register_test_host_ui_layer(host: &mut HostRuntime) -> anyhow::Result<ComponentRef> {
+        let instance_id = ExtensionInstanceId::new("test-host-ui-layer");
+        host.engine.register_extension_instance(
+            instance_id.clone(),
+            RuntimeScopeId::new(HOST_SCOPE),
+            test_manifest("rintawa.test-host-ui-layer"),
+            vec![Box::new(ContractComponent::new("runtime"))],
+        )?;
+        host.engine.start_extension_instance(&instance_id)?;
+        let owner = ComponentRef::new(instance_id.clone(), ComponentId::new("runtime"));
+        host.engine.attach_ui_layer(
+            owner.clone(),
+            UiLayerDescriptor::new(vec![UiCapabilityId::new(UI_CAPABILITY_TEXT)]),
+        )?;
+        host.started_instances.push(instance_id);
+        Ok(owner)
+    }
+
+    fn register_test_world_presentation(
+        host: &mut HostRuntime,
+        world_id: WorldId,
+        instance_id: &str,
+        surface_id: &str,
+        should_mount_entry: bool,
+    ) -> anyhow::Result<ComponentRef> {
+        let instance_id = ExtensionInstanceId::new(instance_id);
+        let scope_id = world_runtime_scope_id(world_id);
+        host.engine.register_extension_instance(
+            instance_id.clone(),
+            scope_id,
+            test_manifest(instance_id.as_str()),
+            vec![Box::new(TestWorldPresentationComponent {
+                id: ComponentId::new("runtime"),
+                surface_id: UiSurfaceId::new(surface_id),
+                should_mount_entry,
+            })],
+        )?;
+        host.engine.start_extension_instance(&instance_id)?;
+        let owner = ComponentRef::new(instance_id.clone(), ComponentId::new("runtime"));
+        let active = host
+            .active_worlds
+            .get_mut(&world_id)
+            .ok_or(HostError::WorldNotActive(world_id))?;
+        active.registered_instances.push(instance_id.clone());
+        active.started_instances.push(instance_id);
+        Ok(owner)
+    }
+
     #[test]
     fn test_should_keep_multiple_worlds_active_independently() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
@@ -4397,6 +4590,139 @@ mod tests {
         assert!(!host.is_world_active(world_a));
         assert!(host.is_world_active(world_b));
         assert_eq!(host.active_worlds.len(), 1);
+
+        host.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_focus_composition_selected_world_presentation_without_changing_lifecycle()
+    -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let world_a = home.create_world()?.id;
+        let world_b = home.create_world()?.id;
+        let mut host = HostRuntime::start(&home)?;
+        host.activate_world(&home, world_a)?;
+        host.activate_world(&home, world_b)?;
+        let layer_owner = register_test_host_ui_layer(&mut host)?;
+
+        let _default_a = register_test_world_presentation(
+            &mut host,
+            world_a,
+            "world-a-default-presentation",
+            "world-a.default",
+            true,
+        )?;
+        let preferred_a = register_test_world_presentation(
+            &mut host,
+            world_a,
+            "world-a-preferred-presentation",
+            "world-a.preferred",
+            true,
+        )?;
+        host.engine.set_preferred_contract_provider_in_scope(
+            &world_runtime_scope_id(world_a),
+            world_presentation_contract_key(),
+            preferred_a.clone(),
+        )?;
+        let provider_b = register_test_world_presentation(
+            &mut host,
+            world_b,
+            "world-b-presentation",
+            "world-b.main",
+            true,
+        )?;
+
+        let target_a = host.focus_world_for_ui_layer(&layer_owner, world_a)?;
+        assert_eq!(target_a.world_id, world_a);
+        assert_eq!(target_a.provider, preferred_a);
+        assert_eq!(
+            target_a.descriptor.entry_surface_id.as_str(),
+            "world-a.preferred"
+        );
+        assert_eq!(
+            host.focused_world_for_ui_layer(&layer_owner)?,
+            Some(world_a)
+        );
+        assert!(host.is_world_active(world_a));
+        assert!(host.is_world_active(world_b));
+        let visible_a = host.engine.portable_ui_surfaces_for_layer(&layer_owner)?;
+        assert!(
+            visible_a
+                .iter()
+                .any(|surface| surface.contribution.id.as_str() == "world-a.preferred")
+        );
+        assert!(
+            visible_a
+                .iter()
+                .all(|surface| surface.contribution.id.as_str() != "world-b.main")
+        );
+
+        let target_b = host.focus_world_for_ui_layer(&layer_owner, world_b)?;
+        assert_eq!(target_b.provider, provider_b);
+        assert_eq!(
+            host.focused_world_for_ui_layer(&layer_owner)?,
+            Some(world_b)
+        );
+        assert!(host.is_world_active(world_a));
+        assert!(host.is_world_active(world_b));
+        let visible_b = host.engine.portable_ui_surfaces_for_layer(&layer_owner)?;
+        assert!(
+            visible_b
+                .iter()
+                .any(|surface| surface.contribution.id.as_str() == "world-b.main")
+        );
+        assert!(
+            visible_b
+                .iter()
+                .all(|surface| { !surface.contribution.id.as_str().starts_with("world-a.") })
+        );
+
+        host.deactivate_world(world_b)?;
+        assert_eq!(host.focused_world_for_ui_layer(&layer_owner)?, None);
+        assert!(host.is_world_active(world_a));
+        assert!(!host.is_world_active(world_b));
+
+        host.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_fail_closed_for_missing_or_unmounted_world_presentation() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let headless_world = home.create_world()?.id;
+        let unmounted_world = home.create_world()?.id;
+        let mut host = HostRuntime::start(&home)?;
+        host.activate_world(&home, headless_world)?;
+        host.activate_world(&home, unmounted_world)?;
+        let layer_owner = register_test_host_ui_layer(&mut host)?;
+
+        assert!(matches!(
+            host.focus_world_for_ui_layer(&layer_owner, headless_world),
+            Err(HostError::ContractRoleUnavailable {
+                reason: UnresolvedContractReason::NoProvider,
+                ..
+            })
+        ));
+        assert!(host.is_world_active(headless_world));
+        assert_eq!(host.focused_world_for_ui_layer(&layer_owner)?, None);
+
+        register_test_world_presentation(
+            &mut host,
+            unmounted_world,
+            "world-unmounted-presentation",
+            "world-unmounted.main",
+            false,
+        )?;
+        assert!(matches!(
+            host.focus_world_for_ui_layer(&layer_owner, unmounted_world),
+            Err(HostError::WorldPresentationEntryUnavailable { world_id, .. })
+                if world_id == unmounted_world
+        ));
+        assert!(host.is_world_active(unmounted_world));
+        assert_eq!(host.focused_world_for_ui_layer(&layer_owner)?, None);
 
         host.shutdown()?;
         Ok(())

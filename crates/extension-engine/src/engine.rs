@@ -22,6 +22,7 @@ use rintawa_sdk::{
         RuntimeScopeId,
     },
     ui::{UiActionEvent, UiError, UiLayerDescriptor, WorldPresentationDescriptor},
+    world::WorldId,
 };
 use rintawa_ui_runtime::{UiPresentationSurface, UiRuntime};
 use tracing::warn;
@@ -1755,6 +1756,56 @@ impl ExtensionEngine {
         owner: &ComponentRef,
     ) -> EngineResult<WorldPresentationDescriptor> {
         Ok(self.ui.registered_world_presentation_descriptor(owner)?)
+    }
+
+    /// Imports one active World scope into an exact UI Layer presentation session.
+    ///
+    /// This changes presentation visibility only. It never starts or stops the World
+    /// runtime or mutates authoritative World state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Ui`] when `layer_owner` is not an active UI Layer or
+    /// the focused World contains a mounted surface unsupported by that layer.
+    pub fn set_focused_world_for_ui_layer(
+        &self,
+        layer_owner: &ComponentRef,
+        world_id: WorldId,
+        scope_id: RuntimeScopeId,
+    ) -> EngineResult<()> {
+        self.ui
+            .set_focused_world_scope(layer_owner, world_id, scope_id)?;
+        Ok(())
+    }
+
+    /// Clears the focused World imported into one UI Layer presentation session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Ui`] when `layer_owner` is not the active UI Layer.
+    pub fn clear_focused_world_for_ui_layer(&self, layer_owner: &ComponentRef) -> EngineResult<()> {
+        self.ui.clear_focused_world_scope(layer_owner)?;
+        Ok(())
+    }
+
+    /// Returns the World currently focused by one UI Layer presentation session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Ui`] when `layer_owner` is not the active UI Layer.
+    pub fn focused_world_for_ui_layer(
+        &self,
+        layer_owner: &ComponentRef,
+    ) -> EngineResult<Option<WorldId>> {
+        Ok(self.ui.focused_world_for_layer(layer_owner)?)
+    }
+
+    /// Clears one deactivated World scope from every UI Layer presentation session.
+    ///
+    /// Cleanup is fail-safe and recovers poisoned UI state so a stopped World cannot
+    /// remain referenced as the foreground presentation context.
+    pub fn clear_focused_world_scope_for_all_ui_layers(&self, scope_id: &RuntimeScopeId) {
+        self.ui.clear_focused_world_scope_for_all_layers(scope_id);
     }
 
     /// Attaches the statically registered descriptor for the selected UI Layer provider.

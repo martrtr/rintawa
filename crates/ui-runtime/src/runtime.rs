@@ -571,6 +571,27 @@ impl UiRuntime {
         Ok(())
     }
 
+    /// Clears references to one focused World scope from every active UI Layer session.
+    ///
+    /// World lifecycle supervisors use this after deactivating a World so no renderer
+    /// session retains a stale presentation focus. Other focused World scopes are unchanged.
+    /// Cleanup recovers poisoned shared state just like instance unregistration.
+    pub fn clear_focused_world_scope_for_all_layers(&self, scope_id: &RuntimeScopeId) {
+        let mut state = match self.state.write() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for layer in state.layers.values_mut() {
+            if layer
+                .focused_scope
+                .as_ref()
+                .is_some_and(|focused| &focused.scope_id == scope_id)
+            {
+                layer.focused_scope = None;
+            }
+        }
+    }
+
     /// Returns the World focused by one active UI Layer presentation session.
     ///
     /// # Errors

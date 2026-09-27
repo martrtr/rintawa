@@ -30,6 +30,7 @@ use rintawa_sdk::{
     contracts::{ComponentRef, ContractKey},
     runtime_permissions::RuntimePermission,
     types::{ComponentId, ExtensionInstanceId, RuntimeScopeId},
+    ui::WorldPresentationDescriptor,
     world::{PrincipalId, SchemaKey, WorldId},
 };
 use rintawa_storage::SqliteWorldStorage;
@@ -304,6 +305,14 @@ pub enum HostError {
     /// A world runtime is not active in this host process.
     #[error("world `{0}` is not active")]
     WorldNotActive(WorldId),
+    /// The selected World presentation entry surface is not currently mounted.
+    #[error("world `{world_id}` presentation entry surface `{surface_id}` is not mounted")]
+    WorldPresentationEntryUnavailable {
+        /// Active World whose presentation could not be focused.
+        world_id: WorldId,
+        /// Exact owner-scoped entry surface declared by the selected provider.
+        surface_id: String,
+    },
     /// Persisted composition policy contains a record for another runtime scope.
     #[error("composition scope mismatch: expected `{expected_scope}`, found `{actual_scope}`")]
     CompositionScopeMismatch {
@@ -668,6 +677,17 @@ pub struct WorldSummary {
     pub id: WorldId,
     /// Last committed local world position.
     pub commit_position: u64,
+}
+
+/// One resolved entry point for an active World's presentation in a concrete UI session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorldPresentationTarget {
+    /// Active authoritative World being presented.
+    pub world_id: WorldId,
+    /// Exact active component selected by the World's composition policy.
+    pub provider: ComponentRef,
+    /// Owner-scoped entry surface and optional semantic intent registered by the provider.
+    pub descriptor: WorldPresentationDescriptor,
 }
 
 /// Persistent local Rintawa home containing CAS bytes, worlds, and baseline composition.
