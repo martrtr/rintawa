@@ -21,6 +21,7 @@ mod host_access;
 mod loader;
 mod runtime;
 mod secrets;
+mod shell_composition;
 mod state;
 
 mod services;
@@ -56,6 +57,7 @@ pub use loader::ExtensionLoader;
 pub use runtime::{WasmComponent, WasmExecutionBudget, WasmRuntimeEngine};
 pub use secrets::SecretManager;
 pub use services::{BoundServiceCaller, PlatformServiceCaller};
+pub use shell_composition::{ShellComposer, ShellWorldEntryRequest};
 pub use state::{ExtensionStateRecord, ExtensionsStateConfig, STATE_FILE_NAME};
 
 #[cfg(test)]
