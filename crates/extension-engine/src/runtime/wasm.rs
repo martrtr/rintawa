@@ -133,6 +133,9 @@ use bindings::rintawa::engine::{
         ContractProtocol as WitContractProtocol, Error as RegistrationError,
         Host as RegistrationHost, ResolutionPolicy as WitResolutionPolicy,
     },
+    runtime_context::{
+        Context as WitRuntimeContext, Error as RuntimeContextError, Host as RuntimeContextHost,
+    },
     runtime_effects::{Error as RuntimeEffectError, Host as RuntimeEffectsHost},
     runtime_policy::{
         ArtifactPolicy as WitRuntimeArtifactPolicy, ComponentPolicy as WitRuntimePolicyComponent,
@@ -1192,6 +1195,32 @@ impl HostOperations for WasmHostState {
 
     fn publish_event(&mut self, _topic: String, _payload: Vec<u8>) -> Result<(), PublishError> {
         Err(PublishError::Unavailable)
+    }
+}
+
+impl RuntimeContextHost for WasmHostState {
+    fn current(&mut self) -> Result<WitRuntimeContext, RuntimeContextError> {
+        let owner = self
+            .current_execution_owner()
+            .ok_or(RuntimeContextError::AccessNotActive)?;
+        let scope_id = self
+            .services
+            .component_scope_id(owner)
+            .ok_or(RuntimeContextError::Rejected)?;
+        let world_id = self
+            .host_access
+            .runtime_context
+            .world_id_for_scope(&scope_id)
+            .map_err(|error| match error {
+                crate::host_access::HostAccessError::Unavailable => {
+                    RuntimeContextError::Unavailable
+                }
+                _ => RuntimeContextError::Rejected,
+            })?;
+        Ok(WitRuntimeContext {
+            scope_id: scope_id.to_string(),
+            world_id: world_id.map(|world_id| world_id.to_string()),
+        })
     }
 }
 

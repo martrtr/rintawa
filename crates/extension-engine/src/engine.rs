@@ -44,8 +44,8 @@ use crate::{
     execution_targets::{ExecutionTargetDependency, ExecutionTargetRegistry},
     host_access::{
         ArtifactStoreAccess, AssetStoreAccess, CompositionAccess, HostAccessServices,
-        PreferenceAccess, RuntimePolicyAccess, UserContentAccess, UserContentWriteAccess,
-        WorldCommandAccess, WorldProjectionAccess, WorldSessionAccess,
+        PreferenceAccess, RuntimeContextAccess, RuntimePolicyAccess, UserContentAccess,
+        UserContentWriteAccess, WorldCommandAccess, WorldProjectionAccess, WorldSessionAccess,
     },
     runtime::WasmRuntimeEngine,
     runtime_effects::RuntimeEffectRegistry,
@@ -310,6 +310,13 @@ impl ExtensionEngine {
             ),
             ..Self::default()
         }
+    }
+
+    /// Attaches Host-owned resolution of opaque runtime scopes to World identity.
+    ///
+    /// Embedded hosts that do not call this method remain fail-closed.
+    pub fn attach_runtime_context_access(&mut self, access: Arc<dyn RuntimeContextAccess>) {
+        self.host_access = self.host_access.clone().with_runtime_context_access(access);
     }
 
     /// Attaches generic read-only user-content library access.

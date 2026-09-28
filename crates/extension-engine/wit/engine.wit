@@ -143,6 +143,22 @@ interface runtime-effects {
     unsubscribe-signal: func(handle: handle) -> result<_, error>;
 }
 
+/// Read-only identity of the component callback currently executing in the Host.
+interface runtime-context {
+    variant error {
+        access-not-active,
+        unavailable,
+        rejected,
+    }
+
+    record context {
+        scope-id: string,
+        world-id: option<string>,
+    }
+
+    current: func() -> result<context, error>;
+}
+
 /// Owner-scoped cooperative background tasks.
 interface runtime-tasks {
     /// Opaque host task handle.
@@ -964,6 +980,7 @@ interface guest {
 /// The plugin world contract combining host imports and guest exports.
 world plugin {
     import host;
+    import runtime-context;
     import registration;
     import world-registration;
     import runtime-effects;
@@ -1003,6 +1020,7 @@ world task-plugin {
 /// Combined authoring world for an ordinary WASM component with background tasks.
 world task-runtime-plugin {
     import host;
+    import runtime-context;
     import registration;
     import world-registration;
     import runtime-effects;
@@ -1032,6 +1050,7 @@ world task-runtime-plugin {
 /// Combined authoring world for a WASM runtime-provider component.
 world runtime-provider-plugin {
     import host;
+    import runtime-context;
     import registration;
     import world-registration;
     import runtime-effects;
@@ -1061,6 +1080,7 @@ world runtime-provider-plugin {
 /// Combined authoring world for a runtime provider that also schedules tasks.
 world runtime-provider-task-plugin {
     import host;
+    import runtime-context;
     import registration;
     import world-registration;
     import runtime-effects;

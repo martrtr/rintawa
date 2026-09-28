@@ -268,6 +268,15 @@ impl PlatformServiceCaller {
 }
 
 impl ServiceRuntime {
+    pub(crate) fn component_scope_id(&self, owner: &ComponentRef) -> Option<RuntimeScopeId> {
+        self.state
+            .read()
+            .ok()?
+            .instances
+            .get(&owner.instance_id)
+            .map(|instance| instance.scope_id.clone())
+    }
+
     pub(crate) fn new(secrets: SecretManager) -> Self {
         Self {
             state: Arc::new(RwLock::new(ServiceRuntimeState::default())),

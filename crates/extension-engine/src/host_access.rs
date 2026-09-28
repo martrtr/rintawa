@@ -122,6 +122,15 @@ pub enum HostAccessError {
 /// Result used by generic host-access capabilities.
 pub type HostAccessResult<T> = Result<T, HostAccessError>;
 
+/// Host-owned mapping from opaque runtime scopes to authoritative World identity.
+pub trait RuntimeContextAccess: Send + Sync {
+    /// Returns the World owning `scope_id`, or `None` for a non-World runtime scope.
+    fn world_id_for_scope(
+        &self,
+        scope_id: &rintawa_sdk::types::RuntimeScopeId,
+    ) -> HostAccessResult<Option<rintawa_sdk::world::WorldId>>;
+}
+
 /// Generic immutable RTW artifact-store operations.
 pub trait ArtifactStoreAccess: Send + Sync {
     /// Validates and imports exact RTW bytes without selecting them for activation.
@@ -731,6 +740,18 @@ impl RuntimePolicyAccess for UnavailableRuntimePolicyAccess {
 }
 
 #[derive(Default)]
+struct UnavailableRuntimeContextAccess;
+
+impl RuntimeContextAccess for UnavailableRuntimeContextAccess {
+    fn world_id_for_scope(
+        &self,
+        _scope_id: &rintawa_sdk::types::RuntimeScopeId,
+    ) -> HostAccessResult<Option<rintawa_sdk::world::WorldId>> {
+        Err(HostAccessError::Unavailable)
+    }
+}
+
+#[derive(Default)]
 struct UnavailableCompositionAccess;
 
 impl CompositionAccess for UnavailableCompositionAccess {
@@ -761,6 +782,7 @@ impl CompositionAccess for UnavailableCompositionAccess {
 
 #[derive(Clone)]
 pub(crate) struct HostAccessServices {
+    pub(crate) runtime_context: Arc<dyn RuntimeContextAccess>,
     pub(crate) artifact_store: Arc<dyn ArtifactStoreAccess>,
     pub(crate) asset_store: Arc<dyn AssetStoreAccess>,
     pub(crate) user_content: Arc<dyn UserContentAccess>,
@@ -783,6 +805,7 @@ impl HostAccessServices {
         runtime_policy: Arc<dyn RuntimePolicyAccess>,
     ) -> Self {
         Self {
+            runtime_context: Arc::new(UnavailableRuntimeContextAccess),
             artifact_store,
             asset_store,
             user_content: Arc::new(UnavailableUserContentAccess),
@@ -794,6 +817,14 @@ impl HostAccessServices {
             preferences,
             runtime_policy,
         }
+    }
+
+    pub(crate) fn with_runtime_context_access(
+        mut self,
+        runtime_context: Arc<dyn RuntimeContextAccess>,
+    ) -> Self {
+        self.runtime_context = runtime_context;
+        self
     }
 
     pub(crate) fn with_user_content_access(
@@ -830,6 +861,7 @@ impl HostAccessServices {
 
     pub(crate) fn unavailable() -> Self {
         Self {
+            runtime_context: Arc::new(UnavailableRuntimeContextAccess),
             artifact_store: Arc::new(UnavailableArtifactStoreAccess),
             asset_store: Arc::new(UnavailableAssetStoreAccess),
             user_content: Arc::new(UnavailableUserContentAccess),

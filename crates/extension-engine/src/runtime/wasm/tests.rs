@@ -6,13 +6,15 @@ use crate::{
         AcceptedUserContentWrite, AcceptedWorldCommand, AcceptedWorldProjectionRead,
         ArtifactStoreAccess, AssetStoreAccess, CompositionAccess, CompositionActivation,
         HostAccessError, HostAccessResult, ImportedArtifact, ImportedAsset, PreferenceAccess,
-        RuntimeArtifactPolicy, RuntimePolicyAccess, RuntimePolicyComponent, UserContentAccess,
-        UserContentDocument, UserContentSummary, UserContentWriteAccess, UserContentWriteStatus,
-        WorldCommandAccess, WorldCommandAccessResult, WorldCommandRequest, WorldProjectionAccess,
-        WorldProjectionAccessError, WorldProjectionAccessResult, WorldProjectionReadStatus,
-        WorldProjectionReadView, WorldProjectionRequest, WorldSessionAccess, WorldSessionSummary,
+        RuntimeArtifactPolicy, RuntimeContextAccess, RuntimePolicyAccess, RuntimePolicyComponent,
+        UserContentAccess, UserContentDocument, UserContentSummary, UserContentWriteAccess,
+        UserContentWriteStatus, WorldCommandAccess, WorldCommandAccessResult, WorldCommandRequest,
+        WorldProjectionAccess, WorldProjectionAccessError, WorldProjectionAccessResult,
+        WorldProjectionReadStatus, WorldProjectionReadView, WorldProjectionRequest,
+        WorldSessionAccess, WorldSessionSummary,
     },
     secrets::InMemorySecretVault,
+    services::ServiceInstanceRegistration,
 };
 use rintawa_sdk::{
     api::{LogLevel, LoggerApi},
@@ -69,6 +71,15 @@ struct RecordingScopedHostAccess {
     world_session_writes: Mutex<Vec<(String, bool)>>,
     world_command_writes: Mutex<Vec<WorldCommandRequest>>,
     world_projection_reads: Mutex<Vec<WorldProjectionRequest>>,
+}
+
+impl RuntimeContextAccess for RecordingScopedHostAccess {
+    fn world_id_for_scope(
+        &self,
+        scope_id: &RuntimeScopeId,
+    ) -> HostAccessResult<Option<rintawa_sdk::world::WorldId>> {
+        Ok((scope_id == &test_scope_id()).then(rintawa_sdk::world::WorldId::new))
+    }
 }
 
 impl ArtifactStoreAccess for RecordingScopedHostAccess {
@@ -1136,6 +1147,65 @@ fn test_should_discard_pending_execution_targets_when_start_scope_aborts() {
 
     state.discard_guest_execution();
     assert!(state.pending_execution_targets.is_empty());
+}
+
+#[test]
+fn test_should_expose_authenticated_runtime_context_only_during_execution() {
+    let access = Arc::new(RecordingScopedHostAccess::default());
+    let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
+    let mut services = WasmHostServices::standalone(secrets);
+    services.host_access = HostAccessServices::new(
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+    )
+    .with_runtime_context_access(access);
+    let mut state = WasmHostState::with_host_services_and_budget(
+        ComponentId::new("runtime"),
+        services,
+        false,
+        &WasmExecutionBudget::default(),
+    );
+    begin_test_registration(&mut state, ExtensionId::new("context.consumer"));
+    state
+        .finish_registration()
+        .expect("test registration should finish");
+    state
+        .services
+        .register_instance(ServiceInstanceRegistration {
+            instance_id: test_instance_id(),
+            extension_id: ExtensionId::new("context.consumer"),
+            scope_id: test_scope_id(),
+            definitions: Vec::new(),
+            providers: Vec::new(),
+            consumers: Vec::new(),
+            components: HashMap::new(),
+        })
+        .expect("test service instance should register");
+
+    assert!(matches!(
+        RuntimeContextHost::current(&mut state),
+        Err(RuntimeContextError::AccessNotActive)
+    ));
+    state.begin_guest_execution();
+    let context = RuntimeContextHost::current(&mut state)
+        .expect("active authenticated callback should expose runtime context");
+    assert_eq!(context.scope_id, test_scope_id().to_string());
+    assert!(context.world_id.is_some());
+    state.discard_guest_execution();
+    assert!(matches!(
+        RuntimeContextHost::current(&mut state),
+        Err(RuntimeContextError::AccessNotActive)
+    ));
+    state.begin_service_execution();
+    let service_context = RuntimeContextHost::current(&mut state)
+        .expect("service callback should retain authenticated runtime identity");
+    assert_eq!(service_context.scope_id, test_scope_id().to_string());
+    assert!(service_context.world_id.is_some());
+    state.finish_service_execution();
 }
 
 #[test]

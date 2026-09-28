@@ -14,12 +14,13 @@ use rintawa_extension_engine::{
     ActivationPlanError, ArtifactStoreAccess, AssetStoreAccess, CompositionAccess,
     CompositionActivation, EngineError, ExtensionEngine, HostAccessError, HostAccessResult,
     ImportedArtifact, ImportedAsset, PreferenceAccess, RtwExtensionLoadOutcome, RtwExtensionLoader,
-    RuntimeArtifactPolicy, RuntimePolicyAccess, RuntimePolicyComponent, RuntimePolicyRequest,
-    UnresolvedContractReason, UserContentAccess, UserContentDocument, UserContentSummary,
-    UserContentWriteAccess, UserContentWriteStatus, WorldCommandAccess, WorldCommandAccessError,
-    WorldCommandAccessResult, WorldCommandActor, WorldCommandRequest, WorldProjectionAccess,
-    WorldProjectionAccessError, WorldProjectionAccessResult, WorldProjectionReadStatus,
-    WorldProjectionReadView, WorldProjectionRequest, WorldSessionAccess, WorldSessionSummary,
+    RuntimeArtifactPolicy, RuntimeContextAccess, RuntimePolicyAccess, RuntimePolicyComponent,
+    RuntimePolicyRequest, UnresolvedContractReason, UserContentAccess, UserContentDocument,
+    UserContentSummary, UserContentWriteAccess, UserContentWriteStatus, WorldCommandAccess,
+    WorldCommandAccessError, WorldCommandAccessResult, WorldCommandActor, WorldCommandRequest,
+    WorldProjectionAccess, WorldProjectionAccessError, WorldProjectionAccessResult,
+    WorldProjectionReadStatus, WorldProjectionReadView, WorldProjectionRequest, WorldSessionAccess,
+    WorldSessionSummary,
 };
 use rintawa_sdk::{
     content::{
@@ -492,6 +493,21 @@ impl LocalHostAccess {
 
     fn home(&self) -> HostAccessResult<HostHome> {
         HostHome::open(&self.home_root).map_err(map_host_access_error)
+    }
+}
+
+impl RuntimeContextAccess for LocalHostAccess {
+    fn world_id_for_scope(&self, scope_id: &RuntimeScopeId) -> HostAccessResult<Option<WorldId>> {
+        let Some(value) = scope_id.as_str().strip_prefix(crate::WORLD_SCOPE_PREFIX) else {
+            return Ok(None);
+        };
+        let Ok(world_id) = value.parse::<WorldId>() else {
+            return Ok(None);
+        };
+        if world_runtime_scope_id(world_id) != *scope_id {
+            return Ok(None);
+        }
+        Ok(Some(world_id))
     }
 }
 
@@ -1213,6 +1229,8 @@ impl HostRuntime {
             preference_access,
             runtime_policy_access,
         );
+        let runtime_context_access: Arc<dyn RuntimeContextAccess> = access.clone();
+        engine.attach_runtime_context_access(runtime_context_access);
         engine.attach_user_content_access(user_content_access);
         engine.attach_user_content_write_access(user_content_write_access);
         engine.attach_world_command_access(world_command_access);
@@ -2803,6 +2821,37 @@ mod tests {
         world_projection_service_contract_key, world_system_service_contract_key,
     };
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn test_should_resolve_world_identity_only_for_canonical_world_runtime_scope()
+    -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let access = LocalHostAccess::new(
+            root.path(),
+            PrincipalId::new(),
+            UserContentWriteRuntimeControl::default(),
+            WorldSessionRuntimeControl::default(),
+            WorldCommandRuntimeControl::default(),
+            WorldProjectionRuntimeControl::default(),
+        );
+        let world_id = WorldId::new();
+        assert_eq!(
+            RuntimeContextAccess::world_id_for_scope(&access, &RuntimeScopeId::new(HOST_SCOPE)),
+            Ok(None)
+        );
+        assert_eq!(
+            RuntimeContextAccess::world_id_for_scope(&access, &world_runtime_scope_id(world_id)),
+            Ok(Some(world_id))
+        );
+        assert_eq!(
+            RuntimeContextAccess::world_id_for_scope(
+                &access,
+                &RuntimeScopeId::new("world:not-a-world-id"),
+            ),
+            Ok(None)
+        );
+        Ok(())
+    }
 
     struct ContractComponent {
         id: ComponentId,
