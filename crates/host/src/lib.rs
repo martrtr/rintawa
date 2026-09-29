@@ -312,6 +312,16 @@ pub enum HostError {
         /// Maximum accepted UTF-8 byte length.
         maximum_bytes: usize,
     },
+    /// Human-facing World description exceeds the platform bound.
+    #[error(
+        "world description must contain at most {maximum_bytes} UTF-8 bytes; found {actual_bytes}"
+    )]
+    InvalidWorldDescription {
+        /// UTF-8 byte length after trimming surrounding whitespace.
+        actual_bytes: usize,
+        /// Maximum accepted UTF-8 byte length.
+        maximum_bytes: usize,
+    },
     /// A World catalog metadata sidecar is absent where one was explicitly requested.
     #[error("world catalog metadata file `{0}` is missing")]
     WorldCatalogMetadataMissing(PathBuf),
@@ -713,6 +723,8 @@ pub struct WorldSummary {
     pub id: WorldId,
     /// Human-facing host-owned catalog title.
     pub title: String,
+    /// Optional human-facing description.
+    pub description: Option<String>,
     /// Optional immutable cover asset reference.
     pub cover: Option<rintawa_artifacts::AssetRef>,
     /// Last committed local world position.
@@ -903,6 +915,7 @@ impl HostHome {
         &self,
         world_id: WorldId,
         title: impl Into<String>,
+        description: Option<String>,
         cover: Option<rintawa_artifacts::AssetRef>,
     ) -> HostResult<WorldSummary> {
         let directory = self.worlds_directory.join(world_id.to_string());
@@ -910,9 +923,25 @@ impl HostHome {
         if let Some(reference) = &cover {
             self.asset_store.verify(reference)?;
         }
-        let metadata = WorldCatalogMetadata::new(title, cover)?;
+        let metadata = WorldCatalogMetadata::new(title, cover)?.with_description(description)?;
         metadata.save(&directory.join(WORLD_CATALOG_METADATA_FILE))?;
         Ok(world_summary(&storage.load_session()?, metadata))
+    }
+
+    /// Deletes one inactive persistent World including its exact world composition.
+    ///
+    /// Shared immutable artifact and asset stores are intentionally left untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the World does not exist, its directory identity is unsafe,
+    /// or the host cannot remove the validated World directory.
+    pub fn delete_world(&self, world_id: WorldId) -> HostResult<()> {
+        let directory = self.worlds_directory.join(world_id.to_string());
+        let storage = open_world_database(&directory, world_id)?;
+        drop(storage);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
     }
 
     /// Reads host-owned human-facing metadata for one persistent World.
@@ -1684,6 +1713,7 @@ fn world_summary(state: &WorldSessionState, metadata: WorldCatalogMetadata) -> W
     WorldSummary {
         id: state.id(),
         title: metadata.title().to_string(),
+        description: metadata.description().map(str::to_string),
         cover: metadata.cover().cloned(),
         commit_position: state.commit_position(),
     }

@@ -15,6 +15,8 @@ use crate::{HostError, HostResult};
 pub const WORLD_CATALOG_METADATA_SCHEMA: u32 = 1;
 /// Maximum UTF-8 byte length accepted for a human-facing World title.
 pub const MAX_WORLD_TITLE_BYTES: usize = 256;
+/// Maximum UTF-8 byte length accepted for an optional human-facing World description.
+pub const MAX_WORLD_DESCRIPTION_BYTES: usize = 4 * 1024;
 /// File stored inside each host-owned World directory.
 pub const WORLD_CATALOG_METADATA_FILE: &str = "catalog.toml";
 
@@ -24,6 +26,8 @@ pub const WORLD_CATALOG_METADATA_FILE: &str = "catalog.toml";
 pub struct WorldCatalogMetadata {
     schema: u32,
     title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cover: Option<AssetRef>,
 }
@@ -39,6 +43,7 @@ impl WorldCatalogMetadata {
         Ok(Self {
             schema: WORLD_CATALOG_METADATA_SCHEMA,
             title,
+            description: None,
             cover,
         })
     }
@@ -46,6 +51,11 @@ impl WorldCatalogMetadata {
     /// Returns the normalized human-facing title.
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    /// Returns the optional normalized human-facing description.
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
     }
 
     /// Returns the immutable cover reference when one is configured.
@@ -59,7 +69,17 @@ impl WorldCatalogMetadata {
         Ok(self)
     }
 
-    /// Replaces the immutable cover reference while preserving the title.
+    /// Replaces the optional description while preserving other metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::InvalidWorldDescription`] when a non-empty description exceeds the bound.
+    pub fn with_description(mut self, description: Option<String>) -> HostResult<Self> {
+        self.description = normalize_description(description)?;
+        Ok(self)
+    }
+
+    /// Replaces the immutable cover reference while preserving the title and description.
     pub fn with_cover(mut self, cover: Option<AssetRef>) -> Self {
         self.cover = cover;
         self
@@ -86,7 +106,7 @@ impl WorldCatalogMetadata {
                 decoded.schema,
             ));
         }
-        Self::new(decoded.title, decoded.cover)
+        Self::new(decoded.title, decoded.cover)?.with_description(decoded.description)
     }
 
     pub(crate) fn save(&self, path: &Path) -> HostResult<()> {
@@ -111,6 +131,23 @@ impl WorldCatalogMetadata {
     }
 }
 
+fn normalize_description(description: Option<String>) -> HostResult<Option<String>> {
+    let Some(description) = description else {
+        return Ok(None);
+    };
+    let description = description.trim().to_string();
+    if description.is_empty() {
+        return Ok(None);
+    }
+    if description.len() > MAX_WORLD_DESCRIPTION_BYTES {
+        return Err(HostError::InvalidWorldDescription {
+            actual_bytes: description.len(),
+            maximum_bytes: MAX_WORLD_DESCRIPTION_BYTES,
+        });
+    }
+    Ok(Some(description))
+}
+
 pub(crate) fn normalize_title(title: String) -> HostResult<String> {
     let title = title.trim().to_string();
     if title.is_empty() || title.len() > MAX_WORLD_TITLE_BYTES {
@@ -130,10 +167,26 @@ mod tests {
     fn test_should_round_trip_catalog_metadata_atomically() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let path = root.path().join(WORLD_CATALOG_METADATA_FILE);
-        let expected = WorldCatalogMetadata::new("  My World  ", None)?;
+        let expected = WorldCatalogMetadata::new("  My World  ", None)?
+            .with_description(Some(String::from("  A quiet place  ")))?;
         expected.save(&path)?;
         assert_eq!(WorldCatalogMetadata::load(&path)?, expected);
         assert_eq!(expected.title(), "My World");
+        assert_eq!(expected.description(), Some("A quiet place"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_normalize_empty_description_and_reject_oversized_description()
+    -> anyhow::Result<()> {
+        let empty = WorldCatalogMetadata::new("World", None)?
+            .with_description(Some(String::from("   ")))?;
+        assert_eq!(empty.description(), None);
+        assert!(matches!(
+            WorldCatalogMetadata::new("World", None)?
+                .with_description(Some("x".repeat(MAX_WORLD_DESCRIPTION_BYTES + 1))),
+            Err(HostError::InvalidWorldDescription { .. })
+        ));
         Ok(())
     }
 

@@ -37,6 +37,8 @@ pub struct WorldSessionSummary {
     pub world_id: String,
     /// Human-facing host-owned catalog title.
     pub title: String,
+    /// Optional human-facing host-owned description.
+    pub description: Option<String>,
     /// Optional immutable cover asset reference.
     pub cover: Option<WorldSessionAssetRef>,
     /// Last committed authoritative world position.
@@ -227,8 +229,12 @@ pub trait WorldSessionAccess: Send + Sync {
         &self,
         world_id: &str,
         title: &str,
+        description: Option<&str>,
         cover: Option<WorldSessionAssetRef>,
     ) -> HostAccessResult<WorldSessionSummary>;
+
+    /// Deletes one persistent World when it has no active or pending lifecycle state.
+    fn delete_world(&self, world_id: &str) -> HostAccessResult<()>;
 
     /// Requests the desired active state to be applied after guest execution unwinds.
     fn set_active(&self, world_id: &str, active: bool) -> HostAccessResult<()>;
@@ -660,8 +666,13 @@ impl WorldSessionAccess for UnavailableWorldSessionAccess {
         &self,
         _world_id: &str,
         _title: &str,
+        _description: Option<&str>,
         _cover: Option<WorldSessionAssetRef>,
     ) -> HostAccessResult<WorldSessionSummary> {
+        Err(HostAccessError::Unavailable)
+    }
+
+    fn delete_world(&self, _world_id: &str) -> HostAccessResult<()> {
         Err(HostAccessError::Unavailable)
     }
 

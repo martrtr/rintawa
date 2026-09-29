@@ -201,12 +201,16 @@ impl WorldSessionsHost for WasmHostState {
         &mut self,
         world_id: String,
         title: String,
+        description: Option<String>,
         cover: Option<WitAssetRef>,
     ) -> Result<WitWorldSummary, WorldSessionError> {
         self.require_world_session_permission(RuntimePermission::WorldSessionWrite)?;
         self.consume_world_session_mutation_budget()?;
         if world_id.len() > self.max_host_message_bytes
             || title.len() > self.max_host_message_bytes
+            || description
+                .as_ref()
+                .is_some_and(|value| value.len() > self.max_host_message_bytes)
             || cover.as_ref().is_some_and(|reference| {
                 reference
                     .digest
@@ -225,9 +229,21 @@ impl WorldSessionsHost for WasmHostState {
         let world = self
             .host_access
             .world_sessions
-            .set_metadata(&world_id, &title, cover)
+            .set_metadata(&world_id, &title, description.as_deref(), cover)
             .map_err(map_world_session_access_error)?;
         self.bound_world_session_summary(world)
+    }
+
+    fn delete(&mut self, world_id: String) -> Result<(), WorldSessionError> {
+        self.require_world_session_permission(RuntimePermission::WorldSessionWrite)?;
+        self.consume_world_session_mutation_budget()?;
+        if world_id.len() > self.max_host_message_bytes {
+            return Err(WorldSessionError::MessageTooLarge);
+        }
+        self.host_access
+            .world_sessions
+            .delete_world(&world_id)
+            .map_err(map_world_session_access_error)
     }
 
     fn set_active(&mut self, world_id: String, active: bool) -> Result<(), WorldSessionError> {
@@ -965,6 +981,15 @@ impl WasmHostState {
         let message_bytes = worlds.iter().fold(0_usize, |total, world| {
             total
                 .saturating_add(world.world_id.len())
+                .saturating_add(world.title.len())
+                .saturating_add(world.description.as_ref().map_or(0, String::len))
+                .saturating_add(world.cover.as_ref().map_or(0, |reference| {
+                    reference
+                        .digest
+                        .len()
+                        .saturating_add(reference.media_type.len())
+                        .saturating_add(8)
+                }))
                 .saturating_add(world.last_error.as_ref().map_or(0, String::len))
                 .saturating_add(24)
         });
@@ -981,6 +1006,15 @@ impl WasmHostState {
         if world
             .world_id
             .len()
+            .saturating_add(world.title.len())
+            .saturating_add(world.description.as_ref().map_or(0, String::len))
+            .saturating_add(world.cover.as_ref().map_or(0, |reference| {
+                reference
+                    .digest
+                    .len()
+                    .saturating_add(reference.media_type.len())
+                    .saturating_add(8)
+            }))
             .saturating_add(world.last_error.as_ref().map_or(0, String::len))
             .saturating_add(24)
             > self.max_host_message_bytes
@@ -1044,6 +1078,7 @@ fn to_wit_world_summary(world: WorldSessionSummary) -> WitWorldSummary {
     WitWorldSummary {
         world_id: world.world_id,
         title: world.title,
+        description: world.description,
         cover: world.cover.map(|reference| WitAssetRef {
             digest: reference.digest,
             size: reference.size,

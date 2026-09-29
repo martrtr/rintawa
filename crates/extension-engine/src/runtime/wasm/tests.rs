@@ -181,6 +181,7 @@ impl WorldSessionAccess for RecordingScopedHostAccess {
         Ok(vec![WorldSessionSummary {
             world_id: String::from("018f0000-0000-7000-8000-000000000001"),
             title: String::from("Recorded World"),
+            description: Some(String::from("Recorded description")),
             cover: None,
             commit_position: 7,
             active: true,
@@ -193,6 +194,7 @@ impl WorldSessionAccess for RecordingScopedHostAccess {
         Ok(WorldSessionSummary {
             world_id: String::from("018f0000-0000-7000-8000-000000000002"),
             title: String::from("New World"),
+            description: None,
             cover: None,
             commit_position: 0,
             active: false,
@@ -205,17 +207,23 @@ impl WorldSessionAccess for RecordingScopedHostAccess {
         &self,
         world_id: &str,
         title: &str,
+        description: Option<&str>,
         cover: Option<crate::host_access::WorldSessionAssetRef>,
     ) -> HostAccessResult<WorldSessionSummary> {
         Ok(WorldSessionSummary {
             world_id: world_id.to_string(),
             title: title.to_string(),
+            description: description.map(str::to_string),
             cover,
             commit_position: 7,
             active: true,
             pending_active: None,
             last_error: None,
         })
+    }
+
+    fn delete_world(&self, _world_id: &str) -> HostAccessResult<()> {
+        Ok(())
     }
 
     fn set_active(&self, world_id: &str, active: bool) -> HostAccessResult<()> {
@@ -1429,7 +1437,7 @@ fn test_should_gate_world_session_catalog_and_lifecycle_requests() {
         access.clone(),
     );
     let budget = WasmExecutionBudget {
-        max_world_session_mutations_per_execution: 3,
+        max_world_session_mutations_per_execution: 4,
         ..WasmExecutionBudget::default()
     };
     let mut state = WasmHostState::with_host_services_and_budget(
@@ -1477,11 +1485,14 @@ fn test_should_gate_world_session_catalog_and_lifecycle_requests() {
         &mut state,
         created.world_id.clone(),
         String::from("Renamed World"),
+        Some(String::from("Renamed description")),
         None,
     )
     .unwrap();
     assert_eq!(renamed.title, "Renamed World");
+    assert_eq!(renamed.description.as_deref(), Some("Renamed description"));
     WorldSessionsHost::set_active(&mut state, created.world_id.clone(), true).unwrap();
+    WorldSessionsHost::delete(&mut state, created.world_id.clone()).unwrap();
     assert!(matches!(
         WorldSessionsHost::create(&mut state),
         Err(WorldSessionError::LimitExceeded)

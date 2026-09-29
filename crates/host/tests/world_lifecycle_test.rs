@@ -34,17 +34,24 @@ fn test_should_persist_renamed_world_catalog_metadata_across_restart() -> anyhow
     let home = HostHome::open(&home_path)?;
     let created = home.create_world()?;
 
-    let renamed = home.update_world_catalog_metadata(created.id, "  Tavern Night  ", None)?;
+    let renamed = home.update_world_catalog_metadata(
+        created.id,
+        "  Tavern Night  ",
+        Some(String::from("  A warm tavern  ")),
+        None,
+    )?;
     assert_eq!(renamed.title, "Tavern Night");
+    assert_eq!(renamed.description.as_deref(), Some("A warm tavern"));
     assert_eq!(home.list_worlds()?[0].title, "Tavern Night");
     drop(home);
 
     let reopened = HostHome::open(&home_path)?;
-    assert_eq!(reopened.list_worlds()?[0].title, "Tavern Night");
-    assert_eq!(
-        reopened.load_world_catalog_metadata(created.id)?.title(),
-        "Tavern Night"
-    );
+    let reopened_world = &reopened.list_worlds()?[0];
+    assert_eq!(reopened_world.title, "Tavern Night");
+    assert_eq!(reopened_world.description.as_deref(), Some("A warm tavern"));
+    let reopened_metadata = reopened.load_world_catalog_metadata(created.id)?;
+    assert_eq!(reopened_metadata.title(), "Tavern Night");
+    assert_eq!(reopened_metadata.description(), Some("A warm tavern"));
     Ok(())
 }
 
@@ -69,6 +76,27 @@ fn test_should_migrate_world_without_catalog_sidecar_on_first_listing() -> anyho
 
     let reopened = HostHome::open(&home_path)?;
     assert_eq!(reopened.list_worlds()?[0].title, "World 1");
+    Ok(())
+}
+
+#[test]
+fn test_should_delete_world_owned_storage_and_composition() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let home = HostHome::open(root.path().join("home"))?;
+    let created = home.create_world()?;
+    let world_directory = home.root().join("worlds").join(created.id.to_string());
+    let composition = world_directory.join("composition.toml");
+    assert!(world_directory.is_dir());
+    assert!(composition.is_file());
+
+    home.delete_world(created.id)?;
+
+    assert!(!world_directory.exists());
+    assert!(home.list_worlds()?.is_empty());
+    assert!(matches!(
+        home.load_world_state(created.id),
+        Err(HostError::WorldNotFound(id)) if id == created.id
+    ));
     Ok(())
 }
 

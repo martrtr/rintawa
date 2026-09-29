@@ -376,6 +376,7 @@ interface world-sessions {
     record summary {
         world-id: string,
         title: string,
+        description: option<string>,
         cover: option<asset-ref>,
         commit-position: u64,
         active: bool,
@@ -403,7 +404,10 @@ interface world-sessions {
     create: func() -> result<summary, error>;
 
     /// Replaces human-facing catalog metadata. Requires `world-session-write`.
-    set-metadata: func(world-id: string, title: string, cover: option<asset-ref>) -> result<summary, error>;
+    set-metadata: func(world-id: string, title: string, description: option<string>, cover: option<asset-ref>) -> result<summary, error>;
+
+    /// Deletes one stopped persistent World. Requires `world-session-write`.
+    delete: func(world-id: string) -> result<_, error>;
 
     /// Requests active/inactive runtime state. Requires `world-session-write`.
     /// The request is applied after the current guest callback unwinds, during a

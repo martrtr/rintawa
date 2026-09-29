@@ -114,6 +114,7 @@ impl WorldSessionRuntimeControl {
         Ok(WorldSessionSummary {
             world_id: world.id.to_string(),
             title: world.title,
+            description: world.description,
             cover: world.cover.map(|reference| WorldSessionAssetRef {
                 digest: reference.digest.to_string(),
                 size: reference.size,
@@ -137,6 +138,22 @@ impl WorldSessionRuntimeControl {
             return Err(HostAccessError::QueueFull);
         }
         state.pending.insert(world_id, active);
+        state.last_errors.remove(&world_id);
+        Ok(())
+    }
+
+    fn delete_inactive<F>(&self, world_id: WorldId, delete: F) -> HostAccessResult<()>
+    where
+        F: FnOnce() -> HostResult<()>,
+    {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| HostAccessError::Unavailable)?;
+        if state.active.contains(&world_id) || state.pending.contains_key(&world_id) {
+            return Err(HostAccessError::Rejected);
+        }
+        delete().map_err(map_host_access_error)?;
         state.last_errors.remove(&world_id);
         Ok(())
     }
@@ -671,6 +688,7 @@ impl WorldSessionAccess for LocalHostAccess {
         &self,
         world_id: &str,
         title: &str,
+        description: Option<&str>,
         cover: Option<WorldSessionAssetRef>,
     ) -> HostAccessResult<WorldSessionSummary> {
         let world_id = world_id
@@ -689,9 +707,20 @@ impl WorldSessionAccess for LocalHostAccess {
             .transpose()?;
         let world = self
             .home()?
-            .update_world_catalog_metadata(world_id, title, cover)
+            .update_world_catalog_metadata(world_id, title, description.map(str::to_string), cover)
             .map_err(map_host_access_error)?;
         self.world_sessions.summary(world)
+    }
+
+    fn delete_world(&self, world_id: &str) -> HostAccessResult<()> {
+        let world_id = world_id
+            .parse::<WorldId>()
+            .map_err(|_| HostAccessError::InvalidWorldId)?;
+        let home = self.home()?;
+        home.load_world_state(world_id)
+            .map_err(map_host_access_error)?;
+        self.world_sessions
+            .delete_inactive(world_id, || home.delete_world(world_id))
     }
 
     fn set_active(&self, world_id: &str, active: bool) -> HostAccessResult<()> {
@@ -3640,6 +3669,7 @@ mod tests {
         let summary = WorldSummary {
             id: world_id,
             title: String::from("Test World"),
+            description: None,
             cover: None,
             commit_position: 0,
         };
@@ -3674,6 +3704,7 @@ mod tests {
             .summary(WorldSummary {
                 id: world_id,
                 title: String::from("Test World"),
+                description: None,
                 cover: None,
                 commit_position: 3,
             })
@@ -3708,6 +3739,17 @@ mod tests {
             Err(HostAccessError::NotFound)
         );
 
+        let deletable = WorldSessionAccess::create_world(access.as_ref())
+            .expect("world-session access must create an inactive world for deletion");
+        WorldSessionAccess::delete_world(access.as_ref(), &deletable.world_id)
+            .expect("inactive world must be deletable");
+        assert!(
+            WorldSessionAccess::list_worlds(access.as_ref())
+                .expect("world-session catalog must remain readable after delete")
+                .iter()
+                .all(|world| world.world_id != deletable.world_id)
+        );
+
         let created = WorldSessionAccess::create_world(access.as_ref())
             .expect("world-session access must create an empty world");
         let world_id: WorldId = created.world_id.parse()?;
@@ -3718,6 +3760,10 @@ mod tests {
 
         WorldSessionAccess::set_active(access.as_ref(), &created.world_id, true)
             .expect("world-session access must queue activation");
+        assert_eq!(
+            WorldSessionAccess::delete_world(access.as_ref(), &created.world_id),
+            Err(HostAccessError::Rejected)
+        );
         let pending = WorldSessionAccess::list_worlds(access.as_ref())
             .expect("world-session access must list pending activation");
         let pending = pending
@@ -3737,6 +3783,10 @@ mod tests {
         assert!(active.active);
         assert_eq!(active.pending_active, None);
         assert_eq!(active.last_error, None);
+        assert_eq!(
+            WorldSessionAccess::delete_world(access.as_ref(), &created.world_id),
+            Err(HostAccessError::Rejected)
+        );
 
         WorldSessionAccess::set_active(access.as_ref(), &created.world_id, false)
             .expect("world-session access must queue deactivation");
@@ -3747,6 +3797,10 @@ mod tests {
             .expect("pending world must remain listed");
         assert!(pending.active);
         assert_eq!(pending.pending_active, Some(false));
+        assert_eq!(
+            WorldSessionAccess::delete_world(access.as_ref(), &created.world_id),
+            Err(HostAccessError::Rejected)
+        );
 
         host.poll_runtime()?;
         assert!(!host.is_world_active(world_id));
@@ -3758,6 +3812,14 @@ mod tests {
         assert!(!inactive.active);
         assert_eq!(inactive.pending_active, None);
         assert_eq!(inactive.last_error, None);
+        WorldSessionAccess::delete_world(access.as_ref(), &created.world_id)
+            .expect("stopped world must be deletable");
+        assert!(
+            WorldSessionAccess::list_worlds(access.as_ref())
+                .expect("catalog must remain readable after deleting stopped world")
+                .iter()
+                .all(|world| world.world_id != created.world_id)
+        );
         Ok(())
     }
 
