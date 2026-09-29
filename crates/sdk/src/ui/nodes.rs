@@ -317,6 +317,9 @@ pub struct UiTextInputNode {
     pub change_action: Option<UiActionId>,
     /// Optional action emitted on submit.
     pub submit_action: Option<UiActionId>,
+    /// Optional user-visible label for a renderer-provided submit control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submit_label: Option<String>,
     /// Whether user input is currently enabled.
     pub is_enabled: bool,
 }
@@ -332,6 +335,9 @@ pub struct UiTextAreaNode {
     pub change_action: Option<UiActionId>,
     /// Optional action emitted on submit.
     pub submit_action: Option<UiActionId>,
+    /// Optional user-visible label for a renderer-provided submit control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submit_label: Option<String>,
     /// Whether user input is currently enabled.
     pub is_enabled: bool,
 }

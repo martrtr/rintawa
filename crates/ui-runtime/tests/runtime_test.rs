@@ -67,6 +67,7 @@ fn base_snapshot() -> UiSurfaceSnapshot {
                     placeholder: Some(String::from("Message")),
                     change_action: Some(UiActionId::new("example.change")),
                     submit_action: Some(UiActionId::new("example.send-text")),
+                    submit_label: None,
                     is_enabled: true,
                 }),
             ),
