@@ -3593,6 +3593,14 @@ mod tests {
         )?;
         home.asset_store().verify(&reference)?;
         assert_eq!(
+            AssetStoreAccess::read_asset(&access, &imported.digest, imported.size, "image/png", 64,),
+            Ok(b"portrait".to_vec())
+        );
+        assert_eq!(
+            AssetStoreAccess::read_asset(&access, &imported.digest, imported.size, "image/png", 4,),
+            Err(HostAccessError::Rejected)
+        );
+        assert_eq!(
             AssetStoreAccess::import_asset(&access, b"portrait", "invalid media type"),
             Err(HostAccessError::InvalidAsset)
         );
