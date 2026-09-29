@@ -370,9 +370,13 @@ interface user-content {
 
 /// Generic persistent-world catalog and deferred runtime lifecycle control.
 interface world-sessions {
-    /// One persistent world plus host runtime lifecycle status.
+    use asset-store.{asset-ref};
+
+    /// One persistent world plus host-owned catalog metadata and runtime lifecycle status.
     record summary {
         world-id: string,
+        title: string,
+        cover: option<asset-ref>,
         commit-position: u64,
         active: bool,
         pending-active: option<bool>,
@@ -397,6 +401,9 @@ interface world-sessions {
 
     /// Creates one empty persistent world. Requires `world-session-write`.
     create: func() -> result<summary, error>;
+
+    /// Replaces human-facing catalog metadata. Requires `world-session-write`.
+    set-metadata: func(world-id: string, title: string, cover: option<asset-ref>) -> result<summary, error>;
 
     /// Requests active/inactive runtime state. Requires `world-session-write`.
     /// The request is applied after the current guest callback unwinds, during a

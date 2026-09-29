@@ -12,6 +12,7 @@ mod profile;
 mod runtime;
 mod runtime_signal;
 mod user_content;
+mod world_catalog;
 
 use std::{
     fmt,
@@ -52,6 +53,10 @@ pub use runtime_signal::{
     MAX_RUNTIME_SIGNAL_TOPIC_BYTES,
 };
 pub use user_content::{USER_CONTENT_LIBRARY_SCHEMA, UserContentEntry, UserContentId};
+pub use world_catalog::{
+    MAX_WORLD_TITLE_BYTES, WORLD_CATALOG_METADATA_FILE, WORLD_CATALOG_METADATA_SCHEMA,
+    WorldCatalogMetadata,
+};
 
 /// Stable runtime scope used by the pre-world/bootstrap composition.
 pub const HOST_SCOPE: &str = "host";
@@ -299,6 +304,37 @@ pub enum HostError {
     /// A requested local world does not exist.
     #[error("world `{0}` is not present in the local host home")]
     WorldNotFound(WorldId),
+    /// Human-facing World title is blank or exceeds the platform bound.
+    #[error("world title must contain 1..={maximum_bytes} UTF-8 bytes; found {actual_bytes}")]
+    InvalidWorldTitle {
+        /// UTF-8 byte length after trimming surrounding whitespace.
+        actual_bytes: usize,
+        /// Maximum accepted UTF-8 byte length.
+        maximum_bytes: usize,
+    },
+    /// A World catalog metadata sidecar is absent where one was explicitly requested.
+    #[error("world catalog metadata file `{0}` is missing")]
+    WorldCatalogMetadataMissing(PathBuf),
+    /// A World catalog metadata path is not a safe regular file.
+    #[error("invalid world catalog metadata file `{0}`")]
+    InvalidWorldCatalogMetadataFile(PathBuf),
+    /// Persisted World catalog metadata could not be decoded.
+    #[error("invalid world catalog metadata: {source}")]
+    WorldCatalogMetadataDecode {
+        /// TOML decoding failure.
+        #[source]
+        source: toml::de::Error,
+    },
+    /// World catalog metadata could not be encoded.
+    #[error("failed to encode world catalog metadata: {source}")]
+    WorldCatalogMetadataEncode {
+        /// TOML encoding failure.
+        #[source]
+        source: toml::ser::Error,
+    },
+    /// Persisted World catalog metadata uses a newer schema.
+    #[error("unsupported world catalog metadata schema {0}")]
+    UnsupportedWorldCatalogMetadataSchema(u32),
     /// A world runtime is already active in this host process.
     #[error("world `{0}` is already active")]
     WorldAlreadyActive(WorldId),
@@ -671,10 +707,14 @@ enum PersistedCompositionScope {
 }
 
 /// Summary of one persistent authoritative world available in the local host home.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorldSummary {
     /// Stable authoritative world identity.
     pub id: WorldId,
+    /// Human-facing host-owned catalog title.
+    pub title: String,
+    /// Optional immutable cover asset reference.
+    pub cover: Option<rintawa_artifacts::AssetRef>,
     /// Last committed local world position.
     pub commit_position: u64,
 }
@@ -778,10 +818,12 @@ impl HostHome {
                     Ok(storage) => (|| {
                         let state = storage.load_session()?;
                         drop(storage);
+                        let metadata = WorldCatalogMetadata::new("New World", None)?;
+                        metadata.save(&directory.join(WORLD_CATALOG_METADATA_FILE))?;
                         let scope_id = world_runtime_scope_id(world_id);
                         let profile = default_world.materialize_all(scope_id);
                         self.save_world_composition(world_id, &profile)?;
-                        Ok(world_summary(&state))
+                        Ok(world_summary(&state, metadata))
                     })(),
                     Err(error) => Err(error.into()),
                 };
@@ -814,7 +856,7 @@ impl HostHome {
         entries.sort_by_key(std::fs::DirEntry::file_name);
 
         let mut worlds = Vec::with_capacity(entries.len());
-        for entry in entries {
+        for (index, entry) in entries.into_iter().enumerate() {
             let directory = entry.path();
             validate_world_directory(&directory)?;
             let name =
@@ -832,11 +874,59 @@ impl HostHome {
                         reason: "directory name must be a canonical WorldId",
                     })?;
             let storage = open_world_database(&directory, world_id)?;
-            worlds.push(world_summary(&storage.load_session()?));
+            let metadata_path = directory.join(WORLD_CATALOG_METADATA_FILE);
+            let metadata = match WorldCatalogMetadata::load(&metadata_path) {
+                Ok(metadata) => metadata,
+                Err(HostError::WorldCatalogMetadataMissing(_)) => {
+                    let metadata = WorldCatalogMetadata::new(format!("World {}", index + 1), None)?;
+                    metadata.save(&metadata_path)?;
+                    metadata
+                }
+                Err(error) => return Err(error),
+            };
+            worlds.push(world_summary(&storage.load_session()?, metadata));
         }
 
         worlds.sort_by_key(|world| world.id);
         Ok(worlds)
+    }
+
+    /// Updates host-owned human-facing metadata for one persistent World.
+    ///
+    /// The cover, when supplied, must already exist in the immutable host asset store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the World is absent, title is invalid, cover verification fails,
+    /// or the metadata sidecar cannot be persisted atomically.
+    pub fn update_world_catalog_metadata(
+        &self,
+        world_id: WorldId,
+        title: impl Into<String>,
+        cover: Option<rintawa_artifacts::AssetRef>,
+    ) -> HostResult<WorldSummary> {
+        let directory = self.worlds_directory.join(world_id.to_string());
+        let storage = self.open_world_storage(world_id)?;
+        if let Some(reference) = &cover {
+            self.asset_store.verify(reference)?;
+        }
+        let metadata = WorldCatalogMetadata::new(title, cover)?;
+        metadata.save(&directory.join(WORLD_CATALOG_METADATA_FILE))?;
+        Ok(world_summary(&storage.load_session()?, metadata))
+    }
+
+    /// Reads host-owned human-facing metadata for one persistent World.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the World or metadata sidecar is absent or invalid.
+    pub fn load_world_catalog_metadata(
+        &self,
+        world_id: WorldId,
+    ) -> HostResult<WorldCatalogMetadata> {
+        let directory = self.worlds_directory.join(world_id.to_string());
+        self.open_world_storage(world_id)?;
+        WorldCatalogMetadata::load(&directory.join(WORLD_CATALOG_METADATA_FILE))
     }
 
     pub(crate) fn open_world_storage(&self, world_id: WorldId) -> HostResult<SqliteWorldStorage> {
@@ -1590,9 +1680,11 @@ fn open_world_database(directory: &Path, directory_id: WorldId) -> HostResult<Sq
     Ok(storage)
 }
 
-fn world_summary(state: &WorldSessionState) -> WorldSummary {
+fn world_summary(state: &WorldSessionState, metadata: WorldCatalogMetadata) -> WorldSummary {
     WorldSummary {
         id: state.id(),
+        title: metadata.title().to_string(),
+        cover: metadata.cover().cloned(),
         commit_position: state.commit_position(),
     }
 }

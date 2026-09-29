@@ -19,11 +19,26 @@ pub struct ImportedAsset {
     pub media_type: String,
 }
 
+/// Immutable asset reference attached to host-owned World catalog metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorldSessionAssetRef {
+    /// Canonical SHA-256 asset digest.
+    pub digest: String,
+    /// Exact byte length.
+    pub size: u64,
+    /// Canonical media type.
+    pub media_type: String,
+}
+
 /// One persistent world plus its host runtime lifecycle status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorldSessionSummary {
     /// Stable persistent world identity in canonical textual form.
     pub world_id: String,
+    /// Human-facing host-owned catalog title.
+    pub title: String,
+    /// Optional immutable cover asset reference.
+    pub cover: Option<WorldSessionAssetRef>,
     /// Last committed authoritative world position.
     pub commit_position: u64,
     /// Whether the world currently owns a running authoritative runtime.
@@ -206,6 +221,14 @@ pub trait WorldSessionAccess: Send + Sync {
 
     /// Creates one empty persistent authoritative world.
     fn create_world(&self) -> HostAccessResult<WorldSessionSummary>;
+
+    /// Replaces host-owned human-facing metadata for one persistent World.
+    fn set_metadata(
+        &self,
+        world_id: &str,
+        title: &str,
+        cover: Option<WorldSessionAssetRef>,
+    ) -> HostAccessResult<WorldSessionSummary>;
 
     /// Requests the desired active state to be applied after guest execution unwinds.
     fn set_active(&self, world_id: &str, active: bool) -> HostAccessResult<()>;
@@ -630,6 +653,15 @@ impl WorldSessionAccess for UnavailableWorldSessionAccess {
     }
 
     fn create_world(&self) -> HostAccessResult<WorldSessionSummary> {
+        Err(HostAccessError::Unavailable)
+    }
+
+    fn set_metadata(
+        &self,
+        _world_id: &str,
+        _title: &str,
+        _cover: Option<WorldSessionAssetRef>,
+    ) -> HostAccessResult<WorldSessionSummary> {
         Err(HostAccessError::Unavailable)
     }
 

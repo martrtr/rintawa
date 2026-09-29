@@ -51,7 +51,8 @@ pub use host_access::{
     UserContentWriteAccess, UserContentWriteStatus, WorldCommandAccess, WorldCommandAccessError,
     WorldCommandAccessResult, WorldCommandActor, WorldCommandRequest, WorldProjectionAccess,
     WorldProjectionAccessError, WorldProjectionAccessResult, WorldProjectionReadStatus,
-    WorldProjectionReadView, WorldProjectionRequest, WorldSessionAccess, WorldSessionSummary,
+    WorldProjectionReadView, WorldProjectionRequest, WorldSessionAccess, WorldSessionAssetRef,
+    WorldSessionSummary,
 };
 pub use loader::ExtensionLoader;
 pub use runtime::{WasmComponent, WasmExecutionBudget, WasmRuntimeEngine};

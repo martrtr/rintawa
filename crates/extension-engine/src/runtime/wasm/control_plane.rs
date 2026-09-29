@@ -10,7 +10,7 @@ use crate::{
         UserContentSummary, UserContentWriteStatus, WorldCommandAccessError,
         WorldCommandActor as HostWorldCommandActor, WorldCommandRequest,
         WorldProjectionAccessError, WorldProjectionReadStatus, WorldProjectionRequest,
-        WorldSessionSummary,
+        WorldSessionAssetRef, WorldSessionSummary,
     },
     runtime::wasm::{
         ArtifactStoreError, ArtifactStoreHost, AssetStoreError, AssetStoreHost, CompositionError,
@@ -193,6 +193,39 @@ impl WorldSessionsHost for WasmHostState {
             .host_access
             .world_sessions
             .create_world()
+            .map_err(map_world_session_access_error)?;
+        self.bound_world_session_summary(world)
+    }
+
+    fn set_metadata(
+        &mut self,
+        world_id: String,
+        title: String,
+        cover: Option<WitAssetRef>,
+    ) -> Result<WitWorldSummary, WorldSessionError> {
+        self.require_world_session_permission(RuntimePermission::WorldSessionWrite)?;
+        self.consume_world_session_mutation_budget()?;
+        if world_id.len() > self.max_host_message_bytes
+            || title.len() > self.max_host_message_bytes
+            || cover.as_ref().is_some_and(|reference| {
+                reference
+                    .digest
+                    .len()
+                    .saturating_add(reference.media_type.len())
+                    > self.max_host_message_bytes
+            })
+        {
+            return Err(WorldSessionError::MessageTooLarge);
+        }
+        let cover = cover.map(|reference| WorldSessionAssetRef {
+            digest: reference.digest,
+            size: reference.size,
+            media_type: reference.media_type,
+        });
+        let world = self
+            .host_access
+            .world_sessions
+            .set_metadata(&world_id, &title, cover)
             .map_err(map_world_session_access_error)?;
         self.bound_world_session_summary(world)
     }
@@ -1010,6 +1043,12 @@ impl WasmHostState {
 fn to_wit_world_summary(world: WorldSessionSummary) -> WitWorldSummary {
     WitWorldSummary {
         world_id: world.world_id,
+        title: world.title,
+        cover: world.cover.map(|reference| WitAssetRef {
+            digest: reference.digest,
+            size: reference.size,
+            media_type: reference.media_type,
+        }),
         commit_position: world.commit_position,
         active: world.active,
         pending_active: world.pending_active,

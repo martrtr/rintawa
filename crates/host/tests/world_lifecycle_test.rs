@@ -1,6 +1,6 @@
 //! Integration tests for Host-managed world lifecycle behavior.
 
-use rintawa_host::{HostError, HostHome};
+use rintawa_host::{HostError, HostHome, WORLD_CATALOG_METADATA_FILE};
 use rintawa_sdk::world::WorldId;
 
 #[test]
@@ -11,9 +11,11 @@ fn test_should_create_list_and_restore_world_across_host_restart() -> anyhow::Re
     let home = HostHome::open(&home_path)?;
     let created = home.create_world()?;
     assert_eq!(created.commit_position, 0);
+    assert_eq!(created.title, "New World");
+    assert!(created.cover.is_none());
 
     let listed = home.list_worlds()?;
-    assert_eq!(listed, vec![created]);
+    assert_eq!(listed, vec![created.clone()]);
     drop(home);
 
     let reopened = HostHome::open(&home_path)?;
@@ -22,6 +24,51 @@ fn test_should_create_list_and_restore_world_across_host_restart() -> anyhow::Re
     assert_eq!(state.commit_position(), 0);
     assert!(state.schemas().is_empty());
     assert_eq!(reopened.list_worlds()?, vec![created]);
+    Ok(())
+}
+
+#[test]
+fn test_should_persist_renamed_world_catalog_metadata_across_restart() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let home_path = root.path().join("home");
+    let home = HostHome::open(&home_path)?;
+    let created = home.create_world()?;
+
+    let renamed = home.update_world_catalog_metadata(created.id, "  Tavern Night  ", None)?;
+    assert_eq!(renamed.title, "Tavern Night");
+    assert_eq!(home.list_worlds()?[0].title, "Tavern Night");
+    drop(home);
+
+    let reopened = HostHome::open(&home_path)?;
+    assert_eq!(reopened.list_worlds()?[0].title, "Tavern Night");
+    assert_eq!(
+        reopened.load_world_catalog_metadata(created.id)?.title(),
+        "Tavern Night"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_migrate_world_without_catalog_sidecar_on_first_listing() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let home_path = root.path().join("home");
+    let home = HostHome::open(&home_path)?;
+    let created = home.create_world()?;
+    let metadata = home
+        .root()
+        .join("worlds")
+        .join(created.id.to_string())
+        .join(WORLD_CATALOG_METADATA_FILE);
+    std::fs::remove_file(&metadata)?;
+
+    let worlds = home.list_worlds()?;
+    assert_eq!(worlds.len(), 1);
+    assert_eq!(worlds[0].title, "World 1");
+    assert!(metadata.is_file());
+    drop(home);
+
+    let reopened = HostHome::open(&home_path)?;
+    assert_eq!(reopened.list_worlds()?[0].title, "World 1");
     Ok(())
 }
 

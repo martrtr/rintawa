@@ -180,6 +180,8 @@ impl WorldSessionAccess for RecordingScopedHostAccess {
     fn list_worlds(&self) -> HostAccessResult<Vec<WorldSessionSummary>> {
         Ok(vec![WorldSessionSummary {
             world_id: String::from("018f0000-0000-7000-8000-000000000001"),
+            title: String::from("Recorded World"),
+            cover: None,
             commit_position: 7,
             active: true,
             pending_active: None,
@@ -190,8 +192,27 @@ impl WorldSessionAccess for RecordingScopedHostAccess {
     fn create_world(&self) -> HostAccessResult<WorldSessionSummary> {
         Ok(WorldSessionSummary {
             world_id: String::from("018f0000-0000-7000-8000-000000000002"),
+            title: String::from("New World"),
+            cover: None,
             commit_position: 0,
             active: false,
+            pending_active: None,
+            last_error: None,
+        })
+    }
+
+    fn set_metadata(
+        &self,
+        world_id: &str,
+        title: &str,
+        cover: Option<crate::host_access::WorldSessionAssetRef>,
+    ) -> HostAccessResult<WorldSessionSummary> {
+        Ok(WorldSessionSummary {
+            world_id: world_id.to_string(),
+            title: title.to_string(),
+            cover,
+            commit_position: 7,
+            active: true,
             pending_active: None,
             last_error: None,
         })
@@ -1408,7 +1429,7 @@ fn test_should_gate_world_session_catalog_and_lifecycle_requests() {
         access.clone(),
     );
     let budget = WasmExecutionBudget {
-        max_world_session_mutations_per_execution: 2,
+        max_world_session_mutations_per_execution: 3,
         ..WasmExecutionBudget::default()
     };
     let mut state = WasmHostState::with_host_services_and_budget(
@@ -1437,6 +1458,7 @@ fn test_should_gate_world_session_catalog_and_lifecycle_requests() {
         .unwrap();
     let worlds = WorldSessionsHost::list_worlds(&mut state).unwrap();
     assert_eq!(worlds.len(), 1);
+    assert_eq!(worlds[0].title, "Recorded World");
     assert_eq!(worlds[0].commit_position, 7);
     assert!(worlds[0].active);
 
@@ -1449,7 +1471,16 @@ fn test_should_gate_world_session_catalog_and_lifecycle_requests() {
         .grant(owner, RuntimePermission::WorldSessionWrite)
         .unwrap();
     let created = WorldSessionsHost::create(&mut state).unwrap();
+    assert_eq!(created.title, "New World");
     assert_eq!(created.commit_position, 0);
+    let renamed = WorldSessionsHost::set_metadata(
+        &mut state,
+        created.world_id.clone(),
+        String::from("Renamed World"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(renamed.title, "Renamed World");
     WorldSessionsHost::set_active(&mut state, created.world_id.clone(), true).unwrap();
     assert!(matches!(
         WorldSessionsHost::create(&mut state),

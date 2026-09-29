@@ -8,7 +8,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rintawa_artifacts::{ArtifactDigest, ContentType, RtwArchive, RtwLimits};
+use rintawa_artifacts::{
+    ArtifactDigest, AssetDigest, AssetMediaType, AssetRef, ContentType, RtwArchive, RtwLimits,
+};
 use rintawa_extension_engine::{
     AcceptedUserContentWrite, AcceptedWorldCommand, AcceptedWorldProjectionRead,
     ActivationPlanError, ArtifactStoreAccess, AssetStoreAccess, CompositionAccess,
@@ -20,7 +22,7 @@ use rintawa_extension_engine::{
     WorldCommandAccessError, WorldCommandAccessResult, WorldCommandActor, WorldCommandRequest,
     WorldProjectionAccess, WorldProjectionAccessError, WorldProjectionAccessResult,
     WorldProjectionReadStatus, WorldProjectionReadView, WorldProjectionRequest, WorldSessionAccess,
-    WorldSessionSummary,
+    WorldSessionAssetRef, WorldSessionSummary,
 };
 use rintawa_sdk::{
     content::{
@@ -111,6 +113,12 @@ impl WorldSessionRuntimeControl {
             .map_err(|_| HostAccessError::Unavailable)?;
         Ok(WorldSessionSummary {
             world_id: world.id.to_string(),
+            title: world.title,
+            cover: world.cover.map(|reference| WorldSessionAssetRef {
+                digest: reference.digest.to_string(),
+                size: reference.size,
+                media_type: reference.media_type.to_string(),
+            }),
             commit_position: world.commit_position,
             active: state.active.contains(&world.id),
             pending_active: state.pending.get(&world.id).copied(),
@@ -656,6 +664,33 @@ impl WorldSessionAccess for LocalHostAccess {
 
     fn create_world(&self) -> HostAccessResult<WorldSessionSummary> {
         let world = self.home()?.create_world().map_err(map_host_access_error)?;
+        self.world_sessions.summary(world)
+    }
+
+    fn set_metadata(
+        &self,
+        world_id: &str,
+        title: &str,
+        cover: Option<WorldSessionAssetRef>,
+    ) -> HostAccessResult<WorldSessionSummary> {
+        let world_id = world_id
+            .parse::<WorldId>()
+            .map_err(|_| HostAccessError::InvalidWorldId)?;
+        let cover = cover
+            .map(|reference| {
+                Ok(AssetRef {
+                    digest: AssetDigest::parse(reference.digest)
+                        .map_err(|_| HostAccessError::InvalidAsset)?,
+                    size: reference.size,
+                    media_type: AssetMediaType::parse(reference.media_type)
+                        .map_err(|_| HostAccessError::InvalidAsset)?,
+                })
+            })
+            .transpose()?;
+        let world = self
+            .home()?
+            .update_world_catalog_metadata(world_id, title, cover)
+            .map_err(map_host_access_error)?;
         self.world_sessions.summary(world)
     }
 
@@ -3604,6 +3639,8 @@ mod tests {
         let world_id = WorldId::new();
         let summary = WorldSummary {
             id: world_id,
+            title: String::from("Test World"),
+            cover: None,
             commit_position: 0,
         };
 
@@ -3636,6 +3673,8 @@ mod tests {
         let observed = control
             .summary(WorldSummary {
                 id: world_id,
+                title: String::from("Test World"),
+                cover: None,
                 commit_position: 3,
             })
             .expect("world-session status must remain readable");
