@@ -158,6 +158,15 @@ pub trait ArtifactStoreAccess: Send + Sync {
 pub trait AssetStoreAccess: Send + Sync {
     /// Imports exact bytes and returns their immutable digest/size/media reference.
     fn import_asset(&self, bytes: &[u8], media_type: &str) -> HostAccessResult<ImportedAsset>;
+
+    /// Reads one exact verified immutable asset under an explicit caller-owned byte bound.
+    fn read_asset(
+        &self,
+        digest: &str,
+        size: u64,
+        media_type: &str,
+        maximum_bytes: usize,
+    ) -> HostAccessResult<Vec<u8>>;
 }
 
 /// Generic read-only access to the persistent user-content library.
@@ -601,6 +610,16 @@ struct UnavailableAssetStoreAccess;
 
 impl AssetStoreAccess for UnavailableAssetStoreAccess {
     fn import_asset(&self, _bytes: &[u8], _media_type: &str) -> HostAccessResult<ImportedAsset> {
+        Err(HostAccessError::Unavailable)
+    }
+
+    fn read_asset(
+        &self,
+        _digest: &str,
+        _size: u64,
+        _media_type: &str,
+        _maximum_bytes: usize,
+    ) -> HostAccessResult<Vec<u8>> {
         Err(HostAccessError::Unavailable)
     }
 }

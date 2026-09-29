@@ -5,10 +5,11 @@ use rintawa_sdk::{
     contracts::{ComponentRef, ContractKey, ContractVersion},
     types::{ExtensionInstanceId, RuntimeScopeId},
     ui::{
-        UI_CAPABILITY_DATA_GRID, UI_CAPABILITY_TEXT, UiActionId, UiCapabilityId, UiDataGridColumn,
-        UiDataGridNode, UiDataGridSortDirection, UiError, UiIconNode, UiIconSlotId, UiImageNode,
-        UiLayerDescriptor, UiNode, UiNodeKind, UiPlacementHint, UiSplitAxis, UiSplitNode,
-        UiSurfaceContribution, UiSurfaceId, UiSurfaceSnapshot, UiTextNode,
+        UI_CAPABILITY_DATA_GRID, UI_CAPABILITY_TEXT, UiActionId, UiAssetImageNode, UiCapabilityId,
+        UiDataGridColumn, UiDataGridNode, UiDataGridSortDirection, UiError, UiIconNode,
+        UiIconSlotId, UiImageNode, UiLayerDescriptor, UiNode, UiNodeKind, UiPlacementHint,
+        UiSplitAxis, UiSplitNode, UiSurfaceContribution, UiSurfaceId, UiSurfaceSnapshot,
+        UiTextNode,
     },
 };
 use rintawa_ui_runtime::{OwnedUiLayerDescriptor, OwnedUiSurfaceContribution, UiRuntime};
@@ -378,6 +379,49 @@ fn test_should_reject_image_and_icon_values_unsupported_by_capability_v1() -> Re
         runtime.mount_surface(&owner("feature"), invalid_icon),
         Err(UiError::InvalidLayout(_))
     ));
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_invalid_asset_backed_image_references() -> Result<()> {
+    let runtime = UiRuntime::new();
+    register_feature(&runtime, surface())?;
+
+    let snapshot = |digest: &str, size: u64, media_type: &str| UiSurfaceSnapshot {
+        surface_id: UiSurfaceId::new("example.main"),
+        revision: 1,
+        root: "asset".into(),
+        nodes: vec![UiNode::new(
+            "asset",
+            UiNodeKind::AssetImage(UiAssetImageNode {
+                digest: digest.to_string(),
+                size,
+                media_type: media_type.to_string(),
+                alt: String::from("Example"),
+                width: Some(64),
+                height: Some(64),
+            }),
+        )],
+    };
+
+    for invalid in [
+        snapshot("sha256:ABC", 4, "image/png"),
+        snapshot(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            0,
+            "image/png",
+        ),
+        snapshot(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            4,
+            "image/svg+xml",
+        ),
+    ] {
+        assert!(matches!(
+            runtime.mount_surface(&owner("feature"), invalid),
+            Err(UiError::InvalidLayout(_))
+        ));
+    }
     Ok(())
 }
 

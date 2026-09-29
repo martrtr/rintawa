@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -566,6 +566,36 @@ impl AssetStoreAccess for LocalHostAccess {
             size: reference.size,
             media_type: reference.media_type.to_string(),
         })
+    }
+
+    fn read_asset(
+        &self,
+        digest: &str,
+        size: u64,
+        media_type: &str,
+        maximum_bytes: usize,
+    ) -> HostAccessResult<Vec<u8>> {
+        let maximum_bytes = u64::try_from(maximum_bytes).map_err(|_| HostAccessError::Rejected)?;
+        if size == 0 || size > maximum_bytes {
+            return Err(HostAccessError::Rejected);
+        }
+        let digest = AssetDigest::parse(digest).map_err(|_| HostAccessError::InvalidDigest)?;
+        let reference =
+            AssetRef::new(digest, size, media_type).map_err(|_| HostAccessError::InvalidAsset)?;
+        let file = self
+            .home()?
+            .asset_store()
+            .open_asset(&reference)
+            .map_err(map_asset_store_read_error)?;
+        let capacity = usize::try_from(size).map_err(|_| HostAccessError::Rejected)?;
+        let mut bytes = Vec::with_capacity(capacity);
+        file.take(maximum_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|_| HostAccessError::Unavailable)?;
+        if bytes.len() != capacity {
+            return Err(HostAccessError::Unavailable);
+        }
+        Ok(bytes)
     }
 }
 
@@ -1174,6 +1204,20 @@ fn map_asset_import_error(error: rintawa_artifacts::AssetError) -> HostAccessErr
         | rintawa_artifacts::AssetError::AssetTooLarge { .. } => HostAccessError::InvalidAsset,
         rintawa_artifacts::AssetError::Io(_)
         | rintawa_artifacts::AssetError::StoredAssetNotFound(_)
+        | rintawa_artifacts::AssetError::StoreCorruption(_)
+        | rintawa_artifacts::AssetError::SizeMismatch { .. }
+        | rintawa_artifacts::AssetError::InvalidStoreEntry { .. } => HostAccessError::Unavailable,
+    }
+}
+
+fn map_asset_store_read_error(error: rintawa_artifacts::AssetError) -> HostAccessError {
+    match error {
+        rintawa_artifacts::AssetError::InvalidDigest(_) => HostAccessError::InvalidDigest,
+        rintawa_artifacts::AssetError::InvalidMediaType { .. } => HostAccessError::InvalidAsset,
+        rintawa_artifacts::AssetError::StoredAssetNotFound(_) => HostAccessError::NotFound,
+        rintawa_artifacts::AssetError::Io(_)
+        | rintawa_artifacts::AssetError::UnsupportedSource(_)
+        | rintawa_artifacts::AssetError::AssetTooLarge { .. }
         | rintawa_artifacts::AssetError::StoreCorruption(_)
         | rintawa_artifacts::AssetError::SizeMismatch { .. }
         | rintawa_artifacts::AssetError::InvalidStoreEntry { .. } => HostAccessError::Unavailable,

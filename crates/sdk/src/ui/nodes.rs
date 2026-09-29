@@ -5,11 +5,11 @@ use serde::{Deserialize, Serialize};
 use crate::contracts::ContractKey;
 
 use crate::ui::{
-    UI_CAPABILITY_BUTTON, UI_CAPABILITY_CHECKBOX, UI_CAPABILITY_COLUMN, UI_CAPABILITY_DATA_GRID,
-    UI_CAPABILITY_ICON, UI_CAPABILITY_IMAGE, UI_CAPABILITY_LIST, UI_CAPABILITY_MARKDOWN,
-    UI_CAPABILITY_ROW, UI_CAPABILITY_SELECT, UI_CAPABILITY_SPLIT, UI_CAPABILITY_TEXT,
-    UI_CAPABILITY_TEXT_AREA, UI_CAPABILITY_TEXT_INPUT, UiActionId, UiActionPayload, UiCapabilityId,
-    UiIconSlotId, UiNodeId, UiNodeSemanticTraitId,
+    UI_CAPABILITY_ASSET_IMAGE, UI_CAPABILITY_BUTTON, UI_CAPABILITY_CHECKBOX, UI_CAPABILITY_COLUMN,
+    UI_CAPABILITY_DATA_GRID, UI_CAPABILITY_ICON, UI_CAPABILITY_IMAGE, UI_CAPABILITY_LIST,
+    UI_CAPABILITY_MARKDOWN, UI_CAPABILITY_ROW, UI_CAPABILITY_SELECT, UI_CAPABILITY_SPLIT,
+    UI_CAPABILITY_TEXT, UI_CAPABILITY_TEXT_AREA, UI_CAPABILITY_TEXT_INPUT, UiActionId,
+    UiActionPayload, UiCapabilityId, UiIconSlotId, UiNodeId, UiNodeSemanticTraitId,
 };
 
 /// One node in a portable UI surface.
@@ -63,8 +63,10 @@ pub enum UiNodeKind {
     Button(UiButtonNode),
     /// Semantic interface icon resolved by the active UI Layer/theme.
     Icon(UiIconNode),
-    /// Verified raster image content.
+    /// Verified embedded raster image content.
     Image(UiImageNode),
+    /// Host-verified immutable asset-backed raster image content.
+    AssetImage(UiAssetImageNode),
     /// Boolean checkbox control.
     Checkbox(UiCheckboxNode),
     /// Single-value selection control.
@@ -94,6 +96,7 @@ impl UiNodeKind {
             Self::Button(_) => UI_CAPABILITY_BUTTON,
             Self::Icon(_) => UI_CAPABILITY_ICON,
             Self::Image(_) => UI_CAPABILITY_IMAGE,
+            Self::AssetImage(_) => UI_CAPABILITY_ASSET_IMAGE,
             Self::Checkbox(_) => UI_CAPABILITY_CHECKBOX,
             Self::Select(_) => UI_CAPABILITY_SELECT,
             Self::TextInput(_) => UI_CAPABILITY_TEXT_INPUT,
@@ -262,6 +265,25 @@ pub struct UiImageNode {
     /// Base64-encoded verified image bytes.
     pub data_base64: String,
     /// Alternative text used when the image cannot be presented.
+    pub alt: String,
+    /// Optional renderer-neutral requested width in logical pixels.
+    #[serde(default)]
+    pub width: Option<u32>,
+    /// Optional renderer-neutral requested height in logical pixels.
+    #[serde(default)]
+    pub height: Option<u32>,
+}
+
+/// Immutable host-owned asset rendered as an image without embedding bytes in the snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiAssetImageNode {
+    /// Canonical `sha256:<lowercase-hex>` identity of the exact asset bytes.
+    pub digest: String,
+    /// Exact immutable asset byte length.
+    pub size: u64,
+    /// Canonical raster media type.
+    pub media_type: String,
+    /// Alternative text used when the asset cannot be presented.
     pub alt: String,
     /// Optional renderer-neutral requested width in logical pixels.
     #[serde(default)]

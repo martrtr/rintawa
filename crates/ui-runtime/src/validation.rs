@@ -3,14 +3,15 @@
 use std::collections::{HashMap, HashSet};
 
 use rintawa_sdk::ui::{
-    UiCapabilityId, UiDataGridNode, UiError, UiIconNode, UiImageNode, UiNode, UiNodeId, UiNodeKind,
-    UiSelectNode, UiSplitNode, UiSurfaceSnapshot,
+    UiAssetImageNode, UiCapabilityId, UiDataGridNode, UiError, UiIconNode, UiImageNode, UiNode,
+    UiNodeId, UiNodeKind, UiSelectNode, UiSplitNode, UiSurfaceSnapshot,
 };
 
 const MAX_LAYOUT_WEIGHT: u32 = 10_000;
 const MAX_ICON_SIZE: u32 = 256;
 const MAX_IMAGE_DIMENSION: u32 = 4096;
 const MAX_IMAGE_BASE64_BYTES: usize = 1024 * 1024;
+const MAX_ASSET_IMAGE_BYTES: u64 = 1024 * 1024;
 const MAX_SELECT_OPTIONS: usize = 256;
 const MAX_DATA_GRID_COLUMNS: usize = 64;
 
@@ -35,6 +36,7 @@ pub(crate) fn validate_snapshot(snapshot: &UiSurfaceSnapshot) -> Result<(), UiEr
         match &node.kind {
             UiNodeKind::Icon(icon) => validate_icon(&node.id, icon)?,
             UiNodeKind::Image(image) => validate_image(&node.id, image)?,
+            UiNodeKind::AssetImage(image) => validate_asset_image(&node.id, image)?,
             UiNodeKind::Select(select) => validate_select(&node.id, select)?,
             UiNodeKind::Split(split) => validate_split_layout(&node.id, split)?,
             UiNodeKind::DataGrid(grid) => validate_data_grid_layout(&node.id, grid)?,
@@ -91,6 +93,48 @@ fn validate_image(node_id: &UiNodeId, image: &UiImageNode) -> Result<(), UiError
     {
         return Err(UiError::InvalidLayout(format!(
             "image node '{node_id}' requires requested dimensions in 1..={MAX_IMAGE_DIMENSION}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_asset_image(node_id: &UiNodeId, image: &UiAssetImageNode) -> Result<(), UiError> {
+    let Some(hex) = image.digest.strip_prefix("sha256:") else {
+        return Err(UiError::InvalidLayout(format!(
+            "asset-image node '{node_id}' requires canonical sha256 digest"
+        )));
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(UiError::InvalidLayout(format!(
+            "asset-image node '{node_id}' requires canonical sha256 digest"
+        )));
+    }
+    if image.size == 0 || image.size > MAX_ASSET_IMAGE_BYTES {
+        return Err(UiError::InvalidLayout(format!(
+            "asset-image node '{node_id}' requires asset size in 1..={MAX_ASSET_IMAGE_BYTES}"
+        )));
+    }
+    if !matches!(
+        image.media_type.as_str(),
+        "image/png" | "image/webp" | "image/jpeg"
+    ) {
+        return Err(UiError::InvalidLayout(format!(
+            "asset-image node '{node_id}' requires PNG, WebP, or JPEG media"
+        )));
+    }
+    if image
+        .width
+        .is_some_and(|width| width == 0 || width > MAX_IMAGE_DIMENSION)
+        || image
+            .height
+            .is_some_and(|height| height == 0 || height > MAX_IMAGE_DIMENSION)
+    {
+        return Err(UiError::InvalidLayout(format!(
+            "asset-image node '{node_id}' requires requested dimensions in 1..={MAX_IMAGE_DIMENSION}"
         )));
     }
     Ok(())

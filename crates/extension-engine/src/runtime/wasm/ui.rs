@@ -6,16 +6,19 @@ use rintawa_sdk::{
     contracts::{ContractKey, ContractVersion},
     ui::{
         UiActionEvent, UiActivityContribution, UiActivityId, UiCapabilityId, UiError, UiIconSlotId,
-        UiLayerDescriptor, UiPatchBatch, UiPlacementHint, UiSurfaceContribution, UiSurfaceId,
-        UiSurfaceSnapshot, UiSurfaceTraitId, WorldPresentationDescriptor,
+        UiLayerDescriptor, UiNodeKind, UiPatchBatch, UiPlacementHint, UiSurfaceContribution,
+        UiSurfaceId, UiSurfaceSnapshot, UiSurfaceTraitId, WorldPresentationDescriptor,
     },
     world::WorldId,
 };
 use tracing::warn;
 
-use crate::runtime::wasm::{
-    PortableUiError, PortableUiHost, UiLayerError, UiLayerHost, WasmHostState, WitActivity,
-    WitPlacementHint,
+use crate::{
+    HostAccessError,
+    runtime::wasm::{
+        PortableUiError, PortableUiHost, UiLayerError, UiLayerHost, WasmHostState, WitActivity,
+        WitPlacementHint, WitPresentedAsset,
+    },
 };
 
 #[derive(Debug)]
@@ -333,6 +336,17 @@ impl PortableUiHost for WasmHostState {
     }
 }
 
+fn map_presented_asset_access_error(error: HostAccessError) -> UiLayerError {
+    match error {
+        HostAccessError::InvalidAsset | HostAccessError::InvalidDigest => {
+            UiLayerError::InvalidPayload
+        }
+        HostAccessError::NotFound => UiLayerError::Rejected,
+        HostAccessError::Unavailable => UiLayerError::Unavailable,
+        _ => UiLayerError::Rejected,
+    }
+}
+
 fn map_ui_layer_error(error: UiError) -> UiLayerError {
     match error {
         UiError::LayerNotOwner | UiError::LayerNotRegistered => UiLayerError::NotActiveLayer,
@@ -361,6 +375,53 @@ impl UiLayerHost for WasmHostState {
             return Err(UiLayerError::MessageTooLarge);
         }
         serde_json::to_vec(&surfaces).map_err(|_| UiLayerError::Unavailable)
+    }
+
+    fn read_presented_asset(&mut self, digest: String) -> Result<WitPresentedAsset, UiLayerError> {
+        if !self.ui_access_active {
+            return Err(UiLayerError::AccessNotActive);
+        }
+        if digest.len() > self.max_host_message_bytes {
+            return Err(UiLayerError::MessageTooLarge);
+        }
+        let owner = self
+            .current_execution_owner()
+            .cloned()
+            .ok_or(UiLayerError::AccessNotActive)?;
+        let surfaces = self
+            .ui
+            .presentation_surfaces_for_layer(&owner)
+            .map_err(map_ui_layer_error)?;
+        let mut reference: Option<(u64, String)> = None;
+        for surface in surfaces {
+            for node in surface.snapshot.nodes {
+                let UiNodeKind::AssetImage(image) = node.kind else {
+                    continue;
+                };
+                if image.digest != digest {
+                    continue;
+                }
+                let candidate = (image.size, image.media_type);
+                if reference
+                    .as_ref()
+                    .is_some_and(|current| current != &candidate)
+                {
+                    return Err(UiLayerError::Rejected);
+                }
+                reference = Some(candidate);
+            }
+        }
+        let (size, media_type) = reference.ok_or(UiLayerError::Rejected)?;
+        let maximum_bytes = self.max_host_message_bytes;
+        let bytes = self
+            .host_access
+            .asset_store
+            .read_asset(&digest, size, &media_type, maximum_bytes)
+            .map_err(map_presented_asset_access_error)?;
+        if bytes.len() > maximum_bytes {
+            return Err(UiLayerError::MessageTooLarge);
+        }
+        Ok(WitPresentedAsset { media_type, bytes })
     }
 
     fn presentation_state(&mut self) -> Result<Vec<u8>, UiLayerError> {

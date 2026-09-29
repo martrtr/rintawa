@@ -876,6 +876,16 @@ interface ui-layer {
     /// Returns the current visible presentation as serialized JSON.
     presentation-surfaces: func() -> result<list<u8>, error>;
 
+    /// Exact verified bytes for one immutable asset already referenced by the visible presentation.
+    record presented-asset {
+        media-type: string,
+        bytes: list<u8>,
+    }
+
+    /// Reads an asset only when this exact active UI Layer can currently see an asset-image node
+    /// carrying the requested digest. This never exposes host filesystem or CAS paths.
+    read-presented-asset: func(digest: string) -> result<presented-asset, error>;
+
     /// Returns renderer-session World focus state as serialized JSON.
     presentation-state: func() -> result<list<u8>, error>;
 

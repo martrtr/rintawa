@@ -81,8 +81,10 @@ pub const UI_CAPABILITY_MARKDOWN: &str = "rintawa.ui.markdown@1";
 pub const UI_CAPABILITY_BUTTON: &str = "rintawa.ui.button@1";
 /// Capability required for semantic interface icons.
 pub const UI_CAPABILITY_ICON: &str = "rintawa.ui.icon@1";
-/// Capability required for verified raster images.
+/// Capability required for verified embedded raster images.
 pub const UI_CAPABILITY_IMAGE: &str = "rintawa.ui.image@1";
+/// Capability required for host-verified asset-backed raster images.
+pub const UI_CAPABILITY_ASSET_IMAGE: &str = "rintawa.ui.asset-image@1";
 /// Capability required for checkbox controls.
 pub const UI_CAPABILITY_CHECKBOX: &str = "rintawa.ui.input.checkbox@1";
 /// Capability required for select controls.

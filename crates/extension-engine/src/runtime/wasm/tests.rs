@@ -98,6 +98,23 @@ impl AssetStoreAccess for RecordingScopedHostAccess {
             media_type: media_type.to_ascii_lowercase(),
         })
     }
+
+    fn read_asset(
+        &self,
+        digest: &str,
+        size: u64,
+        media_type: &str,
+        maximum_bytes: usize,
+    ) -> HostAccessResult<Vec<u8>> {
+        if digest != "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            || size != 4
+            || media_type != "image/png"
+            || maximum_bytes < 4
+        {
+            return Err(HostAccessError::NotFound);
+        }
+        Ok(vec![1, 2, 3, 4])
+    }
 }
 
 impl UserContentAccess for RecordingScopedHostAccess {
@@ -966,6 +983,105 @@ fn test_should_stage_and_apply_wasm_portable_ui_operations() {
     PortableUiHost::unmount_surface(&mut state, String::from("example.main")).unwrap();
     state.finish_service_execution();
     assert!(state.ui.presentation_surfaces().is_empty());
+}
+
+#[test]
+fn test_should_read_only_asset_referenced_by_active_layer_presentation() {
+    let access = Arc::new(RecordingScopedHostAccess::default());
+    let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
+    let mut services = WasmHostServices::standalone(secrets);
+    services.host_access = HostAccessServices::new(
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access,
+    );
+    let mut state = WasmHostState::with_host_services_and_budget(
+        ComponentId::new("runtime"),
+        services,
+        false,
+        &WasmExecutionBudget::default(),
+    );
+    begin_test_registration(&mut state, ExtensionId::new("example.layer"));
+    PortableUiHost::register_surface(
+        &mut state,
+        String::from("example.main"),
+        WitPlacementHint::Primary,
+        None,
+        None,
+        None,
+        Vec::new(),
+        vec![String::from(rintawa_sdk::ui::UI_CAPABILITY_ASSET_IMAGE)],
+    )
+    .unwrap();
+    PortableUiHost::register_layer(
+        &mut state,
+        rintawa_sdk::ui::PORTABLE_UI_PROTOCOL_MAJOR,
+        vec![String::from(rintawa_sdk::ui::UI_CAPABILITY_ASSET_IMAGE)],
+    )
+    .unwrap();
+    let registrations = state.finish_registration().unwrap();
+    let owner = ComponentRef::new(test_instance_id(), ComponentId::new("runtime"));
+    let descriptor = registrations
+        .ui_layer
+        .expect("test layer descriptor must exist");
+    state
+        .ui
+        .register_instance(
+            test_instance_id(),
+            test_scope_id(),
+            vec![rintawa_ui_runtime::OwnedUiSurfaceContribution {
+                owner: owner.clone(),
+                contribution: registrations.ui_surfaces[0].clone(),
+            }],
+            vec![rintawa_ui_runtime::OwnedUiLayerDescriptor {
+                owner: owner.clone(),
+                descriptor,
+            }],
+        )
+        .unwrap();
+    state
+        .ui
+        .set_instance_active(&test_instance_id(), true)
+        .unwrap();
+    state.ui.attach_registered_layer(owner).unwrap();
+
+    let digest =
+        String::from("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let snapshot = UiSurfaceSnapshot {
+        surface_id: UiSurfaceId::new("example.main"),
+        revision: 1,
+        root: "asset".into(),
+        nodes: vec![rintawa_sdk::ui::UiNode::new(
+            "asset",
+            rintawa_sdk::ui::UiNodeKind::AssetImage(rintawa_sdk::ui::UiAssetImageNode {
+                digest: digest.clone(),
+                size: 4,
+                media_type: String::from("image/png"),
+                alt: String::from("Example"),
+                width: Some(64),
+                height: Some(64),
+            }),
+        )],
+    };
+    state.begin_guest_execution();
+    PortableUiHost::mount_surface(&mut state, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    state.finish_service_execution();
+
+    state.begin_guest_execution();
+    assert!(matches!(
+        UiLayerHost::read_presented_asset(
+            &mut state,
+            String::from("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",),
+        ),
+        Err(UiLayerError::Rejected)
+    ));
+    let presented = UiLayerHost::read_presented_asset(&mut state, digest).unwrap();
+    assert_eq!(presented.media_type, "image/png");
+    assert_eq!(presented.bytes, vec![1, 2, 3, 4]);
+    state.finish_service_execution();
 }
 
 #[test]

@@ -147,7 +147,7 @@ use bindings::rintawa::engine::{
     scoped_runtime_policy::Host as ScopedRuntimePolicyHost,
     secrets::{Error as SecretError, Host as SecretsHost},
     services::{Error as ServiceTransportError, Host as ServicesHost},
-    ui_layer::{Error as UiLayerError, Host as UiLayerHost},
+    ui_layer::{Error as UiLayerError, Host as UiLayerHost, PresentedAsset as WitPresentedAsset},
     user_content::{
         AcceptedWrite as WitAcceptedUserContentWrite, Document as WitUserContentDocument,
         Entry as WitUserContentEntry, Error as UserContentError, Host as UserContentHost,
