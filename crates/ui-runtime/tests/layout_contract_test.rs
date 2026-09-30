@@ -5,11 +5,11 @@ use rintawa_sdk::{
     contracts::{ComponentRef, ContractKey, ContractVersion},
     types::{ExtensionInstanceId, RuntimeScopeId},
     ui::{
-        UI_CAPABILITY_DATA_GRID, UI_CAPABILITY_TEXT, UiActionId, UiAssetImageNode, UiCapabilityId,
-        UiDataGridColumn, UiDataGridNode, UiDataGridSortDirection, UiError, UiIconNode,
-        UiIconSlotId, UiImageNode, UiLayerDescriptor, UiNode, UiNodeKind, UiPlacementHint,
-        UiSplitAxis, UiSplitNode, UiSurfaceContribution, UiSurfaceId, UiSurfaceSnapshot,
-        UiTextNode,
+        UI_CAPABILITY_DATA_GRID, UI_CAPABILITY_TEXT, UiActionAssetRef, UiActionId, UiActionPayload,
+        UiAssetImageNode, UiAssetPickerNode, UiCapabilityId, UiDataGridColumn, UiDataGridNode,
+        UiDataGridSortDirection, UiError, UiIconNode, UiIconSlotId, UiImageNode, UiLayerDescriptor,
+        UiNode, UiNodeKind, UiPlacementHint, UiSplitAxis, UiSplitNode, UiSurfaceContribution,
+        UiSurfaceId, UiSurfaceSnapshot, UiTextNode,
     },
 };
 use rintawa_ui_runtime::{OwnedUiLayerDescriptor, OwnedUiSurfaceContribution, UiRuntime};
@@ -379,6 +379,72 @@ fn test_should_reject_image_and_icon_values_unsupported_by_capability_v1() -> Re
         runtime.mount_surface(&owner("feature"), invalid_icon),
         Err(UiError::InvalidLayout(_))
     ));
+    Ok(())
+}
+
+#[test]
+fn test_should_validate_asset_picker_bounds_and_action_payloads() -> Result<()> {
+    let runtime = UiRuntime::new();
+    register_feature(&runtime, surface())?;
+
+    let picker = UiAssetPickerNode {
+        label: String::from("Attach image"),
+        accepted_media_types: vec![String::from("image/png"), String::from("image/jpeg")],
+        max_bytes: 1024,
+        change_action: UiActionId::new("example.attach"),
+        is_enabled: true,
+    };
+    let picker_kind = UiNodeKind::AssetPicker(picker.clone());
+    assert!(picker_kind.accepts_action_payload(
+        &UiActionId::new("example.attach"),
+        &UiActionPayload::Asset(UiActionAssetRef {
+            digest: String::from(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            size: 4,
+            media_type: String::from("image/png"),
+            name: Some(String::from("image.png")),
+        }),
+    ));
+    assert!(!picker_kind.accepts_action_payload(
+        &UiActionId::new("example.attach"),
+        &UiActionPayload::Asset(UiActionAssetRef {
+            digest: String::from(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            size: 4,
+            media_type: String::from("image/webp"),
+            name: None,
+        }),
+    ));
+
+    let snapshot = |picker: UiAssetPickerNode| UiSurfaceSnapshot {
+        surface_id: UiSurfaceId::new("example.main"),
+        revision: 1,
+        root: "picker".into(),
+        nodes: vec![UiNode::new("picker", UiNodeKind::AssetPicker(picker))],
+    };
+    runtime.mount_surface(&owner("feature"), snapshot(picker.clone()))?;
+
+    for invalid in [
+        UiAssetPickerNode {
+            max_bytes: 0,
+            ..picker.clone()
+        },
+        UiAssetPickerNode {
+            accepted_media_types: vec![String::from("Image/PNG")],
+            ..picker.clone()
+        },
+        UiAssetPickerNode {
+            accepted_media_types: vec![String::from("image/png"), String::from("image/png")],
+            ..picker
+        },
+    ] {
+        assert!(matches!(
+            runtime.mount_surface(&owner("feature"), snapshot(invalid)),
+            Err(UiError::InvalidLayout(_))
+        ));
+    }
     Ok(())
 }
 

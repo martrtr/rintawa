@@ -5,11 +5,12 @@ use serde::{Deserialize, Serialize};
 use crate::contracts::ContractKey;
 
 use crate::ui::{
-    UI_CAPABILITY_ASSET_IMAGE, UI_CAPABILITY_BUTTON, UI_CAPABILITY_CHECKBOX, UI_CAPABILITY_COLUMN,
-    UI_CAPABILITY_DATA_GRID, UI_CAPABILITY_ICON, UI_CAPABILITY_IMAGE, UI_CAPABILITY_LIST,
-    UI_CAPABILITY_MARKDOWN, UI_CAPABILITY_ROW, UI_CAPABILITY_SELECT, UI_CAPABILITY_SPLIT,
-    UI_CAPABILITY_TEXT, UI_CAPABILITY_TEXT_AREA, UI_CAPABILITY_TEXT_INPUT, UiActionId,
-    UiActionPayload, UiCapabilityId, UiIconSlotId, UiNodeId, UiNodeSemanticTraitId,
+    UI_CAPABILITY_ASSET_IMAGE, UI_CAPABILITY_ASSET_PICKER, UI_CAPABILITY_BUTTON,
+    UI_CAPABILITY_CHECKBOX, UI_CAPABILITY_COLUMN, UI_CAPABILITY_DATA_GRID, UI_CAPABILITY_ICON,
+    UI_CAPABILITY_IMAGE, UI_CAPABILITY_LIST, UI_CAPABILITY_MARKDOWN, UI_CAPABILITY_ROW,
+    UI_CAPABILITY_SELECT, UI_CAPABILITY_SPLIT, UI_CAPABILITY_TEXT, UI_CAPABILITY_TEXT_AREA,
+    UI_CAPABILITY_TEXT_INPUT, UiActionId, UiActionPayload, UiCapabilityId, UiIconSlotId, UiNodeId,
+    UiNodeSemanticTraitId,
 };
 
 /// One node in a portable UI surface.
@@ -75,6 +76,8 @@ pub enum UiNodeKind {
     TextInput(UiTextInputNode),
     /// Multiline text input.
     TextArea(UiTextAreaNode),
+    /// User-mediated picker that imports one immutable asset before emitting its reference.
+    AssetPicker(UiAssetPickerNode),
     /// Weighted renderer-neutral split container.
     Split(UiSplitNode),
     /// Horizontal child container.
@@ -101,6 +104,7 @@ impl UiNodeKind {
             Self::Select(_) => UI_CAPABILITY_SELECT,
             Self::TextInput(_) => UI_CAPABILITY_TEXT_INPUT,
             Self::TextArea(_) => UI_CAPABILITY_TEXT_AREA,
+            Self::AssetPicker(_) => UI_CAPABILITY_ASSET_PICKER,
             Self::Split(_) => UI_CAPABILITY_SPLIT,
             Self::Row(_) => UI_CAPABILITY_ROW,
             Self::Column(_) => UI_CAPABILITY_COLUMN,
@@ -144,6 +148,7 @@ impl UiNodeKind {
                 node.change_action.as_ref() == Some(action)
                     || node.submit_action.as_ref() == Some(action)
             }
+            Self::AssetPicker(node) => &node.change_action == action,
             Self::DataGrid(node) => {
                 node.row_action.as_ref() == Some(action)
                     || node
@@ -163,6 +168,7 @@ impl UiNodeKind {
             Self::Select(node) => &node.change_action == action && node.is_enabled,
             Self::TextInput(node) => self.has_action(action) && node.is_enabled,
             Self::TextArea(node) => self.has_action(action) && node.is_enabled,
+            Self::AssetPicker(node) => &node.change_action == action && node.is_enabled,
             Self::DataGrid(_) => self.has_action(action),
             _ => false,
         }
@@ -183,6 +189,13 @@ impl UiNodeKind {
             Self::TextInput(_) | Self::TextArea(_) if self.has_action(action) => {
                 matches!(payload, UiActionPayload::Text(_))
             }
+            Self::AssetPicker(node) if &node.change_action == action => {
+                matches!(payload, UiActionPayload::Asset(asset) if {
+                    asset.size > 0
+                        && asset.size <= node.max_bytes
+                        && node.accepted_media_types.iter().any(|media_type| media_type == &asset.media_type)
+                })
+            }
             Self::DataGrid(node) => match payload {
                 UiActionPayload::Text(value)
                     if node.row_action.as_ref() == Some(action)
@@ -194,7 +207,9 @@ impl UiNodeKind {
                     column.sort_action.as_ref() == Some(action)
                         && column.key.as_ref() == Some(value)
                 }),
-                UiActionPayload::None | UiActionPayload::Boolean(_) => false,
+                UiActionPayload::None | UiActionPayload::Boolean(_) | UiActionPayload::Asset(_) => {
+                    false
+                }
             },
             _ => false,
         }
@@ -372,6 +387,21 @@ pub enum UiSplitAxis {
     Horizontal,
     /// Children are laid out from top to bottom.
     Vertical,
+}
+
+/// User-mediated immutable asset picker control data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiAssetPickerNode {
+    /// User-visible control label.
+    pub label: String,
+    /// Exact media types accepted by the owning feature.
+    pub accepted_media_types: Vec<String>,
+    /// Maximum accepted byte length for one selected asset.
+    pub max_bytes: u64,
+    /// Semantic action emitted with a Host-issued asset reference.
+    pub change_action: UiActionId,
+    /// Whether user selection is currently enabled.
+    pub is_enabled: bool,
 }
 
 /// Weighted split layout data.

@@ -5,9 +5,10 @@ use std::io::Write;
 use rintawa_sdk::{
     contracts::{ContractKey, ContractVersion},
     ui::{
-        UiActionEvent, UiActivityContribution, UiActivityId, UiCapabilityId, UiError, UiIconSlotId,
-        UiLayerDescriptor, UiNodeKind, UiPatchBatch, UiPlacementHint, UiSurfaceContribution,
-        UiSurfaceId, UiSurfaceSnapshot, UiSurfaceTraitId, WorldPresentationDescriptor,
+        UiActionEvent, UiActionPayload, UiActivityContribution, UiActivityId, UiCapabilityId,
+        UiError, UiIconSlotId, UiLayerDescriptor, UiNodeKind, UiPatchBatch, UiPlacementHint,
+        UiSurfaceContribution, UiSurfaceId, UiSurfaceSnapshot, UiSurfaceTraitId,
+        WorldPresentationDescriptor,
     },
     world::WorldId,
 };
@@ -485,6 +486,13 @@ impl UiLayerHost for WasmHostState {
         }
         let event: UiActionEvent =
             serde_json::from_slice(&action_json).map_err(|_| UiLayerError::InvalidPayload)?;
+        if let UiActionPayload::Asset(asset) = &event.payload {
+            let maximum_bytes = self.max_asset_import_bytes;
+            self.host_access
+                .asset_store
+                .read_asset(&asset.digest, asset.size, &asset.media_type, maximum_bytes)
+                .map_err(map_presented_asset_access_error)?;
+        }
         let owner = self
             .current_execution_owner()
             .cloned()

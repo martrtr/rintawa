@@ -6,6 +6,19 @@ use crate::types::ExtensionInstanceId;
 
 use crate::ui::{UiActionId, UiNodeId, UiSurfaceId};
 
+/// Immutable Host-issued asset selected through a renderer-neutral asset picker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiActionAssetRef {
+    /// Canonical `sha256:<lowercase-hex>` identity of the exact bytes.
+    pub digest: String,
+    /// Exact immutable asset byte length.
+    pub size: u64,
+    /// Canonical media type returned by the Host asset store.
+    pub media_type: String,
+    /// Original user-facing file name, when supplied by the UI Layer.
+    pub name: Option<String>,
+}
+
 /// Typed payload carried by a portable UI action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "kebab-case")]
@@ -16,6 +29,8 @@ pub enum UiActionPayload {
     Text(String),
     /// Boolean supplied by a toggle control.
     Boolean(bool),
+    /// Immutable asset imported by the trusted UI Layer after explicit user selection.
+    Asset(UiActionAssetRef),
 }
 
 /// One semantic action emitted by the active UI Layer.
