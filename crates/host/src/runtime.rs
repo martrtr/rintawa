@@ -18,11 +18,11 @@ use rintawa_extension_engine::{
     ImportedArtifact, ImportedAsset, PreferenceAccess, RtwExtensionLoadOutcome, RtwExtensionLoader,
     RuntimeArtifactPolicy, RuntimeContextAccess, RuntimePolicyAccess, RuntimePolicyComponent,
     RuntimePolicyRequest, UnresolvedContractReason, UserContentAccess, UserContentDocument,
-    UserContentSummary, UserContentWriteAccess, UserContentWriteStatus, WorldCommandAccess,
-    WorldCommandAccessError, WorldCommandAccessResult, WorldCommandActor, WorldCommandRequest,
-    WorldProjectionAccess, WorldProjectionAccessError, WorldProjectionAccessResult,
-    WorldProjectionReadStatus, WorldProjectionReadView, WorldProjectionRequest, WorldSessionAccess,
-    WorldSessionAssetRef, WorldSessionSummary,
+    UserContentSummary, UserContentWriteAccess, UserContentWriteStatus, UserResourceAccess,
+    UserResourceRef, WorldCommandAccess, WorldCommandAccessError, WorldCommandAccessResult,
+    WorldCommandActor, WorldCommandRequest, WorldProjectionAccess, WorldProjectionAccessError,
+    WorldProjectionAccessResult, WorldProjectionReadStatus, WorldProjectionReadView,
+    WorldProjectionRequest, WorldSessionAccess, WorldSessionAssetRef, WorldSessionSummary,
 };
 use rintawa_sdk::{
     content::{
@@ -76,6 +76,16 @@ const MAX_PENDING_USER_CONTENT_WRITES: usize = 32;
 const MAX_PENDING_USER_CONTENT_WRITE_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum completed/pending write statuses retained for owner-scoped inspection.
 const MAX_RETAINED_USER_CONTENT_WRITE_STATUSES: usize = 256;
+/// Maximum one-shot user resources retained by one HostRuntime.
+const MAX_USER_RESOURCES: usize = 32;
+/// Maximum bytes accepted for one ephemeral user resource.
+const MAX_USER_RESOURCE_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum total bytes retained across all ephemeral user resources.
+const MAX_USER_RESOURCE_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum UTF-8 bytes retained for one resource media type.
+const MAX_USER_RESOURCE_MEDIA_TYPE_BYTES: usize = 128;
+/// Maximum UTF-8 bytes retained for one optional original file name.
+const MAX_USER_RESOURCE_NAME_BYTES: usize = 512;
 /// Maximum diagnostic bytes retained for one failed deferred user-content write.
 const MAX_USER_CONTENT_WRITE_DIAGNOSTIC_BYTES: usize = 2 * 1024;
 /// Maximum distinct world lifecycle requests accepted before a host pump drains them.
@@ -203,6 +213,115 @@ impl WorldSessionRuntimeControl {
         } else {
             state.last_errors.remove(&world_id);
         }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct StoredUserResource {
+    reference: UserResourceRef,
+    bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct UserResourceRuntimeState {
+    resources: BTreeMap<String, StoredUserResource>,
+    total_bytes: usize,
+}
+
+#[derive(Clone, Default)]
+struct UserResourceRuntimeControl {
+    state: Arc<Mutex<UserResourceRuntimeState>>,
+}
+
+impl UserResourceRuntimeControl {
+    fn import(
+        &self,
+        bytes: &[u8],
+        media_type: &str,
+        name: Option<&str>,
+    ) -> HostAccessResult<UserResourceRef> {
+        if bytes.is_empty() || bytes.len() > MAX_USER_RESOURCE_BYTES {
+            return Err(HostAccessError::Rejected);
+        }
+        if media_type.is_empty()
+            || media_type.len() > MAX_USER_RESOURCE_MEDIA_TYPE_BYTES
+            || media_type != media_type.to_ascii_lowercase()
+            || !media_type.contains('/')
+        {
+            return Err(HostAccessError::Rejected);
+        }
+        if name.is_some_and(|value| {
+            value.trim().is_empty()
+                || value.len() > MAX_USER_RESOURCE_NAME_BYTES
+                || value.contains(['/', '\\'])
+        }) {
+            return Err(HostAccessError::Rejected);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| HostAccessError::Unavailable)?;
+        let next_total = state.total_bytes.saturating_add(bytes.len());
+        if state.resources.len() >= MAX_USER_RESOURCES || next_total > MAX_USER_RESOURCE_TOTAL_BYTES
+        {
+            return Err(HostAccessError::QueueFull);
+        }
+        let id = Uuid::now_v7().to_string();
+        if state.resources.contains_key(&id) {
+            return Err(HostAccessError::Rejected);
+        }
+        let size = u64::try_from(bytes.len()).map_err(|_| HostAccessError::Rejected)?;
+        let reference = UserResourceRef {
+            id: id.clone(),
+            size,
+            media_type: media_type.to_string(),
+            name: name.map(str::to_string),
+        };
+        state.resources.insert(
+            id,
+            StoredUserResource {
+                reference: reference.clone(),
+                bytes: bytes.to_vec(),
+            },
+        );
+        state.total_bytes = next_total;
+        Ok(reference)
+    }
+
+    fn read(&self, reference: &UserResourceRef, maximum_bytes: usize) -> HostAccessResult<Vec<u8>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| HostAccessError::Unavailable)?;
+        let resource = state
+            .resources
+            .get(&reference.id)
+            .ok_or(HostAccessError::NotFound)?;
+        if resource.reference != *reference {
+            return Err(HostAccessError::Rejected);
+        }
+        if resource.bytes.len() > maximum_bytes {
+            return Err(HostAccessError::Rejected);
+        }
+        Ok(resource.bytes.clone())
+    }
+
+    fn release(&self, reference: &UserResourceRef) -> HostAccessResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| HostAccessError::Unavailable)?;
+        let resource = state
+            .resources
+            .get(&reference.id)
+            .ok_or(HostAccessError::NotFound)?;
+        if resource.reference != *reference {
+            return Err(HostAccessError::Rejected);
+        }
+        let size = resource.bytes.len();
+        state.resources.remove(&reference.id);
+        state.total_bytes = state.total_bytes.saturating_sub(size);
         Ok(())
     }
 }
@@ -492,6 +611,7 @@ struct LocalHostAccess {
     home_root: PathBuf,
     local_principal: PrincipalId,
     user_content_writes: UserContentWriteRuntimeControl,
+    user_resources: UserResourceRuntimeControl,
     world_sessions: WorldSessionRuntimeControl,
     world_commands: WorldCommandRuntimeControl,
     world_projections: WorldProjectionRuntimeControl,
@@ -502,6 +622,7 @@ impl LocalHostAccess {
         home_root: &Path,
         local_principal: PrincipalId,
         user_content_writes: UserContentWriteRuntimeControl,
+        user_resources: UserResourceRuntimeControl,
         world_sessions: WorldSessionRuntimeControl,
         world_commands: WorldCommandRuntimeControl,
         world_projections: WorldProjectionRuntimeControl,
@@ -510,6 +631,7 @@ impl LocalHostAccess {
             home_root: home_root.to_path_buf(),
             local_principal,
             user_content_writes,
+            user_resources,
             world_sessions,
             world_commands,
             world_projections,
@@ -596,6 +718,29 @@ impl AssetStoreAccess for LocalHostAccess {
             return Err(HostAccessError::Unavailable);
         }
         Ok(bytes)
+    }
+}
+
+impl UserResourceAccess for LocalHostAccess {
+    fn import_resource(
+        &self,
+        bytes: &[u8],
+        media_type: &str,
+        name: Option<&str>,
+    ) -> HostAccessResult<UserResourceRef> {
+        self.user_resources.import(bytes, media_type, name)
+    }
+
+    fn read_resource(
+        &self,
+        reference: &UserResourceRef,
+        maximum_bytes: usize,
+    ) -> HostAccessResult<Vec<u8>> {
+        self.user_resources.read(reference, maximum_bytes)
+    }
+
+    fn release_resource(&self, reference: &UserResourceRef) -> HostAccessResult<()> {
+        self.user_resources.release(reference)
     }
 }
 
@@ -1308,6 +1453,7 @@ impl HostRuntime {
     pub fn start(home: &HostHome) -> HostResult<Self> {
         let profile = home.load_profile()?;
         let user_content_writes = UserContentWriteRuntimeControl::default();
+        let user_resources = UserResourceRuntimeControl::default();
         let world_sessions = WorldSessionRuntimeControl::default();
         let world_commands = WorldCommandRuntimeControl::default();
         let world_projections = WorldProjectionRuntimeControl::default();
@@ -1315,12 +1461,14 @@ impl HostRuntime {
             home.root(),
             home.local_principal(),
             user_content_writes,
+            user_resources,
             world_sessions,
             world_commands,
             world_projections,
         ));
         let artifact_store_access: Arc<dyn ArtifactStoreAccess> = access.clone();
         let asset_store_access: Arc<dyn AssetStoreAccess> = access.clone();
+        let user_resource_access: Arc<dyn UserResourceAccess> = access.clone();
         let user_content_access: Arc<dyn UserContentAccess> = access.clone();
         let user_content_write_access: Arc<dyn UserContentWriteAccess> = access.clone();
         let world_session_access: Arc<dyn WorldSessionAccess> = access.clone();
@@ -1339,6 +1487,7 @@ impl HostRuntime {
         );
         let runtime_context_access: Arc<dyn RuntimeContextAccess> = access.clone();
         engine.attach_runtime_context_access(runtime_context_access);
+        engine.attach_user_resource_access(user_resource_access);
         engine.attach_user_content_access(user_content_access);
         engine.attach_user_content_write_access(user_content_write_access);
         engine.attach_world_command_access(world_command_access);
@@ -2938,6 +3087,7 @@ mod tests {
             root.path(),
             PrincipalId::new(),
             UserContentWriteRuntimeControl::default(),
+            UserResourceRuntimeControl::default(),
             WorldSessionRuntimeControl::default(),
             WorldCommandRuntimeControl::default(),
             WorldProjectionRuntimeControl::default(),
@@ -3570,6 +3720,106 @@ mod tests {
     }
 
     #[test]
+    fn test_should_bound_verify_and_release_ephemeral_user_resources() -> anyhow::Result<()> {
+        let control = UserResourceRuntimeControl::default();
+        let reference = control
+            .import(
+                br#"{"spec":"chara_card_v3"}"#,
+                "application/json",
+                Some("character.json"),
+            )
+            .map_err(|error| anyhow::anyhow!("resource import failed: {error:?}"))?;
+        assert_eq!(reference.size, 24);
+        assert_eq!(reference.media_type, "application/json");
+        assert_eq!(reference.name.as_deref(), Some("character.json"));
+        assert_eq!(
+            control
+                .read(&reference, 1024)
+                .map_err(|error| anyhow::anyhow!("resource read failed: {error:?}"))?,
+            br#"{"spec":"chara_card_v3"}"#
+        );
+
+        let mut spoofed = reference.clone();
+        spoofed.size = spoofed.size.saturating_add(1);
+        assert_eq!(control.read(&spoofed, 1024), Err(HostAccessError::Rejected));
+
+        let mut spoofed_media_type = reference.clone();
+        spoofed_media_type.media_type = String::from("text/plain");
+        assert_eq!(
+            control.read(&spoofed_media_type, 1024),
+            Err(HostAccessError::Rejected)
+        );
+
+        let mut spoofed_name = reference.clone();
+        spoofed_name.name = Some(String::from("other.json"));
+        assert_eq!(
+            control.read(&spoofed_name, 1024),
+            Err(HostAccessError::Rejected)
+        );
+        assert_eq!(control.read(&reference, 4), Err(HostAccessError::Rejected));
+
+        control
+            .release(&reference)
+            .map_err(|error| anyhow::anyhow!("resource release failed: {error:?}"))?;
+        assert_eq!(
+            control.read(&reference, 1024),
+            Err(HostAccessError::NotFound)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_invalid_user_resource_metadata_and_capacity() -> anyhow::Result<()> {
+        let control = UserResourceRuntimeControl::default();
+
+        assert_eq!(
+            control.import(&[], "application/json", Some("empty.json")),
+            Err(HostAccessError::Rejected)
+        );
+        assert_eq!(
+            control.import(b"{}", "Application/JSON", Some("upper.json")),
+            Err(HostAccessError::Rejected)
+        );
+        assert_eq!(
+            control.import(b"{}", "application/json", Some("../escape.json")),
+            Err(HostAccessError::Rejected)
+        );
+        assert_eq!(
+            control.import(
+                &vec![0_u8; MAX_USER_RESOURCE_BYTES.saturating_add(1)],
+                "application/octet-stream",
+                Some("large.bin"),
+            ),
+            Err(HostAccessError::Rejected)
+        );
+
+        let mut references = Vec::with_capacity(MAX_USER_RESOURCES);
+        for index in 0..MAX_USER_RESOURCES {
+            references.push(
+                control
+                    .import(
+                        &[u8::try_from(index % 255).unwrap_or_default()],
+                        "application/octet-stream",
+                        Some("bounded.bin"),
+                    )
+                    .map_err(|error| anyhow::anyhow!("bounded import failed: {error:?}"))?,
+            );
+        }
+        assert_eq!(
+            control.import(b"x", "application/octet-stream", Some("overflow.bin"),),
+            Err(HostAccessError::QueueFull)
+        );
+
+        control
+            .release(&references[0])
+            .map_err(|error| anyhow::anyhow!("resource release failed: {error:?}"))?;
+        control
+            .import(b"x", "application/octet-stream", Some("replacement.bin"))
+            .map_err(|error| anyhow::anyhow!("replacement import failed: {error:?}"))?;
+        Ok(())
+    }
+
+    #[test]
     fn test_should_import_raw_asset_through_generic_host_access() -> anyhow::Result<()> {
         let root = tempfile::TempDir::new()?;
         let home = HostHome::open(root.path().join("home"))?;
@@ -3577,6 +3827,7 @@ mod tests {
             home.root(),
             home.local_principal(),
             UserContentWriteRuntimeControl::default(),
+            UserResourceRuntimeControl::default(),
             WorldSessionRuntimeControl::default(),
             WorldCommandRuntimeControl::default(),
             WorldProjectionRuntimeControl::default(),
@@ -4275,6 +4526,7 @@ mod tests {
             home.root(),
             home.local_principal(),
             UserContentWriteRuntimeControl::default(),
+            UserResourceRuntimeControl::default(),
             world_sessions,
             WorldCommandRuntimeControl::default(),
             world_projections,
@@ -4390,6 +4642,7 @@ mod tests {
             home.root(),
             principal,
             UserContentWriteRuntimeControl::default(),
+            UserResourceRuntimeControl::default(),
             world_sessions.clone(),
             world_commands.clone(),
             WorldProjectionRuntimeControl::default(),

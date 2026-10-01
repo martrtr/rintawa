@@ -306,6 +306,49 @@ interface asset-store {
     import-asset: func(bytes: list<u8>, media-type: string) -> result<asset-ref, error>;
 }
 
+/// Generic bounded ephemeral user-selected resources.
+///
+/// Resources exist only for the current HostRuntime and are never enumerated or
+/// persisted into artifact/asset stores. Exact refs are bearer capabilities passed
+/// through semantic service/UI flows.
+interface user-resources {
+    /// Opaque exact reference to one ephemeral user-selected resource.
+    record resource-ref {
+        id: string,
+        size: u64,
+        media-type: string,
+        name: option<string>,
+    }
+
+    /// Failure while importing, reading, or releasing one ephemeral resource.
+    variant error {
+        access-not-active,
+        permission-denied,
+        invalid-resource,
+        not-found,
+        queue-full,
+        message-too-large,
+        rejected,
+        unavailable,
+    }
+
+    /// Creates one bounded HostRuntime-local resource. Requires `user-resource-import`.
+    import-resource: func(
+        bytes: list<u8>,
+        media-type: string,
+        name: option<string>,
+    ) -> result<resource-ref, error>;
+
+    /// Reads exact bytes for one ref. Requires `user-resource-read`.
+    read-resource: func(
+        reference: resource-ref,
+        maximum-bytes: u64,
+    ) -> result<list<u8>, error>;
+
+    /// Releases one exact resource early. Requires `user-resource-read`.
+    release-resource: func(reference: resource-ref) -> result<_, error>;
+}
+
 /// Generic persistent user-content library reads.
 interface user-content {
     /// One logical library item pointing at an immutable RTW revision.
@@ -1010,6 +1053,7 @@ world plugin {
     import http-fetch;
     import artifact-store;
     import asset-store;
+    import user-resources;
     import user-content;
     import world-sessions;
     import world-commands;
@@ -1050,6 +1094,7 @@ world task-runtime-plugin {
     import http-fetch;
     import artifact-store;
     import asset-store;
+    import user-resources;
     import user-content;
     import world-sessions;
     import world-commands;
@@ -1080,6 +1125,7 @@ world runtime-provider-plugin {
     import http-fetch;
     import artifact-store;
     import asset-store;
+    import user-resources;
     import user-content;
     import world-sessions;
     import world-commands;
@@ -1110,6 +1156,7 @@ world runtime-provider-task-plugin {
     import http-fetch;
     import artifact-store;
     import asset-store;
+    import user-resources;
     import user-content;
     import world-sessions;
     import world-commands;

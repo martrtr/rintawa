@@ -7,7 +7,7 @@ use rintawa_sdk::{
 use crate::{
     host_access::{
         CompositionActivation, HostAccessError, RuntimePolicyComponent, UserContentDocument,
-        UserContentSummary, UserContentWriteStatus, WorldCommandAccessError,
+        UserContentSummary, UserContentWriteStatus, UserResourceRef, WorldCommandAccessError,
         WorldCommandActor as HostWorldCommandActor, WorldCommandRequest,
         WorldProjectionAccessError, WorldProjectionReadStatus, WorldProjectionRequest,
         WorldSessionAssetRef, WorldSessionSummary,
@@ -16,11 +16,11 @@ use crate::{
         ArtifactStoreError, ArtifactStoreHost, AssetStoreError, AssetStoreHost, CompositionError,
         CompositionHost, PreferenceError, PreferencesHost, RuntimePermissionCheck,
         RuntimePolicyError, RuntimePolicyHost, ScopedCompositionHost, ScopedRuntimePolicyHost,
-        UserContentError, UserContentHost, WasmHostState, WitAcceptedUserContentWrite,
-        WitAcceptedWorldCommand, WitAcceptedWorldProjectionRead, WitAssetRef,
-        WitCompositionActivation, WitImportedArtifact, WitRuntimeArtifactPolicy,
+        UserContentError, UserContentHost, UserResourceError, UserResourcesHost, WasmHostState,
+        WitAcceptedUserContentWrite, WitAcceptedWorldCommand, WitAcceptedWorldProjectionRead,
+        WitAssetRef, WitCompositionActivation, WitImportedArtifact, WitRuntimeArtifactPolicy,
         WitRuntimePolicyComponent, WitRuntimePolicyRequest, WitUserContentDocument,
-        WitUserContentEntry, WitUserContentWriteState, WitWorldCommandActor,
+        WitUserContentEntry, WitUserContentWriteState, WitUserResourceRef, WitWorldCommandActor,
         WitWorldCommandRequest, WitWorldProjectionReadState, WitWorldProjectionRequest,
         WitWorldProjectionView, WitWorldSummary, WorldCommandError, WorldCommandsHost,
         WorldProjectionError, WorldProjectionsHost, WorldSessionError, WorldSessionsHost,
@@ -83,6 +83,121 @@ impl AssetStoreHost for WasmHostState {
             size: imported.size,
             media_type: imported.media_type,
         })
+    }
+}
+
+impl UserResourcesHost for WasmHostState {
+    fn import_resource(
+        &mut self,
+        bytes: Vec<u8>,
+        media_type: String,
+        name: Option<String>,
+    ) -> Result<WitUserResourceRef, UserResourceError> {
+        if !self.host_access_active {
+            return Err(UserResourceError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::UserResourceImport)
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => UserResourceError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => UserResourceError::Unavailable,
+            })?;
+        if bytes.len() > self.max_artifact_import_bytes
+            || media_type.len() > self.max_host_message_bytes
+            || name
+                .as_ref()
+                .is_some_and(|value| value.len() > self.max_host_message_bytes)
+        {
+            return Err(UserResourceError::MessageTooLarge);
+        }
+        let reference = self
+            .host_access
+            .user_resources
+            .import_resource(&bytes, &media_type, name.as_deref())
+            .map_err(map_user_resource_access_error)?;
+        Ok(to_wit_user_resource_ref(reference))
+    }
+
+    fn read_resource(
+        &mut self,
+        reference: WitUserResourceRef,
+        maximum_bytes: u64,
+    ) -> Result<Vec<u8>, UserResourceError> {
+        if !self.host_access_active {
+            return Err(UserResourceError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::UserResourceRead)
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => UserResourceError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => UserResourceError::Unavailable,
+            })?;
+        let maximum_bytes =
+            usize::try_from(maximum_bytes).map_err(|_| UserResourceError::MessageTooLarge)?;
+        if maximum_bytes == 0 || maximum_bytes > self.max_artifact_import_bytes {
+            return Err(UserResourceError::MessageTooLarge);
+        }
+        let reference = from_wit_user_resource_ref(reference)?;
+        self.host_access
+            .user_resources
+            .read_resource(&reference, maximum_bytes)
+            .map_err(map_user_resource_access_error)
+    }
+
+    fn release_resource(&mut self, reference: WitUserResourceRef) -> Result<(), UserResourceError> {
+        if !self.host_access_active {
+            return Err(UserResourceError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::UserResourceRead)
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => UserResourceError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => UserResourceError::Unavailable,
+            })?;
+        let reference = from_wit_user_resource_ref(reference)?;
+        self.host_access
+            .user_resources
+            .release_resource(&reference)
+            .map_err(map_user_resource_access_error)
+    }
+}
+
+fn to_wit_user_resource_ref(reference: UserResourceRef) -> WitUserResourceRef {
+    WitUserResourceRef {
+        id: reference.id,
+        size: reference.size,
+        media_type: reference.media_type,
+        name: reference.name,
+    }
+}
+
+fn from_wit_user_resource_ref(
+    reference: WitUserResourceRef,
+) -> Result<UserResourceRef, UserResourceError> {
+    if reference.id.is_empty() || reference.media_type.is_empty() || reference.size == 0 {
+        return Err(UserResourceError::InvalidResource);
+    }
+    Ok(UserResourceRef {
+        id: reference.id,
+        size: reference.size,
+        media_type: reference.media_type,
+        name: reference.name,
+    })
+}
+
+fn map_user_resource_access_error(error: HostAccessError) -> UserResourceError {
+    match error {
+        HostAccessError::NotFound => UserResourceError::NotFound,
+        HostAccessError::QueueFull => UserResourceError::QueueFull,
+        HostAccessError::Unavailable => UserResourceError::Unavailable,
+        HostAccessError::InvalidAsset
+        | HostAccessError::InvalidArtifact
+        | HostAccessError::InvalidDigest
+        | HostAccessError::InvalidWorldId
+        | HostAccessError::InvalidUserContentId
+        | HostAccessError::InvalidContentType
+        | HostAccessError::UnsupportedContent
+        | HostAccessError::InvalidPermission
+        | HostAccessError::InvalidPreference
+        | HostAccessError::PreferenceQuotaExceeded
+        | HostAccessError::Rejected => UserResourceError::Rejected,
     }
 }
 

@@ -48,11 +48,11 @@ pub use host_access::{
     HostAccessError, HostAccessResult, ImportedArtifact, ImportedAsset, PreferenceAccess,
     RuntimeArtifactPolicy, RuntimeContextAccess, RuntimePolicyAccess, RuntimePolicyComponent,
     RuntimePolicyRequest, UserContentAccess, UserContentDocument, UserContentSummary,
-    UserContentWriteAccess, UserContentWriteStatus, WorldCommandAccess, WorldCommandAccessError,
-    WorldCommandAccessResult, WorldCommandActor, WorldCommandRequest, WorldProjectionAccess,
-    WorldProjectionAccessError, WorldProjectionAccessResult, WorldProjectionReadStatus,
-    WorldProjectionReadView, WorldProjectionRequest, WorldSessionAccess, WorldSessionAssetRef,
-    WorldSessionSummary,
+    UserContentWriteAccess, UserContentWriteStatus, UserResourceAccess, UserResourceRef,
+    WorldCommandAccess, WorldCommandAccessError, WorldCommandAccessResult, WorldCommandActor,
+    WorldCommandRequest, WorldProjectionAccess, WorldProjectionAccessError,
+    WorldProjectionAccessResult, WorldProjectionReadStatus, WorldProjectionReadView,
+    WorldProjectionRequest, WorldSessionAccess, WorldSessionAssetRef, WorldSessionSummary,
 };
 pub use loader::ExtensionLoader;
 pub use runtime::{WasmComponent, WasmExecutionBudget, WasmRuntimeEngine};

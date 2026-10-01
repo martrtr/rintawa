@@ -449,6 +449,88 @@ fn test_should_validate_asset_picker_bounds_and_action_payloads() -> Result<()> 
 }
 
 #[test]
+fn test_should_validate_resource_picker_bounds_and_action_payloads() -> Result<()> {
+    use rintawa_sdk::ui::{UiActionUserResourceRef, UiResourcePickerNode};
+
+    let runtime = UiRuntime::new();
+    register_feature(&runtime, surface())?;
+    let picker = UiResourcePickerNode {
+        label: String::from("Import file"),
+        accepted_media_types: vec![String::from("application/json")],
+        accepted_extensions: vec![String::from(".json"), String::from(".png")],
+        max_bytes: 1024,
+        change_action: UiActionId::new("example.import"),
+        is_enabled: true,
+    };
+    let picker_kind = UiNodeKind::ResourcePicker(picker.clone());
+    assert!(picker_kind.accepts_action_payload(
+        &UiActionId::new("example.import"),
+        &UiActionPayload::Resource(UiActionUserResourceRef {
+            id: String::from("018f-resource"),
+            size: 20,
+            media_type: String::from("application/json"),
+            name: Some(String::from("character.json")),
+        }),
+    ));
+    assert!(picker_kind.accepts_action_payload(
+        &UiActionId::new("example.import"),
+        &UiActionPayload::Resource(UiActionUserResourceRef {
+            id: String::from("018f-resource"),
+            size: 20,
+            media_type: String::from("application/octet-stream"),
+            name: Some(String::from("card.png")),
+        }),
+    ));
+    assert!(!picker_kind.accepts_action_payload(
+        &UiActionId::new("example.import"),
+        &UiActionPayload::Resource(UiActionUserResourceRef {
+            id: String::from("018f-resource"),
+            size: 20,
+            media_type: String::from("text/plain"),
+            name: Some(String::from("card.txt")),
+        }),
+    ));
+    assert!(!picker_kind.accepts_action_payload(
+        &UiActionId::new("example.other"),
+        &UiActionPayload::Resource(UiActionUserResourceRef {
+            id: String::from("018f-resource"),
+            size: 20,
+            media_type: String::from("application/json"),
+            name: Some(String::from("character.json")),
+        }),
+    ));
+
+    let snapshot = |picker: UiResourcePickerNode| UiSurfaceSnapshot {
+        surface_id: UiSurfaceId::new("example.main"),
+        revision: 1,
+        root: "picker".into(),
+        nodes: vec![UiNode::new("picker", UiNodeKind::ResourcePicker(picker))],
+    };
+    runtime.mount_surface(&owner("feature"), snapshot(picker.clone()))?;
+    for invalid in [
+        UiResourcePickerNode {
+            max_bytes: 0,
+            ..picker.clone()
+        },
+        UiResourcePickerNode {
+            accepted_media_types: Vec::new(),
+            accepted_extensions: Vec::new(),
+            ..picker.clone()
+        },
+        UiResourcePickerNode {
+            accepted_extensions: vec![String::from("JSON")],
+            ..picker
+        },
+    ] {
+        assert!(matches!(
+            runtime.mount_surface(&owner("feature"), snapshot(invalid)),
+            Err(UiError::InvalidLayout(_))
+        ));
+    }
+    Ok(())
+}
+
+#[test]
 fn test_should_reject_invalid_asset_backed_image_references() -> Result<()> {
     let runtime = UiRuntime::new();
     register_feature(&runtime, surface())?;

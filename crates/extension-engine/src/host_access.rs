@@ -169,6 +169,43 @@ pub trait AssetStoreAccess: Send + Sync {
     ) -> HostAccessResult<Vec<u8>>;
 }
 
+/// Opaque metadata for one bounded ephemeral user-selected resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserResourceRef {
+    /// Unguessable Host-issued bearer identity valid only for the current HostRuntime.
+    pub id: String,
+    /// Exact selected byte length.
+    pub size: u64,
+    /// Canonical media type supplied by the trusted UI layer.
+    pub media_type: String,
+    /// Original user-facing file name when available.
+    pub name: Option<String>,
+}
+
+/// Generic ephemeral user-resource access.
+///
+/// Resources are intentionally non-enumerable and non-persistent. Possession of an exact
+/// [`UserResourceRef`] plus the corresponding runtime permission is required to read bytes.
+pub trait UserResourceAccess: Send + Sync {
+    /// Creates one bounded HostRuntime-local resource from explicit user-selected bytes.
+    fn import_resource(
+        &self,
+        bytes: &[u8],
+        media_type: &str,
+        name: Option<&str>,
+    ) -> HostAccessResult<UserResourceRef>;
+
+    /// Reads one exact resource after verifying all reference metadata and the caller bound.
+    fn read_resource(
+        &self,
+        reference: &UserResourceRef,
+        maximum_bytes: usize,
+    ) -> HostAccessResult<Vec<u8>>;
+
+    /// Explicitly releases one exact ephemeral resource. Missing/mismatched refs fail closed.
+    fn release_resource(&self, reference: &UserResourceRef) -> HostAccessResult<()>;
+}
+
 /// Generic read-only access to the persistent user-content library.
 pub trait UserContentAccess: Send + Sync {
     /// Lists logical items, optionally restricted to one exact versioned content type.
@@ -625,6 +662,31 @@ impl AssetStoreAccess for UnavailableAssetStoreAccess {
 }
 
 #[derive(Default)]
+struct UnavailableUserResourceAccess;
+
+impl UserResourceAccess for UnavailableUserResourceAccess {
+    fn import_resource(
+        &self,
+        _bytes: &[u8],
+        _media_type: &str,
+        _name: Option<&str>,
+    ) -> HostAccessResult<UserResourceRef> {
+        Err(HostAccessError::Unavailable)
+    }
+
+    fn read_resource(
+        &self,
+        _reference: &UserResourceRef,
+        _maximum_bytes: usize,
+    ) -> HostAccessResult<Vec<u8>> {
+        Err(HostAccessError::Unavailable)
+    }
+
+    fn release_resource(&self, _reference: &UserResourceRef) -> HostAccessResult<()> {
+        Err(HostAccessError::Unavailable)
+    }
+}
+
 struct UnavailableUserContentAccess;
 
 impl UserContentAccess for UnavailableUserContentAccess {
@@ -847,6 +909,7 @@ pub(crate) struct HostAccessServices {
     pub(crate) runtime_context: Arc<dyn RuntimeContextAccess>,
     pub(crate) artifact_store: Arc<dyn ArtifactStoreAccess>,
     pub(crate) asset_store: Arc<dyn AssetStoreAccess>,
+    pub(crate) user_resources: Arc<dyn UserResourceAccess>,
     pub(crate) user_content: Arc<dyn UserContentAccess>,
     pub(crate) user_content_write: Arc<dyn UserContentWriteAccess>,
     pub(crate) world_sessions: Arc<dyn WorldSessionAccess>,
@@ -870,6 +933,7 @@ impl HostAccessServices {
             runtime_context: Arc::new(UnavailableRuntimeContextAccess),
             artifact_store,
             asset_store,
+            user_resources: Arc::new(UnavailableUserResourceAccess),
             user_content: Arc::new(UnavailableUserContentAccess),
             user_content_write: Arc::new(UnavailableUserContentWriteAccess),
             world_sessions,
@@ -886,6 +950,14 @@ impl HostAccessServices {
         runtime_context: Arc<dyn RuntimeContextAccess>,
     ) -> Self {
         self.runtime_context = runtime_context;
+        self
+    }
+
+    pub(crate) fn with_user_resource_access(
+        mut self,
+        user_resources: Arc<dyn UserResourceAccess>,
+    ) -> Self {
+        self.user_resources = user_resources;
         self
     }
 
@@ -926,6 +998,7 @@ impl HostAccessServices {
             runtime_context: Arc::new(UnavailableRuntimeContextAccess),
             artifact_store: Arc::new(UnavailableArtifactStoreAccess),
             asset_store: Arc::new(UnavailableAssetStoreAccess),
+            user_resources: Arc::new(UnavailableUserResourceAccess),
             user_content: Arc::new(UnavailableUserContentAccess),
             user_content_write: Arc::new(UnavailableUserContentWriteAccess),
             world_sessions: Arc::new(UnavailableWorldSessionAccess),

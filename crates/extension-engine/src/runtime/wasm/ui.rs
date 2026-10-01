@@ -15,7 +15,7 @@ use rintawa_sdk::{
 use tracing::warn;
 
 use crate::{
-    HostAccessError,
+    HostAccessError, UserResourceRef,
     runtime::wasm::{
         PortableUiError, PortableUiHost, UiLayerError, UiLayerHost, WasmHostState, WitActivity,
         WitPlacementHint, WitPresentedAsset,
@@ -491,6 +491,18 @@ impl UiLayerHost for WasmHostState {
             self.host_access
                 .asset_store
                 .read_asset(&asset.digest, asset.size, &asset.media_type, maximum_bytes)
+                .map_err(map_presented_asset_access_error)?;
+        }
+        if let UiActionPayload::Resource(resource) = &event.payload {
+            let reference = UserResourceRef {
+                id: resource.id.clone(),
+                size: resource.size,
+                media_type: resource.media_type.clone(),
+                name: resource.name.clone(),
+            };
+            self.host_access
+                .user_resources
+                .read_resource(&reference, self.max_artifact_import_bytes)
                 .map_err(map_presented_asset_access_error)?;
         }
         let owner = self

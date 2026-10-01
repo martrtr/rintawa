@@ -153,6 +153,9 @@ use bindings::rintawa::engine::{
         Entry as WitUserContentEntry, Error as UserContentError, Host as UserContentHost,
         WriteState as WitUserContentWriteState,
     },
+    user_resources::{
+        Error as UserResourceError, Host as UserResourcesHost, ResourceRef as WitUserResourceRef,
+    },
     world_commands::{
         Accepted as WitAcceptedWorldCommand, Actor as WitWorldCommandActor,
         Error as WorldCommandError, Host as WorldCommandsHost, Request as WitWorldCommandRequest,
