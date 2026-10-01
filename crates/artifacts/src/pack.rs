@@ -76,6 +76,15 @@ impl RtwPackEntry {
     }
 }
 
+/// Compression policy for deterministic in-memory RTW packing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtwCompression {
+    /// Deflate every regular ZIP entry. This remains the default package/release policy.
+    Deflated,
+    /// Store entries without compression to minimize bounded runtime CPU/fuel cost.
+    Stored,
+}
+
 /// Packs a validated manifest and regular-file entries into deterministic RTW bytes.
 ///
 /// The root `rtw.toml` is generated from `manifest`; callers must not provide it as
@@ -93,6 +102,25 @@ pub fn pack_entries(
     entries: impl IntoIterator<Item = RtwPackEntry>,
     limits: RtwLimits,
 ) -> RtwResult<Vec<u8>> {
+    pack_entries_with_compression(manifest, entries, limits, RtwCompression::Deflated)
+}
+
+/// Packs validated in-memory entries with an explicit deterministic ZIP compression policy.
+///
+/// Use [`RtwCompression::Stored`] for sandboxed runtime-generated content where bounded
+/// CPU/fuel is more important than archive size. Filesystem/package publishing should
+/// normally keep using [`pack_entries`] or [`pack_directory`], both of which remain
+/// deflated by default.
+///
+/// # Errors
+///
+/// Returns the same validation, limit, ZIP, and post-pack errors as [`pack_entries`].
+pub fn pack_entries_with_compression(
+    manifest: &RtwManifest,
+    entries: impl IntoIterator<Item = RtwPackEntry>,
+    limits: RtwLimits,
+    compression: RtwCompression,
+) -> RtwResult<Vec<u8>> {
     manifest.validate()?;
     let manifest_bytes = toml::to_string(manifest)?.into_bytes();
     let mut entries = entries.into_iter().collect::<Vec<_>>();
@@ -101,7 +129,7 @@ pub fn pack_entries(
 
     let cursor = Cursor::new(Vec::new());
     let mut writer = ZipWriter::new(cursor);
-    let options = archive_options();
+    let options = archive_options(compression);
     writer.start_file(RTW_MANIFEST_PATH, options)?;
     writer.write_all(&manifest_bytes)?;
     for entry in &entries {
@@ -339,7 +367,7 @@ fn write_archive(output: &Path, files: &[SourceFile], limits: RtwLimits) -> RtwR
     let temporary = NamedTempFile::new_in(parent)?;
     let writer_file = temporary.reopen()?;
     let mut writer = ZipWriter::new(writer_file);
-    let options = archive_options();
+    let options = archive_options(RtwCompression::Deflated);
 
     if let Some(manifest) = files
         .iter()
@@ -370,9 +398,13 @@ fn write_archive(output: &Path, files: &[SourceFile], limits: RtwLimits) -> RtwR
     Ok(())
 }
 
-fn archive_options() -> SimpleFileOptions {
+fn archive_options(compression: RtwCompression) -> SimpleFileOptions {
+    let method = match compression {
+        RtwCompression::Deflated => CompressionMethod::Deflated,
+        RtwCompression::Stored => CompressionMethod::Stored,
+    };
     SimpleFileOptions::default()
-        .compression_method(CompressionMethod::Deflated)
+        .compression_method(method)
         .last_modified_time(DateTime::DEFAULT)
         .unix_permissions(0o644)
 }

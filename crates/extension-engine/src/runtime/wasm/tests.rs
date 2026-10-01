@@ -8,10 +8,10 @@ use crate::{
         HostAccessError, HostAccessResult, ImportedArtifact, ImportedAsset, PreferenceAccess,
         RuntimeArtifactPolicy, RuntimeContextAccess, RuntimePolicyAccess, RuntimePolicyComponent,
         UserContentAccess, UserContentDocument, UserContentSummary, UserContentWriteAccess,
-        UserContentWriteStatus, WorldCommandAccess, WorldCommandAccessResult, WorldCommandRequest,
-        WorldProjectionAccess, WorldProjectionAccessError, WorldProjectionAccessResult,
-        WorldProjectionReadStatus, WorldProjectionReadView, WorldProjectionRequest,
-        WorldSessionAccess, WorldSessionSummary,
+        UserContentWriteStatus, UserResourceAccess, UserResourceRef, WorldCommandAccess,
+        WorldCommandAccessResult, WorldCommandRequest, WorldProjectionAccess,
+        WorldProjectionAccessError, WorldProjectionAccessResult, WorldProjectionReadStatus,
+        WorldProjectionReadView, WorldProjectionRequest, WorldSessionAccess, WorldSessionSummary,
     },
     secrets::InMemorySecretVault,
     services::ServiceInstanceRegistration,
@@ -67,6 +67,7 @@ struct RecordingScopedHostAccess {
     preferred_provider_clears: Mutex<Vec<PreferredProviderClear>>,
     world_default_writes: Mutex<Vec<(String, bool)>>,
     runtime_policy_reads: Mutex<Vec<String>>,
+    user_resources: Mutex<Vec<Vec<u8>>>,
     user_content_writes: Mutex<Vec<Vec<u8>>>,
     world_session_writes: Mutex<Vec<(String, bool)>>,
     world_command_writes: Mutex<Vec<WorldCommandRequest>>,
@@ -114,6 +115,38 @@ impl AssetStoreAccess for RecordingScopedHostAccess {
             return Err(HostAccessError::NotFound);
         }
         Ok(vec![1, 2, 3, 4])
+    }
+}
+
+impl UserResourceAccess for RecordingScopedHostAccess {
+    fn import_resource(
+        &self,
+        bytes: &[u8],
+        media_type: &str,
+        name: Option<&str>,
+    ) -> HostAccessResult<UserResourceRef> {
+        self.user_resources
+            .lock()
+            .expect("test user-resource lock must stay healthy")
+            .push(bytes.to_vec());
+        Ok(UserResourceRef {
+            id: String::from("resource-1"),
+            size: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            media_type: media_type.to_string(),
+            name: name.map(str::to_string),
+        })
+    }
+
+    fn read_resource(
+        &self,
+        _reference: &UserResourceRef,
+        _maximum_bytes: usize,
+    ) -> HostAccessResult<Vec<u8>> {
+        Err(HostAccessError::NotFound)
+    }
+
+    fn release_resource(&self, _reference: &UserResourceRef) -> HostAccessResult<()> {
+        Err(HostAccessError::NotFound)
     }
 }
 
@@ -1405,6 +1438,115 @@ fn test_should_gate_and_bound_generic_asset_import() {
     assert_eq!(imported.size, 3);
     assert_eq!(imported.media_type, "image/png");
     assert!(imported.digest.starts_with("sha256:"));
+
+    let handle = AssetStoreHost::begin_upload(&mut state, String::from("image/png"), 4).unwrap();
+    AssetStoreHost::append_upload(&mut state, handle, b"12".to_vec()).unwrap();
+    assert!(matches!(
+        AssetStoreHost::finish_upload(&mut state, handle),
+        Err(AssetStoreError::Rejected)
+    ));
+    AssetStoreHost::append_upload(&mut state, handle, b"34".to_vec()).unwrap();
+    let streamed = AssetStoreHost::finish_upload(&mut state, handle).unwrap();
+    assert_eq!(streamed.size, 4);
+    assert_eq!(streamed.media_type, "image/png");
+    assert!(matches!(
+        AssetStoreHost::finish_upload(&mut state, handle),
+        Err(AssetStoreError::Rejected)
+    ));
+
+    assert!(matches!(
+        AssetStoreHost::begin_upload(&mut state, String::from("image/png"), 5),
+        Err(AssetStoreError::MessageTooLarge)
+    ));
+    let reserved = AssetStoreHost::begin_upload(&mut state, String::from("image/png"), 3).unwrap();
+    assert!(matches!(
+        AssetStoreHost::begin_upload(&mut state, String::from("image/png"), 2),
+        Err(AssetStoreError::Rejected)
+    ));
+    assert!(matches!(
+        AssetStoreHost::append_upload(&mut state, reserved, b"1234".to_vec()),
+        Err(AssetStoreError::MessageTooLarge)
+    ));
+    AssetStoreHost::cancel_upload(&mut state, reserved).unwrap();
+    let replacement =
+        AssetStoreHost::begin_upload(&mut state, String::from("image/png"), 4).unwrap();
+    AssetStoreHost::cancel_upload(&mut state, replacement).unwrap();
+}
+
+#[test]
+fn test_should_stream_ephemeral_user_resource_with_bounded_staging() {
+    let access = Arc::new(RecordingScopedHostAccess::default());
+    let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
+    let mut services = WasmHostServices::standalone(secrets);
+    services.host_access = HostAccessServices::new(
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+    )
+    .with_user_resource_access(access.clone());
+    let budget = WasmExecutionBudget {
+        max_artifact_import_bytes: 8,
+        max_host_message_bytes: 4,
+        ..WasmExecutionBudget::default()
+    };
+    let mut state = WasmHostState::with_host_services_and_budget(
+        ComponentId::new("runtime"),
+        services,
+        false,
+        &budget,
+    );
+    begin_test_registration(&mut state, ExtensionId::new("resource.importer"));
+    state.finish_registration().unwrap();
+    state.begin_guest_execution();
+    let owner = state.registered_owner().unwrap();
+    state
+        .runtime_permissions
+        .grant(owner, RuntimePermission::UserResourceImport)
+        .unwrap();
+
+    assert!(matches!(
+        UserResourcesHost::begin_upload(
+            &mut state,
+            String::from("text/x"),
+            Some(String::from("card")),
+            9,
+        ),
+        Err(UserResourceError::MessageTooLarge)
+    ));
+    let handle = UserResourcesHost::begin_upload(
+        &mut state,
+        String::from("x"),
+        Some(String::from("card")),
+        6,
+    )
+    .unwrap();
+    UserResourcesHost::append_upload(&mut state, handle, b"abc".to_vec()).unwrap();
+    assert!(matches!(
+        UserResourcesHost::finish_upload(&mut state, handle),
+        Err(UserResourceError::Rejected)
+    ));
+    UserResourcesHost::append_upload(&mut state, handle, b"def".to_vec()).unwrap();
+    let reference = UserResourcesHost::finish_upload(&mut state, handle).unwrap();
+    assert_eq!(reference.size, 6);
+    assert_eq!(reference.name.as_deref(), Some("card"));
+    assert_eq!(
+        access
+            .user_resources
+            .lock()
+            .expect("test user-resource lock must stay healthy")
+            .as_slice(),
+        &[b"abcdef".to_vec()]
+    );
+
+    let reserved = UserResourcesHost::begin_upload(&mut state, String::from("x"), None, 5).unwrap();
+    assert!(matches!(
+        UserResourcesHost::begin_upload(&mut state, String::from("x"), None, 4),
+        Err(UserResourceError::Rejected)
+    ));
+    UserResourcesHost::cancel_upload(&mut state, reserved).unwrap();
 }
 
 #[test]

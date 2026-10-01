@@ -303,7 +303,80 @@ interface asset-store {
     }
 
     /// Imports exact bytes under a canonical media type and returns an AssetRef.
+    /// Intended for small payloads that fit comfortably inside one callback budget.
     import-asset: func(bytes: list<u8>, media-type: string) -> result<asset-ref, error>;
+
+    /// Starts one bounded host-owned streaming asset upload.
+    /// The declared size reserves quota but does not allocate the complete buffer eagerly.
+    begin-upload: func(media-type: string, expected-size: u64) -> result<u64, error>;
+
+    /// Appends one bounded chunk to an existing streaming upload.
+    append-upload: func(handle: u64, bytes: list<u8>) -> result<_, error>;
+
+    /// Finalizes an exactly-sized upload into the immutable asset store.
+    finish-upload: func(handle: u64) -> result<asset-ref, error>;
+
+    /// Cancels one streaming upload and releases its host-owned staging state.
+    cancel-upload: func(handle: u64) -> result<_, error>;
+}
+
+/// Generic bounded ephemeral user-selected resources.
+///
+/// Resources exist only for the current HostRuntime and are never enumerated or
+/// persisted into artifact/asset stores. Exact refs are bearer capabilities passed
+/// through semantic service/UI flows.
+interface user-resources {
+    /// Opaque exact reference to one ephemeral user-selected resource.
+    record resource-ref {
+        id: string,
+        size: u64,
+        media-type: string,
+        name: option<string>,
+    }
+
+    /// Failure while importing, reading, or releasing one ephemeral resource.
+    variant error {
+        access-not-active,
+        permission-denied,
+        invalid-resource,
+        not-found,
+        queue-full,
+        message-too-large,
+        rejected,
+        unavailable,
+    }
+
+    /// Creates one bounded HostRuntime-local resource. Requires `user-resource-import`.
+    import-resource: func(
+        bytes: list<u8>,
+        media-type: string,
+        name: option<string>,
+    ) -> result<resource-ref, error>;
+
+    /// Starts one bounded HostRuntime-local streaming resource upload.
+    begin-upload: func(
+        media-type: string,
+        name: option<string>,
+        expected-size: u64,
+    ) -> result<u64, error>;
+
+    /// Appends one bounded chunk to an existing resource upload.
+    append-upload: func(handle: u64, bytes: list<u8>) -> result<_, error>;
+
+    /// Finalizes one exactly-sized upload and returns its opaque resource ref.
+    finish-upload: func(handle: u64) -> result<resource-ref, error>;
+
+    /// Cancels one in-flight resource upload and releases its staging bytes.
+    cancel-upload: func(handle: u64) -> result<_, error>;
+
+    /// Reads exact bytes for one ref. Requires `user-resource-read`.
+    read-resource: func(
+        reference: resource-ref,
+        maximum-bytes: u64,
+    ) -> result<list<u8>, error>;
+
+    /// Releases one exact resource early. Requires `user-resource-read`.
+    release-resource: func(reference: resource-ref) -> result<_, error>;
 }
 
 /// Generic persistent user-content library reads.
@@ -1010,6 +1083,7 @@ world plugin {
     import http-fetch;
     import artifact-store;
     import asset-store;
+    import user-resources;
     import user-content;
     import world-sessions;
     import world-commands;
@@ -1050,6 +1124,7 @@ world task-runtime-plugin {
     import http-fetch;
     import artifact-store;
     import asset-store;
+    import user-resources;
     import user-content;
     import world-sessions;
     import world-commands;
@@ -1080,6 +1155,7 @@ world runtime-provider-plugin {
     import http-fetch;
     import artifact-store;
     import asset-store;
+    import user-resources;
     import user-content;
     import world-sessions;
     import world-commands;
@@ -1110,6 +1186,7 @@ world runtime-provider-task-plugin {
     import http-fetch;
     import artifact-store;
     import asset-store;
+    import user-resources;
     import user-content;
     import world-sessions;
     import world-commands;

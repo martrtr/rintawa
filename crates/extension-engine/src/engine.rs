@@ -45,7 +45,8 @@ use crate::{
     host_access::{
         ArtifactStoreAccess, AssetStoreAccess, CompositionAccess, HostAccessServices,
         PreferenceAccess, RuntimeContextAccess, RuntimePolicyAccess, UserContentAccess,
-        UserContentWriteAccess, WorldCommandAccess, WorldProjectionAccess, WorldSessionAccess,
+        UserContentWriteAccess, UserResourceAccess, WorldCommandAccess, WorldProjectionAccess,
+        WorldSessionAccess,
     },
     runtime::WasmRuntimeEngine,
     runtime_effects::RuntimeEffectRegistry,
@@ -317,6 +318,14 @@ impl ExtensionEngine {
     /// Embedded hosts that do not call this method remain fail-closed.
     pub fn attach_runtime_context_access(&mut self, access: Arc<dyn RuntimeContextAccess>) {
         self.host_access = self.host_access.clone().with_runtime_context_access(access);
+    }
+
+    /// Attaches generic ephemeral user-resource ingress/read access.
+    ///
+    /// Embedded hosts that do not call this method remain fail-closed. Guest operations
+    /// are separately permission-gated and resources never become persistent artifacts.
+    pub fn attach_user_resource_access(&mut self, access: Arc<dyn UserResourceAccess>) {
+        self.host_access = self.host_access.clone().with_user_resource_access(access);
     }
 
     /// Attaches generic read-only user-content library access.

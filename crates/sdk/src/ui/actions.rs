@@ -19,6 +19,19 @@ pub struct UiActionAssetRef {
     pub name: Option<String>,
 }
 
+/// Opaque HostRuntime-local resource selected through a renderer-neutral file picker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiActionUserResourceRef {
+    /// Unguessable Host-issued bearer identity.
+    pub id: String,
+    /// Exact selected byte length.
+    pub size: u64,
+    /// Canonical media type retained by the Host.
+    pub media_type: String,
+    /// Original user-facing file name when available.
+    pub name: Option<String>,
+}
+
 /// Typed payload carried by a portable UI action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "kebab-case")]
@@ -31,6 +44,8 @@ pub enum UiActionPayload {
     Boolean(bool),
     /// Immutable asset imported by the trusted UI Layer after explicit user selection.
     Asset(UiActionAssetRef),
+    /// Ephemeral resource imported by the trusted UI Layer for one semantic workflow.
+    Resource(UiActionUserResourceRef),
 }
 
 /// One semantic action emitted by the active UI Layer.

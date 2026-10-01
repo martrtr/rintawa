@@ -20,6 +20,8 @@ pub use asset::{
 pub use digest::ArtifactDigest;
 pub use error::{RtwError, RtwResult};
 pub use manifest::{ContentType, RTW_FORMAT_VERSION, RTW_MANIFEST_PATH, RtwManifest};
-pub use pack::{RtwPackEntry, pack_directory, pack_entries};
+pub use pack::{
+    RtwCompression, RtwPackEntry, pack_directory, pack_entries, pack_entries_with_compression,
+};
 pub use path::ArtifactPath;
 pub use store::{ArtifactImport, ArtifactStore, ImportDisposition};

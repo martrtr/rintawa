@@ -95,6 +95,8 @@ pub const UI_CAPABILITY_TEXT_INPUT: &str = "rintawa.ui.input.text@1";
 pub const UI_CAPABILITY_TEXT_AREA: &str = "rintawa.ui.input.text-area@1";
 /// Capability required for user-mediated immutable asset selection.
 pub const UI_CAPABILITY_ASSET_PICKER: &str = "rintawa.ui.input.asset@1";
+/// Capability required for user-mediated ephemeral file/resource selection.
+pub const UI_CAPABILITY_RESOURCE_PICKER: &str = "rintawa.ui.input.resource@1";
 /// Capability required for weighted split containers.
 pub const UI_CAPABILITY_SPLIT: &str = "rintawa.ui.layout.split@1";
 /// Capability required for horizontal containers.

@@ -8,9 +8,9 @@ use crate::contracts::{ContractKey, ContractVersion};
 pub const CONTENT_HANDLER_SERVICE_PROTOCOL_VERSION: ContractVersion = ContractVersion::new(1);
 /// Maximum content descriptor bytes passed to one handler validation call.
 ///
-/// This remains below the generic service-message budget even after worst-case
+/// This remains below the dedicated generic service-message budget even after worst-case
 /// JSON serialization of the byte sequence used by the v1 handler transport.
-pub const MAX_CONTENT_HANDLER_ENTRY_BYTES: usize = 128 * 1024;
+pub const MAX_CONTENT_HANDLER_ENTRY_BYTES: usize = 1024 * 1024;
 /// Maximum human-readable rejection diagnostic accepted from a content handler.
 pub const MAX_CONTENT_HANDLER_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 

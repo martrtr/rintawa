@@ -412,11 +412,11 @@ impl WasmTargetProviderEndpoint {
         contract: &ContractKey,
         request: &[u8],
     ) -> ExtensionResult<Vec<u8>> {
-        if request.len() > self.budget.max_host_message_bytes {
+        if request.len() > self.budget.max_service_message_bytes {
             return Err(ExtensionError::HostMessageTooLarge {
                 operation: "target service request",
                 actual_bytes: request.len(),
-                maximum_bytes: self.budget.max_host_message_bytes,
+                maximum_bytes: self.budget.max_service_message_bytes,
             });
         }
         let owner = rintawa_sdk::contracts::ComponentRef::new(
@@ -447,11 +447,11 @@ impl WasmTargetProviderEndpoint {
         };
         instance.store.data_mut().finish_service_execution();
         let response = result?.map_err(|error| map_wit_target_host_error("service", error))?;
-        if response.len() > self.budget.max_host_message_bytes {
+        if response.len() > self.budget.max_service_message_bytes {
             return Err(ExtensionError::HostMessageTooLarge {
                 operation: "target service response",
                 actual_bytes: response.len(),
-                maximum_bytes: self.budget.max_host_message_bytes,
+                maximum_bytes: self.budget.max_service_message_bytes,
             });
         }
         Ok(response)
@@ -534,7 +534,7 @@ impl Component for WasmExecutionTargetProxy {
     }
 
     fn service_message_limit(&self) -> Option<usize> {
-        Some(self.provider.budget.max_host_message_bytes)
+        Some(self.provider.budget.max_service_message_bytes)
     }
 
     fn handle_service(

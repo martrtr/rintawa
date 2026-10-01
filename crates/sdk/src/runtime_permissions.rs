@@ -23,6 +23,10 @@ pub enum RuntimePermission {
     ArtifactImport,
     /// Allows importing bounded immutable raw assets into the local asset store.
     AssetImport,
+    /// Allows creating bounded ephemeral user-selected resources for semantic import workflows.
+    UserResourceImport,
+    /// Allows reading exact opaque ephemeral resources explicitly passed to the component.
+    UserResourceRead,
     /// Allows reading the persistent generic user-content library and descriptors.
     UserContentRead,
     /// Allows requesting deferred validated imports/replacements in the user-content library.
@@ -54,6 +58,8 @@ impl fmt::Display for RuntimePermission {
             Self::HttpFetch => formatter.write_str("http-fetch"),
             Self::ArtifactImport => formatter.write_str("artifact-import"),
             Self::AssetImport => formatter.write_str("asset-import"),
+            Self::UserResourceImport => formatter.write_str("user-resource-import"),
+            Self::UserResourceRead => formatter.write_str("user-resource-read"),
             Self::UserContentRead => formatter.write_str("user-content-read"),
             Self::UserContentWrite => formatter.write_str("user-content-write"),
             Self::WorldSessionRead => formatter.write_str("world-session-read"),
@@ -91,6 +97,8 @@ impl FromStr for RuntimePermission {
             "http-fetch" => Ok(Self::HttpFetch),
             "artifact-import" => Ok(Self::ArtifactImport),
             "asset-import" => Ok(Self::AssetImport),
+            "user-resource-import" => Ok(Self::UserResourceImport),
+            "user-resource-read" => Ok(Self::UserResourceRead),
             "user-content-read" => Ok(Self::UserContentRead),
             "user-content-write" => Ok(Self::UserContentWrite),
             "world-session-read" => Ok(Self::WorldSessionRead),
@@ -117,6 +125,17 @@ mod tests {
             "asset-import".parse::<RuntimePermission>(),
             Ok(RuntimePermission::AssetImport)
         );
+    }
+
+    #[test]
+    fn test_should_round_trip_user_resource_permissions() {
+        for permission in [
+            RuntimePermission::UserResourceImport,
+            RuntimePermission::UserResourceRead,
+        ] {
+            let text = permission.to_string();
+            assert_eq!(text.parse::<RuntimePermission>(), Ok(permission));
+        }
     }
 
     #[test]

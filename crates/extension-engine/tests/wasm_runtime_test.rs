@@ -216,7 +216,8 @@ fn test_should_use_dedicated_fuel_budget_for_service_requests() -> EngineResult<
 #[test]
 fn test_should_reject_oversized_wasm_service_request() -> EngineResult<()> {
     let budget = WasmExecutionBudget {
-        max_host_message_bytes: 32,
+        max_host_message_bytes: 16,
+        max_service_message_bytes: 32,
         ..WasmExecutionBudget::default()
     };
     let runtime = WasmRuntimeEngine::with_execution_budget(budget)?;

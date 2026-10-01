@@ -7,7 +7,7 @@ use rintawa_sdk::{
 use crate::{
     host_access::{
         CompositionActivation, HostAccessError, RuntimePolicyComponent, UserContentDocument,
-        UserContentSummary, UserContentWriteStatus, WorldCommandAccessError,
+        UserContentSummary, UserContentWriteStatus, UserResourceRef, WorldCommandAccessError,
         WorldCommandActor as HostWorldCommandActor, WorldCommandRequest,
         WorldProjectionAccessError, WorldProjectionReadStatus, WorldProjectionRequest,
         WorldSessionAssetRef, WorldSessionSummary,
@@ -16,11 +16,11 @@ use crate::{
         ArtifactStoreError, ArtifactStoreHost, AssetStoreError, AssetStoreHost, CompositionError,
         CompositionHost, PreferenceError, PreferencesHost, RuntimePermissionCheck,
         RuntimePolicyError, RuntimePolicyHost, ScopedCompositionHost, ScopedRuntimePolicyHost,
-        UserContentError, UserContentHost, WasmHostState, WitAcceptedUserContentWrite,
-        WitAcceptedWorldCommand, WitAcceptedWorldProjectionRead, WitAssetRef,
-        WitCompositionActivation, WitImportedArtifact, WitRuntimeArtifactPolicy,
+        UserContentError, UserContentHost, UserResourceError, UserResourcesHost, WasmHostState,
+        WitAcceptedUserContentWrite, WitAcceptedWorldCommand, WitAcceptedWorldProjectionRead,
+        WitAssetRef, WitCompositionActivation, WitImportedArtifact, WitRuntimeArtifactPolicy,
         WitRuntimePolicyComponent, WitRuntimePolicyRequest, WitUserContentDocument,
-        WitUserContentEntry, WitUserContentWriteState, WitWorldCommandActor,
+        WitUserContentEntry, WitUserContentWriteState, WitUserResourceRef, WitWorldCommandActor,
         WitWorldCommandRequest, WitWorldProjectionReadState, WitWorldProjectionRequest,
         WitWorldProjectionView, WitWorldSummary, WorldCommandError, WorldCommandsHost,
         WorldProjectionError, WorldProjectionsHost, WorldSessionError, WorldSessionsHost,
@@ -59,30 +59,352 @@ impl AssetStoreHost for WasmHostState {
         bytes: Vec<u8>,
         media_type: String,
     ) -> Result<WitAssetRef, AssetStoreError> {
-        if !self.host_access_active {
-            return Err(AssetStoreError::AccessNotActive);
-        }
-        self.runtime_permission_owner(RuntimePermission::AssetImport)
-            .map_err(|error| match error {
-                RuntimePermissionCheck::Denied => AssetStoreError::PermissionDenied,
-                RuntimePermissionCheck::Unavailable => AssetStoreError::Unavailable,
-            })?;
+        self.require_asset_import_access()?;
         if bytes.len() > self.max_asset_import_bytes
             || media_type.len() > self.max_host_message_bytes
         {
             return Err(AssetStoreError::MessageTooLarge);
         }
+        self.publish_asset(&bytes, &media_type)
+    }
 
+    fn begin_upload(
+        &mut self,
+        media_type: String,
+        expected_size: u64,
+    ) -> Result<u64, AssetStoreError> {
+        self.require_asset_import_access()?;
+        let expected_size =
+            usize::try_from(expected_size).map_err(|_| AssetStoreError::MessageTooLarge)?;
+        if expected_size == 0
+            || expected_size > self.max_asset_import_bytes
+            || media_type.is_empty()
+            || media_type.len() > self.max_host_message_bytes
+        {
+            return Err(AssetStoreError::MessageTooLarge);
+        }
+        let reserved = self
+            .asset_uploads
+            .values()
+            .try_fold(0_usize, |total, upload| {
+                total.checked_add(upload.expected_size)
+            })
+            .ok_or(AssetStoreError::Rejected)?;
+        if reserved.saturating_add(expected_size) > self.max_asset_import_bytes {
+            return Err(AssetStoreError::Rejected);
+        }
+        let handle = self
+            .next_asset_upload_handle
+            .checked_add(1)
+            .ok_or(AssetStoreError::Rejected)?;
+        self.next_asset_upload_handle = handle;
+        self.asset_uploads.insert(
+            handle,
+            super::PendingAssetUpload {
+                expected_size,
+                media_type,
+                bytes: Vec::new(),
+            },
+        );
+        Ok(handle)
+    }
+
+    fn append_upload(&mut self, handle: u64, bytes: Vec<u8>) -> Result<(), AssetStoreError> {
+        self.require_asset_import_access()?;
+        if bytes.is_empty() || bytes.len() > self.max_host_message_bytes {
+            return Err(AssetStoreError::MessageTooLarge);
+        }
+        let upload = self
+            .asset_uploads
+            .get_mut(&handle)
+            .ok_or(AssetStoreError::Rejected)?;
+        let next_len = upload
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or(AssetStoreError::MessageTooLarge)?;
+        if next_len > upload.expected_size {
+            return Err(AssetStoreError::MessageTooLarge);
+        }
+        upload.bytes.extend_from_slice(&bytes);
+        Ok(())
+    }
+
+    fn finish_upload(&mut self, handle: u64) -> Result<WitAssetRef, AssetStoreError> {
+        self.require_asset_import_access()?;
+        let complete = self
+            .asset_uploads
+            .get(&handle)
+            .is_some_and(|upload| upload.bytes.len() == upload.expected_size);
+        if !complete {
+            return Err(AssetStoreError::Rejected);
+        }
+        let upload = self
+            .asset_uploads
+            .remove(&handle)
+            .ok_or(AssetStoreError::Rejected)?;
+        self.publish_asset(&upload.bytes, &upload.media_type)
+    }
+
+    fn cancel_upload(&mut self, handle: u64) -> Result<(), AssetStoreError> {
+        self.require_asset_import_access()?;
+        self.asset_uploads
+            .remove(&handle)
+            .map(|_| ())
+            .ok_or(AssetStoreError::Rejected)
+    }
+}
+
+impl WasmHostState {
+    fn require_asset_import_access(&self) -> Result<(), AssetStoreError> {
+        if !self.host_access_active {
+            return Err(AssetStoreError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::AssetImport)
+            .map(|_| ())
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => AssetStoreError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => AssetStoreError::Unavailable,
+            })
+    }
+
+    fn publish_asset(
+        &self,
+        bytes: &[u8],
+        media_type: &str,
+    ) -> Result<WitAssetRef, AssetStoreError> {
         let imported = self
             .host_access
             .asset_store
-            .import_asset(&bytes, &media_type)
+            .import_asset(bytes, media_type)
             .map_err(map_asset_store_access_error)?;
         Ok(WitAssetRef {
             digest: imported.digest,
             size: imported.size,
             media_type: imported.media_type,
         })
+    }
+}
+
+impl UserResourcesHost for WasmHostState {
+    fn import_resource(
+        &mut self,
+        bytes: Vec<u8>,
+        media_type: String,
+        name: Option<String>,
+    ) -> Result<WitUserResourceRef, UserResourceError> {
+        self.require_user_resource_import_access()?;
+        if bytes.len() > self.max_artifact_import_bytes
+            || media_type.len() > self.max_host_message_bytes
+            || name
+                .as_ref()
+                .is_some_and(|value| value.len() > self.max_host_message_bytes)
+        {
+            return Err(UserResourceError::MessageTooLarge);
+        }
+        self.publish_user_resource(&bytes, &media_type, name.as_deref())
+    }
+
+    fn begin_upload(
+        &mut self,
+        media_type: String,
+        name: Option<String>,
+        expected_size: u64,
+    ) -> Result<u64, UserResourceError> {
+        self.require_user_resource_import_access()?;
+        let expected_size =
+            usize::try_from(expected_size).map_err(|_| UserResourceError::MessageTooLarge)?;
+        if expected_size == 0
+            || expected_size > self.max_artifact_import_bytes
+            || media_type.is_empty()
+            || media_type.len() > self.max_host_message_bytes
+            || name
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.len() > self.max_host_message_bytes)
+        {
+            return Err(UserResourceError::MessageTooLarge);
+        }
+        let reserved = self
+            .user_resource_uploads
+            .values()
+            .try_fold(0_usize, |total, upload| {
+                total.checked_add(upload.expected_size)
+            })
+            .ok_or(UserResourceError::Rejected)?;
+        if reserved.saturating_add(expected_size) > self.max_artifact_import_bytes {
+            return Err(UserResourceError::Rejected);
+        }
+        let handle = self
+            .next_user_resource_upload_handle
+            .checked_add(1)
+            .ok_or(UserResourceError::Rejected)?;
+        self.next_user_resource_upload_handle = handle;
+        self.user_resource_uploads.insert(
+            handle,
+            super::PendingUserResourceUpload {
+                expected_size,
+                media_type,
+                name,
+                bytes: Vec::new(),
+            },
+        );
+        Ok(handle)
+    }
+
+    fn append_upload(&mut self, handle: u64, bytes: Vec<u8>) -> Result<(), UserResourceError> {
+        self.require_user_resource_import_access()?;
+        if bytes.is_empty() || bytes.len() > self.max_host_message_bytes {
+            return Err(UserResourceError::MessageTooLarge);
+        }
+        let upload = self
+            .user_resource_uploads
+            .get_mut(&handle)
+            .ok_or(UserResourceError::Rejected)?;
+        let next_len = upload
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or(UserResourceError::MessageTooLarge)?;
+        if next_len > upload.expected_size {
+            return Err(UserResourceError::MessageTooLarge);
+        }
+        upload.bytes.extend_from_slice(&bytes);
+        Ok(())
+    }
+
+    fn finish_upload(&mut self, handle: u64) -> Result<WitUserResourceRef, UserResourceError> {
+        self.require_user_resource_import_access()?;
+        let complete = self
+            .user_resource_uploads
+            .get(&handle)
+            .is_some_and(|upload| upload.bytes.len() == upload.expected_size);
+        if !complete {
+            return Err(UserResourceError::Rejected);
+        }
+        let upload = self
+            .user_resource_uploads
+            .remove(&handle)
+            .ok_or(UserResourceError::Rejected)?;
+        self.publish_user_resource(&upload.bytes, &upload.media_type, upload.name.as_deref())
+    }
+
+    fn cancel_upload(&mut self, handle: u64) -> Result<(), UserResourceError> {
+        self.require_user_resource_import_access()?;
+        self.user_resource_uploads
+            .remove(&handle)
+            .map(|_| ())
+            .ok_or(UserResourceError::Rejected)
+    }
+
+    fn read_resource(
+        &mut self,
+        reference: WitUserResourceRef,
+        maximum_bytes: u64,
+    ) -> Result<Vec<u8>, UserResourceError> {
+        if !self.host_access_active {
+            return Err(UserResourceError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::UserResourceRead)
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => UserResourceError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => UserResourceError::Unavailable,
+            })?;
+        let maximum_bytes =
+            usize::try_from(maximum_bytes).map_err(|_| UserResourceError::MessageTooLarge)?;
+        if maximum_bytes == 0 || maximum_bytes > self.max_artifact_import_bytes {
+            return Err(UserResourceError::MessageTooLarge);
+        }
+        let reference = from_wit_user_resource_ref(reference)?;
+        self.host_access
+            .user_resources
+            .read_resource(&reference, maximum_bytes)
+            .map_err(map_user_resource_access_error)
+    }
+
+    fn release_resource(&mut self, reference: WitUserResourceRef) -> Result<(), UserResourceError> {
+        if !self.host_access_active {
+            return Err(UserResourceError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::UserResourceRead)
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => UserResourceError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => UserResourceError::Unavailable,
+            })?;
+        let reference = from_wit_user_resource_ref(reference)?;
+        self.host_access
+            .user_resources
+            .release_resource(&reference)
+            .map_err(map_user_resource_access_error)
+    }
+}
+
+impl WasmHostState {
+    fn require_user_resource_import_access(&self) -> Result<(), UserResourceError> {
+        if !self.host_access_active {
+            return Err(UserResourceError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::UserResourceImport)
+            .map(|_| ())
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => UserResourceError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => UserResourceError::Unavailable,
+            })
+    }
+
+    fn publish_user_resource(
+        &self,
+        bytes: &[u8],
+        media_type: &str,
+        name: Option<&str>,
+    ) -> Result<WitUserResourceRef, UserResourceError> {
+        let reference = self
+            .host_access
+            .user_resources
+            .import_resource(bytes, media_type, name)
+            .map_err(map_user_resource_access_error)?;
+        Ok(to_wit_user_resource_ref(reference))
+    }
+}
+
+fn to_wit_user_resource_ref(reference: UserResourceRef) -> WitUserResourceRef {
+    WitUserResourceRef {
+        id: reference.id,
+        size: reference.size,
+        media_type: reference.media_type,
+        name: reference.name,
+    }
+}
+
+fn from_wit_user_resource_ref(
+    reference: WitUserResourceRef,
+) -> Result<UserResourceRef, UserResourceError> {
+    if reference.id.is_empty() || reference.media_type.is_empty() || reference.size == 0 {
+        return Err(UserResourceError::InvalidResource);
+    }
+    Ok(UserResourceRef {
+        id: reference.id,
+        size: reference.size,
+        media_type: reference.media_type,
+        name: reference.name,
+    })
+}
+
+fn map_user_resource_access_error(error: HostAccessError) -> UserResourceError {
+    match error {
+        HostAccessError::NotFound => UserResourceError::NotFound,
+        HostAccessError::QueueFull => UserResourceError::QueueFull,
+        HostAccessError::Unavailable => UserResourceError::Unavailable,
+        HostAccessError::InvalidAsset
+        | HostAccessError::InvalidArtifact
+        | HostAccessError::InvalidDigest
+        | HostAccessError::InvalidWorldId
+        | HostAccessError::InvalidUserContentId
+        | HostAccessError::InvalidContentType
+        | HostAccessError::UnsupportedContent
+        | HostAccessError::InvalidPermission
+        | HostAccessError::InvalidPreference
+        | HostAccessError::PreferenceQuotaExceeded
+        | HostAccessError::Rejected => UserResourceError::Rejected,
     }
 }
 

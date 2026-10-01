@@ -153,6 +153,9 @@ use bindings::rintawa::engine::{
         Entry as WitUserContentEntry, Error as UserContentError, Host as UserContentHost,
         WriteState as WitUserContentWriteState,
     },
+    user_resources::{
+        Error as UserResourceError, Host as UserResourcesHost, ResourceRef as WitUserResourceRef,
+    },
     world_commands::{
         Accepted as WitAcceptedWorldCommand, Actor as WitWorldCommandActor,
         Error as WorldCommandError, Host as WorldCommandsHost, Request as WitWorldCommandRequest,
@@ -171,6 +174,21 @@ use bindings::rintawa::engine::{
 };
 use target_provider_bindings::TargetProviderPlugin;
 use task_bindings::TaskPlugin;
+
+#[derive(Debug)]
+struct PendingAssetUpload {
+    expected_size: usize,
+    media_type: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct PendingUserResourceUpload {
+    expected_size: usize,
+    media_type: String,
+    name: Option<String>,
+    bytes: Vec<u8>,
+}
 
 /// Internal host state stored inside the Wasmtime Store context.
 pub struct WasmHostState {
@@ -213,6 +231,11 @@ pub struct WasmHostState {
     max_artifact_read_bytes: usize,
     max_artifact_import_bytes: usize,
     max_asset_import_bytes: usize,
+    next_asset_upload_handle: u64,
+    asset_uploads: HashMap<u64, PendingAssetUpload>,
+    next_user_resource_upload_handle: u64,
+    user_resource_uploads: HashMap<u64, PendingUserResourceUpload>,
+    max_presented_asset_bytes: usize,
     max_user_content_writes_per_execution: usize,
     user_content_writes_this_execution: usize,
     max_world_session_mutations_per_execution: usize,
@@ -385,6 +408,11 @@ impl WasmHostState {
             max_artifact_read_bytes: budget.max_artifact_read_bytes,
             max_artifact_import_bytes: budget.max_artifact_import_bytes,
             max_asset_import_bytes: budget.max_asset_import_bytes,
+            next_asset_upload_handle: 0,
+            asset_uploads: HashMap::new(),
+            next_user_resource_upload_handle: 0,
+            user_resource_uploads: HashMap::new(),
+            max_presented_asset_bytes: budget.max_presented_asset_bytes,
             max_user_content_writes_per_execution: budget.max_user_content_writes_per_execution,
             user_content_writes_this_execution: 0,
             max_world_session_mutations_per_execution: budget
@@ -1951,7 +1979,7 @@ impl Component for WasmComponent {
     }
 
     fn service_message_limit(&self) -> Option<usize> {
-        Some(self.budget.max_host_message_bytes)
+        Some(self.budget.max_service_message_bytes)
     }
 
     fn register(&mut self, ctx: &mut dyn RegistrationContext) -> ExtensionResult<()> {
@@ -2265,7 +2293,13 @@ impl Component for WasmComponent {
         request: &[u8],
     ) -> ExtensionResult<Vec<u8>> {
         self.validate_inbound_message("service contract", contract.id.as_str().len())?;
-        self.validate_inbound_message("service request", request.len())?;
+        if request.len() > self.budget.max_service_message_bytes {
+            return Err(ExtensionError::HostMessageTooLarge {
+                operation: "service request",
+                actual_bytes: request.len(),
+                maximum_bytes: self.budget.max_service_message_bytes,
+            });
+        }
         let budget = self.budget.clone();
         let mut runtime = self.runtime()?;
         let instance = self.ensure_instance(&mut runtime)?;

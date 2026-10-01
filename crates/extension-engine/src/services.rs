@@ -28,7 +28,7 @@ use crate::{
     secrets::SecretManager,
 };
 
-pub(crate) const DEFAULT_MAX_SERVICE_MESSAGE_BYTES: usize = 1024 * 1024;
+pub(crate) const DEFAULT_MAX_SERVICE_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_SERVICE_PROVIDERS_PER_CONTRACT: usize = 64;
 
 pub(crate) type ComponentHandle = Arc<Mutex<Box<dyn Component>>>;

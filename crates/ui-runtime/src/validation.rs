@@ -4,17 +4,22 @@ use std::collections::{HashMap, HashSet};
 
 use rintawa_sdk::ui::{
     UiAssetImageNode, UiAssetPickerNode, UiCapabilityId, UiDataGridNode, UiError, UiIconNode,
-    UiImageNode, UiNode, UiNodeId, UiNodeKind, UiSelectNode, UiSplitNode, UiSurfaceSnapshot,
+    UiImageNode, UiNode, UiNodeId, UiNodeKind, UiResourcePickerNode, UiSelectNode, UiSplitNode,
+    UiSurfaceSnapshot,
 };
 
 const MAX_LAYOUT_WEIGHT: u32 = 10_000;
 const MAX_ICON_SIZE: u32 = 256;
 const MAX_IMAGE_DIMENSION: u32 = 4096;
 const MAX_IMAGE_BASE64_BYTES: usize = 1024 * 1024;
-const MAX_ASSET_IMAGE_BYTES: u64 = 1024 * 1024;
-const MAX_ASSET_PICKER_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_ASSET_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_ASSET_PICKER_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_ASSET_PICKER_MEDIA_TYPES: usize = 16;
 const MAX_ASSET_PICKER_MEDIA_TYPE_BYTES: usize = 128;
+const MAX_RESOURCE_PICKER_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_RESOURCE_PICKER_MEDIA_TYPES: usize = 16;
+const MAX_RESOURCE_PICKER_EXTENSIONS: usize = 32;
+const MAX_RESOURCE_PICKER_EXTENSION_BYTES: usize = 32;
 const MAX_SELECT_OPTIONS: usize = 256;
 const MAX_DATA_GRID_COLUMNS: usize = 64;
 
@@ -41,6 +46,7 @@ pub(crate) fn validate_snapshot(snapshot: &UiSurfaceSnapshot) -> Result<(), UiEr
             UiNodeKind::Image(image) => validate_image(&node.id, image)?,
             UiNodeKind::AssetImage(image) => validate_asset_image(&node.id, image)?,
             UiNodeKind::AssetPicker(picker) => validate_asset_picker(&node.id, picker)?,
+            UiNodeKind::ResourcePicker(picker) => validate_resource_picker(&node.id, picker)?,
             UiNodeKind::Select(select) => validate_select(&node.id, select)?,
             UiNodeKind::Split(split) => validate_split_layout(&node.id, split)?,
             UiNodeKind::DataGrid(grid) => validate_data_grid_layout(&node.id, grid)?,
@@ -167,6 +173,56 @@ fn validate_asset_picker(node_id: &UiNodeId, picker: &UiAssetPickerNode) -> Resu
         {
             return Err(UiError::InvalidLayout(format!(
                 "asset-picker node '{node_id}' requires unique canonical lowercase media types"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_resource_picker(
+    node_id: &UiNodeId,
+    picker: &UiResourcePickerNode,
+) -> Result<(), UiError> {
+    if picker.max_bytes == 0 || picker.max_bytes > MAX_RESOURCE_PICKER_BYTES {
+        return Err(UiError::InvalidLayout(format!(
+            "resource-picker node '{node_id}' requires max-bytes in 1..={MAX_RESOURCE_PICKER_BYTES}"
+        )));
+    }
+    if picker.accepted_media_types.len() > MAX_RESOURCE_PICKER_MEDIA_TYPES
+        || picker.accepted_extensions.len() > MAX_RESOURCE_PICKER_EXTENSIONS
+        || (picker.accepted_media_types.is_empty() && picker.accepted_extensions.is_empty())
+    {
+        return Err(UiError::InvalidLayout(format!(
+            "resource-picker node '{node_id}' requires at least one bounded media type or extension"
+        )));
+    }
+    let mut seen_media_types = HashSet::new();
+    for media_type in &picker.accepted_media_types {
+        if media_type.is_empty()
+            || media_type.len() > MAX_ASSET_PICKER_MEDIA_TYPE_BYTES
+            || media_type != &media_type.to_ascii_lowercase()
+            || !media_type.contains('/')
+            || !seen_media_types.insert(media_type)
+        {
+            return Err(UiError::InvalidLayout(format!(
+                "resource-picker node '{node_id}' requires unique canonical lowercase media types"
+            )));
+        }
+    }
+    let mut seen_extensions = HashSet::new();
+    for extension in &picker.accepted_extensions {
+        if extension.len() < 2
+            || extension.len() > MAX_RESOURCE_PICKER_EXTENSION_BYTES
+            || !extension.starts_with('.')
+            || extension != &extension.to_ascii_lowercase()
+            || !extension
+                .bytes()
+                .skip(1)
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            || !seen_extensions.insert(extension)
+        {
+            return Err(UiError::InvalidLayout(format!(
+                "resource-picker node '{node_id}' requires unique lowercase file extensions"
             )));
         }
     }

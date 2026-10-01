@@ -4,8 +4,8 @@ use std::{fs, io::Write};
 
 use anyhow::Result;
 use rintawa_artifacts::{
-    ArtifactPath, ContentType, RTW_FORMAT_VERSION, RtwArchive, RtwError, RtwLimits, RtwManifest,
-    RtwPackEntry, pack_directory, pack_entries,
+    ArtifactPath, ContentType, RTW_FORMAT_VERSION, RtwArchive, RtwCompression, RtwError, RtwLimits,
+    RtwManifest, RtwPackEntry, pack_directory, pack_entries, pack_entries_with_compression,
 };
 use tempfile::TempDir;
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileOptions};
@@ -85,6 +85,26 @@ fn test_should_pack_memory_entries_identically_to_directory_source() -> Result<(
     )?;
 
     assert_eq!(bytes, fs::read(output)?);
+    Ok(())
+}
+
+#[test]
+fn test_should_pack_memory_entries_with_explicit_stored_compression() -> Result<()> {
+    let bytes = pack_entries_with_compression(
+        &example_manifest("manifest.toml")?,
+        memory_entries()?,
+        RtwLimits::default(),
+        RtwCompression::Stored,
+    )?;
+
+    let mut archive = ZipArchive::new(std::io::Cursor::new(bytes))?;
+    assert_eq!(archive.len(), 3);
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index)?;
+        assert_eq!(entry.compression(), CompressionMethod::Stored);
+        assert_eq!(entry.last_modified(), Some(DateTime::DEFAULT));
+        assert_eq!(entry.unix_mode().map(|mode| mode & 0o777), Some(0o644));
+    }
     Ok(())
 }
 
