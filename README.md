@@ -1,9 +1,13 @@
 # Rintawa
 
-Rintawa Core hosts exact local RTW artifacts. Network repositories, version discovery,
-updates, and dependency solving belong to replaceable Package Manager extensions.
+Rintawa is a local-first runtime for persistent Worlds composed from immutable RTW
+packages. Core provides generic package execution, scoped composition, authoritative World
+state and renderer-neutral UI infrastructure; product features are extensions.
 
-Current clean-build bootstrap:
+Standard packages and the Web experience live in
+[rtwKit](https://github.com/martrtr/rtwKit).
+
+## Quick start
 
 ```bash
 rintawa install ./package.rtw
@@ -13,10 +17,12 @@ rintawa enable <subject>
 rintawa run
 ```
 
-Artifacts are validated and stored immutably by SHA-256. `profiles/baseline.toml`
-contains the pre-world activation composition required to start UI and host tools.
-Future State Engine worlds are expected to add their own overlays over the same CAS
-instead of turning the bootstrap/main-menu scope into a world.
+RTW artifacts are validated and stored immutably by SHA-256. Global tools run in the
+baseline composition; new Worlds are materialized from an independent default-world recipe
+and then keep their own exact composition.
 
-The RTW root manifest intentionally stays minimal: container format, versioned content
-type, and content-specific entry descriptor. Content handlers own richer metadata.
+## Documentation
+
+- [Architecture](docs/architecture.md)
+- [0.0.1 roadmap](docs/roadmap.md)
+- [Coding style](docs/engineering/coding-style.md)
