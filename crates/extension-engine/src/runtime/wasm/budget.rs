@@ -70,6 +70,16 @@ pub struct WasmExecutionBudget {
     pub http_fetch_timeout_ms: u64,
     /// Maximum number of manually validated HTTPS redirects.
     pub max_http_redirects: usize,
+    /// Maximum concurrent HTTP request handles for one component owner.
+    pub max_http_request_handles: usize,
+    /// Largest outbound body accepted by one request.
+    pub max_http_request_body_bytes: usize,
+    /// Maximum header count on one request or streamed response.
+    pub max_http_request_headers: usize,
+    /// Maximum aggregate header bytes on one request or streamed response.
+    pub max_http_request_header_bytes: usize,
+    /// Largest chunk returned by one nonblocking HTTP poll.
+    pub max_http_request_chunk_bytes: usize,
 }
 
 impl Default for WasmExecutionBudget {
@@ -103,6 +113,11 @@ impl Default for WasmExecutionBudget {
             max_http_fetch_bytes: 32 * 1024 * 1024,
             http_fetch_timeout_ms: 15_000,
             max_http_redirects: 5,
+            max_http_request_handles: 8,
+            max_http_request_body_bytes: 1024 * 1024,
+            max_http_request_headers: 32,
+            max_http_request_header_bytes: 8 * 1024,
+            max_http_request_chunk_bytes: 16 * 1024,
         }
     }
 }

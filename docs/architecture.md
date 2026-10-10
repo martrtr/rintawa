@@ -56,6 +56,27 @@ Extensions expose versioned contracts through the Extension Engine.
 Execution targets, services, UI surfaces and runtime effects are revoked with their
 owning component lifecycle.
 
+## Outbound HTTP
+
+Core offers two distinct owner-scoped network capabilities:
+
+- `http-fetch`: the existing bounded synchronous HTTPS GET used by current packages.
+- `http-request`: a separate permission-gated, nonblocking HTTPS request API with
+  methods, validated headers, bounded body, response events and cancellation.
+
+The `http-request` Component Model interface exposes `start`, `poll` and `close`.
+The Host runs the request outside the guest callback and returns ordered response
+headers, provisional byte chunks, then completion or failure. The guest does not
+receive arbitrary sockets or filesystem access. A started request remains bound to
+the initiating component principal and is cancelled when its handle is closed or
+its owning runtime resources are revoked.
+
+The current outbound request policy permits only publicly routable HTTPS targets
+with DNS destination pinning, no ambient proxy and no followed redirects. Local
+HTTP and more granular per-origin approvals are not exposed by this contract yet.
+Per-owner and process-wide concurrency, body, response, header, chunk and timeout
+budgets are Host-enforced. This transport does not know AI, Chat or World schemas.
+
 ## World authority
 
 A World is the authoritative unit of simulation and persistence.

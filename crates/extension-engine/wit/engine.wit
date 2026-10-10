@@ -233,6 +233,64 @@ interface network {
     close: func(handle: handle) -> result<_, error>;
 }
 
+/// Owner-scoped bounded asynchronous HTTP requests without implicit redirects.
+interface http-request {
+    /// One validated outbound HTTP header.
+    record header {
+        name: string,
+        value: string,
+    }
+
+    /// HTTP method, target, request headers and bounded body.
+    record request {
+        method: string,
+        url: string,
+        headers: list<header>,
+        body: list<u8>,
+        max-response-bytes: u32,
+    }
+
+    /// Headers are delivered before response bytes.
+    record response-head {
+        status: u16,
+        headers: list<header>,
+    }
+
+    /// One nonblocking poll result. Bytes remain provisional until completed.
+    variant event {
+        pending,
+        response(response-head),
+        data(list<u8>),
+        completed,
+        failed(error),
+    }
+
+    /// Transport/policy failures are distinct from HTTP response status codes.
+    variant error {
+        access-not-active,
+        permission-denied,
+        invalid-url,
+        invalid-method,
+        invalid-header,
+        forbidden-destination,
+        request-too-large,
+        response-too-large,
+        limit-exceeded,
+        unknown-handle,
+        timeout,
+        unavailable,
+    }
+
+    /// Starts one request without blocking on DNS, TLS, upload or response.
+    start: func(request: request) -> result<u64, error>;
+
+    /// Reads at most the requested number of response bytes without blocking.
+    poll: func(handle: u64, max-bytes: u32) -> result<event, error>;
+
+    /// Cancels and closes the exact request owned by this component.
+    close: func(handle: u64) -> result<_, error>;
+}
+
 /// Bounded outbound HTTPS reads available only with an explicit host grant.
 interface http-fetch {
     /// One completed response after safe redirect handling.
@@ -1081,6 +1139,7 @@ world plugin {
     import runtime-tasks;
     import network;
     import http-fetch;
+    import http-request;
     import artifact-store;
     import asset-store;
     import user-resources;
@@ -1122,6 +1181,7 @@ world task-runtime-plugin {
     import runtime-tasks;
     import network;
     import http-fetch;
+    import http-request;
     import artifact-store;
     import asset-store;
     import user-resources;
@@ -1153,6 +1213,7 @@ world runtime-provider-plugin {
     import runtime-tasks;
     import network;
     import http-fetch;
+    import http-request;
     import artifact-store;
     import asset-store;
     import user-resources;
@@ -1184,6 +1245,7 @@ world runtime-provider-task-plugin {
     import runtime-tasks;
     import network;
     import http-fetch;
+    import http-request;
     import artifact-store;
     import asset-store;
     import user-resources;

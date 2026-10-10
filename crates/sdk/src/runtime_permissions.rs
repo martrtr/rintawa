@@ -19,6 +19,8 @@ pub enum RuntimePermission {
     LoopbackConnect,
     /// Allows bounded outbound HTTPS GET requests through the host HTTP client.
     HttpFetch,
+    /// Allows bounded asynchronous outbound HTTPS requests with explicit host grants.
+    HttpRequest,
     /// Allows importing validated RTW bytes into the local immutable artifact store.
     ArtifactImport,
     /// Allows importing bounded immutable raw assets into the local asset store.
@@ -56,6 +58,7 @@ impl fmt::Display for RuntimePermission {
             Self::LoopbackListen => formatter.write_str("loopback-listen"),
             Self::LoopbackConnect => formatter.write_str("loopback-connect"),
             Self::HttpFetch => formatter.write_str("http-fetch"),
+            Self::HttpRequest => formatter.write_str("http-request"),
             Self::ArtifactImport => formatter.write_str("artifact-import"),
             Self::AssetImport => formatter.write_str("asset-import"),
             Self::UserResourceImport => formatter.write_str("user-resource-import"),
@@ -95,6 +98,7 @@ impl FromStr for RuntimePermission {
             "loopback-listen" => Ok(Self::LoopbackListen),
             "loopback-connect" => Ok(Self::LoopbackConnect),
             "http-fetch" => Ok(Self::HttpFetch),
+            "http-request" => Ok(Self::HttpRequest),
             "artifact-import" => Ok(Self::ArtifactImport),
             "asset-import" => Ok(Self::AssetImport),
             "user-resource-import" => Ok(Self::UserResourceImport),
@@ -117,6 +121,16 @@ impl FromStr for RuntimePermission {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_should_round_trip_async_http_request_permission() {
+        assert_eq!(RuntimePermission::HttpRequest.to_string(), "http-request");
+        assert_eq!(
+            "http-request".parse::<RuntimePermission>(),
+            Ok(RuntimePermission::HttpRequest)
+        );
+        assert_eq!(RuntimePermission::HttpFetch.to_string(), "http-fetch");
+    }
 
     #[test]
     fn test_should_round_trip_asset_import_permission() {

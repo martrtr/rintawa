@@ -49,12 +49,14 @@ use crate::{
 
 mod budget;
 mod control_plane;
+mod http_request;
 mod network;
 mod target_provider;
 mod ui;
 
 pub use crate::runtime::wasm::budget::WasmExecutionBudget;
 
+use crate::runtime::wasm::http_request::OwnedHttpRequest;
 use crate::runtime::wasm::network::OwnedNetworkHandle;
 use crate::runtime::wasm::target_provider::{WasmExecutionTargetHost, WasmTargetProviderEndpoint};
 
@@ -120,6 +122,10 @@ use bindings::rintawa::engine::{
     },
     host::{Host as HostOperations, LogLevel, PublishError},
     http_fetch::{Error as HttpFetchError, Host as HttpFetchHost, Response as WitHttpResponse},
+    http_request::{
+        Error as HttpRequestError, Event as WitHttpEvent, Header as WitHttpHeader,
+        Host as HttpRequestHost, Request as WitHttpRequest, ResponseHead as WitHttpResponseHead,
+    },
     network::{
         Error as NetworkError, Host as NetworkHost, Listener as WitNetworkListener,
         ReadResult as WitNetworkReadResult,
@@ -210,8 +216,11 @@ pub struct WasmHostState {
     active_tasks: HashMap<u64, ActiveWasmTask>,
     network_access_active: bool,
     host_access_active: bool,
+    http_request_access_active: bool,
     next_network_handle: u64,
     network_handles: HashMap<u64, OwnedNetworkHandle>,
+    http_requests: HashMap<u64, OwnedHttpRequest>,
+    next_http_request_handle: u64,
     max_background_tasks: usize,
     min_background_task_interval_ms: u32,
     max_network_handles: usize,
@@ -220,6 +229,11 @@ pub struct WasmHostState {
     max_http_fetch_bytes: usize,
     http_fetch_timeout_ms: u64,
     max_http_redirects: usize,
+    max_http_request_handles: usize,
+    max_http_request_body_bytes: usize,
+    max_http_request_headers: usize,
+    max_http_request_header_bytes: usize,
+    max_http_request_chunk_bytes: usize,
     secrets: SecretManager,
     services: ServiceRuntime,
     ui: UiRuntime,
@@ -387,8 +401,11 @@ impl WasmHostState {
             active_tasks: HashMap::new(),
             network_access_active: false,
             host_access_active: false,
+            http_request_access_active: false,
             next_network_handle: 0,
             network_handles: HashMap::new(),
+            http_requests: HashMap::new(),
+            next_http_request_handle: 0,
             max_background_tasks: budget.max_background_tasks,
             min_background_task_interval_ms: budget.min_background_task_interval_ms,
             max_network_handles: budget.max_network_handles,
@@ -397,6 +414,11 @@ impl WasmHostState {
             max_http_fetch_bytes: budget.max_http_fetch_bytes,
             http_fetch_timeout_ms: budget.http_fetch_timeout_ms,
             max_http_redirects: budget.max_http_redirects,
+            max_http_request_handles: budget.max_http_request_handles,
+            max_http_request_body_bytes: budget.max_http_request_body_bytes,
+            max_http_request_headers: budget.max_http_request_headers,
+            max_http_request_header_bytes: budget.max_http_request_header_bytes,
+            max_http_request_chunk_bytes: budget.max_http_request_chunk_bytes,
             secrets,
             services,
             ui,
@@ -477,6 +499,7 @@ impl WasmHostState {
         self.task_access_active = false;
         self.network_access_active = false;
         self.host_access_active = false;
+        self.http_request_access_active = false;
         self.secret_access_active = false;
         self.service_access_active = false;
         self.ui_access_active = false;
@@ -575,6 +598,7 @@ impl WasmHostState {
         self.task_access_active = false;
         self.network_access_active = false;
         self.host_access_active = false;
+        self.http_request_access_active = false;
         self.user_content_writes_this_execution = 0;
         self.world_session_mutations_this_execution = 0;
         self.world_command_submissions_this_execution = 0;
@@ -801,6 +825,7 @@ impl WasmHostState {
         self.task_access_active = true;
         self.network_access_active = true;
         self.host_access_active = true;
+        self.http_request_access_active = true;
         self.user_content_writes_this_execution = 0;
         self.world_session_mutations_this_execution = 0;
         self.world_command_submissions_this_execution = 0;
@@ -817,6 +842,7 @@ impl WasmHostState {
         self.task_access_active = true;
         self.network_access_active = true;
         self.host_access_active = true;
+        self.http_request_access_active = true;
         self.user_content_writes_this_execution = 0;
         self.world_session_mutations_this_execution = 0;
         self.world_command_submissions_this_execution = 0;
@@ -836,6 +862,7 @@ impl WasmHostState {
         self.task_access_active = true;
         self.network_access_active = true;
         self.host_access_active = true;
+        self.http_request_access_active = true;
         self.user_content_writes_this_execution = 0;
         self.world_session_mutations_this_execution = 0;
         self.world_command_submissions_this_execution = 0;
@@ -866,6 +893,7 @@ impl WasmHostState {
         self.task_access_active = false;
         self.network_access_active = false;
         self.host_access_active = false;
+        self.http_request_access_active = true;
         self.secret_access_active = true;
         self.service_access_active = true;
         self.ui_access_active = true;
@@ -877,6 +905,7 @@ impl WasmHostState {
         self.task_access_active = false;
         self.network_access_active = false;
         self.host_access_active = false;
+        self.http_request_access_active = true;
         self.secret_access_active = true;
         self.service_access_active = true;
         self.ui_access_active = true;
@@ -887,6 +916,7 @@ impl WasmHostState {
         self.task_access_active = false;
         self.network_access_active = false;
         self.host_access_active = false;
+        self.http_request_access_active = false;
         self.secret_access_active = false;
         self.service_access_active = false;
         self.ui_access_active = false;
@@ -899,6 +929,7 @@ impl WasmHostState {
         self.task_access_active = false;
         self.network_access_active = false;
         self.host_access_active = false;
+        self.http_request_access_active = false;
         self.secret_access_active = false;
         self.service_access_active = false;
         self.ui_access_active = false;
@@ -1047,6 +1078,8 @@ impl WasmHostState {
         self.active_tasks.retain(|_, task| &task.owner != owner);
         self.network_handles
             .retain(|_, resource| &resource.owner != owner);
+        self.http_requests
+            .retain(|_, request| &request.owner != owner);
     }
 
     fn next_task_due_in(&self, now: Instant) -> Option<Duration> {

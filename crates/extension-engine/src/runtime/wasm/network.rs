@@ -345,6 +345,7 @@ pub(super) fn build_bounded_https_client(
         .ok_or(HttpFetchError::InvalidUrl)?;
 
     let mut builder = HttpClient::builder()
+        .no_proxy()
         .redirect(RedirectPolicy::none())
         .timeout(timeout)
         .connect_timeout(timeout.min(Duration::from_secs(5)));
