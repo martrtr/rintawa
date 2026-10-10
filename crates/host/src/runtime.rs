@@ -16,13 +16,14 @@ use rintawa_extension_engine::{
     ActivationPlanError, ArtifactStoreAccess, AssetStoreAccess, CompositionAccess,
     CompositionActivation, EngineError, ExtensionEngine, HostAccessError, HostAccessResult,
     ImportedArtifact, ImportedAsset, PreferenceAccess, RtwExtensionLoadOutcome, RtwExtensionLoader,
-    RuntimeArtifactPolicy, RuntimeContextAccess, RuntimePolicyAccess, RuntimePolicyComponent,
-    RuntimePolicyRequest, UnresolvedContractReason, UserContentAccess, UserContentDocument,
-    UserContentSummary, UserContentWriteAccess, UserContentWriteStatus, UserResourceAccess,
-    UserResourceRef, WorldCommandAccess, WorldCommandAccessError, WorldCommandAccessResult,
-    WorldCommandActor, WorldCommandRequest, WorldProjectionAccess, WorldProjectionAccessError,
-    WorldProjectionAccessResult, WorldProjectionReadStatus, WorldProjectionReadView,
-    WorldProjectionRequest, WorldSessionAccess, WorldSessionAssetRef, WorldSessionSummary,
+    RuntimeArtifactPolicy, RuntimeContextAccess, RuntimeHttpOriginGrant, RuntimePolicyAccess,
+    RuntimePolicyComponent, RuntimePolicyRequest, UnresolvedContractReason, UserContentAccess,
+    UserContentDocument, UserContentSummary, UserContentWriteAccess, UserContentWriteStatus,
+    UserResourceAccess, UserResourceRef, WorldCommandAccess, WorldCommandAccessError,
+    WorldCommandAccessResult, WorldCommandActor, WorldCommandRequest, WorldProjectionAccess,
+    WorldProjectionAccessError, WorldProjectionAccessResult, WorldProjectionReadStatus,
+    WorldProjectionReadView, WorldProjectionRequest, WorldSessionAccess, WorldSessionAssetRef,
+    WorldSessionSummary,
 };
 use rintawa_sdk::{
     content::{
@@ -1100,6 +1101,55 @@ fn inspect_runtime_artifact(
 }
 
 impl RuntimePolicyAccess for LocalHostAccess {
+    fn list_http_origins(&self, scope_id: &str) -> HostAccessResult<Vec<RuntimeHttpOriginGrant>> {
+        self.home()?
+            .list_http_loopback_origins(&RuntimeScopeId::new(scope_id))
+            .map(|origins| {
+                origins
+                    .into_iter()
+                    .map(|grant| RuntimeHttpOriginGrant {
+                        scope_id: grant.scope_id.to_string(),
+                        instance_id: grant.instance_id.to_string(),
+                        component_id: grant.component_id.to_string(),
+                        origin: grant.origin,
+                    })
+                    .collect()
+            })
+            .map_err(map_host_access_error)
+    }
+
+    fn grant_http_origin(
+        &self,
+        scope_id: &str,
+        instance_id: &str,
+        component_id: &str,
+        origin: &str,
+    ) -> HostAccessResult<()> {
+        self.home()?
+            .grant_http_loopback_origin(
+                RuntimeScopeId::new(scope_id),
+                ComponentRef::new(instance_id, component_id),
+                origin,
+            )
+            .map_err(map_host_access_error)
+    }
+
+    fn revoke_http_origin(
+        &self,
+        scope_id: &str,
+        instance_id: &str,
+        component_id: &str,
+        origin: &str,
+    ) -> HostAccessResult<()> {
+        self.home()?
+            .revoke_http_loopback_origin(
+                &RuntimeScopeId::new(scope_id),
+                &ComponentRef::new(instance_id, component_id),
+                origin,
+            )
+            .map_err(map_host_access_error)
+    }
+
     fn inspect_artifact(&self, digest: &str) -> HostAccessResult<RuntimeArtifactPolicy> {
         inspect_runtime_artifact(self, digest)
     }

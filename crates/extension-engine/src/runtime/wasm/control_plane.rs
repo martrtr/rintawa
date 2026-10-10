@@ -19,11 +19,12 @@ use crate::{
         UserContentError, UserContentHost, UserResourceError, UserResourcesHost, WasmHostState,
         WitAcceptedUserContentWrite, WitAcceptedWorldCommand, WitAcceptedWorldProjectionRead,
         WitAssetRef, WitCompositionActivation, WitImportedArtifact, WitRuntimeArtifactPolicy,
-        WitRuntimePolicyComponent, WitRuntimePolicyRequest, WitUserContentDocument,
-        WitUserContentEntry, WitUserContentWriteState, WitUserResourceRef, WitWorldCommandActor,
-        WitWorldCommandRequest, WitWorldProjectionReadState, WitWorldProjectionRequest,
-        WitWorldProjectionView, WitWorldSummary, WorldCommandError, WorldCommandsHost,
-        WorldProjectionError, WorldProjectionsHost, WorldSessionError, WorldSessionsHost,
+        WitRuntimeHttpOriginGrant, WitRuntimePolicyComponent, WitRuntimePolicyRequest,
+        WitUserContentDocument, WitUserContentEntry, WitUserContentWriteState, WitUserResourceRef,
+        WitWorldCommandActor, WitWorldCommandRequest, WitWorldProjectionReadState,
+        WitWorldProjectionRequest, WitWorldProjectionView, WitWorldSummary, WorldCommandError,
+        WorldCommandsHost, WorldProjectionError, WorldProjectionsHost, WorldSessionError,
+        WorldSessionsHost,
     },
 };
 
@@ -826,6 +827,88 @@ impl RuntimePolicyHost for WasmHostState {
             .list_components()
             .map_err(map_runtime_policy_access_error)?;
         self.bound_runtime_policy_components(components)
+    }
+
+    fn list_http_origins(
+        &mut self,
+        scope_id: String,
+    ) -> Result<Vec<WitRuntimeHttpOriginGrant>, RuntimePolicyError> {
+        self.require_runtime_policy_read()?;
+        if scope_id.len() > self.max_host_message_bytes {
+            return Err(RuntimePolicyError::MessageTooLarge);
+        }
+        let origins = self
+            .host_access
+            .runtime_policy
+            .list_http_origins(&scope_id)
+            .map_err(map_runtime_policy_access_error)?;
+        // Bound aggregate response size; a malicious Host adapter cannot force
+        // an unbounded message to be transferred into the guest.
+        let mut size = 0usize;
+        let mut output = Vec::new();
+        for grant in origins {
+            size = size
+                .saturating_add(grant.scope_id.len())
+                .saturating_add(grant.instance_id.len())
+                .saturating_add(grant.component_id.len())
+                .saturating_add(grant.origin.len());
+            if size > self.max_host_message_bytes {
+                return Err(RuntimePolicyError::MessageTooLarge);
+            }
+            output.push(WitRuntimeHttpOriginGrant {
+                scope_id: grant.scope_id,
+                instance_id: grant.instance_id,
+                component_id: grant.component_id,
+                origin: grant.origin,
+            });
+        }
+        Ok(output)
+    }
+
+    fn grant_http_origin(
+        &mut self,
+        scope_id: String,
+        instance_id: String,
+        component_id: String,
+        origin: String,
+    ) -> Result<(), RuntimePolicyError> {
+        self.require_runtime_policy_write()?;
+        if scope_id
+            .len()
+            .saturating_add(instance_id.len())
+            .saturating_add(component_id.len())
+            .saturating_add(origin.len())
+            > self.max_host_message_bytes
+        {
+            return Err(RuntimePolicyError::MessageTooLarge);
+        }
+        self.host_access
+            .runtime_policy
+            .grant_http_origin(&scope_id, &instance_id, &component_id, &origin)
+            .map_err(map_runtime_policy_access_error)
+    }
+
+    fn revoke_http_origin(
+        &mut self,
+        scope_id: String,
+        instance_id: String,
+        component_id: String,
+        origin: String,
+    ) -> Result<(), RuntimePolicyError> {
+        self.require_runtime_policy_write()?;
+        if scope_id
+            .len()
+            .saturating_add(instance_id.len())
+            .saturating_add(component_id.len())
+            .saturating_add(origin.len())
+            > self.max_host_message_bytes
+        {
+            return Err(RuntimePolicyError::MessageTooLarge);
+        }
+        self.host_access
+            .runtime_policy
+            .revoke_http_origin(&scope_id, &instance_id, &component_id, &origin)
+            .map_err(map_runtime_policy_access_error)
     }
 
     fn grant(

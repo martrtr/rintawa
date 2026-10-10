@@ -78,9 +78,9 @@ a grant for `http://127.0.0.1:11434` does not authorize another port, LAN IP or
 other component. Public HTTP and automatic loopback grants are prohibited.
 The Host persists exact origin approvals with each composition profile and
 restores them during activation only for manifest-authorized component principals.
-The CLI exposes explicit grant, list and revoke operations. Existing Worlds do
-not inherit later baseline changes; copied default-World recipes retain their
-own exact approvals.
+The CLI and the standard Package Manager runtime-policy interface expose explicit
+grant, list and revoke operations. Existing Worlds do not inherit later baseline
+changes; copied default-World recipes retain their own exact approvals.
 An operator first grants the manifest-requested `http-request` permission, then the
 separate exact loopback origin. For example:
 

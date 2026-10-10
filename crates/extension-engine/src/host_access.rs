@@ -514,6 +514,19 @@ pub struct RuntimePolicyComponent {
     pub granted: Vec<String>,
 }
 
+/// One exact HTTP loopback origin granted to a component in one runtime scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeHttpOriginGrant {
+    /// Scope of the exact owning runtime instance.
+    pub scope_id: String,
+    /// Concrete extension instance authorized by the Host.
+    pub instance_id: String,
+    /// Component within the authorized instance.
+    pub component_id: String,
+    /// Canonical HTTP origin including its exact port.
+    pub origin: String,
+}
+
 /// Generic administrative access to runtime permission policy.
 pub trait RuntimePolicyAccess: Send + Sync {
     /// Inspects requested runtime permissions in one exact imported artifact.
@@ -529,6 +542,35 @@ pub trait RuntimePolicyAccess: Send + Sync {
         &self,
         _scope_id: &str,
     ) -> HostAccessResult<Vec<RuntimePolicyComponent>> {
+        Err(HostAccessError::Rejected)
+    }
+
+    /// Lists approved local HTTP origins in one exact composition scope.
+    ///
+    /// Host adapters without this capability fail closed.
+    fn list_http_origins(&self, _scope_id: &str) -> HostAccessResult<Vec<RuntimeHttpOriginGrant>> {
+        Err(HostAccessError::Rejected)
+    }
+
+    /// Approves one exact local origin for one manifest-authorized principal.
+    fn grant_http_origin(
+        &self,
+        _scope_id: &str,
+        _instance_id: &str,
+        _component_id: &str,
+        _origin: &str,
+    ) -> HostAccessResult<()> {
+        Err(HostAccessError::Rejected)
+    }
+
+    /// Revokes one exact local origin independently of other granted ports.
+    fn revoke_http_origin(
+        &self,
+        _scope_id: &str,
+        _instance_id: &str,
+        _component_id: &str,
+        _origin: &str,
+    ) -> HostAccessResult<()> {
         Err(HostAccessError::Rejected)
     }
 

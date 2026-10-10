@@ -6,10 +6,10 @@ use crate::{
         AcceptedUserContentWrite, AcceptedWorldCommand, AcceptedWorldProjectionRead,
         ArtifactStoreAccess, AssetStoreAccess, CompositionAccess, CompositionActivation,
         HostAccessError, HostAccessResult, ImportedArtifact, ImportedAsset, PreferenceAccess,
-        RuntimeArtifactPolicy, RuntimeContextAccess, RuntimePolicyAccess, RuntimePolicyComponent,
-        UserContentAccess, UserContentDocument, UserContentSummary, UserContentWriteAccess,
-        UserContentWriteStatus, UserResourceAccess, UserResourceRef, WorldCommandAccess,
-        WorldCommandAccessResult, WorldCommandRequest, WorldProjectionAccess,
+        RuntimeArtifactPolicy, RuntimeContextAccess, RuntimeHttpOriginGrant, RuntimePolicyAccess,
+        RuntimePolicyComponent, UserContentAccess, UserContentDocument, UserContentSummary,
+        UserContentWriteAccess, UserContentWriteStatus, UserResourceAccess, UserResourceRef,
+        WorldCommandAccess, WorldCommandAccessResult, WorldCommandRequest, WorldProjectionAccess,
         WorldProjectionAccessError, WorldProjectionAccessResult, WorldProjectionReadStatus,
         WorldProjectionReadView, WorldProjectionRequest, WorldSessionAccess, WorldSessionSummary,
     },
@@ -59,6 +59,8 @@ struct PreferredProviderClear {
     contract_version: u32,
 }
 
+type HttpOriginPolicyWrite = (String, String, String, String, bool);
+
 #[derive(Default)]
 struct RecordingScopedHostAccess {
     composition_reads: Mutex<Vec<String>>,
@@ -67,6 +69,8 @@ struct RecordingScopedHostAccess {
     preferred_provider_clears: Mutex<Vec<PreferredProviderClear>>,
     world_default_writes: Mutex<Vec<(String, bool)>>,
     runtime_policy_reads: Mutex<Vec<String>>,
+    http_origin_policy_reads: Mutex<Vec<String>>,
+    http_origin_policy_writes: Mutex<Vec<HttpOriginPolicyWrite>>,
     user_resources: Mutex<Vec<Vec<u8>>>,
     user_content_writes: Mutex<Vec<Vec<u8>>>,
     world_session_writes: Mutex<Vec<(String, bool)>>,
@@ -481,6 +485,59 @@ impl CompositionAccess for RecordingScopedHostAccess {
 }
 
 impl RuntimePolicyAccess for RecordingScopedHostAccess {
+    fn list_http_origins(&self, scope_id: &str) -> HostAccessResult<Vec<RuntimeHttpOriginGrant>> {
+        self.http_origin_policy_reads
+            .lock()
+            .expect("test HTTP origin read lock should be healthy")
+            .push(scope_id.to_string());
+        Ok(vec![RuntimeHttpOriginGrant {
+            scope_id: scope_id.to_string(),
+            instance_id: "provider-instance".to_owned(),
+            component_id: "runtime".to_owned(),
+            origin: "http://127.0.0.1:11434".to_owned(),
+        }])
+    }
+
+    fn grant_http_origin(
+        &self,
+        scope_id: &str,
+        instance_id: &str,
+        component_id: &str,
+        origin: &str,
+    ) -> HostAccessResult<()> {
+        self.http_origin_policy_writes
+            .lock()
+            .expect("test HTTP origin write lock should be healthy")
+            .push((
+                scope_id.to_owned(),
+                instance_id.to_owned(),
+                component_id.to_owned(),
+                origin.to_owned(),
+                true,
+            ));
+        Ok(())
+    }
+
+    fn revoke_http_origin(
+        &self,
+        scope_id: &str,
+        instance_id: &str,
+        component_id: &str,
+        origin: &str,
+    ) -> HostAccessResult<()> {
+        self.http_origin_policy_writes
+            .lock()
+            .expect("test HTTP origin write lock should be healthy")
+            .push((
+                scope_id.to_owned(),
+                instance_id.to_owned(),
+                component_id.to_owned(),
+                origin.to_owned(),
+                false,
+            ));
+        Ok(())
+    }
+
     fn inspect_artifact(&self, _digest: &str) -> HostAccessResult<RuntimeArtifactPolicy> {
         Err(HostAccessError::Rejected)
     }
@@ -2519,4 +2576,294 @@ fn test_should_preserve_other_owner_effect_handles_after_delegated_abort() {
     assert_eq!(error.to_string(), "simulated delegated failure");
     assert!(!state.effect_handles.contains_key("own"));
     assert!(state.effect_handles.contains_key("other"));
+}
+
+#[cfg(test)]
+mod http_origin_policy_host_tests {
+    use super::*;
+
+    fn state_with_policy(access: Arc<RecordingScopedHostAccess>) -> WasmHostState {
+        let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
+        let mut services = WasmHostServices::standalone(secrets);
+        services.host_access = HostAccessServices::new(
+            access.clone(),
+            access.clone(),
+            access.clone(),
+            access.clone(),
+            access.clone(),
+            access,
+        );
+        let mut state = WasmHostState::with_host_services_and_budget(
+            ComponentId::new("runtime"),
+            services,
+            false,
+            &WasmExecutionBudget::default(),
+        );
+        begin_test_registration(&mut state, ExtensionId::new("admin.ui"));
+        state
+            .finish_registration()
+            .expect("test registration should finish");
+        state.begin_guest_execution();
+        state
+    }
+
+    fn sample_origin() -> String {
+        String::from("http://127.0.0.1:11434")
+    }
+
+    #[test]
+    fn test_should_deny_http_origin_inspection_without_runtime_policy_read() {
+        let access = Arc::new(RecordingScopedHostAccess::default());
+        let mut state = state_with_policy(access.clone());
+        assert!(matches!(
+            RuntimePolicyHost::list_http_origins(&mut state, String::from("host")),
+            Err(RuntimePolicyError::PermissionDenied)
+        ));
+        assert!(
+            access
+                .http_origin_policy_reads
+                .lock()
+                .expect("test lock")
+                .is_empty()
+        );
+
+        let owner = state.registered_owner().expect("test owner should exist");
+        // Possessing HTTP egress permission never confers admin access.
+        state
+            .runtime_permissions
+            .grant(owner, RuntimePermission::HttpRequest)
+            .expect("test grant should work");
+        assert!(matches!(
+            RuntimePolicyHost::list_http_origins(&mut state, String::from("host")),
+            Err(RuntimePolicyError::PermissionDenied)
+        ));
+        assert!(
+            access
+                .http_origin_policy_reads
+                .lock()
+                .expect("test lock")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_should_deny_http_origin_changes_without_runtime_policy_write() {
+        let access = Arc::new(RecordingScopedHostAccess::default());
+        let mut state = state_with_policy(access.clone());
+        let owner = state.registered_owner().expect("test owner should exist");
+        state
+            .runtime_permissions
+            .grant(owner, RuntimePermission::RuntimePolicyRead)
+            .expect("test grant should work");
+
+        let origins = RuntimePolicyHost::list_http_origins(&mut state, String::from("host"))
+            .expect("read-only policy should be visible");
+        assert_eq!(origins.len(), 1);
+        assert_eq!(origins[0].origin, sample_origin());
+
+        for result in [
+            RuntimePolicyHost::grant_http_origin(
+                &mut state,
+                String::from("host"),
+                String::from("provider-instance"),
+                String::from("runtime"),
+                sample_origin(),
+            ),
+            RuntimePolicyHost::revoke_http_origin(
+                &mut state,
+                String::from("host"),
+                String::from("provider-instance"),
+                String::from("runtime"),
+                sample_origin(),
+            ),
+        ] {
+            assert!(matches!(result, Err(RuntimePolicyError::PermissionDenied)));
+        }
+        assert!(
+            access
+                .http_origin_policy_writes
+                .lock()
+                .expect("test lock")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_should_route_origin_policy_by_exact_scope_and_component_identity() {
+        let access = Arc::new(RecordingScopedHostAccess::default());
+        let mut state = state_with_policy(access.clone());
+        let owner = state.registered_owner().expect("test owner should exist");
+        state
+            .runtime_permissions
+            .grant(owner.clone(), RuntimePermission::RuntimePolicyRead)
+            .expect("read grant should work");
+        state
+            .runtime_permissions
+            .grant(owner, RuntimePermission::RuntimePolicyWrite)
+            .expect("write grant should work");
+
+        let scope = String::from("world:018f0000-0000-7000-8000-000000000001");
+        let policy = RuntimePolicyHost::list_http_origins(&mut state, scope.clone())
+            .expect("scope-specific origin policy should be available");
+        assert_eq!(policy.len(), 1);
+        assert_eq!(policy[0].scope_id, scope);
+        assert_eq!(policy[0].instance_id, "provider-instance");
+        assert_eq!(policy[0].component_id, "runtime");
+        assert_eq!(policy[0].origin, sample_origin());
+
+        RuntimePolicyHost::grant_http_origin(
+            &mut state,
+            scope.clone(),
+            String::from("provider-instance"),
+            String::from("runtime"),
+            sample_origin(),
+        )
+        .expect("administrative grant should delegate to Host");
+        RuntimePolicyHost::revoke_http_origin(
+            &mut state,
+            scope.clone(),
+            String::from("provider-instance"),
+            String::from("runtime"),
+            sample_origin(),
+        )
+        .expect("administrative revoke should delegate to Host");
+
+        assert_eq!(
+            access
+                .http_origin_policy_reads
+                .lock()
+                .expect("test read lock")
+                .as_slice(),
+            std::slice::from_ref(&scope)
+        );
+        assert_eq!(
+            access
+                .http_origin_policy_writes
+                .lock()
+                .expect("test write lock")
+                .as_slice(),
+            &[
+                (
+                    scope.clone(),
+                    "provider-instance".to_owned(),
+                    "runtime".to_owned(),
+                    sample_origin(),
+                    true
+                ),
+                (
+                    scope,
+                    "provider-instance".to_owned(),
+                    "runtime".to_owned(),
+                    sample_origin(),
+                    false
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_should_reject_oversized_origin_policy_inputs_before_host_access() {
+        let access = Arc::new(RecordingScopedHostAccess::default());
+        let mut state = state_with_policy(access.clone());
+        let owner = state.registered_owner().expect("test owner should exist");
+        state
+            .runtime_permissions
+            .grant(owner.clone(), RuntimePermission::RuntimePolicyRead)
+            .expect("read grant should work");
+        state
+            .runtime_permissions
+            .grant(owner, RuntimePermission::RuntimePolicyWrite)
+            .expect("write grant should work");
+        state.max_host_message_bytes = 24;
+
+        assert!(matches!(
+            RuntimePolicyHost::list_http_origins(
+                &mut state,
+                String::from("long-scope-with-many-characters")
+            ),
+            Err(RuntimePolicyError::MessageTooLarge)
+        ));
+        assert!(matches!(
+            RuntimePolicyHost::grant_http_origin(
+                &mut state,
+                String::from("host"),
+                String::from("provider-instance"),
+                String::from("runtime"),
+                sample_origin(),
+            ),
+            Err(RuntimePolicyError::MessageTooLarge)
+        ));
+        assert!(matches!(
+            RuntimePolicyHost::revoke_http_origin(
+                &mut state,
+                String::from("host"),
+                String::from("provider-instance"),
+                String::from("runtime"),
+                sample_origin(),
+            ),
+            Err(RuntimePolicyError::MessageTooLarge)
+        ));
+        assert!(
+            access
+                .http_origin_policy_reads
+                .lock()
+                .expect("test lock")
+                .is_empty()
+        );
+        assert!(
+            access
+                .http_origin_policy_writes
+                .lock()
+                .expect("test lock")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_should_fail_closed_when_http_origin_policy_output_exceeds_host_limit() {
+        let access = Arc::new(RecordingScopedHostAccess::default());
+        let mut state = state_with_policy(access);
+        let owner = state.registered_owner().expect("test owner should exist");
+        state
+            .runtime_permissions
+            .grant(owner, RuntimePermission::RuntimePolicyRead)
+            .expect("read grant should work");
+        state.max_host_message_bytes = 30;
+        assert!(matches!(
+            RuntimePolicyHost::list_http_origins(&mut state, String::from("host")),
+            Err(RuntimePolicyError::MessageTooLarge)
+        ));
+    }
+
+    #[test]
+    fn test_should_require_host_access_session_for_http_origin_policy() {
+        let mut state = WasmHostState::new(ComponentId::new("runtime"));
+        begin_test_registration(&mut state, ExtensionId::new("admin.ui"));
+        state
+            .finish_registration()
+            .expect("registration should finish");
+        let owner = state.registered_owner().expect("test owner should exist");
+        state
+            .runtime_permissions
+            .grant(owner.clone(), RuntimePermission::RuntimePolicyRead)
+            .expect("read grant should work");
+        state
+            .runtime_permissions
+            .grant(owner, RuntimePermission::RuntimePolicyWrite)
+            .expect("write grant should work");
+        assert!(matches!(
+            RuntimePolicyHost::list_http_origins(&mut state, String::from("host")),
+            Err(RuntimePolicyError::AccessNotActive)
+        ));
+        assert!(matches!(
+            RuntimePolicyHost::grant_http_origin(
+                &mut state,
+                String::from("host"),
+                String::from("provider-instance"),
+                String::from("runtime"),
+                sample_origin(),
+            ),
+            Err(RuntimePolicyError::AccessNotActive)
+        ));
+    }
 }

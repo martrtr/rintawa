@@ -146,7 +146,7 @@ use bindings::rintawa::engine::{
     runtime_policy::{
         ArtifactPolicy as WitRuntimeArtifactPolicy, ComponentPolicy as WitRuntimePolicyComponent,
         ComponentRequest as WitRuntimePolicyRequest, Error as RuntimePolicyError,
-        Host as RuntimePolicyHost,
+        Host as RuntimePolicyHost, HttpOriginGrant as WitRuntimeHttpOriginGrant,
     },
     runtime_tasks::{Error as RuntimeTaskError, Host as RuntimeTasksHost},
     scoped_composition::Host as ScopedCompositionHost,

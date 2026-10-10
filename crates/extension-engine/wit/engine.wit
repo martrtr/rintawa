@@ -781,6 +781,14 @@ interface runtime-policy {
         granted: list<string>,
     }
 
+    /// One exact Host-approved local HTTP origin for a component principal.
+    record http-origin-grant {
+        scope-id: string,
+        instance-id: string,
+        component-id: string,
+        origin: string,
+    }
+
     /// Failure while reading or mutating runtime permission policy.
     variant error {
         access-not-active,
@@ -813,6 +821,29 @@ interface runtime-policy {
         instance-id: string,
         component-id: string,
         permission: string,
+    ) -> result<_, error>;
+
+    /// Lists exact Host-approved loopback HTTP origins within a chosen scope.
+    /// Requires runtime-policy-read. Results are bounded by the Host.
+    list-http-origins: func(scope-id: string) -> result<list<http-origin-grant>, error>;
+
+    /// Approves one exact HTTP loopback origin, never a path or wildcard.
+    /// The component must have separately received http-request permission.
+    /// Requires runtime-policy-write. Takes effect at next activation.
+    grant-http-origin: func(
+        scope-id: string,
+        instance-id: string,
+        component-id: string,
+        origin: string,
+    ) -> result<_, error>;
+
+    /// Removes one exact HTTP origin approval without affecting adjacent ports.
+    /// Requires runtime-policy-write. Takes effect at next activation.
+    revoke-http-origin: func(
+        scope-id: string,
+        instance-id: string,
+        component-id: string,
+        origin: string,
     ) -> result<_, error>;
 }
 
