@@ -180,6 +180,10 @@ pub enum EngineError {
     #[error("runtime permission policy is unavailable")]
     RuntimePermissionUnavailable,
 
+    /// The Host attempted to grant an invalid or non-loopback HTTP origin.
+    #[error("invalid HTTP loopback origin; an exact localhost origin is required")]
+    InvalidHttpLoopbackOrigin,
+
     /// A WASM component artifact exceeded the host-owned byte limit.
     #[error(
         "WASM component `{component_id}` is at least {observed_bytes} bytes, exceeding the {maximum_bytes}-byte limit"

@@ -71,9 +71,13 @@ receive arbitrary sockets or filesystem access. A started request remains bound 
 the initiating component principal and is cancelled when its handle is closed or
 its owning runtime resources are revoked.
 
-The current outbound request policy permits only publicly routable HTTPS targets
-with DNS destination pinning, no ambient proxy and no followed redirects. Local
-HTTP and more granular per-origin approvals are not exposed by this contract yet.
+The default outbound request policy permits only publicly routable HTTPS targets,
+with DNS destination pinning, no ambient proxy and no followed redirects.
+Host-approved HTTP loopback origins are a distinct, exact-origin policy:
+a grant for `http://127.0.0.1:11434` does not authorize another port, LAN IP or
+other component. Public HTTP and automatic loopback grants are prohibited.
+The Engine supports Host-side approval/revocation; persistent origin approval UX
+has not yet been integrated into the Host profile.
 Per-owner and process-wide concurrency, body, response, header, chunk and timeout
 budgets are Host-enforced. This transport does not know AI, Chat or World schemas.
 

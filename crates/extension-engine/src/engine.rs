@@ -1004,6 +1004,73 @@ impl ExtensionEngine {
             .map_err(|()| EngineError::RuntimePermissionUnavailable)
     }
 
+    /// Grants one exact local HTTP origin to a manifest-authorized component.
+    ///
+    /// This Host-controlled capability is distinct from enabling generic HTTPS.
+    /// It does not grant access to other ports, local network interfaces or
+    /// adjacent component instances. Host UI/persistence integration must still
+    /// explicitly expose and restore approved origins.
+    ///
+    /// # Errors
+    ///
+    /// Returns the ordinary runtime permission errors when the extension did not
+    /// request HTTP access, or `InvalidHttpLoopbackOrigin` for an invalid origin.
+    pub fn approve_requested_http_loopback_origin_for_instance(
+        &self,
+        instance_id: &ExtensionInstanceId,
+        component_id: &ComponentId,
+        origin: &str,
+    ) -> EngineResult<()> {
+        use crate::runtime_permissions::HttpOriginGrantError;
+
+        // Validate before granting *any* permission to avoid partial mutation
+        // when Host UI supplies an invalid origin.
+        crate::runtime_permissions::parse_exact_local_http_origin(origin)
+            .map_err(|_| EngineError::InvalidHttpLoopbackOrigin)?;
+        let owner = ComponentRef::new(instance_id.clone(), component_id.clone());
+        // This path is only usable for exact manifest-requested permissions.
+        self.grant_requested_runtime_permission_for_instance(
+            instance_id,
+            component_id,
+            RuntimePermission::HttpRequest,
+        )?;
+        self.runtime_permissions
+            .approve_http_loopback_origin(owner, origin)
+            .map_err(|error| match error {
+                HttpOriginGrantError::InvalidOrigin => EngineError::InvalidHttpLoopbackOrigin,
+                HttpOriginGrantError::PermissionDenied | HttpOriginGrantError::Unavailable => {
+                    EngineError::RuntimePermissionUnavailable
+                }
+            })
+    }
+
+    /// Revokes one exact local HTTP origin for the owning extension instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidHttpLoopbackOrigin` on malformed input or
+    /// `RuntimePermissionUnavailable` if the policy lock is unavailable.
+    pub fn revoke_http_loopback_origin_for_instance(
+        &self,
+        instance_id: &ExtensionInstanceId,
+        component_id: &ComponentId,
+        origin: &str,
+    ) -> EngineResult<()> {
+        use crate::runtime_permissions::HttpOriginGrantError;
+
+        self.runtime_permissions
+            .revoke_http_loopback_origin(
+                &ComponentRef::new(instance_id.clone(), component_id.clone()),
+                origin,
+            )
+            .map_err(|error| match error {
+                HttpOriginGrantError::InvalidOrigin => EngineError::InvalidHttpLoopbackOrigin,
+                HttpOriginGrantError::PermissionDenied | HttpOriginGrantError::Unavailable => {
+                    EngineError::RuntimePermissionUnavailable
+                }
+            })
+    }
+
     /// Activates the default runtime instance of one logical extension.
     ///
     /// # Errors

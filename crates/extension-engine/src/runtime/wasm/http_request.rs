@@ -23,10 +23,13 @@ use reqwest::{
 use rintawa_sdk::{contracts::ComponentRef, runtime_permissions::RuntimePermission};
 use url::Url;
 
-use crate::runtime::wasm::{
-    HttpFetchError, HttpRequestError, HttpRequestHost, RuntimePermissionCheck, WasmHostState,
-    WitHttpEvent, WitHttpHeader, WitHttpRequest, WitHttpResponseHead,
-    network::build_bounded_https_client,
+use crate::{
+    runtime::wasm::{
+        HttpFetchError, HttpRequestError, HttpRequestHost, RuntimePermissionCheck, WasmHostState,
+        WitHttpEvent, WitHttpHeader, WitHttpRequest, WitHttpResponseHead,
+        network::build_bounded_http_client,
+    },
+    runtime_permissions::is_local_http_origin,
 };
 
 const HTTP_WORKER_CHANNEL_CAPACITY: usize = 4;
@@ -34,22 +37,28 @@ const MAX_GLOBAL_HTTP_WORKERS: usize = 64;
 static GLOBAL_HTTP_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 /// A process-wide worker slot bounds total OS threads across all World instances.
-struct HttpWorkerPermit;
+struct HttpWorkerPermit {
+    counter: &'static AtomicUsize,
+}
 
 impl HttpWorkerPermit {
     fn acquire() -> Result<Self, HttpRequestError> {
-        let mut observed = GLOBAL_HTTP_WORKERS.load(Ordering::Acquire);
+        Self::acquire_from(&GLOBAL_HTTP_WORKERS, MAX_GLOBAL_HTTP_WORKERS)
+    }
+
+    fn acquire_from(counter: &'static AtomicUsize, limit: usize) -> Result<Self, HttpRequestError> {
+        let mut observed = counter.load(Ordering::Acquire);
         loop {
-            if observed >= MAX_GLOBAL_HTTP_WORKERS {
+            if observed >= limit {
                 return Err(HttpRequestError::LimitExceeded);
             }
-            match GLOBAL_HTTP_WORKERS.compare_exchange_weak(
+            match counter.compare_exchange_weak(
                 observed,
                 observed + 1,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(Self),
+                Ok(_) => return Ok(Self { counter }),
                 Err(actual) => observed = actual,
             }
         }
@@ -58,7 +67,7 @@ impl HttpWorkerPermit {
 
 impl Drop for HttpWorkerPermit {
     fn drop(&mut self) {
-        GLOBAL_HTTP_WORKERS.fetch_sub(1, Ordering::AcqRel);
+        self.counter.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -78,6 +87,7 @@ pub(super) struct OwnedHttpRequest {
     pub(super) owner: ComponentRef,
     receiver: Receiver<WorkerEvent>,
     cancelled: Arc<AtomicBool>,
+    local_origin: Option<Url>,
     pending_chunk: Vec<u8>,
     deadline: Instant,
     completed: bool,
@@ -91,11 +101,17 @@ impl Drop for OwnedHttpRequest {
 }
 
 struct ValidatedRequest {
+    local_origin_access: Option<(
+        ComponentRef,
+        crate::runtime_permissions::RuntimePermissionManager,
+    )>,
     method: Method,
     url: Url,
     headers: HeaderMap,
     body: Vec<u8>,
     response_limit: usize,
+    max_response_headers: usize,
+    max_response_header_bytes: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -140,6 +156,7 @@ impl WasmHostState {
         owner: ComponentRef,
         receiver: Receiver<WorkerEvent>,
         cancelled: Arc<AtomicBool>,
+        local_origin: Option<Url>,
     ) -> Result<u64, HttpRequestError> {
         let owned_count = self
             .http_requests
@@ -158,6 +175,7 @@ impl WasmHostState {
                 owner,
                 receiver,
                 cancelled,
+                local_origin,
                 pending_chunk: Vec::new(),
                 deadline: Instant::now() + Duration::from_millis(self.http_fetch_timeout_ms),
                 completed: false,
@@ -181,12 +199,23 @@ impl HttpRequestHost for WasmHostState {
             return Err(HttpRequestError::LimitExceeded);
         }
 
-        let validated = validate_request(request, self.http_limits())?;
+        let mut validated = validate_request(request, self.http_limits())?;
+        validated.local_origin_access = Some((owner.clone(), self.runtime_permissions.clone()));
+        if validated.url.scheme() == "http"
+            && !self
+                .runtime_permissions
+                .has_http_loopback_origin(&owner, &validated.url)
+                .map_err(|()| HttpRequestError::Unavailable)?
+        {
+            return Err(HttpRequestError::ForbiddenDestination);
+        }
         let (sender, receiver) = mpsc::sync_channel(HTTP_WORKER_CHANNEL_CAPACITY);
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let timeout = Duration::from_millis(self.http_fetch_timeout_ms);
         let permit = HttpWorkerPermit::acquire()?;
+
+        let local_origin = (validated.url.scheme() == "http").then(|| validated.url.clone());
 
         thread::Builder::new()
             .name(String::from("rintawa-http-request"))
@@ -196,7 +225,7 @@ impl HttpRequestHost for WasmHostState {
             })
             .map_err(|_| HttpRequestError::Unavailable)?;
 
-        self.allocate_http_request_handle(owner, receiver, cancelled)
+        self.allocate_http_request_handle(owner, receiver, cancelled, local_origin)
     }
 
     fn poll(&mut self, handle: u64, max_bytes: u32) -> Result<WitHttpEvent, HttpRequestError> {
@@ -212,6 +241,19 @@ impl HttpRequestHost for WasmHostState {
         };
         if request.owner != owner {
             return Err(HttpRequestError::UnknownHandle);
+        }
+        // A revoked origin cannot be used to drain response bytes previously
+        // queued by an in-flight HTTP worker.
+        if let Some(origin) = &request.local_origin {
+            let is_authorized = self
+                .runtime_permissions
+                .has_http_loopback_origin(&owner, origin)
+                .map_err(|()| HttpRequestError::Unavailable)?;
+            if !is_authorized {
+                request.cancelled.store(true, Ordering::Release);
+                request.pending_chunk.clear();
+                request.failure = Some(HttpRequestError::PermissionDenied);
+            }
         }
         if !request.completed && request.failure.is_none() && Instant::now() >= request.deadline {
             request.cancelled.store(true, Ordering::Release);
@@ -283,7 +325,7 @@ fn validate_request(
         _ => return Err(HttpRequestError::InvalidMethod),
     };
     let url = Url::parse(&request.url).map_err(|_| HttpRequestError::InvalidUrl)?;
-    if url.scheme() != "https"
+    if (url.scheme() != "https" && !is_local_http_origin(&url))
         || url.host().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
@@ -324,6 +366,9 @@ fn validate_request(
         headers.insert(name, value);
     }
     Ok(ValidatedRequest {
+        local_origin_access: None,
+        max_response_headers: limits.max_headers,
+        max_response_header_bytes: limits.max_header_bytes,
         method,
         url,
         headers,
@@ -376,9 +421,17 @@ fn perform_http_request(
     if cancelled.load(Ordering::Acquire) {
         return Err(HttpRequestError::Unavailable);
     }
-    let client = build_bounded_https_client(&request.url, timeout).map_err(map_fetch_error)?;
+    let is_loopback_http = request.url.scheme() == "http";
+    if is_loopback_http && !has_active_local_grant(request)? {
+        return Err(HttpRequestError::ForbiddenDestination);
+    }
+    let client = build_bounded_http_client(&request.url, timeout, is_loopback_http)
+        .map_err(map_fetch_error)?;
     if cancelled.load(Ordering::Acquire) {
         return Err(HttpRequestError::Unavailable);
+    }
+    if is_loopback_http && !has_active_local_grant(request)? {
+        return Err(HttpRequestError::PermissionDenied);
     }
     let mut response = client
         .request(request.method.clone(), request.url.clone())
@@ -393,7 +446,11 @@ fn perform_http_request(
     {
         return Err(HttpRequestError::ResponseTooLarge);
     }
-    let head = response_head(&response)?;
+    let head = response_head(
+        &response,
+        request.max_response_headers,
+        request.max_response_header_bytes,
+    )?;
     if !send_event(sender, cancelled, WorkerEvent::Head(head), deadline) {
         return Err(HttpRequestError::Unavailable);
     }
@@ -403,6 +460,9 @@ fn perform_http_request(
     loop {
         if cancelled.load(Ordering::Acquire) {
             return Err(HttpRequestError::Unavailable);
+        }
+        if is_loopback_http && !has_active_local_grant(request)? {
+            return Err(HttpRequestError::PermissionDenied);
         }
         if Instant::now() >= deadline {
             return Err(HttpRequestError::Timeout);
@@ -434,9 +494,20 @@ fn perform_http_request(
     }
 }
 
-fn response_head(response: &Response) -> Result<WitHttpResponseHead, HttpRequestError> {
-    const MAX_RESPONSE_HEADERS: usize = 32;
-    const MAX_RESPONSE_HEADER_BYTES: usize = 8 * 1024;
+fn has_active_local_grant(request: &ValidatedRequest) -> Result<bool, HttpRequestError> {
+    let Some((owner, policy)) = &request.local_origin_access else {
+        return Ok(false);
+    };
+    policy
+        .has_http_loopback_origin(owner, &request.url)
+        .map_err(|()| HttpRequestError::Unavailable)
+}
+
+fn response_head(
+    response: &Response,
+    max_headers: usize,
+    max_header_bytes: usize,
+) -> Result<WitHttpResponseHead, HttpRequestError> {
     let mut headers = Vec::new();
     let mut total_bytes = 0usize;
     for (name, value) in response.headers() {
@@ -451,7 +522,7 @@ fn response_head(response: &Response) -> Result<WitHttpResponseHead, HttpRequest
             .checked_add(name.as_str().len())
             .and_then(|length| length.checked_add(value.len()))
             .ok_or(HttpRequestError::ResponseTooLarge)?;
-        if headers.len() >= MAX_RESPONSE_HEADERS || total_bytes > MAX_RESPONSE_HEADER_BYTES {
+        if headers.len() >= max_headers || total_bytes > max_header_bytes {
             return Err(HttpRequestError::ResponseTooLarge);
         }
         headers.push(WitHttpHeader {
@@ -565,7 +636,7 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(4);
         let cancelled = Arc::new(AtomicBool::new(false));
         let handle = state
-            .allocate_http_request_handle(principal, receiver, Arc::clone(&cancelled))
+            .allocate_http_request_handle(principal, receiver, Arc::clone(&cancelled), None)
             .expect("test handle allocation should succeed");
         (handle, sender, cancelled)
     }
@@ -941,7 +1012,10 @@ mod tests {
             let parsed = Url::parse(url).expect("test URL is well formed");
             assert!(
                 matches!(
-                    build_bounded_https_client(&parsed, Duration::from_millis(50)),
+                    super::super::network::build_bounded_https_client(
+                        &parsed,
+                        Duration::from_millis(50)
+                    ),
                     Err(HttpFetchError::ForbiddenDestination)
                 ),
                 "unexpectedly accepted private destination {url}"
@@ -982,12 +1056,23 @@ mod permit_tests {
     use super::*;
 
     #[test]
-    fn test_should_release_global_http_worker_slot_when_worker_exits() {
-        let before = GLOBAL_HTTP_WORKERS.load(Ordering::Acquire);
-        let permit = HttpWorkerPermit::acquire().expect("test slot should be available");
-        assert_eq!(GLOBAL_HTTP_WORKERS.load(Ordering::Acquire), before + 1);
-        drop(permit);
-        assert_eq!(GLOBAL_HTTP_WORKERS.load(Ordering::Acquire), before);
+    fn test_should_release_http_worker_slot_on_drop_and_enforce_global_limit() {
+        // Isolate the count: other network tests may run HTTP workers in parallel.
+        static TEST_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+        let first = HttpWorkerPermit::acquire_from(&TEST_WORKERS, 1)
+            .expect("first permit should be issued");
+        assert_eq!(TEST_WORKERS.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            HttpWorkerPermit::acquire_from(&TEST_WORKERS, 1),
+            Err(HttpRequestError::LimitExceeded)
+        ));
+        drop(first);
+        assert_eq!(TEST_WORKERS.load(Ordering::Acquire), 0);
+        let second = HttpWorkerPermit::acquire_from(&TEST_WORKERS, 1)
+            .expect("released slot must be available again");
+        drop(second);
+        assert_eq!(TEST_WORKERS.load(Ordering::Acquire), 0);
     }
 }
 
@@ -1023,7 +1108,7 @@ mod revocation_tests {
         let (_sender, receiver) = mpsc::sync_channel(1);
         let cancellation = Arc::new(AtomicBool::new(false));
         let handle = state
-            .allocate_http_request_handle(owner.clone(), receiver, Arc::clone(&cancellation))
+            .allocate_http_request_handle(owner.clone(), receiver, Arc::clone(&cancellation), None)
             .expect("test allocation should succeed");
         state.runtime_permissions.revoke_component(&owner);
 
@@ -1033,5 +1118,327 @@ mod revocation_tests {
         ));
         assert!(!state.http_requests.contains_key(&handle));
         assert!(cancellation.load(Ordering::Acquire));
+    }
+}
+
+#[cfg(test)]
+mod loopback_http_integration_tests {
+    use super::*;
+    use rintawa_sdk::{
+        contracts::ComponentRef,
+        runtime_permissions::RuntimePermission,
+        types::{ComponentId, ExtensionInstanceId},
+    };
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    fn owner(name: &str) -> ComponentRef {
+        ComponentRef::new(ExtensionInstanceId::new(name), ComponentId::new("provider"))
+    }
+
+    fn state(name: &str) -> WasmHostState {
+        let mut state = WasmHostState::new(ComponentId::new("provider"));
+        let principal = owner(name);
+        state
+            .runtime_permissions
+            .grant(principal.clone(), RuntimePermission::HttpRequest)
+            .expect("test permission should be granted");
+        state.execution_owner = Some(principal);
+        state.http_request_access_active = true;
+        state
+    }
+
+    fn make_request(url: &str, method: &str, body: &[u8]) -> WitHttpRequest {
+        WitHttpRequest {
+            method: method.to_owned(),
+            url: url.to_owned(),
+            headers: vec![WitHttpHeader {
+                name: "Content-Type".to_owned(),
+                value: "application/json".to_owned(),
+            }],
+            body: body.to_vec(),
+            max_response_bytes: 1024,
+        }
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("test read timeout should be configured");
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 4096];
+        let boundary = loop {
+            let n = stream
+                .read(&mut buffer)
+                .expect("test request must be readable");
+            assert_ne!(n, 0, "request ended without HTTP headers");
+            bytes.extend_from_slice(&buffer[..n]);
+            if let Some(i) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                break i + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&bytes[..boundary]).to_ascii_lowercase();
+        let length = head
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("content-length:")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        while bytes.len() - boundary < length {
+            let n = stream
+                .read(&mut buffer)
+                .expect("test body must be readable");
+            assert_ne!(n, 0, "test request body truncated");
+            bytes.extend_from_slice(&buffer[..n]);
+        }
+        bytes
+    }
+
+    fn collect(state: &mut WasmHostState, handle: u64) -> (u16, Vec<u8>) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut status = None;
+        let mut body = Vec::new();
+        loop {
+            assert!(Instant::now() < deadline, "HTTP operation stalled");
+            match HttpRequestHost::poll(state, handle, 3).expect("HTTP poll should work") {
+                WitHttpEvent::Pending => thread::sleep(Duration::from_millis(1)),
+                WitHttpEvent::Response(head) => {
+                    assert!(status.replace(head.status).is_none(), "duplicate headers");
+                }
+                WitHttpEvent::Data(chunk) => body.extend(chunk),
+                WitHttpEvent::Completed => {
+                    return (status.expect("HTTP status must precede completion"), body);
+                }
+                WitHttpEvent::Failed(error) => panic!("unexpected transport failure: {error:?}"),
+            }
+        }
+    }
+
+    fn respond(status: &str, body: &'static [u8], split: bool) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+        let origin = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("test listener address").port()
+        );
+        let status = status.to_owned();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test server should accept");
+            let received = read_http_request(&mut stream);
+            assert!(received.starts_with(b"POST /v1/test HTTP/1.1"));
+            assert!(received.ends_with(b"{\"hello\":true}"));
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .expect("test response head should write");
+            if split {
+                stream
+                    .write_all(&body[..3])
+                    .expect("first chunk should send");
+                thread::sleep(Duration::from_millis(20));
+                stream
+                    .write_all(&body[3..])
+                    .expect("second chunk should send");
+            } else {
+                stream.write_all(body).expect("response should send");
+            }
+        });
+        (origin, server)
+    }
+
+    #[test]
+    fn test_should_round_trip_real_loopback_http_post_and_chunked_polls() {
+        let (origin, server) = respond("200 OK", b"hello world", true);
+        let mut state = state("first");
+        state
+            .runtime_permissions
+            .approve_http_loopback_origin(owner("first"), &origin)
+            .expect("exact host approval should succeed");
+        let started = Instant::now();
+        let handle = HttpRequestHost::start(
+            &mut state,
+            make_request(&format!("{origin}/v1/test"), "POST", b"{\"hello\":true}"),
+        )
+        .expect("authorized request should start");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "start must be nonblocking"
+        );
+        assert_eq!(collect(&mut state, handle), (200, b"hello world".to_vec()));
+        HttpRequestHost::close(&mut state, handle).expect("close should succeed");
+        server.join().expect("test server should finish");
+    }
+
+    #[test]
+    fn test_should_deliver_real_http_429_as_response_not_transport_error() {
+        let (origin, server) = respond("429 Too Many Requests", b"busy", false);
+        let mut state = state("first");
+        state
+            .runtime_permissions
+            .approve_http_loopback_origin(owner("first"), &origin)
+            .expect("exact host approval should succeed");
+        let handle = HttpRequestHost::start(
+            &mut state,
+            make_request(&format!("{origin}/v1/test"), "POST", b"{\"hello\":true}"),
+        )
+        .expect("authorized request should start");
+        assert_eq!(collect(&mut state, handle), (429, b"busy".to_vec()));
+        HttpRequestHost::close(&mut state, handle).expect("close should succeed");
+        server.join().expect("test server should finish");
+    }
+
+    #[test]
+    fn test_should_deny_ungranted_local_requests_without_spawning_worker() {
+        let mut state = state("first");
+        let active = GLOBAL_HTTP_WORKERS.load(Ordering::Acquire);
+        assert!(matches!(
+            HttpRequestHost::start(
+                &mut state,
+                make_request("http://127.0.0.1:11434/api", "POST", b"{}")
+            ),
+            Err(HttpRequestError::ForbiddenDestination)
+        ));
+        assert_eq!(GLOBAL_HTTP_WORKERS.load(Ordering::Acquire), active);
+    }
+
+    #[test]
+    fn test_should_not_inherit_approval_across_ports_or_components() {
+        let mut state = state("first");
+        state
+            .runtime_permissions
+            .approve_http_loopback_origin(owner("first"), "http://127.0.0.1:11434")
+            .expect("host approval should succeed");
+        assert!(matches!(
+            HttpRequestHost::start(
+                &mut state,
+                make_request("http://127.0.0.1:11435/api", "POST", b"{}")
+            ),
+            Err(HttpRequestError::ForbiddenDestination)
+        ));
+        let second = owner("second");
+        state
+            .runtime_permissions
+            .grant(second.clone(), RuntimePermission::HttpRequest)
+            .expect("second grant should succeed");
+        state.execution_owner = Some(second);
+        assert!(matches!(
+            HttpRequestHost::start(
+                &mut state,
+                make_request("http://127.0.0.1:11434/api", "POST", b"{}")
+            ),
+            Err(HttpRequestError::ForbiddenDestination)
+        ));
+    }
+
+    #[test]
+    fn test_should_reject_lan_metadata_and_public_cleartext_even_if_local_is_granted() {
+        let mut state = state("first");
+        state
+            .runtime_permissions
+            .approve_http_loopback_origin(owner("first"), "http://127.0.0.1:11434")
+            .expect("host approval should succeed");
+        for endpoint in [
+            "http://10.0.0.1:11434/api",
+            "http://192.168.1.10:11434/api",
+            "http://169.254.169.254/latest/meta-data",
+            "http://example.com:11434/api",
+        ] {
+            assert!(
+                matches!(
+                    HttpRequestHost::start(&mut state, make_request(endpoint, "GET", b"")),
+                    Err(HttpRequestError::InvalidUrl | HttpRequestError::ForbiddenDestination)
+                ),
+                "unexpectedly accepted: {endpoint}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod http_origin_revocation_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+
+    use rintawa_sdk::{
+        contracts::ComponentRef,
+        runtime_permissions::RuntimePermission,
+        types::{ComponentId, ExtensionInstanceId},
+    };
+
+    use super::*;
+
+    #[test]
+    fn test_should_not_expose_queued_bytes_after_exact_origin_grant_is_revoked() {
+        let principal = ComponentRef::new(
+            ExtensionInstanceId::new("test.provider"),
+            ComponentId::new("runtime"),
+        );
+        let origin = "http://127.0.0.1:11434";
+        let mut state = WasmHostState::new(ComponentId::new("runtime"));
+        state
+            .runtime_permissions
+            .grant(principal.clone(), RuntimePermission::HttpRequest)
+            .expect("test HTTP runtime permission should be granted");
+        state
+            .runtime_permissions
+            .approve_http_loopback_origin(principal.clone(), origin)
+            .expect("exact origin should be approved");
+
+        state.execution_owner = Some(principal.clone());
+        state.http_request_access_active = true;
+
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let endpoint =
+            Url::parse("http://127.0.0.1:11434/api/generate").expect("test URL should be valid");
+        let handle = state
+            .allocate_http_request_handle(
+                principal.clone(),
+                receiver,
+                Arc::clone(&cancelled),
+                Some(endpoint),
+            )
+            .expect("test allocation should succeed");
+
+        sender
+            .send(WorkerEvent::Head(WitHttpResponseHead {
+                status: 200,
+                headers: Vec::new(),
+            }))
+            .expect("test response headers should be queued");
+        assert!(matches!(
+            HttpRequestHost::poll(&mut state, handle, 32),
+            Ok(WitHttpEvent::Response(head)) if head.status == 200
+        ));
+        sender
+            .send(WorkerEvent::Chunk(b"secret-response".to_vec()))
+            .expect("test response bytes should be queued");
+        state
+            .runtime_permissions
+            .revoke_http_loopback_origin(&principal, origin)
+            .expect("test grant should be revoked");
+
+        assert!(matches!(
+            HttpRequestHost::poll(&mut state, handle, 32),
+            Ok(WitHttpEvent::Failed(HttpRequestError::PermissionDenied))
+        ));
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(matches!(
+            HttpRequestHost::poll(&mut state, handle, 32),
+            Ok(WitHttpEvent::Failed(HttpRequestError::PermissionDenied))
+        ));
+        HttpRequestHost::close(&mut state, handle).expect("owner cleanup should succeed");
     }
 }
