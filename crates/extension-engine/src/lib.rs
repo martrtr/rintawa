@@ -55,6 +55,14 @@ pub use host_access::{
 };
 pub use loader::ExtensionLoader;
 pub use runtime::{WasmComponent, WasmExecutionBudget, WasmRuntimeEngine};
+
+/// Validates an exact Host-approved loopback HTTP origin and returns its canonical spelling.
+///
+/// Public HTTPS destinations never require this separate per-origin approval.
+/// Returns `None` for unsafe, malformed, non-loopback, or path-bearing origins.
+pub fn canonical_http_loopback_origin(origin: &str) -> Option<String> {
+    runtime_permissions::parse_exact_local_http_origin(origin).ok()
+}
 pub use secrets::SecretManager;
 pub use services::{BoundServiceCaller, PlatformServiceCaller};
 pub use state::{ExtensionStateRecord, ExtensionsStateConfig, STATE_FILE_NAME};

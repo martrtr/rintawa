@@ -73,6 +73,36 @@ enum Commands {
         #[arg(long, default_value = HOST_SCOPE)]
         scope: String,
     },
+    /// List explicitly approved local HTTP origins for one composition scope.
+    ListHttpOrigins {
+        /// Baseline, default-world recipe or exact World runtime scope.
+        #[arg(long, default_value = HOST_SCOPE)]
+        scope: String,
+    },
+    /// Approve one exact local HTTP origin for a manifest-authorized component.
+    GrantHttpOrigin {
+        /// Concrete extension instance receiving the origin grant.
+        instance: String,
+        /// Component within this exact instance.
+        component: String,
+        /// Local origin, for example http://127.0.0.1:11434.
+        origin: String,
+        /// Composition scope containing this principal.
+        #[arg(long, default_value = HOST_SCOPE)]
+        scope: String,
+    },
+    /// Revoke one exact local HTTP origin without changing other permissions.
+    RevokeHttpOrigin {
+        /// Concrete extension instance receiving the origin grant.
+        instance: String,
+        /// Component within this exact instance.
+        component: String,
+        /// Exact local origin previously approved.
+        origin: String,
+        /// Composition scope containing this principal.
+        #[arg(long, default_value = HOST_SCOPE)]
+        scope: String,
+    },
     /// Import a validated RTW into the generic persistent user-content library.
     ContentImport {
         /// Local RTW content file.
@@ -131,6 +161,19 @@ fn main() -> Result<()> {
             permission,
             scope,
         } => revoke_runtime_permission(&home, instance, component, permission, scope),
+        Commands::ListHttpOrigins { scope } => list_http_origins(&home, scope),
+        Commands::GrantHttpOrigin {
+            instance,
+            component,
+            origin,
+            scope,
+        } => grant_http_origin(&home, instance, component, origin, scope),
+        Commands::RevokeHttpOrigin {
+            instance,
+            component,
+            origin,
+            scope,
+        } => revoke_http_origin(&home, instance, component, origin, scope),
         Commands::ContentImport { path } => content_import(&home, path),
         Commands::ContentList => content_list(&home),
         Commands::ContentReplace { id, path } => content_replace(&home, id, path),
@@ -234,6 +277,56 @@ fn revoke_runtime_permission(
     println!(
         "{} {} {}: revoked",
         owner.instance_id, owner.component_id, permission
+    );
+    Ok(())
+}
+
+fn list_http_origins(home: &HostHome, scope: String) -> Result<()> {
+    let scope_id = RuntimeScopeId::new(scope);
+    let origins = home.list_http_loopback_origins(&scope_id)?;
+    if origins.is_empty() {
+        println!("No approved HTTP loopback origins in scope {scope_id}.");
+    } else {
+        for grant in origins {
+            println!(
+                "{} {} {} {}",
+                grant.scope_id, grant.instance_id, grant.component_id, grant.origin
+            );
+        }
+    }
+    Ok(())
+}
+
+fn grant_http_origin(
+    home: &HostHome,
+    instance: String,
+    component: String,
+    origin: String,
+    scope: String,
+) -> Result<()> {
+    let scope_id = RuntimeScopeId::new(scope);
+    let owner = ComponentRef::new(instance, component);
+    home.grant_http_loopback_origin(scope_id, owner.clone(), &origin)?;
+    println!(
+        "{} {} {}: origin granted",
+        owner.instance_id, owner.component_id, origin
+    );
+    Ok(())
+}
+
+fn revoke_http_origin(
+    home: &HostHome,
+    instance: String,
+    component: String,
+    origin: String,
+    scope: String,
+) -> Result<()> {
+    let scope_id = RuntimeScopeId::new(scope);
+    let owner = ComponentRef::new(instance, component);
+    home.revoke_http_loopback_origin(&scope_id, &owner, &origin)?;
+    println!(
+        "{} {} {}: origin revoked",
+        owner.instance_id, owner.component_id, origin
     );
     Ok(())
 }
@@ -446,6 +539,53 @@ mod tests {
                 scope,
                 ..
             } if scope == "world:test"
+        ));
+    }
+
+    #[test]
+    fn test_should_parse_http_origin_policy_commands() {
+        let grant = Cli::try_parse_from([
+            "rintawa",
+            "grant-http-origin",
+            "provider.instance",
+            "runtime",
+            "http://127.0.0.1:11434",
+            "--scope",
+            "world:example",
+        ])
+        .expect("grant-http-origin must parse");
+        assert!(matches!(
+            grant.command,
+            Commands::GrantHttpOrigin { instance, component, origin, scope }
+                if instance == "provider.instance"
+                    && component == "runtime"
+                    && origin == "http://127.0.0.1:11434"
+                    && scope == "world:example"
+        ));
+
+        let revoke = Cli::try_parse_from([
+            "rintawa",
+            "revoke-http-origin",
+            "provider.instance",
+            "runtime",
+            "http://localhost:11434",
+        ])
+        .expect("revoke-http-origin must parse");
+        assert!(matches!(
+            revoke.command,
+            Commands::RevokeHttpOrigin { instance, component, origin, scope }
+                if instance == "provider.instance"
+                    && component == "runtime"
+                    && origin == "http://localhost:11434"
+                    && scope == HOST_SCOPE
+        ));
+
+        let list =
+            Cli::try_parse_from(["rintawa", "list-http-origins", "--scope", "default-world"])
+                .expect("list-http-origins must parse");
+        assert!(matches!(
+            list.command,
+            Commands::ListHttpOrigins { scope } if scope == "default-world"
         ));
     }
 

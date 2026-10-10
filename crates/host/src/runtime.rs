@@ -2739,6 +2739,16 @@ fn activate_composition(
                                 grant.permission,
                             )?;
                         }
+                        for grant in profile.http_loopback_origins.iter().filter(|grant| {
+                            grant.scope_id == activation.scope_id
+                                && grant.instance_id == activation.instance_id
+                        }) {
+                            engine.approve_requested_http_loopback_origin_for_instance(
+                                &activation.instance_id,
+                                &grant.component_id,
+                                &grant.origin,
+                            )?;
+                        }
                         made_progress = true;
                     }
                     RtwExtensionLoadOutcome::Deferred(waiting) => {

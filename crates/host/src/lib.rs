@@ -1,8 +1,8 @@
 //! Local host composition for exact RTW artifacts.
 //!
-//! This crate intentionally contains no repository, HTTP, update, or version-selection
-//! policy. It persists exact artifact activations that a CLI, installer, or package
-//! manager can request after obtaining RTW bytes by any means.
+//! This crate intentionally contains no repository fetching, HTTP request execution,
+//! update, or version-selection policy. It persists exact artifact activations and
+//! Host-approved network permissions, leaving transport implementation to the Engine.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, rustdoc::broken_intra_doc_links)]
@@ -25,7 +25,7 @@ use rintawa_artifacts::{
 };
 use rintawa_extension_engine::{
     ActivationPlanError, DeferredExecutionTarget, EngineError, ExtensionEngine, RtwExtensionLoader,
-    UnresolvedContractReason,
+    UnresolvedContractReason, canonical_http_loopback_origin,
 };
 use rintawa_sdk::{
     contracts::{ComponentRef, ContractKey},
@@ -41,7 +41,7 @@ use uuid::Uuid;
 
 pub use identity::HOST_IDENTITY_SCHEMA;
 pub use profile::{
-    ActivationRecord, BaselineProfile, CompositionProfile, PROFILE_SCHEMA,
+    ActivationRecord, BaselineProfile, CompositionProfile, HttpLoopbackOriginGrant, PROFILE_SCHEMA,
     PreferredProviderSelection, RuntimePermissionGrant,
 };
 pub use runtime::{
@@ -482,6 +482,19 @@ pub enum HostError {
         /// Runtime permission approved more than once.
         permission: String,
     },
+    /// A local HTTP approval contains a non-loopback or noncanonical origin.
+    #[error("invalid HTTP loopback origin; specify the exact canonical local origin")]
+    InvalidHttpLoopbackOrigin,
+    /// A local HTTP origin was stored twice for the same component in one scope.
+    #[error("duplicate HTTP loopback origin approval for one component")]
+    DuplicateHttpLoopbackOriginGrant,
+    /// The origin quota for a profile or one component has been exceeded.
+    #[error("HTTP loopback origin approval limit exceeded")]
+    HttpLoopbackOriginLimitExceeded,
+    /// A local HTTP origin requires its own previously approved HTTP request capability.
+    #[error("approve the manifest-requested http-request permission before approving an origin")]
+    HttpRequestPermissionRequired,
+
     /// A preferred provider references an activation not installed in the baseline profile.
     #[error("preferred provider instance `{0}` is not installed in the baseline profile")]
     PreferredProviderActivationNotFound(String),
@@ -1213,6 +1226,17 @@ impl HostHome {
                     && component.permissions.runtime.contains(&grant.permission)
             })
         });
+        profile.http_loopback_origins.retain(|grant| {
+            if grant.scope_id != scope_id || grant.instance_id != instance_id {
+                return true;
+            }
+            profile.runtime_permissions.iter().any(|permission| {
+                permission.scope_id == grant.scope_id
+                    && permission.instance_id == grant.instance_id
+                    && permission.component_id == grant.component_id
+                    && permission.permission == RuntimePermission::HttpRequest
+            })
+        });
         self.save_composition_for_scope(&scope_id, &profile)?;
         let world_default = matches!(composition_scope, PersistedCompositionScope::Baseline)
             && self.is_exact_default_world_activation(&subject, digest)?;
@@ -1296,6 +1320,18 @@ impl HostHome {
                 component_id: grant.component_id.clone(),
                 permission: grant.permission,
             });
+        }
+        for grant in baseline
+            .http_loopback_origins
+            .iter()
+            .filter(|grant| grant.instance_id == activation.instance_id)
+        {
+            recipe.grant_http_loopback_origin(HttpLoopbackOriginGrant {
+                scope_id: default_scope.clone(),
+                instance_id: selected.instance_id.clone(),
+                component_id: grant.component_id.clone(),
+                origin: grant.origin.clone(),
+            })?;
         }
         for preference in baseline
             .preferences
@@ -1539,6 +1575,75 @@ impl HostHome {
     ) -> HostResult<()> {
         let mut profile = self.load_composition_for_scope(scope_id)?;
         profile.revoke_runtime_permission(scope_id, owner, permission);
+        self.save_composition_for_scope(scope_id, &profile)
+    }
+
+    /// Returns the exact local HTTP origins currently approved in this scope.
+    ///
+    /// These records are Host-controlled policy, not guest preferences. No
+    /// component can read another scope's policy through normal HTTP imports.
+    pub fn list_http_loopback_origins(
+        &self,
+        scope_id: &RuntimeScopeId,
+    ) -> HostResult<Vec<HttpLoopbackOriginGrant>> {
+        let mut origins = self
+            .load_composition_for_scope(scope_id)?
+            .http_loopback_origins;
+        origins.sort_by(|left, right| {
+            left.instance_id
+                .as_str()
+                .cmp(right.instance_id.as_str())
+                .then_with(|| left.component_id.as_str().cmp(right.component_id.as_str()))
+                .then_with(|| left.origin.cmp(&right.origin))
+        });
+        Ok(origins)
+    }
+
+    /// Persists an explicit local HTTP origin approval for an exact component.
+    ///
+    /// The host must first approve the ordinary `http-request` permission for
+    /// this component. This is a separate decision and cannot grant new runtime
+    /// capabilities by itself.
+    pub fn grant_http_loopback_origin(
+        &self,
+        scope_id: RuntimeScopeId,
+        owner: ComponentRef,
+        origin: &str,
+    ) -> HostResult<()> {
+        let canonical_origin =
+            canonical_http_loopback_origin(origin).ok_or(HostError::InvalidHttpLoopbackOrigin)?;
+        let mut profile = self.load_composition_for_scope(&scope_id)?;
+        let has_http_grant = profile.runtime_permissions.iter().any(|grant| {
+            grant.scope_id == scope_id
+                && grant.instance_id == owner.instance_id
+                && grant.component_id == owner.component_id
+                && grant.permission == RuntimePermission::HttpRequest
+        });
+        if !has_http_grant {
+            return Err(HostError::HttpRequestPermissionRequired);
+        }
+        profile.grant_http_loopback_origin(HttpLoopbackOriginGrant::new(
+            scope_id.clone(),
+            owner,
+            canonical_origin,
+        ))?;
+        self.save_composition_for_scope(&scope_id, &profile)
+    }
+
+    /// Removes one persisted local HTTP origin approval from an exact component.
+    ///
+    /// This does not need to reload the original artifact manifest, so a valid
+    /// persisted policy can still be changed when that artifact is unavailable.
+    pub fn revoke_http_loopback_origin(
+        &self,
+        scope_id: &RuntimeScopeId,
+        owner: &ComponentRef,
+        origin: &str,
+    ) -> HostResult<()> {
+        let canonical_origin =
+            canonical_http_loopback_origin(origin).ok_or(HostError::InvalidHttpLoopbackOrigin)?;
+        let mut profile = self.load_composition_for_scope(scope_id)?;
+        profile.revoke_http_loopback_origin(scope_id, owner, &canonical_origin);
         self.save_composition_for_scope(scope_id, &profile)
     }
 

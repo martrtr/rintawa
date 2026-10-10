@@ -76,8 +76,25 @@ with DNS destination pinning, no ambient proxy and no followed redirects.
 Host-approved HTTP loopback origins are a distinct, exact-origin policy:
 a grant for `http://127.0.0.1:11434` does not authorize another port, LAN IP or
 other component. Public HTTP and automatic loopback grants are prohibited.
-The Engine supports Host-side approval/revocation; persistent origin approval UX
-has not yet been integrated into the Host profile.
+The Host persists exact origin approvals with each composition profile and
+restores them during activation only for manifest-authorized component principals.
+The CLI exposes explicit grant, list and revoke operations. Existing Worlds do
+not inherit later baseline changes; copied default-World recipes retain their
+own exact approvals.
+An operator first grants the manifest-requested `http-request` permission, then the
+separate exact loopback origin. For example:
+
+```shell
+rintawa grant-runtime <instance> <component> http-request
+rintawa grant-http-origin <instance> <component> http://127.0.0.1:11434
+rintawa list-http-origins
+rintawa revoke-http-origin <instance> <component> http://127.0.0.1:11434
+```
+
+The persisted policy is reapplied on Host activation. Editing a running Host
+profile does not yet hot-reload its active permission managers; an operator
+restarts the affected runtime to apply new or revoked persistent grants.
+
 Per-owner and process-wide concurrency, body, response, header, chunk and timeout
 budgets are Host-enforced. This transport does not know AI, Chat or World schemas.
 

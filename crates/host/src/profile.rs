@@ -7,6 +7,7 @@ use std::{
 };
 
 use rintawa_artifacts::{ArtifactDigest, ContentType};
+use rintawa_extension_engine::canonical_http_loopback_origin;
 use rintawa_sdk::{
     contracts::{ComponentRef, ContractKey, ContractVersion},
     runtime_permissions::RuntimePermission,
@@ -19,13 +20,16 @@ use uuid::Uuid;
 use crate::{HostError, HostResult};
 
 /// Current host composition profile schema.
-pub const PROFILE_SCHEMA: u32 = 6;
+pub const PROFILE_SCHEMA: u32 = 7;
 const LEGACY_PROFILE_SCHEMA_V1: u32 = 1;
 const LEGACY_PROFILE_SCHEMA_V2: u32 = 2;
 const LEGACY_PROFILE_SCHEMA_V3: u32 = 3;
 const LEGACY_PROFILE_SCHEMA_V4: u32 = 4;
 const LEGACY_PROFILE_SCHEMA_V5: u32 = 5;
+const LEGACY_PROFILE_SCHEMA_V6: u32 = 6;
 
+const MAX_HTTP_ORIGINS_PER_COMPONENT: usize = 32;
+const MAX_HTTP_ORIGINS_PER_PROFILE: usize = 512;
 const MAX_PREFERENCE_ENTRIES_PER_COMPONENT: usize = 256;
 const MAX_PREFERENCE_KEY_BYTES: usize = 128;
 const MAX_PREFERENCE_VALUE_BYTES: usize = 64 * 1024;
@@ -141,6 +145,37 @@ impl RuntimePermissionGrant {
     }
 }
 
+/// One explicit Host-approved HTTP loopback origin for an exact component.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct HttpLoopbackOriginGrant {
+    /// Runtime scope containing the component.
+    pub scope_id: RuntimeScopeId,
+    /// Exact installed extension instance receiving this approval.
+    pub instance_id: ExtensionInstanceId,
+    /// Component granted access to this local HTTP origin.
+    pub component_id: ComponentId,
+    /// Exact canonical HTTP loopback origin, including the TCP port.
+    pub origin: String,
+}
+
+impl HttpLoopbackOriginGrant {
+    /// Constructs one host-approved, canonical origin policy record.
+    pub fn new(scope_id: RuntimeScopeId, owner: ComponentRef, origin: String) -> Self {
+        Self {
+            scope_id,
+            instance_id: owner.instance_id,
+            component_id: owner.component_id,
+            origin,
+        }
+    }
+
+    /// Returns the exact principal receiving this approval.
+    pub fn owner(&self) -> ComponentRef {
+        ComponentRef::new(self.instance_id.clone(), self.component_id.clone())
+    }
+}
+
 /// One owner-scoped, non-authoritative extension preference.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -180,6 +215,9 @@ pub struct CompositionProfile {
     /// Explicit runtime capabilities approved for exact component principals.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_permissions: Vec<RuntimePermissionGrant>,
+    /// Individually approved local HTTP origins for exact component principals.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub http_loopback_origins: Vec<HttpLoopbackOriginGrant>,
     /// Owner-scoped non-authoritative extension preferences.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub preferences: Vec<PreferenceRecord>,
@@ -195,6 +233,7 @@ impl Default for CompositionProfile {
             activations: Vec::new(),
             preferred_providers: Vec::new(),
             runtime_permissions: Vec::new(),
+            http_loopback_origins: Vec::new(),
             preferences: Vec::new(),
         }
     }
@@ -213,7 +252,8 @@ impl CompositionProfile {
             | LEGACY_PROFILE_SCHEMA_V2
             | LEGACY_PROFILE_SCHEMA_V3
             | LEGACY_PROFILE_SCHEMA_V4
-            | LEGACY_PROFILE_SCHEMA_V5 => {
+            | LEGACY_PROFILE_SCHEMA_V5
+            | LEGACY_PROFILE_SCHEMA_V6 => {
                 profile.schema = PROFILE_SCHEMA;
             }
             unsupported => return Err(HostError::UnsupportedProfileSchema(unsupported)),
@@ -229,6 +269,7 @@ impl CompositionProfile {
             .map(|item| &item.scope_id)
             .chain(self.preferred_providers.iter().map(|item| &item.scope_id))
             .chain(self.runtime_permissions.iter().map(|item| &item.scope_id))
+            .chain(self.http_loopback_origins.iter().map(|item| &item.scope_id))
             .chain(self.preferences.iter().map(|item| &item.scope_id))
             .find(|scope| *scope != expected);
         if let Some(actual) = actual {
@@ -241,6 +282,7 @@ impl CompositionProfile {
     }
 
     pub(crate) fn save(&self, path: &Path) -> HostResult<()> {
+        self.validate()?;
         let parent = path.parent().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -285,6 +327,41 @@ impl CompositionProfile {
                     component_id: grant.component_id.to_string(),
                     permission: grant.permission.to_string(),
                 });
+            }
+        }
+
+        let mut origin_grants = HashSet::new();
+        let mut origins_per_owner = HashMap::new();
+        if self.http_loopback_origins.len() > MAX_HTTP_ORIGINS_PER_PROFILE {
+            return Err(HostError::HttpLoopbackOriginLimitExceeded);
+        }
+        for grant in &self.http_loopback_origins {
+            if canonical_http_loopback_origin(&grant.origin).as_deref()
+                != Some(grant.origin.as_str())
+            {
+                return Err(HostError::InvalidHttpLoopbackOrigin);
+            }
+            let has_http_request = self.runtime_permissions.iter().any(|permission| {
+                permission.scope_id == grant.scope_id
+                    && permission.instance_id == grant.instance_id
+                    && permission.component_id == grant.component_id
+                    && permission.permission == RuntimePermission::HttpRequest
+            });
+            if !has_http_request {
+                return Err(HostError::HttpRequestPermissionRequired);
+            }
+            let key = (
+                grant.scope_id.clone(),
+                grant.instance_id.clone(),
+                grant.component_id.clone(),
+            );
+            let count = origins_per_owner.entry(key.clone()).or_insert(0usize);
+            *count += 1;
+            if *count > MAX_HTTP_ORIGINS_PER_COMPONENT {
+                return Err(HostError::HttpLoopbackOriginLimitExceeded);
+            }
+            if !origin_grants.insert((key, grant.origin.clone())) {
+                return Err(HostError::DuplicateHttpLoopbackOriginGrant);
             }
         }
 
@@ -491,6 +568,37 @@ impl CompositionProfile {
                 || grant.component_id != owner.component_id
                 || grant.permission != permission
         });
+        if permission == RuntimePermission::HttpRequest {
+            self.http_loopback_origins.retain(|grant| {
+                &grant.scope_id != scope_id
+                    || grant.instance_id != owner.instance_id
+                    || grant.component_id != owner.component_id
+            });
+        }
+    }
+
+    pub(crate) fn grant_http_loopback_origin(
+        &mut self,
+        grant: HttpLoopbackOriginGrant,
+    ) -> HostResult<()> {
+        if !self.http_loopback_origins.contains(&grant) {
+            self.http_loopback_origins.push(grant);
+        }
+        self.validate()
+    }
+
+    pub(crate) fn revoke_http_loopback_origin(
+        &mut self,
+        scope_id: &RuntimeScopeId,
+        owner: &ComponentRef,
+        origin: &str,
+    ) {
+        self.http_loopback_origins.retain(|grant| {
+            &grant.scope_id != scope_id
+                || grant.instance_id != owner.instance_id
+                || grant.component_id != owner.component_id
+                || grant.origin != origin
+        });
     }
 
     pub(crate) fn materialize_legacy_world_defaults(&self, scope_id: RuntimeScopeId) -> Self {
@@ -555,6 +663,20 @@ impl CompositionProfile {
                     })
             })
             .collect();
+        let http_loopback_origins = self
+            .http_loopback_origins
+            .iter()
+            .filter_map(|grant| {
+                instance_map
+                    .get(&grant.instance_id)
+                    .map(|instance_id| HttpLoopbackOriginGrant {
+                        scope_id: scope_id.clone(),
+                        instance_id: instance_id.clone(),
+                        component_id: grant.component_id.clone(),
+                        origin: grant.origin.clone(),
+                    })
+            })
+            .collect();
         let preferences = self
             .preferences
             .iter()
@@ -576,6 +698,7 @@ impl CompositionProfile {
             activations,
             preferred_providers,
             runtime_permissions,
+            http_loopback_origins,
             preferences,
         }
     }
@@ -630,6 +753,9 @@ impl CompositionProfile {
         let removed = self.activations.remove(index);
 
         self.runtime_permissions.retain(|grant| {
+            grant.scope_id != removed.scope_id || grant.instance_id != removed.instance_id
+        });
+        self.http_loopback_origins.retain(|grant| {
             grant.scope_id != removed.scope_id || grant.instance_id != removed.instance_id
         });
         self.preferred_providers.retain(|selection| {
