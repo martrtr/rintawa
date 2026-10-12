@@ -155,7 +155,18 @@ layer's focus/pending-focus state changes. Mutations in unrelated World scopes d
 invalidate its generation. Web Runtime checks this token and its local management
 context revision before rebuilding the full presentation on its idle network tick.
 A newly connected renderer still receives a full snapshot during the handshake.
-This is separate from the aggregate Portable UI size budget, which remains open.
+Portable UI admission also enforces three renderer-neutral JSON byte budgets:
+768 KiB for one surface snapshot, 768 KiB for the complete visible surface
+envelope of each active UI Layer (including its focused World), and 16 MiB
+across all mounted snapshots retained in the Host. These values leave space
+beneath the current 1 MiB UI Layer Host message ceiling for focus and shell
+metadata. The runtime counts serialized UTF-8 JSON bytes, not Unicode characters.
+It validates an initial mount and every patched result before publication;
+it also checks deferred activation, late UI Layer attachment, and World focus
+against the currently visible aggregate. Failed admission leaves previous
+snapshots, revisions, and focus untouched. Unmount, deactivation and unregister
+release retained byte accounting. User action payloads and streamed media have
+separate budgets and never become presentation values implicitly.
 
 A World chooses its initial UI through the platform-owned
 `rintawa.world.presentation@1` binding. The selected provider must own the declared entry

@@ -1,6 +1,11 @@
 //! Structural validation for renderer-neutral portable UI snapshots.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Write,
+};
+
+use serde::Serialize;
 
 use rintawa_sdk::ui::{
     UiAssetImageNode, UiAssetPickerNode, UiCapabilityId, UiDataGridNode, UiError, UiIconNode,
@@ -23,6 +28,35 @@ const MAX_RESOURCE_PICKER_EXTENSION_BYTES: usize = 32;
 const MAX_SELECT_OPTIONS: usize = 256;
 const MAX_DATA_GRID_COLUMNS: usize = 64;
 
+/// A single mounted UI surface has less room than the 1 MiB host callback envelope.
+pub(crate) const MAX_SURFACE_JSON_BYTES: usize = 768 * 1024;
+/// All retained UI snapshots share one host-memory budget, including inactive Worlds.
+pub(crate) const MAX_MOUNTED_SURFACE_JSON_BYTES: usize = 16 * 1024 * 1024;
+/// One active UI Layer has a tighter bound for the *combined* visible presentation.
+pub(crate) const MAX_VISIBLE_PRESENTATION_JSON_BYTES: usize = 768 * 1024;
+
+#[derive(Default)]
+pub(crate) struct JsonByteCounter {
+    pub(crate) bytes: usize,
+}
+
+impl Write for JsonByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn json_bytes<T: Serialize>(value: &T) -> Result<usize, UiError> {
+    let mut counter = JsonByteCounter::default();
+    serde_json::to_writer(&mut counter, value).map_err(|_| UiError::RuntimeUnavailable)?;
+    Ok(counter.bytes)
+}
+
 pub(crate) const DEFAULT_MAX_SURFACE_NODES: usize = 4096;
 pub(crate) const DEFAULT_MAX_PATCH_OPERATIONS: usize = 1024;
 
@@ -31,6 +65,13 @@ pub(crate) fn validate_snapshot(snapshot: &UiSurfaceSnapshot) -> Result<(), UiEr
         return Err(UiError::SurfaceTooLarge {
             actual: snapshot.nodes.len(),
             maximum: DEFAULT_MAX_SURFACE_NODES,
+        });
+    }
+    let serialized_bytes = json_bytes(snapshot)?;
+    if serialized_bytes > MAX_SURFACE_JSON_BYTES {
+        return Err(UiError::SurfaceBytesTooLarge {
+            actual: serialized_bytes,
+            maximum: MAX_SURFACE_JSON_BYTES,
         });
     }
 

@@ -94,6 +94,30 @@ pub enum UiError {
         /// Maximum accepted nodes.
         maximum: usize,
     },
+    /// Serialized surface exceeds the portable presentation byte budget.
+    #[error("UI surface uses {actual} serialized bytes, exceeding the {maximum}-byte limit")]
+    SurfaceBytesTooLarge {
+        /// Serialized JSON byte count.
+        actual: usize,
+        /// Maximum serialized JSON bytes.
+        maximum: usize,
+    },
+    /// All mounted surface snapshots exceed their shared memory budget.
+    #[error("mounted UI surfaces use {actual} bytes, exceeding the {maximum}-byte budget")]
+    MountedSurfacesTooLarge {
+        /// Sum of mounted snapshot JSON bytes.
+        actual: usize,
+        /// Maximum sum of mounted snapshot JSON bytes.
+        maximum: usize,
+    },
+    /// Visible surfaces exceed the total presentation budget of one UI Layer.
+    #[error("visible UI presentation uses {actual} bytes, exceeding the {maximum}-byte budget")]
+    PresentationBytesTooLarge {
+        /// Serialized visible presentation JSON bytes.
+        actual: usize,
+        /// Maximum visible presentation bytes.
+        maximum: usize,
+    },
     /// A patch batch exceeds the runtime operation limit.
     #[error("UI patch batch contains {actual} operations, exceeding the {maximum}-operation limit")]
     PatchBatchTooLarge {

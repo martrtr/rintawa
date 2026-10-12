@@ -23,7 +23,9 @@ use rintawa_sdk::{
 };
 
 use crate::validation::{
-    DEFAULT_MAX_PATCH_OPERATIONS, node_map, required_capabilities, validate_snapshot,
+    DEFAULT_MAX_PATCH_OPERATIONS, MAX_MOUNTED_SURFACE_JSON_BYTES,
+    MAX_VISIBLE_PRESENTATION_JSON_BYTES, json_bytes, node_map, required_capabilities,
+    validate_snapshot,
 };
 
 /// Static UI surface declaration associated with its owning component.
@@ -164,6 +166,8 @@ struct UiRuntimeState {
     registered_layers: HashMap<ComponentRef, UiLayerDescriptor>,
     registered_world_presentations: HashMap<ComponentRef, WorldPresentationDescriptor>,
     mounted_surfaces: HashMap<UiSurfaceKey, UiSurfaceSnapshot>,
+    mounted_surface_bytes: HashMap<UiSurfaceKey, usize>,
+    total_mounted_surface_bytes: usize,
     layers: HashMap<RuntimeScopeId, ActiveUiLayer>,
     queued_actions: VecDeque<QueuedUiAction>,
     queued_world_focus_requests: VecDeque<QueuedWorldFocusRequest>,
@@ -328,7 +332,7 @@ impl UiRuntime {
         for surface_id in instance.surfaces {
             let key = UiSurfaceKey::new(instance_id.clone(), surface_id);
             state.registered_surfaces.remove(&key);
-            state.mounted_surfaces.remove(&key);
+            remove_mounted_snapshot(&mut state, &key);
         }
         state
             .registered_layers
@@ -368,6 +372,21 @@ impl UiRuntime {
             Err(poisoned) if !is_active => poisoned.into_inner(),
             Err(_) => return Err(UiError::RuntimeUnavailable),
         };
+        if is_active {
+            let instance = state
+                .instances
+                .get(instance_id)
+                .ok_or_else(|| UiError::InstanceNotRegistered(instance_id.to_string()))?;
+            if !instance.is_active {
+                for (layer_scope, layer) in &state.layers {
+                    let focus = layer
+                        .focused_scope
+                        .as_ref()
+                        .map(|focused| (&focused.scope_id, focused.world_id));
+                    ensure_visible_budget(&state, layer_scope, focus, None, Some(instance_id))?;
+                }
+            }
+        }
         let (scope_id, surface_ids, changed) = {
             let instance = state
                 .instances
@@ -384,9 +403,10 @@ impl UiRuntime {
 
         if !is_active {
             for surface_id in surface_ids {
-                state
-                    .mounted_surfaces
-                    .remove(&UiSurfaceKey::new(instance_id.clone(), surface_id));
+                remove_mounted_snapshot(
+                    &mut state,
+                    &UiSurfaceKey::new(instance_id.clone(), surface_id),
+                );
             }
             state.queued_actions.retain(|queued| {
                 &queued.layer_owner.instance_id != instance_id
@@ -503,6 +523,10 @@ impl UiRuntime {
                 .ok_or_else(|| UiError::SurfaceNotRegistered(key.surface_id.to_string()))?;
             ensure_surface_supported(&capabilities, &registered.contribution, snapshot)?;
         }
+        let focus = focused_scope
+            .as_ref()
+            .map(|focused| (&focused.scope_id, focused.world_id));
+        ensure_visible_budget(&state, &scope_id, focus, None, None)?;
 
         let presentation_generation = advance_presentation_generation(&mut state);
         state.layers.insert(
@@ -745,6 +769,13 @@ impl UiRuntime {
                 .ok_or_else(|| UiError::SurfaceNotRegistered(key.surface_id.to_string()))?;
             ensure_surface_supported(&capabilities, &registered.contribution, snapshot)?;
         }
+        ensure_visible_budget(
+            &state,
+            &layer_scope,
+            Some((&scope_id, world_id)),
+            None,
+            None,
+        )?;
         let layer = state
             .layers
             .get_mut(&layer_scope)
@@ -881,7 +912,16 @@ impl UiRuntime {
                 ensure_surface_supported(&layer.capabilities, &registered.contribution, &snapshot)?;
             }
         }
-        state.mounted_surfaces.insert(key, snapshot);
+        let snapshot_bytes = json_bytes(&snapshot)?;
+        ensure_mounted_budget(&state, &key, snapshot_bytes)?;
+        for (layer_scope, layer) in &state.layers {
+            let focus = layer
+                .focused_scope
+                .as_ref()
+                .map(|focused| (&focused.scope_id, focused.world_id));
+            ensure_visible_budget(&state, layer_scope, focus, Some((&key, &snapshot)), None)?;
+        }
+        commit_mounted_snapshot(&mut state, key, snapshot, snapshot_bytes);
         touch_visible_presentation(&mut state, &scope_id);
         Ok(())
     }
@@ -949,7 +989,16 @@ impl UiRuntime {
                 ensure_surface_supported(&layer.capabilities, &registered.contribution, &next)?;
             }
         }
-        state.mounted_surfaces.insert(key, next);
+        let next_bytes = json_bytes(&next)?;
+        ensure_mounted_budget(&state, &key, next_bytes)?;
+        for (layer_scope, layer) in &state.layers {
+            let focus = layer
+                .focused_scope
+                .as_ref()
+                .map(|focused| (&focused.scope_id, focused.world_id));
+            ensure_visible_budget(&state, layer_scope, focus, Some((&key, &next)), None)?;
+        }
+        commit_mounted_snapshot(&mut state, key, next, next_bytes);
         touch_visible_presentation(&mut state, &scope_id);
         Ok(())
     }
@@ -973,7 +1022,7 @@ impl UiRuntime {
         if &registered.owner != owner {
             return Err(UiError::SurfaceNotOwned(surface_id.to_string()));
         }
-        if state.mounted_surfaces.remove(&key).is_none() {
+        if !remove_mounted_snapshot(&mut state, &key) {
             return Err(UiError::SurfaceNotMounted(surface_id.to_string()));
         }
         let scope_id = state
@@ -1203,6 +1252,138 @@ fn touch_visible_presentation(state: &mut UiRuntimeState, changed_scope: &Runtim
     for scope in affected {
         touch_layer_presentation(state, &scope);
     }
+}
+
+/// Serializes one visible presentation in the same envelope and field order as
+/// UiPresentationSurface, borrowing the already validated snapshot instead of cloning it.
+#[derive(Serialize)]
+struct BorrowedPresentationSurface<'a> {
+    owner: &'a ComponentRef,
+    context: UiPresentationContext,
+    contribution: &'a UiSurfaceContribution,
+    snapshot: &'a UiSurfaceSnapshot,
+}
+
+/// Includes an uncommitted mount or patch without mutating shared state.
+/// Validation failures never publish half-applied presentation updates.
+fn prospective_snapshots<'a>(
+    state: &'a UiRuntimeState,
+    replacement: Option<(&'a UiSurfaceKey, &'a UiSurfaceSnapshot)>,
+) -> Vec<(&'a UiSurfaceKey, &'a UiSurfaceSnapshot)> {
+    let mut snapshots: Vec<_> = state
+        .mounted_surfaces
+        .iter()
+        .map(|(key, snapshot)| match replacement {
+            Some((new_key, next)) if new_key == key => (key, next),
+            _ => (key, snapshot),
+        })
+        .collect();
+    if let Some((key, snapshot)) = replacement
+        && !state.mounted_surfaces.contains_key(key)
+    {
+        snapshots.push((key, snapshot));
+    }
+    snapshots
+}
+
+/// All retained mounted snapshots consume host memory, even in inactive Worlds.
+fn ensure_mounted_budget(
+    state: &UiRuntimeState,
+    key: &UiSurfaceKey,
+    next_bytes: usize,
+) -> UiResult<()> {
+    let previous_bytes = state.mounted_surface_bytes.get(key).copied().unwrap_or(0);
+    let total = state
+        .total_mounted_surface_bytes
+        .saturating_sub(previous_bytes)
+        .saturating_add(next_bytes);
+    if total > MAX_MOUNTED_SURFACE_JSON_BYTES {
+        return Err(UiError::MountedSurfacesTooLarge {
+            actual: total,
+            maximum: MAX_MOUNTED_SURFACE_JSON_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn commit_mounted_snapshot(
+    state: &mut UiRuntimeState,
+    key: UiSurfaceKey,
+    snapshot: UiSurfaceSnapshot,
+    bytes: usize,
+) {
+    let previous = state
+        .mounted_surface_bytes
+        .insert(key.clone(), bytes)
+        .unwrap_or(0);
+    state.total_mounted_surface_bytes = state
+        .total_mounted_surface_bytes
+        .saturating_sub(previous)
+        .saturating_add(bytes);
+    state.mounted_surfaces.insert(key, snapshot);
+}
+
+fn remove_mounted_snapshot(state: &mut UiRuntimeState, key: &UiSurfaceKey) -> bool {
+    if state.mounted_surfaces.remove(key).is_none() {
+        return false;
+    }
+    if let Some(bytes) = state.mounted_surface_bytes.remove(key) {
+        state.total_mounted_surface_bytes = state.total_mounted_surface_bytes.saturating_sub(bytes);
+    }
+    true
+}
+
+/// Bounds exactly the visible serialized surface envelope for one UI Layer.
+/// Admission runs only when a surface, focus or lifecycle changes; idle reads stay O(1).
+fn ensure_visible_budget(
+    state: &UiRuntimeState,
+    layer_scope: &RuntimeScopeId,
+    focused_world: Option<(&RuntimeScopeId, WorldId)>,
+    replacement: Option<(&UiSurfaceKey, &UiSurfaceSnapshot)>,
+    activating_instance: Option<&ExtensionInstanceId>,
+) -> UiResult<()> {
+    let mut total = 2_usize; // JSON array delimiters
+    let mut surface_count = 0_usize;
+    for (key, snapshot) in prospective_snapshots(state, replacement) {
+        let Some(instance) = state.instances.get(&key.instance_id) else {
+            continue;
+        };
+        let is_instance_active =
+            instance.is_active || activating_instance == Some(&key.instance_id);
+        if !is_instance_active {
+            continue;
+        }
+        let context = if &instance.scope_id == layer_scope {
+            UiPresentationContext::LayerLocal
+        } else if let Some((world_scope, world_id)) = focused_world {
+            if &instance.scope_id != world_scope {
+                continue;
+            }
+            UiPresentationContext::FocusedWorld { world_id }
+        } else {
+            continue;
+        };
+        let registered = state
+            .registered_surfaces
+            .get(key)
+            .ok_or_else(|| UiError::SurfaceNotRegistered(key.surface_id.to_string()))?;
+        let surface = BorrowedPresentationSurface {
+            owner: &registered.owner,
+            context,
+            contribution: &registered.contribution,
+            snapshot,
+        };
+        let serialized = json_bytes(&surface)?;
+        total = total.saturating_add(serialized + usize::from(surface_count > 0));
+        if total > MAX_VISIBLE_PRESENTATION_JSON_BYTES {
+            return Err(UiError::PresentationBytesTooLarge {
+                actual: total,
+                maximum: MAX_VISIBLE_PRESENTATION_JSON_BYTES,
+            });
+        }
+        surface_count += 1;
+    }
+    Ok(())
 }
 
 fn collect_presentations(

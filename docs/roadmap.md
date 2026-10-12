@@ -26,7 +26,9 @@ The remaining MVP work is:
 
 1. **O(1) idle presentation polling** — per-layer generation and Web Runtime idle-skip
    are implemented and tested; verify exact installed RTW activation before closure.
-2. **Aggregate Portable UI budget** — bound total mounted and post-patch presentation size.
+2. **Aggregate Portable UI budget** — admission-time snapshot, visible UI Layer, and
+   total mounted-snapshot JSON byte limits are implemented and tested; verify
+   exact installed runtime behavior before marking the blocker closed.
 3. **Generic outbound HTTP** — bounded owner-scoped HTTPS request/stream support with
    timeout and network policy.
 4. **Generic asynchronous operations** — long-lived progress/stream/cancel transport.

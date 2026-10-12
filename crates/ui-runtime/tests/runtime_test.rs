@@ -765,3 +765,307 @@ fn test_presentation_generation_invalidated_on_reactivation() -> Result<()> {
     );
     Ok(())
 }
+
+fn sized_text_snapshot(surface_id: &str, repetitions: usize, text: &str) -> UiSurfaceSnapshot {
+    UiSurfaceSnapshot {
+        surface_id: UiSurfaceId::new(surface_id),
+        revision: 1,
+        root: "root".into(),
+        nodes: vec![UiNode::new(
+            "root",
+            UiNodeKind::Text(UiTextNode {
+                text: text.repeat(repetitions),
+            }),
+        )],
+    }
+}
+
+fn register_text_feature(
+    runtime: &UiRuntime,
+    instance_id: &str,
+    feature_scope: RuntimeScopeId,
+    surface_id: &str,
+) -> Result<()> {
+    runtime.register_instance(
+        instance(instance_id),
+        feature_scope,
+        vec![OwnedUiSurfaceContribution {
+            owner: owner(instance_id),
+            contribution: UiSurfaceContribution::new(surface_id, UiPlacementHint::Primary),
+        }],
+        Vec::new(),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn test_should_limit_serialized_surface_bytes_including_multibyte_text() -> Result<()> {
+    let runtime = UiRuntime::new();
+    register_feature(&runtime, surface())?;
+    // 400 Ki Unicode scalars are 800 KiB in UTF-8, before JSON metadata.
+    assert!(matches!(
+        runtime.mount_surface(
+            &owner("feature"),
+            sized_text_snapshot("example.main", 400 * 1024, "é"),
+        ),
+        Err(UiError::SurfaceBytesTooLarge { .. })
+    ));
+    assert!(runtime.presentation_surfaces().is_empty());
+
+    runtime.mount_surface(
+        &owner("feature"),
+        sized_text_snapshot("example.main", 600 * 1024, "a"),
+    )?;
+    runtime.set_instance_active(&instance("feature"), true)?;
+    assert_eq!(runtime.presentation_surfaces().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_combined_visible_mount_without_partial_publication() -> Result<()> {
+    let runtime = UiRuntime::new();
+    register_feature(&runtime, surface())?;
+    register_text_feature(&runtime, "second", scope(), "example.main")?;
+    runtime.set_instance_active(&instance("feature"), true)?;
+    runtime.set_instance_active(&instance("second"), true)?;
+    attach_layer(&runtime, compatible_layer())?;
+
+    runtime.mount_surface(
+        &owner("feature"),
+        sized_text_snapshot("example.main", 460 * 1024, "a"),
+    )?;
+    let before = runtime.presentation_generation_for_layer(&owner("layer"))?;
+    assert!(matches!(
+        runtime.mount_surface(
+            &owner("second"),
+            sized_text_snapshot("example.main", 460 * 1024, "b"),
+        ),
+        Err(UiError::PresentationBytesTooLarge { .. })
+    ));
+    assert_eq!(
+        runtime.presentation_generation_for_layer(&owner("layer"))?,
+        before
+    );
+    assert_eq!(
+        runtime
+            .presentation_surfaces_for_layer(&owner("layer"))?
+            .len(),
+        1
+    );
+    runtime.mount_surface(
+        &owner("second"),
+        sized_text_snapshot("example.main", 100 * 1024, "b"),
+    )?;
+    assert_eq!(
+        runtime
+            .presentation_surfaces_for_layer(&owner("layer"))?
+            .len(),
+        2
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_oversized_patch_and_preserve_revision_and_generation() -> Result<()> {
+    let runtime = UiRuntime::new();
+    register_feature(&runtime, surface())?;
+    register_text_feature(&runtime, "second", scope(), "example.main")?;
+    runtime.set_instance_active(&instance("feature"), true)?;
+    runtime.set_instance_active(&instance("second"), true)?;
+    attach_layer(&runtime, compatible_layer())?;
+    runtime.mount_surface(
+        &owner("feature"),
+        sized_text_snapshot("example.main", 110 * 1024, "a"),
+    )?;
+    runtime.mount_surface(
+        &owner("second"),
+        sized_text_snapshot("example.main", 510 * 1024, "b"),
+    )?;
+
+    let previous = runtime.presentation_generation_for_layer(&owner("layer"))?;
+    let patch = UiPatchBatch {
+        surface_id: UiSurfaceId::new("example.main"),
+        base_revision: 1,
+        next_revision: 2,
+        patches: vec![UiPatch::UpsertNode {
+            node: UiNode::new(
+                "root",
+                UiNodeKind::Text(UiTextNode {
+                    text: "c".repeat(300 * 1024),
+                }),
+            ),
+        }],
+    };
+    assert!(matches!(
+        runtime.apply_patches(&owner("feature"), patch),
+        Err(UiError::PresentationBytesTooLarge { .. })
+    ));
+    assert_eq!(
+        runtime.presentation_generation_for_layer(&owner("layer"))?,
+        previous
+    );
+    let original = runtime.presentation_surfaces_for_layer(&owner("layer"))?;
+    let feature = original
+        .iter()
+        .find(|entry| entry.owner == owner("feature"))
+        .expect("original surface should remain published");
+    assert_eq!(feature.snapshot.revision, 1);
+    assert!(matches!(&feature.snapshot.nodes[0].kind,
+        UiNodeKind::Text(UiTextNode { text }) if text.len() == 110 * 1024
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_should_check_combined_budget_when_focusing_a_world() -> Result<()> {
+    let runtime = UiRuntime::new();
+    register_feature(&runtime, surface())?;
+    runtime.set_instance_active(&instance("feature"), true)?;
+    runtime.mount_surface(
+        &owner("feature"),
+        sized_text_snapshot("example.main", 460 * 1024, "l"),
+    )?;
+    attach_layer(&runtime, compatible_layer())?;
+    let world_scope = RuntimeScopeId::new("world:large");
+    register_text_feature(
+        &runtime,
+        "world-component",
+        world_scope.clone(),
+        "example.main",
+    )?;
+    runtime.set_instance_active(&instance("world-component"), true)?;
+    runtime.mount_surface(
+        &owner("world-component"),
+        sized_text_snapshot("example.main", 460 * 1024, "w"),
+    )?;
+    let generation = runtime.presentation_generation_for_layer(&owner("layer"))?;
+    assert!(matches!(
+        runtime.set_focused_world_scope(
+            &owner("layer"),
+            WorldId::new(),
+            world_scope,
+            WorldPresentationDescriptor::new("example.main"),
+        ),
+        Err(UiError::PresentationBytesTooLarge { .. })
+    ));
+    assert_eq!(runtime.focused_world_for_layer(&owner("layer"))?, None);
+    assert_eq!(
+        runtime.presentation_generation_for_layer(&owner("layer"))?,
+        generation
+    );
+    assert_eq!(
+        runtime
+            .presentation_surfaces_for_layer(&owner("layer"))?
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_activation_that_exceeds_current_layer_budget() -> Result<()> {
+    let runtime = UiRuntime::new();
+    register_feature(&runtime, surface())?;
+    register_text_feature(&runtime, "second", scope(), "example.main")?;
+    runtime.set_instance_active(&instance("feature"), true)?;
+    runtime.mount_surface(
+        &owner("feature"),
+        sized_text_snapshot("example.main", 460 * 1024, "a"),
+    )?;
+    runtime.mount_surface(
+        &owner("second"),
+        sized_text_snapshot("example.main", 460 * 1024, "b"),
+    )?;
+    attach_layer(&runtime, compatible_layer())?;
+    let generation = runtime.presentation_generation_for_layer(&owner("layer"))?;
+    assert!(matches!(
+        runtime.set_instance_active(&instance("second"), true),
+        Err(UiError::PresentationBytesTooLarge { .. })
+    ));
+    assert_eq!(
+        runtime.presentation_generation_for_layer(&owner("layer"))?,
+        generation
+    );
+    assert_eq!(
+        runtime
+            .presentation_surfaces_for_layer(&owner("layer"))?
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_limit_all_retained_mounted_surfaces_and_release_capacity_on_unmount() -> Result<()> {
+    let runtime = UiRuntime::new();
+    let registration: Vec<_> = (0..23)
+        .map(|index| OwnedUiSurfaceContribution {
+            owner: owner("many"),
+            contribution: UiSurfaceContribution::new(
+                format!("many.{index}"),
+                UiPlacementHint::Primary,
+            ),
+        })
+        .collect();
+    runtime.register_instance(instance("many"), scope(), registration, Vec::new())?;
+
+    for index in 0..22 {
+        runtime.mount_surface(
+            &owner("many"),
+            sized_text_snapshot(&format!("many.{index}"), 730 * 1024, "m"),
+        )?;
+    }
+    assert!(matches!(
+        runtime.mount_surface(
+            &owner("many"),
+            sized_text_snapshot("many.22", 730 * 1024, "m"),
+        ),
+        Err(UiError::MountedSurfacesTooLarge { .. })
+    ));
+    runtime.unmount_surface(&owner("many"), &UiSurfaceId::new("many.0"))?;
+    runtime.mount_surface(
+        &owner("many"),
+        sized_text_snapshot("many.22", 730 * 1024, "m"),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_late_layer_attach_if_existing_surfaces_exceed_combined_budget() -> Result<()>
+{
+    let runtime = UiRuntime::new();
+    register_feature(&runtime, surface())?;
+    register_text_feature(&runtime, "second", scope(), "example.main")?;
+    runtime.set_instance_active(&instance("feature"), true)?;
+    runtime.set_instance_active(&instance("second"), true)?;
+    for id in ["feature", "second"] {
+        runtime.mount_surface(
+            &owner(id),
+            sized_text_snapshot("example.main", 460 * 1024, "x"),
+        )?;
+    }
+    runtime.register_instance(
+        instance("layer"),
+        scope(),
+        Vec::new(),
+        vec![OwnedUiLayerDescriptor {
+            owner: owner("layer"),
+            descriptor: compatible_layer(),
+        }],
+    )?;
+    runtime.set_instance_active(&instance("layer"), true)?;
+    assert!(matches!(
+        runtime.attach_registered_layer(owner("layer")),
+        Err(UiError::PresentationBytesTooLarge { .. })
+    ));
+    assert!(runtime.active_layer(&scope()).is_none());
+    runtime.unmount_surface(&owner("second"), &UiSurfaceId::new("example.main"))?;
+    runtime.attach_registered_layer(owner("layer"))?;
+    assert_eq!(
+        runtime
+            .presentation_surfaces_for_layer(&owner("layer"))?
+            .len(),
+        1
+    );
+    Ok(())
+}

@@ -13,6 +13,7 @@ description = "Renderer-neutral portable UI runtime for Rintawa"
 [dependencies]
 rintawa-sdk = { path = "../sdk" }
 serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

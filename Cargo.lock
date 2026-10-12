@@ -2545,6 +2545,7 @@ dependencies = [
  "anyhow",
  "rintawa-sdk",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
