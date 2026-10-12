@@ -126,10 +126,20 @@ per WASM loader, so distinct provider/consumer components from separate loader
 factories in the same Engine can resolve leases correctly. A real two-component
 WASM service fixture exercises this boundary, restart, cancellation and failure.
 
-A durable World effect/job identity remains separate; linking one outbox job,
-restart uncertainty and a deterministic WorldCommand to these ephemeral streams
-remains open. Core never interprets progress bytes as model tokens or commits
-provisional data.
+A durable World effect/job identity remains separate. Owner-pinned World
+effect handlers can now return a bounded deferred continuation and a Host-scheduled
+poll interval. The Host retains this opaque cursor only in the active World's
+memory for the same unexpired SQLite-fenced attempt. Before resumption and
+result application it checks the persisted claim, rejecting cancelled, expired
+or reclaimed attempts. World deactivation or Host restart discards the cursor:
+the same durable EffectJobId becomes eligible for a new attempt only after its
+lease expires. Completion still uses the job-derived deterministic CommandId
+and normal authoritative World command validation. Provisional data is never
+committed as World state.
+
+The direct bridge from a World effect to a separately delegated async-operation
+observer token, and the feature-owned inference adapter/reconciliation policy,
+remain to be implemented. Core does not interpret progress bytes as model tokens.
 
 ## World authority
 

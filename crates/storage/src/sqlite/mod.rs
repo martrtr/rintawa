@@ -422,6 +422,25 @@ impl SqliteWorldStorage {
         outbox::claim_next(&mut connection, self.world_id, now, lease_expires_at)
     }
 
+    /// Checks whether an effect claim is still running under this fencing
+    /// attempt and its lease has not expired at the supplied Host clock.
+    ///
+    /// Returns false for cancelled, completed, reclaimed or expired claims.
+    /// This check does not replace the atomic fenced terminal transitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite/storage error if the job state cannot be read.
+    pub fn is_effect_claim_current(
+        &self,
+        job_id: EffectJobId,
+        attempt: u32,
+        now: UnixTimeMillis,
+    ) -> StorageResult<bool> {
+        let connection = self.reader()?;
+        outbox::claim_is_current(&connection, job_id, attempt, now)
+    }
+
     /// Marks one currently leased effect job complete.
     ///
     /// # Errors

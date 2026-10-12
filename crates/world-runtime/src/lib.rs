@@ -16,7 +16,8 @@ mod snapshot;
 mod system;
 
 pub use effect::{
-    MAX_WORLD_EFFECT_DIAGNOSTIC_BYTES, ServiceWorldEffectHandler,
+    MAX_WORLD_EFFECT_CONTINUATION_BYTES, MAX_WORLD_EFFECT_DEFER_MILLIS,
+    MAX_WORLD_EFFECT_DIAGNOSTIC_BYTES, MIN_WORLD_EFFECT_DEFER_MILLIS, ServiceWorldEffectHandler,
     WORLD_EFFECT_SERVICE_PROTOCOL_VERSION, WorldEffectServiceClient, WorldEffectServiceError,
     WorldEffectServiceRequest, WorldEffectServiceResponse, WorldEffectServiceResult,
     effect_completion_command_id, world_effect_service_contract_key,

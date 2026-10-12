@@ -21,6 +21,12 @@ use thiserror::Error;
 pub const WORLD_EFFECT_SERVICE_PROTOCOL_VERSION: ContractVersion = ContractVersion::new(1);
 /// Maximum UTF-8 bytes accepted in a handler-provided retry/cancel diagnostic.
 pub const MAX_WORLD_EFFECT_DIAGNOSTIC_BYTES: usize = 8 * 1024;
+/// Maximum opaque continuation bytes retained for one in-flight service attempt.
+pub const MAX_WORLD_EFFECT_CONTINUATION_BYTES: usize = 512;
+/// Earliest supported deferred callback interval.
+pub const MIN_WORLD_EFFECT_DEFER_MILLIS: u32 = 50;
+/// Latest supported deferred callback interval.
+pub const MAX_WORLD_EFFECT_DEFER_MILLIS: u32 = 5_000;
 
 /// Returns the platform service contract for one exact effect schema.
 pub fn world_effect_service_contract_key(effect_schema: &SchemaKey) -> ContractKey {
@@ -49,16 +55,19 @@ pub struct WorldEffectServiceRequest {
     job: StoredEffectJob,
     lease_expires_at: UnixTimeMillis,
     completion_command_id: CommandId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    continuation: Option<String>,
 }
 
 impl WorldEffectServiceRequest {
-    fn new(claim: &ClaimedEffectJob) -> Self {
+    fn new(claim: &ClaimedEffectJob, continuation: Option<&str>) -> Self {
         let job = claim.job().clone();
         Self {
             world_id: job.world_id,
             completion_command_id: effect_completion_command_id(job.id),
             job,
             lease_expires_at: claim.lease_expires_at(),
+            continuation: continuation.map(str::to_owned),
         }
     }
 
@@ -81,12 +90,29 @@ impl WorldEffectServiceRequest {
     pub const fn completion_command_id(&self) -> CommandId {
         self.completion_command_id
     }
+
+    /// Returns the opaque provider-owned continuation of this exact claimed attempt.
+    ///
+    /// None indicates a fresh attempt. The Host never interprets this payload
+    /// and forgets it when the lease expires, World deactivates or Host restarts.
+    pub fn continuation(&self) -> Option<&str> {
+        self.continuation.as_deref()
+    }
 }
 
 /// Result produced by one extension effect-handler invocation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "kind")]
 pub enum WorldEffectServiceResponse {
+    /// External work is still in progress. The Host keeps this same leased
+    /// attempt and invokes the provider again with the opaque continuation.
+    /// No provisional data is committed to World state.
+    Defer {
+        /// Provider-local, non-secret, bounded continuation for this attempt.
+        continuation: String,
+        /// Minimum delay until the Host invokes the same claim again.
+        poll_after_millis: u32,
+    },
     /// External work succeeded. The optional command re-enters authoritative state
     /// through the ordinary World Runtime before the durable job is completed.
     Complete {
@@ -123,6 +149,9 @@ pub enum WorldEffectServiceError {
     /// The provider returned a diagnostic larger than the protocol permits.
     #[error("effect service returned an oversized diagnostic")]
     DiagnosticTooLarge,
+    /// Deferred continuation is blank, oversized, or asks for an invalid poll interval.
+    #[error("invalid deferred effect continuation")]
+    InvalidContinuation,
     /// A follow-up command did not use the job-derived idempotency identity.
     #[error("effect follow-up command id must be derived from the durable job id")]
     CommandIdMismatch,
@@ -201,6 +230,19 @@ impl ServiceWorldEffectHandler {
         &self,
         claim: &ClaimedEffectJob,
     ) -> WorldEffectServiceResult<WorldEffectServiceResponse> {
+        self.execute_with_continuation(claim, None)
+    }
+
+    /// Re-enters the same leased attempt after a deferred response.
+    ///
+    /// The Host must not invoke this method after expiry or after any new claim
+    /// advances the persisted attempt. The provider's opaque continuation is
+    /// never promoted to a durable effect identity.
+    pub fn execute_with_continuation(
+        &self,
+        claim: &ClaimedEffectJob,
+        continuation: Option<&str>,
+    ) -> WorldEffectServiceResult<WorldEffectServiceResponse> {
         let job = claim.job();
         if job.world_id != self.world_id {
             return Err(WorldEffectServiceError::WorldMismatch);
@@ -209,7 +251,7 @@ impl ServiceWorldEffectHandler {
             return Err(WorldEffectServiceError::SchemaMismatch);
         }
 
-        let request = serde_json::to_vec(&WorldEffectServiceRequest::new(claim))
+        let request = serde_json::to_vec(&WorldEffectServiceRequest::new(claim, continuation))
             .map_err(|_| WorldEffectServiceError::InvalidResponse)?;
         let response = self.client.call(&self.contract, &request)?;
         let response: WorldEffectServiceResponse = serde_json::from_slice(&response)
@@ -224,6 +266,18 @@ fn validate_response(
     response: &WorldEffectServiceResponse,
 ) -> WorldEffectServiceResult<()> {
     match response {
+        WorldEffectServiceResponse::Defer {
+            continuation,
+            poll_after_millis,
+        } => {
+            if continuation.is_empty()
+                || continuation.len() > MAX_WORLD_EFFECT_CONTINUATION_BYTES
+                || *poll_after_millis < MIN_WORLD_EFFECT_DEFER_MILLIS
+                || *poll_after_millis > MAX_WORLD_EFFECT_DEFER_MILLIS
+            {
+                return Err(WorldEffectServiceError::InvalidContinuation);
+            }
+        }
         WorldEffectServiceResponse::Retry { reason }
         | WorldEffectServiceResponse::Cancel { reason } => {
             if reason.len() > MAX_WORLD_EFFECT_DIAGNOSTIC_BYTES {
@@ -290,6 +344,40 @@ mod tests {
             serde_json::json!({ "result": "ok" }),
         )
         .caused_by(CausationRef::Effect(job.id))
+    }
+
+    #[test]
+    fn test_should_validate_bounded_deferred_effect_continuations() {
+        let job = test_job();
+        for millis in [MIN_WORLD_EFFECT_DEFER_MILLIS, MAX_WORLD_EFFECT_DEFER_MILLIS] {
+            assert!(
+                validate_response(
+                    &job,
+                    &WorldEffectServiceResponse::Defer {
+                        continuation: "cursor".repeat(MAX_WORLD_EFFECT_CONTINUATION_BYTES / 6),
+                        poll_after_millis: millis,
+                    },
+                )
+                .is_ok()
+            );
+        }
+        for (continuation, poll_after_millis) in [
+            (String::new(), 250),
+            ("x".repeat(MAX_WORLD_EFFECT_CONTINUATION_BYTES + 1), 250),
+            (String::from("cursor"), MIN_WORLD_EFFECT_DEFER_MILLIS - 1),
+            (String::from("cursor"), MAX_WORLD_EFFECT_DEFER_MILLIS + 1),
+        ] {
+            assert!(matches!(
+                validate_response(
+                    &job,
+                    &WorldEffectServiceResponse::Defer {
+                        continuation,
+                        poll_after_millis,
+                    },
+                ),
+                Err(WorldEffectServiceError::InvalidContinuation)
+            ));
+        }
     }
 
     #[test]

@@ -27,6 +27,20 @@ pub(super) fn next_wakeup(connection: &Connection) -> StorageResult<Option<UnixT
     Ok(value.map(UnixTimeMillis::new))
 }
 
+pub(super) fn claim_is_current(
+    connection: &Connection,
+    job_id: EffectJobId,
+    attempt: u32,
+    now: UnixTimeMillis,
+) -> StorageResult<bool> {
+    let found: i64 = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM effect_jobs WHERE job_id = ?1 AND status = ?2 AND attempt_count = ?3 AND lease_expires_at_ms > ?4)",
+        params![job_id.into_bytes().as_slice(), STATUS_RUNNING, i64::from(attempt), now.get()],
+        |row| row.get(0),
+    )?;
+    Ok(found == 1)
+}
+
 pub(super) fn claim_next(
     connection: &mut Connection,
     world_id: rintawa_sdk::world::WorldId,
