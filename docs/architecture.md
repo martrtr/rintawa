@@ -149,6 +149,14 @@ its baseline-visible surfaces
 Focus is presentation state, not World lifecycle. Multiple Worlds may remain active while
 one UI session focuses only one of them.
 
+The active UI Layer exposes an O(1), owner-checked presentation generation. It changes
+when a visible surface is mounted, patched, unmounted or deactivated, or when that
+layer's focus/pending-focus state changes. Mutations in unrelated World scopes do not
+invalidate its generation. Web Runtime checks this token and its local management
+context revision before rebuilding the full presentation on its idle network tick.
+A newly connected renderer still receives a full snapshot during the handshake.
+This is separate from the aggregate Portable UI size budget, which remains open.
+
 A World chooses its initial UI through the platform-owned
 `rintawa.world.presentation@1` binding. The selected provider must own the declared entry
 surface. World Manager therefore opens a World without knowing whether the World presents

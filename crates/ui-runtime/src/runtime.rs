@@ -154,6 +154,7 @@ struct ActiveUiLayer {
     focused_scope: Option<FocusedPresentationScope>,
     pending_world_id: Option<WorldId>,
     last_focus_error: Option<String>,
+    presentation_generation: u64,
 }
 
 #[derive(Default)]
@@ -166,6 +167,7 @@ struct UiRuntimeState {
     layers: HashMap<RuntimeScopeId, ActiveUiLayer>,
     queued_actions: VecDeque<QueuedUiAction>,
     queued_world_focus_requests: VecDeque<QueuedWorldFocusRequest>,
+    next_presentation_generation: u64,
 }
 
 /// Shared renderer-neutral runtime for portable surfaces and semantic actions.
@@ -348,6 +350,7 @@ impl UiRuntime {
         {
             state.layers.remove(&instance.scope_id);
         }
+        touch_visible_presentation(&mut state, &instance.scope_id);
     }
 
     /// Updates instance activation and revokes mounted presentation on deactivation.
@@ -365,13 +368,18 @@ impl UiRuntime {
             Err(poisoned) if !is_active => poisoned.into_inner(),
             Err(_) => return Err(UiError::RuntimeUnavailable),
         };
-        let (scope_id, surface_ids) = {
+        let (scope_id, surface_ids, changed) = {
             let instance = state
                 .instances
                 .get_mut(instance_id)
                 .ok_or_else(|| UiError::InstanceNotRegistered(instance_id.to_string()))?;
+            let changed = instance.is_active != is_active;
             instance.is_active = is_active;
-            (instance.scope_id.clone(), instance.surfaces.clone())
+            (
+                instance.scope_id.clone(),
+                instance.surfaces.clone(),
+                changed,
+            )
         };
 
         if !is_active {
@@ -394,6 +402,9 @@ impl UiRuntime {
             {
                 state.layers.remove(&scope_id);
             }
+        }
+        if changed {
+            touch_visible_presentation(&mut state, &scope_id);
         }
         Ok(())
     }
@@ -493,6 +504,7 @@ impl UiRuntime {
             ensure_surface_supported(&capabilities, &registered.contribution, snapshot)?;
         }
 
+        let presentation_generation = advance_presentation_generation(&mut state);
         state.layers.insert(
             scope_id,
             ActiveUiLayer {
@@ -502,6 +514,7 @@ impl UiRuntime {
                 focused_scope,
                 pending_world_id,
                 last_focus_error,
+                presentation_generation,
             },
         );
         Ok(())
@@ -597,6 +610,7 @@ impl UiRuntime {
             .ok_or(UiError::LayerNotOwner)?;
         layer.pending_world_id = Some(world_id);
         layer.last_focus_error = None;
+        touch_layer_presentation(&mut state, &layer_scope);
         Ok(())
     }
 
@@ -635,9 +649,20 @@ impl UiRuntime {
             .values_mut()
             .find(|layer| &layer.owner == layer_owner)
             .ok_or(UiError::LayerNotOwner)?;
-        if layer.pending_world_id == Some(world_id) {
+        let was_pending = layer.pending_world_id == Some(world_id);
+        if was_pending {
             layer.pending_world_id = None;
             layer.last_focus_error = Some(bounded_world_focus_diagnostic(diagnostic));
+        }
+        if was_pending {
+            let layer_scope = state
+                .layers
+                .iter()
+                .find_map(|(scope_id, layer)| {
+                    (&layer.owner == layer_owner).then_some(scope_id.clone())
+                })
+                .ok_or(UiError::LayerNotOwner)?;
+            touch_layer_presentation(&mut state, &layer_scope);
         }
         Ok(())
     }
@@ -733,6 +758,7 @@ impl UiRuntime {
             layer.pending_world_id = None;
         }
         layer.last_focus_error = None;
+        touch_layer_presentation(&mut state, &layer_scope);
         Ok(())
     }
 
@@ -761,6 +787,7 @@ impl UiRuntime {
         state
             .queued_world_focus_requests
             .retain(|request| request.layer_owner != *layer_owner);
+        touch_layer_presentation(&mut state, &layer_scope);
         Ok(())
     }
 
@@ -774,14 +801,24 @@ impl UiRuntime {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        for layer in state.layers.values_mut() {
-            if layer
-                .focused_scope
-                .as_ref()
-                .is_some_and(|focused| &focused.scope_id == scope_id)
-            {
-                layer.focused_scope = None;
-            }
+        let changed: Vec<_> = state
+            .layers
+            .iter_mut()
+            .filter_map(|(layer_scope, layer)| {
+                if layer
+                    .focused_scope
+                    .as_ref()
+                    .is_some_and(|focused| &focused.scope_id == scope_id)
+                {
+                    layer.focused_scope = None;
+                    Some(layer_scope.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for layer_scope in changed {
+            touch_layer_presentation(&mut state, &layer_scope);
         }
     }
 
@@ -845,6 +882,7 @@ impl UiRuntime {
             }
         }
         state.mounted_surfaces.insert(key, snapshot);
+        touch_visible_presentation(&mut state, &scope_id);
         Ok(())
     }
 
@@ -912,6 +950,7 @@ impl UiRuntime {
             }
         }
         state.mounted_surfaces.insert(key, next);
+        touch_visible_presentation(&mut state, &scope_id);
         Ok(())
     }
 
@@ -937,7 +976,36 @@ impl UiRuntime {
         if state.mounted_surfaces.remove(&key).is_none() {
             return Err(UiError::SurfaceNotMounted(surface_id.to_string()));
         }
+        let scope_id = state
+            .instances
+            .get(&owner.instance_id)
+            .ok_or_else(|| UiError::InstanceNotRegistered(owner.instance_id.to_string()))?
+            .scope_id
+            .clone();
+        touch_visible_presentation(&mut state, &scope_id);
         Ok(())
+    }
+
+    /// Reads an O(1) change token for the active UI Layer session.
+    ///
+    /// Only changes to visible scopes or this layer's presentation context
+    /// advance its token. Fetch a full presentation on first attach or change.
+    ///
+    /// # Errors
+    ///
+    /// Returns UiError::LayerNotOwner when the component is not the active layer.
+    pub fn presentation_generation_for_layer(&self, layer_owner: &ComponentRef) -> UiResult<u64> {
+        let state = self.state.read().map_err(|_| UiError::RuntimeUnavailable)?;
+        let scope_id = &state
+            .instances
+            .get(&layer_owner.instance_id)
+            .ok_or(UiError::LayerNotOwner)?
+            .scope_id;
+        let layer = state.layers.get(scope_id).ok_or(UiError::LayerNotOwner)?;
+        if &layer.owner != layer_owner {
+            return Err(UiError::LayerNotOwner);
+        }
+        Ok(layer.presentation_generation)
     }
 
     /// Returns a stable host snapshot of all active mounted portable surfaces.
@@ -1103,6 +1171,37 @@ impl UiRuntime {
             owner: registered.owner.clone(),
             event,
         })
+    }
+}
+
+fn advance_presentation_generation(state: &mut UiRuntimeState) -> u64 {
+    // Generations are ephemeral change tokens, not persistence/security IDs.
+    state.next_presentation_generation = state.next_presentation_generation.wrapping_add(1);
+    state.next_presentation_generation
+}
+
+fn touch_layer_presentation(state: &mut UiRuntimeState, scope_id: &RuntimeScopeId) {
+    let generation = advance_presentation_generation(state);
+    if let Some(layer) = state.layers.get_mut(scope_id) {
+        layer.presentation_generation = generation;
+    }
+}
+
+fn touch_visible_presentation(state: &mut UiRuntimeState, changed_scope: &RuntimeScopeId) {
+    let affected = state
+        .layers
+        .iter()
+        .filter_map(|(scope, layer)| {
+            (scope == changed_scope
+                || layer
+                    .focused_scope
+                    .as_ref()
+                    .is_some_and(|focused| &focused.scope_id == changed_scope))
+            .then_some(scope.clone())
+        })
+        .collect::<Vec<_>>();
+    for scope in affected {
+        touch_layer_presentation(state, &scope);
     }
 }
 

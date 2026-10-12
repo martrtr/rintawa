@@ -24,8 +24,8 @@ The current implementation already includes:
 
 The remaining MVP work is:
 
-1. **O(1) idle presentation polling** — add a presentation generation /
-   `unchanged` path so idle polling does not rebuild the full UI state.
+1. **O(1) idle presentation polling** — per-layer generation and Web Runtime idle-skip
+   are implemented and tested; verify exact installed RTW activation before closure.
 2. **Aggregate Portable UI budget** — bound total mounted and post-patch presentation size.
 3. **Generic outbound HTTP** — bounded owner-scoped HTTPS request/stream support with
    timeout and network policy.

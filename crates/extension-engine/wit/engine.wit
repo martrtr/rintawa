@@ -1035,6 +1035,9 @@ interface ui-layer {
         rejected,
     }
 
+    /// Constant-size layer-local change token for visible presentation changes.
+    presentation-generation: func() -> result<u64, error>;
+
     /// Returns the current visible presentation as serialized JSON.
     presentation-surfaces: func() -> result<list<u8>, error>;
 

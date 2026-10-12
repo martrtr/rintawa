@@ -630,3 +630,138 @@ fn test_should_move_child_using_post_removal_index() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn test_presentation_generation_only_advances_on_successful_visible_changes() -> Result<()> {
+    let runtime = UiRuntime::new();
+    register_feature(&runtime, surface())?;
+    runtime.set_instance_active(&instance("feature"), true)?;
+    assert_eq!(
+        runtime.presentation_generation_for_layer(&owner("feature")),
+        Err(UiError::LayerNotOwner)
+    );
+    attach_layer(&runtime, compatible_layer())?;
+
+    let start = runtime.presentation_generation_for_layer(&owner("layer"))?;
+    assert_eq!(
+        start,
+        runtime.presentation_generation_for_layer(&owner("layer"))?
+    );
+    runtime.mount_surface(&owner("feature"), base_snapshot())?;
+    let mounted = runtime.presentation_generation_for_layer(&owner("layer"))?;
+    assert_ne!(mounted, start);
+
+    let invalid = UiPatchBatch {
+        surface_id: UiSurfaceId::new("example.main"),
+        base_revision: 1,
+        next_revision: 2,
+        patches: vec![UiPatch::RemoveNode {
+            node_id: "missing".into(),
+        }],
+    };
+    assert!(runtime.apply_patches(&owner("feature"), invalid).is_err());
+    assert_eq!(
+        runtime.presentation_generation_for_layer(&owner("layer"))?,
+        mounted
+    );
+
+    runtime.apply_patches(
+        &owner("feature"),
+        UiPatchBatch {
+            surface_id: UiSurfaceId::new("example.main"),
+            base_revision: 1,
+            next_revision: 2,
+            patches: vec![UiPatch::UpsertNode {
+                node: UiNode::new(
+                    "title",
+                    UiNodeKind::Text(UiTextNode {
+                        text: String::from("Changed"),
+                    }),
+                ),
+            }],
+        },
+    )?;
+    let patched = runtime.presentation_generation_for_layer(&owner("layer"))?;
+    assert_ne!(patched, mounted);
+    runtime.unmount_surface(&owner("feature"), &UiSurfaceId::new("example.main"))?;
+    let unmounted = runtime.presentation_generation_for_layer(&owner("layer"))?;
+    assert_ne!(unmounted, patched);
+    assert_eq!(
+        runtime.presentation_generation_for_layer(&owner("layer"))?,
+        unmounted
+    );
+    Ok(())
+}
+
+#[test]
+fn test_presentation_generation_isolates_unrelated_scopes() -> Result<()> {
+    let runtime = UiRuntime::new();
+    register_feature(&runtime, surface())?;
+    runtime.set_instance_active(&instance("feature"), true)?;
+    attach_layer(&runtime, compatible_layer())?;
+    let baseline = runtime.presentation_generation_for_layer(&owner("layer"))?;
+    let other_scope = RuntimeScopeId::new("other");
+    let other_layer = owner("other-layer");
+    runtime.register_instance(
+        instance("other-layer"),
+        other_scope.clone(),
+        Vec::new(),
+        vec![OwnedUiLayerDescriptor {
+            owner: other_layer.clone(),
+            descriptor: compatible_layer(),
+        }],
+    )?;
+    runtime.set_instance_active(&instance("other-layer"), true)?;
+    runtime.attach_registered_layer(other_layer.clone())?;
+    let other_initial = runtime.presentation_generation_for_layer(&other_layer)?;
+
+    runtime.mount_surface(&owner("feature"), base_snapshot())?;
+    assert_ne!(
+        runtime.presentation_generation_for_layer(&owner("layer"))?,
+        baseline
+    );
+    assert_eq!(
+        runtime.presentation_generation_for_layer(&other_layer)?,
+        other_initial
+    );
+    Ok(())
+}
+
+#[test]
+fn test_presentation_generation_tracks_world_focus_request_and_error() -> Result<()> {
+    let runtime = UiRuntime::new();
+    attach_layer(&runtime, compatible_layer())?;
+    let first = runtime.presentation_generation_for_layer(&owner("layer"))?;
+    let world_id: WorldId = "018f0000-0000-7000-8000-000000000001".parse()?;
+    runtime.queue_world_focus_request(&owner("layer"), world_id)?;
+    let pending = runtime.presentation_generation_for_layer(&owner("layer"))?;
+    assert_ne!(pending, first);
+    runtime.record_world_focus_failure(&owner("layer"), world_id, "unavailable")?;
+    let failed = runtime.presentation_generation_for_layer(&owner("layer"))?;
+    assert_ne!(failed, pending);
+    runtime.record_world_focus_failure(&owner("layer"), world_id, "stale")?;
+    assert_eq!(
+        runtime.presentation_generation_for_layer(&owner("layer"))?,
+        failed
+    );
+    Ok(())
+}
+
+#[test]
+fn test_presentation_generation_invalidated_on_reactivation() -> Result<()> {
+    let runtime = UiRuntime::new();
+    register_feature(&runtime, surface())?;
+    runtime.set_instance_active(&instance("feature"), true)?;
+    attach_layer(&runtime, compatible_layer())?;
+    runtime.mount_surface(&owner("feature"), base_snapshot())?;
+    let first = runtime.presentation_generation_for_layer(&owner("layer"))?;
+    runtime.set_instance_active(&instance("feature"), false)?;
+    let deactivated = runtime.presentation_generation_for_layer(&owner("layer"))?;
+    assert_ne!(deactivated, first);
+    runtime.set_instance_active(&instance("feature"), true)?;
+    assert_ne!(
+        runtime.presentation_generation_for_layer(&owner("layer"))?,
+        deactivated
+    );
+    Ok(())
+}

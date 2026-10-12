@@ -358,6 +358,18 @@ fn map_ui_layer_error(error: UiError) -> UiLayerError {
 }
 
 impl UiLayerHost for WasmHostState {
+    fn presentation_generation(&mut self) -> Result<u64, UiLayerError> {
+        if !self.ui_access_active {
+            return Err(UiLayerError::AccessNotActive);
+        }
+        let owner = self
+            .current_execution_owner()
+            .ok_or(UiLayerError::AccessNotActive)?;
+        self.ui
+            .presentation_generation_for_layer(owner)
+            .map_err(map_ui_layer_error)
+    }
+
     fn presentation_surfaces(&mut self) -> Result<Vec<u8>, UiLayerError> {
         if !self.ui_access_active {
             return Err(UiLayerError::AccessNotActive);
