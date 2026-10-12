@@ -4,4 +4,5 @@
 
 mod wasm;
 
+pub(crate) use wasm::AsyncObserverRegistry;
 pub use wasm::{WasmComponent, WasmExecutionBudget, WasmRuntimeEngine};

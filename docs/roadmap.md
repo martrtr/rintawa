@@ -33,8 +33,8 @@ The remaining MVP work is:
    timeout and network policy.
 4. **Generic asynchronous operations** — bounded owner-scoped streams, terminal
    states, cancellation, short retention and single-reader service-caller handoff
-   are implemented. Durable-job linkage and independent provider/consumer fixture
-   acceptance remain open.
+   are implemented and covered by a real two-component WASM service fixture.
+   Durable effect/job identity linkage and restart/idempotency semantics remain open.
 5. **Provider-neutral inference** — versioned inference contract plus one AI Provider.
 6. **Narrator** — world-scoped event -> context -> inference -> authoritative NPC command.
 7. **Final restart E2E** — verify the complete Tavern -> World -> Chat -> AI reply -> restart

@@ -48,7 +48,7 @@ use crate::{
         UserContentWriteAccess, UserResourceAccess, WorldCommandAccess, WorldProjectionAccess,
         WorldSessionAccess,
     },
-    runtime::WasmRuntimeEngine,
+    runtime::{AsyncObserverRegistry, WasmRuntimeEngine},
     runtime_effects::RuntimeEffectRegistry,
     runtime_permissions::RuntimePermissionManager,
     secrets::SecretManager,
@@ -187,6 +187,7 @@ pub struct ExtensionEngine {
     runtime_permissions: RuntimePermissionManager,
     secrets: SecretManager,
     services: ServiceRuntime,
+    async_observers: Arc<AsyncObserverRegistry>,
     ui: UiRuntime,
     preferred_contract_providers: HashMap<RuntimeScopeId, HashMap<ContractKey, ComponentRef>>,
     platform_contract_definitions:
@@ -274,6 +275,7 @@ impl Default for ExtensionEngine {
             runtime_permissions: RuntimePermissionManager::default(),
             secrets,
             services,
+            async_observers: Arc::new(AsyncObserverRegistry::default()),
             ui: UiRuntime::new(),
             preferred_contract_providers: HashMap::new(),
             platform_contract_definitions: HashMap::new(),
@@ -379,6 +381,7 @@ impl ExtensionEngine {
             runtime_permissions: RuntimePermissionManager::default(),
             secrets,
             services,
+            async_observers: Arc::new(AsyncObserverRegistry::default()),
             ui: UiRuntime::new(),
             preferred_contract_providers: HashMap::new(),
             platform_contract_definitions: HashMap::new(),
@@ -498,6 +501,7 @@ impl ExtensionEngine {
             self.execution_targets.clone(),
             self.runtime_permissions.clone(),
             self.host_access.clone(),
+            self.async_observers.clone(),
         )
     }
 

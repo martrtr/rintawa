@@ -129,7 +129,7 @@ struct ObserverLease {
 }
 
 #[derive(Default)]
-pub(super) struct AsyncObserverRegistry {
+pub(crate) struct AsyncObserverRegistry {
     leases: Mutex<HashMap<String, ObserverLease>>,
 }
 

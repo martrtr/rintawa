@@ -120,7 +120,11 @@ exact principal within the same scope. Delegation transfers consumption of the
 ordered queue but never grants producer actions, cancellation or completion.
 Stopping either party revokes its leases, and producer shutdown releases the
 operation itself. Consumer detachment makes the stream available for a fresh
-explicit handoff; no fanout or implicit cross-scope discovery occurs.
+explicit handoff; no fanout or implicit cross-scope discovery occurs. The
+observer registry is shared at the ExtensionEngine level, not instantiated
+per WASM loader, so distinct provider/consumer components from separate loader
+factories in the same Engine can resolve leases correctly. A real two-component
+WASM service fixture exercises this boundary, restart, cancellation and failure.
 
 A durable World effect/job identity remains separate; linking one outbox job,
 restart uncertainty and a deterministic WorldCommand to these ephemeral streams

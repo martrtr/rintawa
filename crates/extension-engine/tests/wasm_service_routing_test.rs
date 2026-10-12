@@ -109,3 +109,43 @@ fn test_should_route_targeted_multiple_services_between_wasm_components() -> Res
 
     Ok(())
 }
+
+const ASYNC_PROVIDER_COMPONENT: &[u8] = include_bytes!("fixtures/async-operations/producer.wasm");
+const ASYNC_CONSUMER_COMPONENT: &[u8] = include_bytes!("fixtures/async-operations/consumer.wasm");
+
+#[test]
+fn test_should_handoff_ephemeral_stream_between_real_wasm_components() -> Result<()> {
+    let mut engine = ExtensionEngine::new();
+    let producer_id = ExtensionId::new("operation-fixture-provider");
+    let consumer_id = ExtensionId::new("operation-fixture-consumer");
+
+    let producer = engine
+        .wasm_runtime_engine()?
+        .load_component_from_bytes(ComponentId::new("runtime"), ASYNC_PROVIDER_COMPONENT)?;
+    let consumer = engine
+        .wasm_runtime_engine()?
+        .load_component_from_bytes(ComponentId::new("runtime"), ASYNC_CONSUMER_COMPONENT)?;
+
+    engine.register_extension(
+        wasm_manifest(producer_id.as_str()),
+        vec![Box::new(producer)],
+    )?;
+    engine.register_extension(
+        wasm_manifest(consumer_id.as_str()),
+        vec![Box::new(consumer)],
+    )?;
+
+    // The WASM consumer's start callback verifies progress, byte ordering,
+    // completion, cancellation, failure and inability to cancel a producer
+    // operation through its read-only lease.
+    engine.start_extension(&producer_id)?;
+    engine.start_extension(&consumer_id)?;
+
+    // A fresh activation must not need stale observer tokens or guest handles.
+    engine.stop_extension(&consumer_id)?;
+    engine.stop_extension(&producer_id)?;
+    engine.start_extension(&producer_id)?;
+    engine.start_extension(&consumer_id)?;
+
+    Ok(())
+}

@@ -57,7 +57,8 @@ mod ui;
 
 pub use crate::runtime::wasm::budget::WasmExecutionBudget;
 
-use crate::runtime::wasm::async_operations::{AsyncObserverRegistry, OwnedAsyncOperation};
+pub(crate) use crate::runtime::wasm::async_operations::AsyncObserverRegistry;
+use crate::runtime::wasm::async_operations::OwnedAsyncOperation;
 use crate::runtime::wasm::http_request::OwnedHttpRequest;
 use crate::runtime::wasm::network::OwnedNetworkHandle;
 use crate::runtime::wasm::target_provider::{WasmExecutionTargetHost, WasmTargetProviderEndpoint};
@@ -1664,6 +1665,7 @@ impl WasmRuntimeEngine {
         execution_targets: ExecutionTargetRegistry,
         runtime_permissions: RuntimePermissionManager,
         host_access: HostAccessServices,
+        async_observers: Arc<AsyncObserverRegistry>,
     ) -> EngineResult<Self> {
         Self::with_host_services_and_budget(
             WasmHostServices {
@@ -1672,7 +1674,7 @@ impl WasmRuntimeEngine {
                 ui,
                 runtime_permissions,
                 host_access,
-                async_observers: Arc::new(AsyncObserverRegistry::default()),
+                async_observers,
             },
             execution_targets,
             WasmExecutionBudget::default(),
