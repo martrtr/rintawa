@@ -1297,9 +1297,10 @@ mod loopback_http_integration_tests {
     }
 
     #[test]
-    fn test_should_deny_ungranted_local_requests_without_spawning_worker() {
+    fn test_should_reject_ungranted_local_requests_before_allocating_owner_state() {
         let mut state = state("first");
-        let active = GLOBAL_HTTP_WORKERS.load(Ordering::Acquire);
+        let next_handle = state.next_http_request_handle;
+        assert!(state.http_requests.is_empty());
         assert!(matches!(
             HttpRequestHost::start(
                 &mut state,
@@ -1307,7 +1308,10 @@ mod loopback_http_integration_tests {
             ),
             Err(HttpRequestError::ForbiddenDestination)
         ));
-        assert_eq!(GLOBAL_HTTP_WORKERS.load(Ordering::Acquire), active);
+        // Unlike the global worker count, this owner's state cannot change
+        // because another test ran a valid request on a different thread.
+        assert_eq!(state.next_http_request_handle, next_handle);
+        assert!(state.http_requests.is_empty());
     }
 
     #[test]
