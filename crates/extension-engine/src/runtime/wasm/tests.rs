@@ -1435,7 +1435,7 @@ fn test_should_expose_authenticated_runtime_context_only_during_execution() {
         RuntimeContextHost::current(&mut state),
         Err(RuntimeContextError::AccessNotActive)
     ));
-    state.begin_service_execution();
+    state.begin_service_execution(None);
     let service_context = RuntimeContextHost::current(&mut state)
         .expect("service callback should retain authenticated runtime identity");
     assert_eq!(service_context.scope_id, test_scope_id().to_string());

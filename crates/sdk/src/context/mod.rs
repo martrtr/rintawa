@@ -5,7 +5,7 @@
 
 use crate::{
     api::LoggerApi,
-    contracts::{ContractConsumer, ContractDefinition, ContractProvider},
+    contracts::{ComponentRef, ContractConsumer, ContractDefinition, ContractProvider},
     contributions::ContributionDescriptor,
     contributions::WorldSchemaContribution,
     errors::ExtensionResult,
@@ -35,6 +35,14 @@ pub trait ComponentContext {
 
     /// Returns the ID of this component.
     fn component_id(&self) -> &ComponentId;
+
+    /// Authenticated immediate caller while handling a routed service request.
+    ///
+    /// This is supplied by the Host and is never derived from untrusted
+    /// service payloads. Outside routed callbacks, it is absent.
+    fn service_caller(&self) -> Option<&ComponentRef> {
+        None
+    }
 
     /// Returns the logger API for this component.
     fn logger(&self) -> &dyn LoggerApi;

@@ -1,11 +1,12 @@
-//! Bounded owner-scoped ephemeral operation transport.
+//! Bounded, ephemeral and owner-scoped operation transport.
 //!
-//! Guest callbacks use this store to exchange provisional progress and bytes.
-//! Neither a stream chunk nor a completion automatically mutates World state.
-//! Service handoff and durable retry identities are deliberately separate.
+//! A producer owns mutation and cancellation. The authenticated caller of one
+//! routed service request may receive one bounded, read-only consumption lease.
+//! No stream event is a durable WorldEvent or a committed WorldCommand.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
+    sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
 
@@ -19,6 +20,7 @@ use crate::runtime::wasm::{
 
 const MAX_OPERATIONS_PER_OWNER: usize = 8;
 const MAX_OPERATIONS_PER_COMPONENT_STORE: usize = 64;
+const MAX_OBSERVER_LEASES: usize = 256;
 const MAX_PENDING_EVENTS: usize = 16;
 const MAX_PENDING_BYTES: usize = 128 * 1024;
 const MAX_CHUNK_BYTES: usize = 8 * 1024;
@@ -35,6 +37,7 @@ enum Terminal {
 
 pub(super) struct OwnedAsyncOperation {
     pub(super) owner: ComponentRef,
+    delegated_reader: Option<ComponentRef>,
     queue: VecDeque<AsyncOperationEvent>,
     queued_bytes: usize,
     next_sequence: u64,
@@ -48,6 +51,7 @@ impl OwnedAsyncOperation {
     fn new(owner: ComponentRef) -> Self {
         Self {
             owner,
+            delegated_reader: None,
             queue: VecDeque::new(),
             queued_bytes: 0,
             next_sequence: 1,
@@ -88,6 +92,24 @@ impl OwnedAsyncOperation {
         self.touch();
     }
 
+    fn read_next(&mut self) -> AsyncOperationEvent {
+        if matches!(self.terminal, Some(Terminal::Cancelled)) {
+            return AsyncOperationEvent::Cancelled;
+        }
+        if let Some(event) = self.queue.pop_front() {
+            if let AsyncOperationEvent::Data(chunk) = &event {
+                self.queued_bytes -= chunk.bytes.len();
+            }
+            return event;
+        }
+        match &self.terminal {
+            Some(Terminal::Completed(bytes)) => AsyncOperationEvent::Completed(bytes.clone()),
+            Some(Terminal::Failed(reason)) => AsyncOperationEvent::Failed(reason.clone()),
+            Some(Terminal::Cancelled) => AsyncOperationEvent::Cancelled,
+            None => AsyncOperationEvent::Pending,
+        }
+    }
+
     fn expired(&mut self, now: Instant) -> bool {
         if let Some(since) = self.terminal_since {
             return now.duration_since(since) >= TERMINAL_RETENTION;
@@ -96,6 +118,46 @@ impl OwnedAsyncOperation {
             self.terminate(Terminal::Failed(String::from("operation timed out")));
         }
         false
+    }
+}
+
+/// A lease never retains the producer's operation after the producer stops.
+struct ObserverLease {
+    reader: ComponentRef,
+    owner: ComponentRef,
+    operation: Weak<Mutex<OwnedAsyncOperation>>,
+}
+
+#[derive(Default)]
+pub(super) struct AsyncObserverRegistry {
+    leases: Mutex<HashMap<String, ObserverLease>>,
+}
+
+impl AsyncObserverRegistry {
+    /// Revokes both writer-owned streams and read-only leases of a stopped reader.
+    /// Release the registry lock before touching individual streams.
+    pub(super) fn revoke_principal(&self, principal: &ComponentRef) {
+        let mut readers_to_detach = Vec::new();
+        if let Ok(mut leases) = self.leases.lock() {
+            leases.retain(|_, lease| {
+                if &lease.owner == principal {
+                    return false;
+                }
+                if &lease.reader == principal {
+                    readers_to_detach.push((lease.reader.clone(), lease.operation.clone()));
+                    return false;
+                }
+                true
+            });
+        }
+        for (reader, weak) in readers_to_detach {
+            if let Some(operation) = weak.upgrade()
+                && let Ok(mut locked) = operation.lock()
+                && locked.delegated_reader.as_ref() == Some(&reader)
+            {
+                locked.delegated_reader = None;
+            }
+        }
     }
 }
 
@@ -109,25 +171,34 @@ impl WasmHostState {
             .ok_or(AsyncOperationError::AccessNotActive)
     }
 
-    fn owned_operation_mut(
-        &mut self,
+    fn owned_operation(
+        &self,
         handle: &str,
         owner: &ComponentRef,
-    ) -> Result<&mut OwnedAsyncOperation, AsyncOperationError> {
+    ) -> Result<Arc<Mutex<OwnedAsyncOperation>>, AsyncOperationError> {
         let operation = self
             .async_operations
-            .get_mut(handle)
-            .ok_or(AsyncOperationError::UnknownHandle)?;
-        if operation.owner != *owner {
-            return Err(AsyncOperationError::UnknownHandle);
+            .get(handle)
+            .ok_or(AsyncOperationError::UnknownHandle)?
+            .clone();
+        {
+            let locked = operation
+                .lock()
+                .map_err(|_| AsyncOperationError::Unavailable)?;
+            if locked.owner != *owner {
+                return Err(AsyncOperationError::UnknownHandle);
+            }
         }
         Ok(operation)
     }
 
     fn prune_async_operations(&mut self) {
         let now = Instant::now();
-        self.async_operations
-            .retain(|_, operation| !operation.expired(now));
+        self.async_operations.retain(|_, operation| {
+            operation
+                .lock()
+                .is_ok_and(|mut locked| !locked.expired(now))
+        });
     }
 }
 
@@ -139,7 +210,7 @@ impl AsyncOperationHost for WasmHostState {
             || self
                 .async_operations
                 .values()
-                .filter(|operation| operation.owner == owner)
+                .filter(|operation| operation.lock().is_ok_and(|locked| locked.owner == owner))
                 .count()
                 >= MAX_OPERATIONS_PER_OWNER
         {
@@ -151,15 +222,20 @@ impl AsyncOperationHost for WasmHostState {
                 break candidate;
             }
         };
-        self.async_operations
-            .insert(handle.clone(), OwnedAsyncOperation::new(owner));
+        self.async_operations.insert(
+            handle.clone(),
+            Arc::new(Mutex::new(OwnedAsyncOperation::new(owner))),
+        );
         Ok(handle)
     }
 
     fn push_progress(&mut self, handle: String, percent: u8) -> Result<(), AsyncOperationError> {
         let owner = self.current_operation_owner()?;
         self.prune_async_operations();
-        let operation = self.owned_operation_mut(&handle, &owner)?;
+        let operation = self.owned_operation(&handle, &owner)?;
+        let mut operation = operation
+            .lock()
+            .map_err(|_| AsyncOperationError::Unavailable)?;
         if percent > 100 || percent < operation.last_progress {
             return Err(AsyncOperationError::InvalidProgress);
         }
@@ -185,7 +261,10 @@ impl AsyncOperationHost for WasmHostState {
         if data.is_empty() {
             return Err(AsyncOperationError::InvalidState);
         }
-        let operation = self.owned_operation_mut(&handle, &owner)?;
+        let operation = self.owned_operation(&handle, &owner)?;
+        let mut operation = operation
+            .lock()
+            .map_err(|_| AsyncOperationError::Unavailable)?;
         let sequence = operation.reserve_event(data.len())?;
         operation.queued_bytes += data.len();
         operation.next_sequence += 1;
@@ -199,15 +278,18 @@ impl AsyncOperationHost for WasmHostState {
         Ok(())
     }
 
-    fn complete(&mut self, handle: String, result: Vec<u8>) -> Result<(), AsyncOperationError> {
+    fn complete(&mut self, handle: String, output: Vec<u8>) -> Result<(), AsyncOperationError> {
         let owner = self.current_operation_owner()?;
         self.prune_async_operations();
-        if result.len() > MAX_RESULT_BYTES {
+        if output.len() > MAX_RESULT_BYTES {
             return Err(AsyncOperationError::MessageTooLarge);
         }
-        let operation = self.owned_operation_mut(&handle, &owner)?;
+        let operation = self.owned_operation(&handle, &owner)?;
+        let mut operation = operation
+            .lock()
+            .map_err(|_| AsyncOperationError::Unavailable)?;
         operation.ensure_pending()?;
-        operation.terminate(Terminal::Completed(result));
+        operation.terminate(Terminal::Completed(output));
         Ok(())
     }
 
@@ -217,7 +299,10 @@ impl AsyncOperationHost for WasmHostState {
         if reason.len() > MAX_DIAGNOSTIC_BYTES {
             return Err(AsyncOperationError::MessageTooLarge);
         }
-        let operation = self.owned_operation_mut(&handle, &owner)?;
+        let operation = self.owned_operation(&handle, &owner)?;
+        let mut operation = operation
+            .lock()
+            .map_err(|_| AsyncOperationError::Unavailable)?;
         operation.ensure_pending()?;
         operation.terminate(Terminal::Failed(reason));
         Ok(())
@@ -226,7 +311,10 @@ impl AsyncOperationHost for WasmHostState {
     fn cancel(&mut self, handle: String) -> Result<(), AsyncOperationError> {
         let owner = self.current_operation_owner()?;
         self.prune_async_operations();
-        let operation = self.owned_operation_mut(&handle, &owner)?;
+        let operation = self.owned_operation(&handle, &owner)?;
+        let mut operation = operation
+            .lock()
+            .map_err(|_| AsyncOperationError::Unavailable)?;
         if matches!(operation.terminal, Some(Terminal::Cancelled)) {
             return Ok(());
         }
@@ -240,34 +328,131 @@ impl AsyncOperationHost for WasmHostState {
     fn poll(&mut self, handle: String) -> Result<AsyncOperationEvent, AsyncOperationError> {
         let owner = self.current_operation_owner()?;
         self.prune_async_operations();
-        let operation = self.owned_operation_mut(&handle, &owner)?;
-        if matches!(operation.terminal, Some(Terminal::Cancelled)) {
-            return Ok(AsyncOperationEvent::Cancelled);
+        let operation = self.owned_operation(&handle, &owner)?;
+        let mut operation = operation
+            .lock()
+            .map_err(|_| AsyncOperationError::Unavailable)?;
+        if operation.delegated_reader.is_some() {
+            return Err(AsyncOperationError::InvalidState);
         }
-        if let Some(event) = operation.queue.pop_front() {
-            if let AsyncOperationEvent::Data(chunk) = &event {
-                operation.queued_bytes -= chunk.bytes.len();
+        Ok(operation.read_next())
+    }
+
+    fn share_with_caller(&mut self, handle: String) -> Result<String, AsyncOperationError> {
+        let owner = self.current_operation_owner()?;
+        let reader = self
+            .service_caller
+            .clone()
+            .ok_or(AsyncOperationError::InvalidState)?;
+        if reader == owner {
+            return Err(AsyncOperationError::InvalidState);
+        }
+        // A guest-supplied instance ID cannot bypass the service runtime's scope.
+        let producer_scope = self
+            .services
+            .component_scope_id(&owner)
+            .ok_or(AsyncOperationError::Unavailable)?;
+        if self.services.component_scope_id(&reader) != Some(producer_scope) {
+            return Err(AsyncOperationError::InvalidState);
+        }
+        self.prune_async_operations();
+        let operation = self.owned_operation(&handle, &owner)?;
+        let mut locked = operation
+            .lock()
+            .map_err(|_| AsyncOperationError::Unavailable)?;
+        if locked.delegated_reader.is_some() {
+            return Err(AsyncOperationError::InvalidState);
+        }
+        let token = {
+            let mut leases = self
+                .async_observers
+                .leases
+                .lock()
+                .map_err(|_| AsyncOperationError::Unavailable)?;
+            leases.retain(|_, lease| lease.operation.strong_count() > 0);
+            if leases.len() >= MAX_OBSERVER_LEASES {
+                return Err(AsyncOperationError::LimitExceeded);
             }
-            return Ok(event);
+            let token = loop {
+                let token = Uuid::now_v7().to_string();
+                if !leases.contains_key(&token) {
+                    break token;
+                }
+            };
+            leases.insert(
+                token.clone(),
+                ObserverLease {
+                    reader: reader.clone(),
+                    owner,
+                    operation: Arc::downgrade(&operation),
+                },
+            );
+            token
+        };
+        locked.delegated_reader = Some(reader);
+        Ok(token)
+    }
+
+    fn poll_observer(&mut self, token: String) -> Result<AsyncOperationEvent, AsyncOperationError> {
+        let reader = self.current_operation_owner()?;
+        let source = {
+            let leases = self
+                .async_observers
+                .leases
+                .lock()
+                .map_err(|_| AsyncOperationError::Unavailable)?;
+            let lease = leases
+                .get(&token)
+                .ok_or(AsyncOperationError::UnknownHandle)?;
+            if lease.reader != reader {
+                return Err(AsyncOperationError::UnknownHandle);
+            }
+            lease.operation.clone()
+        };
+        let operation = source.upgrade().ok_or(AsyncOperationError::UnknownHandle)?;
+        let mut locked = operation
+            .lock()
+            .map_err(|_| AsyncOperationError::Unavailable)?;
+        if locked.delegated_reader.as_ref() != Some(&reader) || locked.expired(Instant::now()) {
+            return Err(AsyncOperationError::UnknownHandle);
         }
-        Ok(match &operation.terminal {
-            Some(Terminal::Completed(bytes)) => AsyncOperationEvent::Completed(bytes.clone()),
-            Some(Terminal::Failed(reason)) => AsyncOperationEvent::Failed(reason.clone()),
-            Some(Terminal::Cancelled) => AsyncOperationEvent::Cancelled,
-            None => AsyncOperationEvent::Pending,
-        })
+        Ok(locked.read_next())
+    }
+
+    fn close_observer(&mut self, token: String) -> Result<(), AsyncOperationError> {
+        let reader = self.current_operation_owner()?;
+        let source = {
+            let mut leases = self
+                .async_observers
+                .leases
+                .lock()
+                .map_err(|_| AsyncOperationError::Unavailable)?;
+            let lease = leases
+                .get(&token)
+                .ok_or(AsyncOperationError::UnknownHandle)?;
+            if lease.reader != reader {
+                return Err(AsyncOperationError::UnknownHandle);
+            }
+            let source = lease.operation.clone();
+            leases.remove(&token);
+            source
+        };
+        if let Some(operation) = source.upgrade() {
+            let mut locked = operation
+                .lock()
+                .map_err(|_| AsyncOperationError::Unavailable)?;
+            if locked.delegated_reader.as_ref() == Some(&reader) {
+                locked.delegated_reader = None;
+            }
+        }
+        Ok(())
     }
 
     fn close(&mut self, handle: String) -> Result<(), AsyncOperationError> {
         let owner = self.current_operation_owner()?;
         self.prune_async_operations();
-        let operation = self
-            .async_operations
-            .get(&handle)
-            .ok_or(AsyncOperationError::UnknownHandle)?;
-        if operation.owner != owner {
-            return Err(AsyncOperationError::UnknownHandle);
-        }
+        let operation = self.owned_operation(&handle, &owner)?;
+        drop(operation);
         self.async_operations.remove(&handle);
         Ok(())
     }
@@ -431,7 +616,16 @@ mod tests {
             AsyncOperationHost::complete(&mut state, handle.clone(), vec![]),
             Err(AsyncOperationError::InvalidState)
         ));
-        assert_eq!(state.async_operations.get(&handle).unwrap().queued_bytes, 0);
+        assert_eq!(
+            state
+                .async_operations
+                .get(&handle)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .queued_bytes,
+            0
+        );
     }
 
     #[test]
@@ -491,7 +685,9 @@ mod tests {
         AsyncOperationHost::complete(&mut state, expired.clone(), vec![]).unwrap();
         state
             .async_operations
-            .get_mut(&expired)
+            .get(&expired)
+            .unwrap()
+            .lock()
             .unwrap()
             .terminal_since = Some(Instant::now() - TERMINAL_RETENTION - Duration::from_secs(1));
         let other = AsyncOperationHost::create(&mut state).unwrap();
@@ -512,12 +708,217 @@ mod tests {
         let handle = AsyncOperationHost::create(&mut state).unwrap();
         state
             .async_operations
-            .get_mut(&handle)
+            .get(&handle)
+            .unwrap()
+            .lock()
             .unwrap()
             .last_activity = Instant::now() - MAX_IDLE_DURATION - Duration::from_secs(1);
         assert!(matches!(
             AsyncOperationHost::poll(&mut state, handle),
             Ok(AsyncOperationEvent::Failed(reason)) if reason == "operation timed out"
+        ));
+    }
+
+    fn shared_states() -> (WasmHostState, WasmHostState, WasmHostState) {
+        use crate::runtime::wasm::{WasmExecutionBudget, WasmHostServices};
+        use crate::secrets::SecretManager;
+        use crate::services::ServiceInstanceRegistration;
+        use rintawa_sdk::types::{ExtensionId, ExtensionInstanceId, RuntimeScopeId};
+
+        let host = WasmHostServices::standalone(SecretManager::system());
+        for name in ["provider", "client", "intruder"] {
+            host.services
+                .register_instance(ServiceInstanceRegistration {
+                    instance_id: ExtensionInstanceId::new(name),
+                    extension_id: ExtensionId::new("example.stream"),
+                    scope_id: RuntimeScopeId::new("world:test"),
+                    definitions: Vec::new(),
+                    providers: Vec::new(),
+                    consumers: Vec::new(),
+                    components: std::collections::HashMap::new(),
+                })
+                .unwrap();
+        }
+        let make = |name: &str| {
+            let mut state = WasmHostState::with_host_services_and_budget(
+                ComponentId::new("runtime"),
+                host.clone(),
+                false,
+                &WasmExecutionBudget::default(),
+            );
+            state.execution_owner = Some(ComponentRef::new(name, "runtime"));
+            state.operation_access_active = true;
+            state
+        };
+        (make("provider"), make("client"), make("intruder"))
+    }
+
+    #[test]
+    fn observer_lease_is_bound_to_authenticated_service_caller() {
+        let (mut provider, mut client, mut intruder) = shared_states();
+        let handle = AsyncOperationHost::create(&mut provider).unwrap();
+        assert!(matches!(
+            AsyncOperationHost::share_with_caller(&mut provider, handle.clone()),
+            Err(AsyncOperationError::InvalidState)
+        ));
+        provider.service_caller = Some(ComponentRef::new("client", "runtime"));
+        let token = AsyncOperationHost::share_with_caller(&mut provider, handle.clone()).unwrap();
+        assert_ne!(token, handle);
+        assert!(matches!(
+            AsyncOperationHost::share_with_caller(&mut provider, handle.clone()),
+            Err(AsyncOperationError::InvalidState)
+        ));
+        assert!(matches!(
+            AsyncOperationHost::poll_observer(&mut intruder, token.clone()),
+            Err(AsyncOperationError::UnknownHandle)
+        ));
+        assert!(matches!(
+            AsyncOperationHost::close_observer(&mut intruder, token.clone()),
+            Err(AsyncOperationError::UnknownHandle)
+        ));
+        assert!(matches!(
+            AsyncOperationHost::poll(&mut provider, handle.clone()),
+            Err(AsyncOperationError::InvalidState)
+        ));
+        AsyncOperationHost::push_progress(&mut provider, handle.clone(), 25).unwrap();
+        AsyncOperationHost::push_data(&mut provider, handle.clone(), b"stream".to_vec()).unwrap();
+        AsyncOperationHost::complete(&mut provider, handle.clone(), b"done".to_vec()).unwrap();
+        assert!(matches!(
+            AsyncOperationHost::poll_observer(&mut client, token.clone()),
+            Ok(AsyncOperationEvent::Progress(AsyncOperationProgress {
+                sequence: 1,
+                percent: 25
+            }))
+        ));
+        assert!(matches!(
+            AsyncOperationHost::poll_observer(&mut client, token.clone()),
+            Ok(AsyncOperationEvent::Data(AsyncOperationData { sequence: 2, bytes }))
+                if bytes == b"stream"
+        ));
+        assert!(matches!(
+            AsyncOperationHost::poll_observer(&mut client, token.clone()),
+            Ok(AsyncOperationEvent::Completed(bytes)) if bytes == b"done"
+        ));
+        assert!(matches!(
+            AsyncOperationHost::cancel(&mut client, handle.clone()),
+            Err(AsyncOperationError::UnknownHandle)
+        ));
+        AsyncOperationHost::close_observer(&mut client, token.clone()).unwrap();
+        assert!(matches!(
+            AsyncOperationHost::poll_observer(&mut client, token),
+            Err(AsyncOperationError::UnknownHandle)
+        ));
+        assert!(matches!(
+            AsyncOperationHost::poll(&mut provider, handle),
+            Ok(AsyncOperationEvent::Completed(bytes)) if bytes == b"done"
+        ));
+    }
+
+    #[test]
+    fn producer_cancel_revokes_all_provisional_observer_events() {
+        let (mut provider, mut client, _) = shared_states();
+        let handle = AsyncOperationHost::create(&mut provider).unwrap();
+        provider.service_caller = Some(ComponentRef::new("client", "runtime"));
+        let token = AsyncOperationHost::share_with_caller(&mut provider, handle.clone()).unwrap();
+        AsyncOperationHost::push_data(&mut provider, handle.clone(), b"partial".to_vec()).unwrap();
+        AsyncOperationHost::cancel(&mut provider, handle).unwrap();
+        assert!(matches!(
+            AsyncOperationHost::poll_observer(&mut client, token),
+            Ok(AsyncOperationEvent::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn producer_shutdown_invalidates_reader_without_retaining_operation() {
+        let (mut provider, mut client, _) = shared_states();
+        let handle = AsyncOperationHost::create(&mut provider).unwrap();
+        provider.service_caller = Some(ComponentRef::new("client", "runtime"));
+        let token = AsyncOperationHost::share_with_caller(&mut provider, handle).unwrap();
+        provider.revoke_runtime_resources_for_owner(&ComponentRef::new("provider", "runtime"));
+        assert!(matches!(
+            AsyncOperationHost::poll_observer(&mut client, token),
+            Err(AsyncOperationError::UnknownHandle)
+        ));
+        assert_eq!(provider.async_observers.leases.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn consumer_stop_revokes_lease_and_allows_new_reader() {
+        let (mut provider, mut client, _) = shared_states();
+        let handle = AsyncOperationHost::create(&mut provider).unwrap();
+        provider.service_caller = Some(ComponentRef::new("client", "runtime"));
+        let old_token =
+            AsyncOperationHost::share_with_caller(&mut provider, handle.clone()).unwrap();
+        client.revoke_runtime_resources_for_owner(&ComponentRef::new("client", "runtime"));
+        assert!(matches!(
+            AsyncOperationHost::poll_observer(&mut client, old_token),
+            Err(AsyncOperationError::UnknownHandle)
+        ));
+        assert!(matches!(
+            AsyncOperationHost::poll(&mut provider, handle.clone()),
+            Ok(AsyncOperationEvent::Pending)
+        ));
+        let new_token = AsyncOperationHost::share_with_caller(&mut provider, handle).unwrap();
+        assert!(matches!(
+            AsyncOperationHost::poll_observer(&mut client, new_token),
+            Ok(AsyncOperationEvent::Pending)
+        ));
+    }
+
+    #[test]
+    fn idle_observer_poll_exposes_producer_timeout_without_producer_callbacks() {
+        let (mut provider, mut client, _) = shared_states();
+        let handle = AsyncOperationHost::create(&mut provider).unwrap();
+        provider.service_caller = Some(ComponentRef::new("client", "runtime"));
+        let token = AsyncOperationHost::share_with_caller(&mut provider, handle.clone()).unwrap();
+        {
+            let operation = provider.async_operations.get(&handle).unwrap();
+            operation.lock().unwrap().last_activity =
+                Instant::now() - MAX_IDLE_DURATION - Duration::from_secs(1);
+        }
+        assert!(matches!(
+            AsyncOperationHost::poll_observer(&mut client, token.clone()),
+            Ok(AsyncOperationEvent::Failed(reason)) if reason == "operation timed out"
+        ));
+        {
+            let operation = provider.async_operations.get(&handle).unwrap();
+            operation.lock().unwrap().terminal_since =
+                Some(Instant::now() - TERMINAL_RETENTION - Duration::from_secs(1));
+        }
+        assert!(matches!(
+            AsyncOperationHost::poll_observer(&mut client, token),
+            Err(AsyncOperationError::UnknownHandle)
+        ));
+    }
+
+    #[test]
+    fn cross_scope_caller_cannot_receive_operation_lease() {
+        use crate::services::ServiceInstanceRegistration;
+        use rintawa_sdk::types::{ExtensionId, ExtensionInstanceId, RuntimeScopeId};
+
+        let (mut provider, mut client, _) = shared_states();
+        provider
+            .services
+            .register_instance(ServiceInstanceRegistration {
+                instance_id: ExtensionInstanceId::new("other-world"),
+                extension_id: ExtensionId::new("example.stream"),
+                scope_id: RuntimeScopeId::new("world:another"),
+                definitions: Vec::new(),
+                providers: Vec::new(),
+                consumers: Vec::new(),
+                components: std::collections::HashMap::new(),
+            })
+            .unwrap();
+        let handle = AsyncOperationHost::create(&mut provider).unwrap();
+        provider.service_caller = Some(ComponentRef::new("other-world", "runtime"));
+        assert!(matches!(
+            AsyncOperationHost::share_with_caller(&mut provider, handle.clone()),
+            Err(AsyncOperationError::InvalidState)
+        ));
+        assert!(provider.async_observers.leases.lock().unwrap().is_empty());
+        assert!(matches!(
+            AsyncOperationHost::poll_observer(&mut client, handle),
+            Err(AsyncOperationError::UnknownHandle)
         ));
     }
 }

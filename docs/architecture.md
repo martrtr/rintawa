@@ -112,12 +112,20 @@ terminal retention interval. Cancellation immediately discards provisional chunk
 Terminal results are small; larger payloads must use separately bounded transports.
 
 These operations are **ephemeral** progress transport, not durable WorldEvents or
-World effect jobs. The current phase supports one authenticated component principal
-publishing and observing its own operation. Explicit cross-extension service
-handoff, observer authorization and consumer-triggered cancellation are still open.
-The eventual Narrator durable-effect handler must attach a stable job identity to
-the transient operation and apply a separate idempotent WorldCommand on completion.
-Core never interprets progress bytes as model tokens or commits provisional data.
+World effect jobs. The owner may publish and observe directly, or hand off
+**one read-only consumer** through an already authorized, routed service callback.
+The Host supplies the immediate authenticated service caller; the producer cannot
+select a reader from guest payloads. An opaque observer token is bound to this
+exact principal within the same scope. Delegation transfers consumption of the
+ordered queue but never grants producer actions, cancellation or completion.
+Stopping either party revokes its leases, and producer shutdown releases the
+operation itself. Consumer detachment makes the stream available for a fresh
+explicit handoff; no fanout or implicit cross-scope discovery occurs.
+
+A durable World effect/job identity remains separate; linking one outbox job,
+restart uncertainty and a deterministic WorldCommand to these ephemeral streams
+remains open. Core never interprets progress bytes as model tokens or commits
+provisional data.
 
 ## World authority
 

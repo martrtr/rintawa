@@ -821,7 +821,7 @@ mod tests {
     fn test_should_keep_http_access_separate_from_general_host_service_access() {
         let mut state = WasmHostState::new(ComponentId::new("provider"));
         state.instance_id = Some(ExtensionInstanceId::new("example"));
-        state.begin_service_execution();
+        state.begin_service_execution(None);
         assert!(state.http_request_access_active);
         assert!(!state.host_access_active);
         assert!(!state.network_access_active);

@@ -57,7 +57,7 @@ mod ui;
 
 pub use crate::runtime::wasm::budget::WasmExecutionBudget;
 
-use crate::runtime::wasm::async_operations::OwnedAsyncOperation;
+use crate::runtime::wasm::async_operations::{AsyncObserverRegistry, OwnedAsyncOperation};
 use crate::runtime::wasm::http_request::OwnedHttpRequest;
 use crate::runtime::wasm::network::OwnedNetworkHandle;
 use crate::runtime::wasm::target_provider::{WasmExecutionTargetHost, WasmTargetProviderEndpoint};
@@ -225,7 +225,9 @@ pub struct WasmHostState {
     host_access_active: bool,
     http_request_access_active: bool,
     operation_access_active: bool,
-    async_operations: HashMap<String, OwnedAsyncOperation>,
+    service_caller: Option<rintawa_sdk::contracts::ComponentRef>,
+    async_operations: HashMap<String, Arc<Mutex<OwnedAsyncOperation>>>,
+    async_observers: Arc<AsyncObserverRegistry>,
     next_network_handle: u64,
     network_handles: HashMap<u64, OwnedNetworkHandle>,
     http_requests: HashMap<u64, OwnedHttpRequest>,
@@ -343,6 +345,7 @@ struct WasmHostServices {
     ui: UiRuntime,
     runtime_permissions: RuntimePermissionManager,
     host_access: HostAccessServices,
+    async_observers: Arc<AsyncObserverRegistry>,
 }
 
 impl WasmHostServices {
@@ -353,6 +356,7 @@ impl WasmHostServices {
             ui: UiRuntime::new(),
             runtime_permissions: RuntimePermissionManager::default(),
             host_access: HostAccessServices::unavailable(),
+            async_observers: Arc::new(AsyncObserverRegistry::default()),
         }
     }
 }
@@ -390,6 +394,7 @@ impl WasmHostState {
             ui,
             runtime_permissions,
             host_access,
+            async_observers,
         } = host_services;
         Self {
             component_id,
@@ -412,7 +417,9 @@ impl WasmHostState {
             host_access_active: false,
             http_request_access_active: false,
             operation_access_active: false,
+            service_caller: None,
             async_operations: HashMap::new(),
+            async_observers,
             next_network_handle: 0,
             network_handles: HashMap::new(),
             http_requests: HashMap::new(),
@@ -612,6 +619,7 @@ impl WasmHostState {
         self.host_access_active = false;
         self.http_request_access_active = false;
         self.operation_access_active = false;
+        self.service_caller = None;
         self.user_content_writes_this_execution = 0;
         self.world_session_mutations_this_execution = 0;
         self.world_command_submissions_this_execution = 0;
@@ -903,7 +911,11 @@ impl WasmHostState {
         std::mem::take(&mut self.pending_execution_targets)
     }
 
-    fn begin_service_execution(&mut self) {
+    fn begin_service_execution(
+        &mut self,
+        service_caller: Option<rintawa_sdk::contracts::ComponentRef>,
+    ) {
+        self.service_caller = service_caller;
         self.execution_owner = self.registered_owner();
         self.runtime_effects_active = false;
         self.task_access_active = false;
@@ -931,6 +943,7 @@ impl WasmHostState {
 
     fn finish_service_execution(&mut self) {
         self.execution_owner = None;
+        self.service_caller = None;
         self.task_access_active = false;
         self.network_access_active = false;
         self.host_access_active = false;
@@ -1101,7 +1114,8 @@ impl WasmHostState {
         self.http_requests
             .retain(|_, request| &request.owner != owner);
         self.async_operations
-            .retain(|_, operation| &operation.owner != owner);
+            .retain(|_, operation| operation.lock().is_ok_and(|locked| &locked.owner != owner));
+        self.async_observers.revoke_principal(owner);
     }
 
     fn next_task_due_in(&self, now: Instant) -> Option<Duration> {
@@ -1658,6 +1672,7 @@ impl WasmRuntimeEngine {
                 ui,
                 runtime_permissions,
                 host_access,
+                async_observers: Arc::new(AsyncObserverRegistry::default()),
             },
             execution_targets,
             WasmExecutionBudget::default(),
@@ -2361,7 +2376,10 @@ impl Component for WasmComponent {
 
         instance.store.data().validate_execution_owner(ctx)?;
         Self::set_service_request_fuel(&mut instance.store, &budget, "service request")?;
-        instance.store.data_mut().begin_service_execution();
+        instance
+            .store
+            .data_mut()
+            .begin_service_execution(ctx.service_caller().cloned());
 
         let response = instance
             .plugin

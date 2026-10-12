@@ -87,6 +87,12 @@ struct ResolvedServiceBinding {
     providers: Vec<ComponentRef>,
 }
 
+/// Provenance for one nested routed service invocation.
+struct ServiceInvocation<'a> {
+    call_stack: &'a [ComponentRef],
+    authenticated_caller: Option<&'a ComponentRef>,
+}
+
 #[derive(Default)]
 struct ServiceRuntimeState {
     instances: HashMap<ExtensionInstanceId, ServiceExtensionInstance>,
@@ -482,7 +488,10 @@ impl ServiceRuntime {
             provider_identity,
             contract,
             request,
-            &[],
+            ServiceInvocation {
+                call_stack: &[],
+                authenticated_caller: None,
+            },
         )
     }
 
@@ -544,7 +553,10 @@ impl ServiceRuntime {
             provider_identity,
             &contract,
             request,
-            call_stack,
+            ServiceInvocation {
+                call_stack,
+                authenticated_caller: Some(caller),
+            },
         )
     }
 
@@ -606,7 +618,10 @@ impl ServiceRuntime {
             provider_identity,
             contract,
             request,
-            call_stack,
+            ServiceInvocation {
+                call_stack,
+                authenticated_caller: Some(caller),
+            },
         )
     }
 
@@ -617,9 +632,9 @@ impl ServiceRuntime {
         provider_identity: ComponentIdentity,
         contract: &ContractKey,
         request: &[u8],
-        call_stack: &[ComponentRef],
+        invocation: ServiceInvocation<'_>,
     ) -> ServiceCallResult<Vec<u8>> {
-        if call_stack.contains(&provider) {
+        if invocation.call_stack.contains(&provider) {
             return Err(ServiceCallError::CyclicCall);
         }
         let mut component = match component.try_lock() {
@@ -635,7 +650,7 @@ impl ServiceRuntime {
             return Err(ServiceCallError::RequestTooLarge);
         }
 
-        let mut next_call_stack = call_stack.to_vec();
+        let mut next_call_stack = invocation.call_stack.to_vec();
         next_call_stack.push(provider.clone());
         let mut context = ServiceComponentContext::new(
             provider.clone(),
@@ -643,6 +658,7 @@ impl ServiceRuntime {
             self.clone(),
             self.secrets.clone(),
             next_call_stack,
+            invocation.authenticated_caller.cloned(),
         );
         let response = component
             .handle_service(&mut context, contract, request)
@@ -927,6 +943,7 @@ struct ServiceComponentContext {
     services: ServiceRuntime,
     secrets: SecretManager,
     call_stack: Vec<ComponentRef>,
+    caller: Option<ComponentRef>,
 }
 
 impl ServiceComponentContext {
@@ -936,8 +953,10 @@ impl ServiceComponentContext {
         services: ServiceRuntime,
         secrets: SecretManager,
         call_stack: Vec<ComponentRef>,
+        caller: Option<ComponentRef>,
     ) -> Self {
         Self {
+            caller,
             logger: EngineLogger::new(identity.clone()),
             owner,
             identity,
@@ -967,6 +986,10 @@ impl ComponentContext for ServiceComponentContext {
 
     fn logger(&self) -> &dyn LoggerApi {
         &self.logger
+    }
+
+    fn service_caller(&self) -> Option<&ComponentRef> {
+        self.caller.as_ref()
     }
 
     fn read_secret(&self, path: &SecretPath) -> ExtensionResult<SecretValue> {

@@ -283,6 +283,18 @@ interface async-operations {
     cancel: func(handle: string) -> result<_, error>;
     /// Reads at most one ordered event without blocking.
     poll: func(handle: string) -> result<event, error>;
+    /// Transfers read-only consumption of this stream to the authenticated
+    /// immediate caller of a routed service callback, in the same scope.
+    /// Only one reader can be delegated. No guest-selected principal is accepted.
+    share-with-caller: func(handle: string) -> result<string, error>;
+
+    /// Consumes one ordered event through a caller-bound read-only lease.
+    /// The original owner retains cancellation and finalization authority.
+    poll-observer: func(token: string) -> result<event, error>;
+
+    /// Relinquishes the caller-bound lease without cancelling the operation.
+    close-observer: func(token: string) -> result<_, error>;
+
     /// Releases the exact handle before its automatic short terminal expiry.
     close: func(handle: string) -> result<_, error>;
 }

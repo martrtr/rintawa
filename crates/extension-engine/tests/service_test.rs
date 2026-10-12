@@ -10,6 +10,7 @@ enum Handler {
     Static(Vec<u8>),
     Forward(ContractKey),
     ExpectCyclic(ContractKey),
+    EchoAuthenticatedCaller,
 }
 
 struct ServiceComponent {
@@ -51,6 +52,11 @@ impl ServiceComponent {
 
     fn responding(mut self, response: impl Into<Vec<u8>>) -> Self {
         self.handler = Some(Handler::Static(response.into()));
+        self
+    }
+
+    fn with_authenticated_caller_handler(mut self) -> Self {
+        self.handler = Some(Handler::EchoAuthenticatedCaller);
         self
     }
 
@@ -123,6 +129,12 @@ impl Component for ServiceComponent {
     ) -> ExtensionResult<Vec<u8>> {
         match self.handler.as_ref() {
             Some(Handler::Static(response)) => Ok(response.clone()),
+            Some(Handler::EchoAuthenticatedCaller) => {
+                let caller = ctx.service_caller().ok_or_else(|| {
+                    ExtensionError::Message(String::from("missing routed caller"))
+                })?;
+                Ok(format!("{}:{}", caller.instance_id, caller.component_id).into_bytes())
+            }
             Some(Handler::Forward(contract)) => ctx
                 .call_service(contract, request)
                 .map_err(|error| ExtensionError::Message(error.to_string())),
@@ -1210,5 +1222,36 @@ fn test_multiple_service_handles_are_invalidated_by_secret_policy_changes() -> R
     assert_eq!(fresh.len(), 1);
     assert_ne!(fresh[0], handles[0]);
     assert_eq!(caller.call_provider(fresh[0], b"ping")?, b"secure");
+    Ok(())
+}
+
+#[test]
+fn test_service_callback_identifies_authenticated_caller_not_payload() -> Result<()> {
+    let key = contract("example.authenticated-caller");
+    let mut engine = ExtensionEngine::new();
+    engine.register_extension(
+        manifest("caller-provider"),
+        vec![Box::new(
+            ServiceComponent::new("runtime")
+                .defining(ContractDefinition::service(
+                    key.clone(),
+                    ContractResolutionPolicy::Single,
+                ))
+                .providing(ContractProvider::new(key.clone()))
+                .responding(Vec::new())
+                .with_authenticated_caller_handler(),
+        )],
+    )?;
+    engine.register_extension(
+        manifest("caller-consumer"),
+        vec![Box::new(
+            ServiceComponent::new("runtime").consuming(ContractConsumer::new(key.clone(), true)),
+        )],
+    )?;
+    start(&mut engine, &["caller-provider", "caller-consumer"])?;
+    let caller = ComponentRef::new("caller-consumer", "runtime");
+    let forged = b"caller-provider:runtime";
+    let result = engine.call_service(&caller, &key, forged)?;
+    assert_eq!(result, b"caller-consumer:runtime");
     Ok(())
 }
