@@ -233,6 +233,60 @@ interface network {
     close: func(handle: handle) -> result<_, error>;
 }
 
+/// Ephemeral component-owned progress and byte events for long-lived operations.
+///
+/// This is transport, not a WorldEvent or durable effect. One execution principal
+/// owns every handle; cross-component service handoff requires separate policy.
+interface async-operations {
+    record progress-update {
+        sequence: u64,
+        percent: u8,
+    }
+
+    record data-chunk {
+        sequence: u64,
+        bytes: list<u8>,
+    }
+
+    /// Progress and data are provisional until an explicit terminal state.
+    variant event {
+        pending,
+        progress(progress-update),
+        data(data-chunk),
+        completed(list<u8>),
+        failed(string),
+        cancelled,
+    }
+
+    variant error {
+        access-not-active,
+        unknown-handle,
+        invalid-state,
+        invalid-progress,
+        message-too-large,
+        queue-full,
+        limit-exceeded,
+        unavailable,
+    }
+
+    /// Creates one ephemeral operation with an unguessable activation-local ID.
+    create: func() -> result<string, error>;
+    /// Pushes a monotonic progress percentage in 0..=100.
+    push-progress: func(handle: string, percent: u8) -> result<_, error>;
+    /// Pushes one bounded ordered byte chunk; never silently drops a full queue.
+    push-data: func(handle: string, data: list<u8>) -> result<_, error>;
+    /// Declares successful completion after queued progress/data are drained.
+    complete: func(handle: string, output: list<u8>) -> result<_, error>;
+    /// Declares terminal failure with a bounded diagnostic.
+    fail: func(handle: string, reason: string) -> result<_, error>;
+    /// Atomically cancels this owner's operation, discarding provisional events.
+    cancel: func(handle: string) -> result<_, error>;
+    /// Reads at most one ordered event without blocking.
+    poll: func(handle: string) -> result<event, error>;
+    /// Releases the exact handle before its automatic short terminal expiry.
+    close: func(handle: string) -> result<_, error>;
+}
+
 /// Owner-scoped bounded asynchronous HTTP requests without implicit redirects.
 interface http-request {
     /// One validated outbound HTTP header.
@@ -1174,6 +1228,7 @@ world plugin {
     import network;
     import http-fetch;
     import http-request;
+    import async-operations;
     import artifact-store;
     import asset-store;
     import user-resources;
@@ -1216,6 +1271,7 @@ world task-runtime-plugin {
     import network;
     import http-fetch;
     import http-request;
+    import async-operations;
     import artifact-store;
     import asset-store;
     import user-resources;
@@ -1248,6 +1304,7 @@ world runtime-provider-plugin {
     import network;
     import http-fetch;
     import http-request;
+    import async-operations;
     import artifact-store;
     import asset-store;
     import user-resources;
@@ -1280,6 +1337,7 @@ world runtime-provider-task-plugin {
     import network;
     import http-fetch;
     import http-request;
+    import async-operations;
     import artifact-store;
     import asset-store;
     import user-resources;

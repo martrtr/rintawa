@@ -47,6 +47,7 @@ use crate::{
     services::ServiceRuntime,
 };
 
+mod async_operations;
 mod budget;
 mod control_plane;
 mod http_request;
@@ -56,6 +57,7 @@ mod ui;
 
 pub use crate::runtime::wasm::budget::WasmExecutionBudget;
 
+use crate::runtime::wasm::async_operations::OwnedAsyncOperation;
 use crate::runtime::wasm::http_request::OwnedHttpRequest;
 use crate::runtime::wasm::network::OwnedNetworkHandle;
 use crate::runtime::wasm::target_provider::{WasmExecutionTargetHost, WasmTargetProviderEndpoint};
@@ -113,6 +115,11 @@ use bindings::rintawa::engine::{
         ImportedArtifact as WitImportedArtifact,
     },
     asset_store::{AssetRef as WitAssetRef, Error as AssetStoreError, Host as AssetStoreHost},
+    async_operations::{
+        DataChunk as AsyncOperationData, Error as AsyncOperationError,
+        Event as AsyncOperationEvent, Host as AsyncOperationHost,
+        ProgressUpdate as AsyncOperationProgress,
+    },
     composition::{
         Activation as WitCompositionActivation, Error as CompositionError, Host as CompositionHost,
     },
@@ -217,6 +224,8 @@ pub struct WasmHostState {
     network_access_active: bool,
     host_access_active: bool,
     http_request_access_active: bool,
+    operation_access_active: bool,
+    async_operations: HashMap<String, OwnedAsyncOperation>,
     next_network_handle: u64,
     network_handles: HashMap<u64, OwnedNetworkHandle>,
     http_requests: HashMap<u64, OwnedHttpRequest>,
@@ -402,6 +411,8 @@ impl WasmHostState {
             network_access_active: false,
             host_access_active: false,
             http_request_access_active: false,
+            operation_access_active: false,
+            async_operations: HashMap::new(),
             next_network_handle: 0,
             network_handles: HashMap::new(),
             http_requests: HashMap::new(),
@@ -500,6 +511,7 @@ impl WasmHostState {
         self.network_access_active = false;
         self.host_access_active = false;
         self.http_request_access_active = false;
+        self.operation_access_active = false;
         self.secret_access_active = false;
         self.service_access_active = false;
         self.ui_access_active = false;
@@ -599,6 +611,7 @@ impl WasmHostState {
         self.network_access_active = false;
         self.host_access_active = false;
         self.http_request_access_active = false;
+        self.operation_access_active = false;
         self.user_content_writes_this_execution = 0;
         self.world_session_mutations_this_execution = 0;
         self.world_command_submissions_this_execution = 0;
@@ -826,6 +839,7 @@ impl WasmHostState {
         self.network_access_active = true;
         self.host_access_active = true;
         self.http_request_access_active = true;
+        self.operation_access_active = true;
         self.user_content_writes_this_execution = 0;
         self.world_session_mutations_this_execution = 0;
         self.world_command_submissions_this_execution = 0;
@@ -843,6 +857,7 @@ impl WasmHostState {
         self.network_access_active = true;
         self.host_access_active = true;
         self.http_request_access_active = true;
+        self.operation_access_active = true;
         self.user_content_writes_this_execution = 0;
         self.world_session_mutations_this_execution = 0;
         self.world_command_submissions_this_execution = 0;
@@ -863,6 +878,7 @@ impl WasmHostState {
         self.network_access_active = true;
         self.host_access_active = true;
         self.http_request_access_active = true;
+        self.operation_access_active = true;
         self.user_content_writes_this_execution = 0;
         self.world_session_mutations_this_execution = 0;
         self.world_command_submissions_this_execution = 0;
@@ -894,6 +910,7 @@ impl WasmHostState {
         self.network_access_active = false;
         self.host_access_active = false;
         self.http_request_access_active = true;
+        self.operation_access_active = true;
         self.secret_access_active = true;
         self.service_access_active = true;
         self.ui_access_active = true;
@@ -906,6 +923,7 @@ impl WasmHostState {
         self.network_access_active = false;
         self.host_access_active = false;
         self.http_request_access_active = true;
+        self.operation_access_active = true;
         self.secret_access_active = true;
         self.service_access_active = true;
         self.ui_access_active = true;
@@ -917,6 +935,7 @@ impl WasmHostState {
         self.network_access_active = false;
         self.host_access_active = false;
         self.http_request_access_active = false;
+        self.operation_access_active = false;
         self.secret_access_active = false;
         self.service_access_active = false;
         self.ui_access_active = false;
@@ -930,6 +949,7 @@ impl WasmHostState {
         self.network_access_active = false;
         self.host_access_active = false;
         self.http_request_access_active = false;
+        self.operation_access_active = false;
         self.secret_access_active = false;
         self.service_access_active = false;
         self.ui_access_active = false;
@@ -1080,6 +1100,8 @@ impl WasmHostState {
             .retain(|_, resource| &resource.owner != owner);
         self.http_requests
             .retain(|_, request| &request.owner != owner);
+        self.async_operations
+            .retain(|_, operation| &operation.owner != owner);
     }
 
     fn next_task_due_in(&self, now: Instant) -> Option<Duration> {

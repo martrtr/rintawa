@@ -31,7 +31,9 @@ The remaining MVP work is:
    exact installed runtime behavior before marking the blocker closed.
 3. **Generic outbound HTTP** — bounded owner-scoped HTTPS request/stream support with
    timeout and network policy.
-4. **Generic asynchronous operations** — long-lived progress/stream/cancel transport.
+4. **Generic asynchronous operations** — bounded owner-scoped operation streams,
+   terminal states, cancellation and short retention are implemented. Explicit
+   cross-extension observer/service handoff and durable-job linkage remain open.
 5. **Provider-neutral inference** — versioned inference contract plus one AI Provider.
 6. **Narrator** — world-scoped event -> context -> inference -> authoritative NPC command.
 7. **Final restart E2E** — verify the complete Tavern -> World -> Chat -> AI reply -> restart

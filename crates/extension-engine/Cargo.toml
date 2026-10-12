@@ -22,6 +22,7 @@ tracing.workspace = true
 toml.workspace = true
 tempfile.workspace = true
 wasmtime.workspace = true
+uuid = { workspace = true, features = ["v7"] }
 
 rintawa-artifacts = { path = "../artifacts" }
 rintawa-sdk = { path = "../sdk" }

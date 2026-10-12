@@ -98,6 +98,27 @@ restarts the affected runtime to apply new or revoked persistent grants.
 Per-owner and process-wide concurrency, body, response, header, chunk and timeout
 budgets are Host-enforced. This transport does not know AI, Chat or World schemas.
 
+## Ephemeral asynchronous operations
+
+The generic **async-operations** Component Model interface provides component-owned
+handles and ordered nonblocking progress and data events, followed by an
+unambiguous completed, failed or cancelled terminal state. Chunk sequence
+numbers advance monotonically. A full bounded queue refuses new updates with an
+explicit backpressure error rather than dropping or reordering bytes. The Host
+validates exact component ownership for every poll, update, cancellation and close;
+handles are unique to the activation, cleaned up on component stop, bounded per
+component and per WASM instance, and automatically expire after a bounded idle or
+terminal retention interval. Cancellation immediately discards provisional chunks.
+Terminal results are small; larger payloads must use separately bounded transports.
+
+These operations are **ephemeral** progress transport, not durable WorldEvents or
+World effect jobs. The current phase supports one authenticated component principal
+publishing and observing its own operation. Explicit cross-extension service
+handoff, observer authorization and consumer-triggered cancellation are still open.
+The eventual Narrator durable-effect handler must attach a stable job identity to
+the transient operation and apply a separate idempotent WorldCommand on completion.
+Core never interprets progress bytes as model tokens or commits provisional data.
+
 ## World authority
 
 A World is the authoritative unit of simulation and persistence.
