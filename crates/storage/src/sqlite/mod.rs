@@ -25,7 +25,7 @@ use rintawa_world::{
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
-use crate::{ClaimedEffectJob, StorageError, StorageResult};
+use crate::{ClaimedEffectJob, EffectCommitGuard, StorageError, StorageResult};
 
 use self::codec::{load_schema, load_schema_registry, schema_kind_code, world_id_from_blob};
 
@@ -295,8 +295,43 @@ impl SqliteWorldStorage {
         transaction: &WorldTransaction,
         evaluated_position: u64,
     ) -> StorageResult<CommitReceipt> {
+        self.commit_inner(command, transaction, evaluated_position, None)
+    }
+
+    /// Atomically fences a durable effect claim within the World commit.
+    ///
+    /// If the job was cancelled, reclaimed, completed, or its lease expired
+    /// during System evaluation, the entire World transaction is rejected.
+    /// Already-committed identical commands still resolve idempotently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an effect claim or World commit validation/storage error.
+    pub fn commit_effect_follow_up(
+        &self,
+        command: &WorldCommand,
+        transaction: &WorldTransaction,
+        evaluated_position: u64,
+        guard: &EffectCommitGuard,
+    ) -> StorageResult<CommitReceipt> {
+        self.commit_inner(command, transaction, evaluated_position, Some(guard))
+    }
+
+    fn commit_inner(
+        &self,
+        command: &WorldCommand,
+        transaction: &WorldTransaction,
+        evaluated_position: u64,
+        guard: Option<&EffectCommitGuard>,
+    ) -> StorageResult<CommitReceipt> {
         let mut connection = self.writer()?;
-        commit::commit(&mut connection, command, transaction, evaluated_position)
+        commit::commit(
+            &mut connection,
+            command,
+            transaction,
+            evaluated_position,
+            guard,
+        )
     }
 
     /// Loads one current entity by identity.

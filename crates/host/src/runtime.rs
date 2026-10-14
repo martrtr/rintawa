@@ -40,7 +40,7 @@ use rintawa_sdk::{
     world::{EffectJobId, EntityId, PrincipalId, SchemaKey, UnixTimeMillis, WorldId},
     world_projection::MAX_WORLD_PROJECTION_INPUT_BYTES,
 };
-use rintawa_storage::{ClaimedEffectJob, SqliteWorldStorage};
+use rintawa_storage::{ClaimedEffectJob, EffectCommitGuard, SqliteWorldStorage};
 use rintawa_world::{
     ActorRef, CommitDisposition, SchemaDefinition, SchemaKind, StoredWorldEvent, WorldCommand,
 };
@@ -2050,6 +2050,38 @@ impl HostRuntime {
         })
     }
 
+    // Only the World effect worker may submit a claim-fenced follow-up.
+    // The SQLite writer atomically validates the claim and completes the job
+    // alongside the authoritative command, closing cancellation/reclaim races.
+    fn submit_effect_follow_up(
+        &mut self,
+        world_id: WorldId,
+        command: WorldCommand,
+        claim: &ClaimedEffectJob,
+        now: UnixTimeMillis,
+    ) -> HostResult<WorldCommandDispatchOutcome> {
+        let authoritative = {
+            let active = self
+                .active_worlds
+                .get(&world_id)
+                .ok_or(HostError::WorldNotActive(world_id))?;
+            active
+                .runtime
+                .submit_effect_follow_up(command, EffectCommitGuard::new(claim, now))?
+                .wait_outcome()?
+        };
+        let live_delivery = if authoritative.receipt().disposition() == CommitDisposition::Committed
+        {
+            self.dispatch_world_events(authoritative.committed_events())
+        } else {
+            Ok(0)
+        };
+        Ok(WorldCommandDispatchOutcome {
+            authoritative,
+            live_delivery,
+        })
+    }
+
     /// Builds one schema-addressed, Principal-specific view of an active World.
     ///
     /// The projection provider receives only bounded owner-filtered reads from one
@@ -2469,20 +2501,44 @@ impl HostRuntime {
                 }
             }
             Ok(WorldEffectServiceResponse::Complete { command }) => {
-                if let Some(command) = command
-                    && let Err(error) = self.submit_world_command(world_id, command)
-                {
-                    let diagnostic = bounded_effect_diagnostic(&format!(
-                        "effect follow-up command failed: {error}"
-                    ));
-                    self.retry_effect_claim(world_id, job_id, attempt, now, &diagnostic)?;
-                    return Ok(());
+                if let Some(command) = command {
+                    match self.submit_effect_follow_up(world_id, command, &claim, now) {
+                        Ok(outcome) => {
+                            if outcome.authoritative().receipt().disposition()
+                                == CommitDisposition::AlreadyCommitted
+                            {
+                                // Older versions could commit before recording
+                                // completion. Replay heals that interrupted window.
+                                self.active_worlds
+                                    .get(&world_id)
+                                    .ok_or(HostError::WorldNotActive(world_id))?
+                                    .outbox
+                                    .complete_effect(job_id, attempt)?;
+                            }
+                            // A new commit already completed this effect atomically.
+                        }
+                        Err(HostError::WorldRuntime(
+                            rintawa_world_runtime::WorldRuntimeError::Storage(
+                                rintawa_storage::StorageError::EffectJobClaimLost(lost_id),
+                            ),
+                        )) if lost_id == job_id => {
+                            // The writer observed cancellation/reclaim after the
+                            // Host's initial read: never retry a lost claim.
+                        }
+                        Err(error) => {
+                            let diagnostic = bounded_effect_diagnostic(&format!(
+                                "effect follow-up command failed: {error}"
+                            ));
+                            self.retry_effect_claim(world_id, job_id, attempt, now, &diagnostic)?;
+                        }
+                    }
+                } else {
+                    self.active_worlds
+                        .get(&world_id)
+                        .ok_or(HostError::WorldNotActive(world_id))?
+                        .outbox
+                        .complete_effect(job_id, attempt)?;
                 }
-                self.active_worlds
-                    .get(&world_id)
-                    .ok_or(HostError::WorldNotActive(world_id))?
-                    .outbox
-                    .complete_effect(job_id, attempt)?;
             }
             Ok(WorldEffectServiceResponse::Retry { reason }) => {
                 self.retry_effect_claim(world_id, job_id, attempt, now, &reason)?;
@@ -3477,6 +3533,7 @@ mod tests {
         id: ComponentId,
         contract: ContractKey,
         event_schema: SchemaKey,
+        cancel_on_evaluate: Option<(Arc<SqliteWorldStorage>, EffectJobId)>,
     }
 
     impl Component for WorldSystemProvider {
@@ -3501,6 +3558,11 @@ mod tests {
             }
             let request: WorldSystemServiceRequest = serde_json::from_slice(request)
                 .map_err(|error| ExtensionError::Message(error.to_string()))?;
+            if let Some((storage, job_id)) = &self.cancel_on_evaluate {
+                storage
+                    .cancel_effect(*job_id)
+                    .map_err(|error| ExtensionError::Message(error.to_string()))?;
+            }
             let mut transaction = WorldSystemTransaction::new();
             transaction.push_event(WorldSystemEventProposal {
                 schema: self.event_schema.clone(),
@@ -3674,6 +3736,7 @@ mod tests {
         effect_schema: &'a SchemaKey,
         remaining_retries: usize,
         remaining_deferrals: usize,
+        cancel_on_evaluate: Option<(Arc<SqliteWorldStorage>, EffectJobId)>,
         observed: Arc<Mutex<Vec<WorldEffectServiceRequest>>>,
     }
 
@@ -3692,6 +3755,7 @@ mod tests {
                 id: ComponentId::new("runtime"),
                 contract: world_system_service_contract_key(routes.result_schema),
                 event_schema: routes.event_schema.clone(),
+                cancel_on_evaluate: routes.cancel_on_evaluate,
             })],
         )?;
         host.engine.start_extension_instance(&system_instance)?;
@@ -5044,6 +5108,7 @@ mod tests {
                 id: ComponentId::new("runtime"),
                 contract,
                 event_schema: event_schema.clone(),
+                cancel_on_evaluate: None,
             })],
         )?;
         host.engine.start_extension_instance(&provider_instance)?;
@@ -5514,6 +5579,7 @@ mod tests {
                 id: ComponentId::new("runtime"),
                 contract,
                 event_schema: event_schema.clone(),
+                cancel_on_evaluate: None,
             })],
         )?;
         host.engine.start_extension_instance(&provider_instance)?;
@@ -5648,6 +5714,7 @@ mod tests {
                 effect_schema: &effect_schema,
                 remaining_retries: 1,
                 remaining_deferrals: 0,
+                cancel_on_evaluate: None,
                 observed: Arc::clone(&observed),
             },
         )?;
@@ -5754,6 +5821,7 @@ mod tests {
                 effect_schema: &effect_schema,
                 remaining_retries: 0,
                 remaining_deferrals: 2,
+                cancel_on_evaluate: None,
                 observed: Arc::clone(&observed),
             },
         )?;
@@ -5873,6 +5941,7 @@ mod tests {
                 effect_schema: &effect_schema,
                 remaining_retries: 0,
                 remaining_deferrals: 1,
+                cancel_on_evaluate: None,
                 observed: Arc::clone(&observed),
             },
         )?;
@@ -5900,6 +5969,7 @@ mod tests {
                 effect_schema: &effect_schema,
                 remaining_retries: 0,
                 remaining_deferrals: 0,
+                cancel_on_evaluate: None,
                 observed: Arc::clone(&observed),
             },
         )?;
@@ -5997,6 +6067,7 @@ mod tests {
                 effect_schema: &effect_schema,
                 remaining_retries: 0,
                 remaining_deferrals: 0,
+                cancel_on_evaluate: None,
                 observed: Arc::clone(&observed),
             },
         )?;
@@ -6093,6 +6164,7 @@ mod tests {
                 effect_schema: &effect_schema,
                 remaining_retries: 0,
                 remaining_deferrals: 1,
+                cancel_on_evaluate: None,
                 observed: Arc::clone(&observed),
             },
         )?;
@@ -6112,6 +6184,90 @@ mod tests {
         assert!(inspection.events_after(0, 16)?.is_empty());
         let calls = observed.lock().unwrap();
         assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].job().provenance.correlation_id, correlation_id);
+        drop(calls);
+        host.deactivate_world(world_id)?;
+        host.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_fence_cancellation_during_world_system_evaluation() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let world_id = home.create_world()?.id;
+        let seed_schema: SchemaKey = "rintawa.test.effect-seed@1".parse()?;
+        let result_schema: SchemaKey = "rintawa.test.effect-result@1".parse()?;
+        let event_schema: SchemaKey = "rintawa.test.effect-result-event@1".parse()?;
+        let effect_schema: SchemaKey = "rintawa.test.external-effect@1".parse()?;
+        let result_owner = ExtensionId::new("rintawa.effect-result-system");
+        let effect_owner = ExtensionId::new("rintawa.effect-provider");
+        let storage = home.open_world_storage(world_id)?;
+        storage.register_schemas(&[
+            SchemaDefinition::new(
+                seed_schema.clone(),
+                SchemaKind::Command,
+                ExtensionId::new("rintawa.effect-seed"),
+                serde_json::json!({ "type": "object" }),
+            ),
+            SchemaDefinition::new(
+                result_schema.clone(),
+                SchemaKind::Command,
+                result_owner.clone(),
+                serde_json::json!({ "type": "object" }),
+            ),
+            SchemaDefinition::new(
+                event_schema.clone(),
+                SchemaKind::Event,
+                result_owner.clone(),
+                serde_json::json!({ "type": "object" }),
+            ),
+            SchemaDefinition::new(
+                effect_schema.clone(),
+                SchemaKind::Effect,
+                effect_owner.clone(),
+                serde_json::json!({ "type": "object" }),
+            ),
+        ])?;
+        let principal = PrincipalId::new();
+        let (effect_id, correlation_id) =
+            enqueue_test_effect(&storage, &seed_schema, &effect_schema, principal)?;
+        drop(storage);
+
+        let mut host = HostRuntime::start(&home)?;
+        host.activate_world(&home, world_id)?;
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        register_test_effect_routes(
+            &mut host,
+            world_id,
+            TestEffectRoutes {
+                result_owner: &result_owner,
+                result_schema: &result_schema,
+                event_schema: &event_schema,
+                effect_owner: &effect_owner,
+                effect_schema: &effect_schema,
+                remaining_retries: 0,
+                remaining_deferrals: 0,
+                cancel_on_evaluate: Some((Arc::new(home.open_world_storage(world_id)?), effect_id)),
+                observed: Arc::clone(&observed),
+            },
+        )?;
+
+        assert_eq!(
+            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(100))?,
+            1
+        );
+        let inspection = home.open_world_storage(world_id)?;
+        assert_eq!(inspection.load_session()?.commit_position(), 1);
+        assert!(inspection.events_after(0, 10)?.is_empty());
+        assert!(!inspection.cancel_effect(effect_id)?);
+        assert_eq!(
+            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(300))?,
+            0
+        );
+        let calls = observed.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].job().id, effect_id);
         assert_eq!(calls[0].job().provenance.correlation_id, correlation_id);
         drop(calls);
         host.deactivate_world(world_id)?;
@@ -6177,6 +6333,7 @@ mod tests {
                 effect_schema: &effect_schema,
                 remaining_retries: 0,
                 remaining_deferrals: 0,
+                cancel_on_evaluate: None,
                 observed: Arc::clone(&observed),
             },
         )?;

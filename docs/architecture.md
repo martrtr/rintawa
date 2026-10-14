@@ -134,8 +134,15 @@ result application it checks the persisted claim, rejecting cancelled, expired
 or reclaimed attempts. World deactivation or Host restart discards the cursor:
 the same durable EffectJobId becomes eligible for a new attempt only after its
 lease expires. Completion still uses the job-derived deterministic CommandId
-and normal authoritative World command validation. Provisional data is never
-committed as World state.
+and normal authoritative World command validation. A Host-only EffectCommitGuard
+is carried through the single-writer queue. The SQLite BEGIN IMMEDIATE commit
+validates the exact still-running attempt and unexpired lease, commits the
+World result, and marks the job completed in one transaction. Cancellation and
+reclaim serialize under the same writer lock: cancellation during System
+evaluation cannot create canonical state. Monotonic elapsed time is accounted
+for while a follow-up waits and evaluates. Identical already-committed commands
+remain idempotent, including recovery from older interrupted completions.
+Provisional data is never committed as World state.
 
 The direct bridge from a World effect to a separately delegated async-operation
 observer token, and the feature-owned inference adapter/reconciliation policy,

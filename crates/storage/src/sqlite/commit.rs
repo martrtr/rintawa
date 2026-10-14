@@ -18,7 +18,7 @@ use crate::sqlite::codec::{
     digest_from_blob, effect_job_id_from_blob, event_id_from_blob, load_schema_registry,
 };
 use crate::sqlite::query;
-use crate::{StorageError, StorageResult};
+use crate::{EffectCommitGuard, StorageError, StorageResult};
 
 pub(super) fn command_digest(command: &WorldCommand) -> StorageResult<[u8; 32]> {
     let canonical = canonical_json(serde_json::to_value(command)?);
@@ -78,6 +78,7 @@ pub(super) fn commit(
     command: &WorldCommand,
     world_transaction: &WorldTransaction,
     evaluated_position: u64,
+    guard: Option<&EffectCommitGuard>,
 ) -> StorageResult<CommitReceipt> {
     let digest = command_digest(command)?;
     let sql = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -85,6 +86,23 @@ pub(super) fn commit(
     if let Some(receipt) = load_existing_receipt(&sql, command.id(), &digest)? {
         sql.commit()?;
         return Ok(receipt);
+    }
+
+    if let Some(guard) = guard {
+        let expected_command_id = CommandId::from_bytes(guard.job_id().into_bytes());
+        if command.id() != expected_command_id
+            || command.causation() != Some(CausationRef::Effect(guard.job_id()))
+        {
+            return Err(StorageError::EffectJobClaimLost(guard.job_id()));
+        }
+        if !crate::sqlite::outbox::claim_is_current(
+            &sql,
+            guard.job_id(),
+            guard.attempt(),
+            guard.commit_time(),
+        )? {
+            return Err(StorageError::EffectJobClaimLost(guard.job_id()));
+        }
     }
 
     let schemas = load_schema_registry(&sql)?;
@@ -179,6 +197,13 @@ pub(super) fn commit(
         return Err(StorageError::CorruptData(
             "world metadata commit position changed inside serialized transaction".into(),
         ));
+    }
+
+    // The guarded World follow-up and its effect completion are one write
+    // transaction. Neither concurrent cancellation nor reclaim can observe a
+    // committed World result while the same job is still running.
+    if let Some(guard) = guard {
+        crate::sqlite::outbox::complete(&sql, guard.job_id(), guard.attempt())?;
     }
 
     sql.commit()?;

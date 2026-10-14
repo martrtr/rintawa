@@ -35,7 +35,9 @@ The remaining MVP work is:
    states, cancellation, short retention and single-reader service-caller handoff
    are implemented and covered by a real two-component WASM service fixture.
    Durable World effect handlers support bounded same-attempt deferred continuations,
-   fenced resumption, cancellation and restart reclaims; direct effect-to-operation
+   fenced resumption, cancellation and restart reclaims. Guarded World follow-up
+   commits and effect completion are atomic in SQLite, including fencing against
+   cancellation/reclaim during System evaluation. Direct effect-to-operation
    observer linkage and external inference reconciliation remain open.
 5. **Provider-neutral inference** — versioned inference contract plus one AI Provider.
 6. **Narrator** — world-scoped event -> context -> inference -> authoritative NPC command.

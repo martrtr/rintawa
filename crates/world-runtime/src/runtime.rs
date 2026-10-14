@@ -11,7 +11,7 @@ use std::{
 };
 
 use rintawa_sdk::world::{CommandId, SchemaKey, WorldId};
-use rintawa_storage::SqliteWorldStorage;
+use rintawa_storage::{EffectCommitGuard, SqliteWorldStorage};
 use rintawa_world::{
     CommitReceipt, SchemaKind, StoredWorldEvent, WorldCommand, WorldMutation, WorldTransaction,
 };
@@ -240,6 +240,30 @@ impl WorldRuntime {
     /// Returns QueueFull when bounded capacity is exhausted, or RuntimeStopped
     /// after shutdown/worker disconnect.
     pub fn submit(&self, command: WorldCommand) -> WorldRuntimeResult<WorldCommandTicket> {
+        self.submit_with_guard(command, None)
+    }
+
+    /// Enqueues an effect-produced command carrying its durable SQLite fencing
+    /// claim into the same authoritative commit as World mutations and events.
+    ///
+    /// The guard is Host-owned; untrusted extension payloads do not supply it.
+    ///
+    /// # Errors
+    ///
+    /// Returns QueueFull or RuntimeStopped when this World cannot accept work.
+    pub fn submit_effect_follow_up(
+        &self,
+        command: WorldCommand,
+        guard: EffectCommitGuard,
+    ) -> WorldRuntimeResult<WorldCommandTicket> {
+        self.submit_with_guard(command, Some(guard))
+    }
+
+    fn submit_with_guard(
+        &self,
+        command: WorldCommand,
+        effect_guard: Option<EffectCommitGuard>,
+    ) -> WorldRuntimeResult<WorldCommandTicket> {
         let sender = self
             .sender
             .as_ref()
@@ -248,6 +272,7 @@ impl WorldRuntime {
         let (response_sender, response_receiver) = mpsc::channel();
         let job = CommandJob {
             command,
+            effect_guard,
             response: response_sender,
         };
 
@@ -357,6 +382,7 @@ impl WorldCommandTicket {
 
 struct CommandJob {
     command: WorldCommand,
+    effect_guard: Option<EffectCommitGuard>,
     response: mpsc::Sender<WorldRuntimeResult<WorldCommandOutcome>>,
 }
 
@@ -377,7 +403,7 @@ fn worker_loop(
     receiver: Receiver<CommandJob>,
 ) {
     while let Ok(job) = receiver.recv() {
-        let result = process_command(&storage, &systems, job.command);
+        let result = process_command(&storage, &systems, job.command, job.effect_guard);
         let _ = job.response.send(result);
     }
 }
@@ -386,6 +412,7 @@ fn process_command(
     storage: &Arc<SqliteWorldStorage>,
     systems: &BTreeMap<SchemaKey, RegisteredSystem>,
     command: WorldCommand,
+    effect_guard: Option<EffectCommitGuard>,
 ) -> WorldRuntimeResult<WorldCommandOutcome> {
     if let Some(receipt) = storage.committed_receipt(&command)? {
         let events = storage.events_at_position(receipt.position())?;
@@ -410,7 +437,12 @@ fn process_command(
 
     reject_privileged_authority_output(command.schema(), &output, registered.privileges)?;
 
-    let receipt = storage.commit(&command, &output, evaluated_position)?;
+    let receipt = match effect_guard {
+        Some(guard) => {
+            storage.commit_effect_follow_up(&command, &output, evaluated_position, &guard)?
+        }
+        None => storage.commit(&command, &output, evaluated_position)?,
+    };
     let events = storage.events_at_position(receipt.position())?;
     Ok(WorldCommandOutcome::new(receipt, events))
 }

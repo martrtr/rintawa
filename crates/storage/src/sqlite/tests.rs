@@ -916,6 +916,147 @@ fn test_should_reject_mismatched_direct_principal_actor() -> Result<()> {
     Ok(())
 }
 
+fn follow_up_for_effect(
+    schemas: &TestSchemas,
+    principal: PrincipalId,
+    job_id: EffectJobId,
+) -> (WorldCommand, WorldTransaction) {
+    let command = WorldCommand::with_ids(
+        CommandId::from_bytes(job_id.into_bytes()),
+        CorrelationId::new(),
+        schemas.command.clone(),
+        principal,
+        ActorRef::Principal(principal),
+        serde_json::json!({ "action": "finish-effect" }),
+    )
+    .caused_by(rintawa_world::CausationRef::Effect(job_id));
+    let mut transaction = WorldTransaction::new();
+    transaction.push_event(WorldEventDraft::new(
+        schemas.event.clone(),
+        serde_json::json!({ "message": "complete" }),
+    ));
+    (command, transaction)
+}
+
+#[test]
+fn test_should_atomically_reject_cancelled_effect_follow_up() -> Result<()> {
+    let (_root, storage) = create_storage()?;
+    let schemas = register_test_schemas(&storage)?;
+    let principal = PrincipalId::new();
+    let id = enqueue_effect(&storage, &schemas, principal, "cancel-before-commit")?;
+    let claim = storage
+        .claim_next_effect(UnixTimeMillis::new(100), UnixTimeMillis::new(200))?
+        .expect("effect claim");
+    let guard = EffectCommitGuard::new(&claim, UnixTimeMillis::new(100));
+    let (command, result) = follow_up_for_effect(&schemas, principal, id);
+    let position = storage.snapshot_for_command(&command)?.position();
+    assert!(storage.cancel_effect(id)?);
+    assert!(matches!(
+        storage.commit_effect_follow_up(&command, &result, position, &guard),
+        Err(StorageError::EffectJobClaimLost(lost)) if lost == id
+    ));
+    assert_eq!(storage.load_session()?.commit_position(), 1);
+    assert!(storage.events_after(0, 10)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_should_fence_reclaimed_effect_and_atomically_complete_new_attempt() -> Result<()> {
+    let (_root, storage) = create_storage()?;
+    let schemas = register_test_schemas(&storage)?;
+    let principal = PrincipalId::new();
+    let id = enqueue_effect(&storage, &schemas, principal, "reclaim-before-commit")?;
+    let first = storage
+        .claim_next_effect(UnixTimeMillis::new(100), UnixTimeMillis::new(200))?
+        .expect("first claim");
+    let old_guard = EffectCommitGuard::new(&first, UnixTimeMillis::new(100));
+    let (command, result) = follow_up_for_effect(&schemas, principal, id);
+    let position = storage.snapshot_for_command(&command)?.position();
+    let second = storage
+        .claim_next_effect(UnixTimeMillis::new(200), UnixTimeMillis::new(300))?
+        .expect("second claim");
+    assert!(matches!(
+        storage.commit_effect_follow_up(&command, &result, position, &old_guard),
+        Err(StorageError::EffectJobClaimLost(lost)) if lost == id
+    ));
+    assert_eq!(storage.load_session()?.commit_position(), 1);
+
+    let new_guard = EffectCommitGuard::new(&second, UnixTimeMillis::new(200));
+    let receipt = storage.commit_effect_follow_up(&command, &result, position, &new_guard)?;
+    assert_eq!(receipt.disposition(), CommitDisposition::Committed);
+    assert_eq!(storage.load_session()?.commit_position(), 2);
+    assert_eq!(storage.events_after(0, 10)?.len(), 1);
+    assert!(matches!(storage.cancel_effect(id),
+        Err(StorageError::EffectJobTerminal(terminal)) if terminal == id
+    ));
+    // The original stable command identity still replays without a second event.
+    let replay = storage.commit_effect_follow_up(&command, &result, position, &old_guard)?;
+    assert_eq!(replay.disposition(), CommitDisposition::AlreadyCommitted);
+    assert_eq!(storage.load_session()?.commit_position(), 2);
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_effect_follow_up_when_lease_expires_during_execution() -> Result<()> {
+    let (_root, storage) = create_storage()?;
+    let schemas = register_test_schemas(&storage)?;
+    let principal = PrincipalId::new();
+    let id = enqueue_effect(&storage, &schemas, principal, "expired-before-commit")?;
+    let claim = storage
+        .claim_next_effect(UnixTimeMillis::new(100), UnixTimeMillis::new(200))?
+        .expect("claim");
+    let guard = EffectCommitGuard::new(&claim, UnixTimeMillis::new(200));
+    let (command, result) = follow_up_for_effect(&schemas, principal, id);
+    let position = storage.snapshot_for_command(&command)?.position();
+    assert!(matches!(
+        storage.commit_effect_follow_up(&command, &result, position, &guard),
+        Err(StorageError::EffectJobClaimLost(lost)) if lost == id
+    ));
+    assert_eq!(storage.load_session()?.commit_position(), 1);
+    Ok(())
+}
+
+#[test]
+fn test_should_serialize_cancellation_against_guarded_world_commit() -> Result<()> {
+    let (root, storage) = create_storage()?;
+    let schemas = register_test_schemas(&storage)?;
+    let principal = PrincipalId::new();
+    let id = enqueue_effect(&storage, &schemas, principal, "simultaneous-cancel")?;
+    let claim = storage
+        .claim_next_effect(UnixTimeMillis::new(100), UnixTimeMillis::new(200))?
+        .expect("claim");
+    let guard = EffectCommitGuard::new(&claim, UnixTimeMillis::new(100));
+    let (command, result) = follow_up_for_effect(&schemas, principal, id);
+    let position = storage.snapshot_for_command(&command)?.position();
+    let other = SqliteWorldStorage::open(root.path().join("world.sqlite"))?;
+    let barrier = Arc::new(Barrier::new(2));
+    let other_barrier = Arc::clone(&barrier);
+    let canceller = std::thread::spawn(move || {
+        other_barrier.wait();
+        other.cancel_effect(id)
+    });
+    barrier.wait();
+    let commit = storage.commit_effect_follow_up(&command, &result, position, &guard);
+    let cancel = canceller.join().expect("cancellation worker did not panic");
+    match (commit, cancel) {
+        (Ok(receipt), Err(StorageError::EffectJobTerminal(terminal))) => {
+            assert_eq!(terminal, id);
+            assert_eq!(receipt.disposition(), CommitDisposition::Committed);
+            assert_eq!(storage.events_after(0, 10)?.len(), 1);
+            assert_eq!(storage.load_session()?.commit_position(), 2);
+        }
+        (Err(StorageError::EffectJobClaimLost(lost)), Ok(true)) => {
+            assert_eq!(lost, id);
+            assert!(storage.events_after(0, 10)?.is_empty());
+            assert_eq!(storage.load_session()?.commit_position(), 1);
+        }
+        (commit, cancel) => {
+            anyhow::bail!("non-atomic effect/World outcome: commit={commit:?}, cancel={cancel:?}")
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn test_should_reclaim_expired_effect_with_fencing_token() -> Result<()> {
     let (_root, storage) = create_storage()?;

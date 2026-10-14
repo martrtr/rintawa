@@ -11,5 +11,5 @@ mod outbox;
 mod sqlite;
 
 pub use error::{StorageError, StorageResult};
-pub use outbox::ClaimedEffectJob;
+pub use outbox::{ClaimedEffectJob, EffectCommitGuard};
 pub use sqlite::{SqliteWorldSnapshot, SqliteWorldStorage};
