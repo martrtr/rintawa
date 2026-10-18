@@ -1,47 +1,33 @@
 # Roadmap
 
-Rintawa is working toward the first `0.0.1` end-to-end MVP: import a character,
-create a persistent World, talk through world-scoped Chat, receive an AI-controlled reply,
-restart the Host and continue the same session.
+The first Rintawa milestone is a working `0.0.1` experience: import a character,
+create a persistent World, use world-scoped Chat, receive an AI-generated reply,
+and continue the same session after restarting the Host.
 
-## Completed foundation
+## Available in `dev`
 
-The current implementation already includes:
+- RTW package storage, extension execution and scoped composition.
+- Authoritative World commands, events and SQLite persistence.
+- Renderer-neutral Portable UI and World presentation.
+- Standard World Manager, Character Library and Chat packages in
+  [rtwKit](https://github.com/martrtr/rtwKit).
+- Tavern V2/V3 character import and persistent World/Chat sessions.
 
-- immutable RTW/CAS storage and scoped package composition;
-- authoritative World state, SQLite persistence, authority and transactions;
-- durable WorldEvents, effect/outbox execution and multi-World runtime supervision;
-- scoped `Single`/`Multiple` service routing and provider policy;
-- renderer-neutral Portable UI and focused-world presentation;
-- World Manager and shared Manage workspace;
-- bounded file/resource ingress and streaming asset upload;
-- Tavern V2/V3 Character import through `rintawa.world.creator@1`;
-- rollback-safe Tavern -> playable World -> greeting -> Chat bootstrap;
-- world-scoped Chat with conversations, branches, editing, deletion and attachments;
-- restart persistence for the current World/Character/Chat flow.
+## In progress
 
-## 0.0.1 blockers
+- Generic asynchronous HTTP, operation streams, UI presentation limits and
+  deferred World effect handling are implemented on
+  [`feat/mvp-runtime-infrastructure`](https://github.com/martrtr/rintawa/tree/feat/mvp-runtime-infrastructure).
+  Integration and final validation are tracked in [issue #5](https://github.com/martrtr/rintawa/issues/5).
+- Provider-neutral inference and a world-scoped Narrator are being developed
+  as independent [rtwKit](https://github.com/martrtr/rtwKit) packages.
 
-The remaining MVP work is:
+## Before `0.0.1`
 
-1. **O(1) idle presentation polling** — add a presentation generation /
-   `unchanged` path so idle polling does not rebuild the full UI state.
-2. **Aggregate Portable UI budget** — bound total mounted and post-patch presentation size.
-3. **Generic outbound HTTP** — bounded owner-scoped HTTPS request/stream support with
-   timeout and network policy.
-4. **Generic asynchronous operations** — long-lived progress/stream/cancel transport.
-5. **Provider-neutral inference** — versioned inference contract plus one AI Provider.
-6. **Narrator** — world-scoped event -> context -> inference -> authoritative NPC command.
-7. **Final restart E2E** — verify the complete Tavern -> World -> Chat -> AI reply -> restart
-   path, including cancellation/failure and duplicate-safe retry.
+- Integrate and review the runtime infrastructure with compatible RTW packages.
+- Complete the Chat, inference and Narrator interaction within a World.
+- Verify the full flow on a clean install, including failure recovery and
+  persistence across restarts.
 
-## After 0.0.1
-
-Not required for the first MVP:
-
-- general UI rearrangement/tiling editor;
-- richer World bundle, export, fork and archive workflows;
-- marketplace and remote trust/reputation;
-- advanced psychology, memory, agents and embeddings;
-- multiplayer, federation and distributed consensus;
-- 3D/Minecraft presentation adapters.
+Current work is tracked in [Rintawa Issues](https://github.com/martrtr/rintawa/issues)
+and [rtwKit Issues](https://github.com/martrtr/rtwKit/issues).
