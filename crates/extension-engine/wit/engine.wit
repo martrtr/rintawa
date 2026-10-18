@@ -1,0 +1,1207 @@
+package rintawa:engine@0.0.1;
+
+/// Host operations available throughout a WASM component lifecycle.
+interface host {
+    /// Severity level for logging messages.
+    enum log-level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    /// Logs a message to the host's tracing system.
+    log: func(level: log-level, message: string);
+
+    /// An explicit extension-originated event-publication failure.
+    variant publish-error {
+        /// Guest publication is unavailable under the current host policy.
+        unavailable,
+    }
+
+    /// Requests extension-originated runtime event publication.
+    ///
+    /// Host-to-subscriber Event Runtime delivery exists, but arbitrary guest
+    /// publication remains fail-closed until publisher/topic authorization and
+    /// guest-to-host quotas are part of the contract. The host therefore returns
+    /// `unavailable` instead of accepting an event it cannot authorize safely.
+    publish-event: func(topic: string, payload: list<u8>) -> result<_, publish-error>;
+
+}
+
+/// Static contribution declarations available only from guest `register`.
+interface registration {
+    /// Contract provider composition supported by the current resolver.
+    enum resolution-policy {
+        single,
+        multiple,
+    }
+
+    /// Host interaction protocol exposed by a contract.
+    enum contract-protocol {
+        binding,
+        service,
+    }
+
+    /// An explicit failure while declaring static metadata.
+    variant error {
+        registration-not-active,
+        duplicate-contract,
+        invalid-secret-pattern,
+    }
+
+    /// Declares one versioned contract and its resolution policy.
+    define-contract: func(
+        name: string,
+        version: u32,
+        resolution: resolution-policy,
+        protocol: contract-protocol,
+    ) -> result<_, error>;
+
+    /// Declares this component as a provider of one versioned contract.
+    provide-contract: func(
+        name: string,
+        version: u32,
+        required-secret-read: list<string>,
+    ) -> result<_, error>;
+
+    /// Declares this component as a consumer of one versioned contract.
+    consume-contract: func(
+        name: string,
+        version: u32,
+        required: bool,
+        required-secret-read: list<string>,
+    ) -> result<_, error>;
+
+    /// Declares a static capability contract during guest `register`.
+    ///
+    /// Runtime service availability is separate from its public contract.
+    register-capability: func(name: string, schema: string) -> result<_, error>;
+
+    /// Removes a capability declaration staged by the current `register` call.
+    unregister-capability: func(name: string) -> result<_, error>;
+}
+
+/// World-schema declarations available only from guest `register`.
+interface world-registration {
+    /// Semantic category of one immutable world schema.
+    enum schema-kind {
+        entity,
+        relation,
+        facet,
+        command,
+        event,
+        effect,
+        projection,
+    }
+
+    /// Failure while declaring immutable world metadata.
+    variant error {
+        registration-not-active,
+        duplicate-world-schema,
+        invalid-world-schema,
+        message-too-large,
+    }
+
+    /// Declares one immutable versioned world schema.
+    /// Ownership is assigned by the host from the current extension principal.
+    register-world-schema: func(
+        id: string,
+        version: u32,
+        kind: schema-kind,
+        definition-json: string,
+    ) -> result<_, error>;
+}
+
+/// Reversible effects available from guest `start` and `on-event`.
+interface runtime-effects {
+    /// A guest-local handle for one host-owned runtime effect.
+    type handle = string;
+
+    /// An explicit failure while managing a runtime effect.
+    variant error {
+        runtime-not-active,
+        invalid-topic,
+        unknown-effect,
+    }
+
+    /// Adds an owner-scoped subscription while the guest is running.
+    ///
+    /// The handle is later supplied to `unsubscribe-event`. It is valid only
+    /// for the current activation: the host revokes all remaining subscriptions
+    /// on stop or crash, and a later start requires a new subscription.
+    subscribe-event: func(topic: string) -> result<handle, error>;
+
+    /// Removes a subscription previously returned by `subscribe-event`.
+    unsubscribe-event: func(handle: handle) -> result<_, error>;
+
+    /// Adds an owner-scoped ephemeral runtime-signal subscription.
+    subscribe-signal: func(topic: string) -> result<handle, error>;
+
+    /// Removes a signal subscription previously returned by `subscribe-signal`.
+    unsubscribe-signal: func(handle: handle) -> result<_, error>;
+}
+
+/// Read-only identity of the component callback currently executing in the Host.
+interface runtime-context {
+    variant error {
+        access-not-active,
+        unavailable,
+        rejected,
+    }
+
+    record context {
+        scope-id: string,
+        world-id: option<string>,
+    }
+
+    current: func() -> result<context, error>;
+}
+
+/// Owner-scoped cooperative background tasks.
+interface runtime-tasks {
+    /// Opaque host task handle.
+    type handle = u64;
+
+    /// Failure while scheduling or cancelling a background task.
+    variant error {
+        runtime-not-active,
+        permission-denied,
+        invalid-interval,
+        limit-exceeded,
+        unknown-task,
+        unavailable,
+    }
+
+    /// Schedules a periodic callback owned by the current execution principal.
+    ///
+    /// The host executes callbacks cooperatively from its runtime pump; no guest
+    /// thread is created. Remaining tasks are revoked on stop or callback failure.
+    spawn-periodic: func(interval-ms: u32) -> result<handle, error>;
+
+    /// Cancels one task previously created by the current owner.
+    cancel: func(handle: handle) -> result<_, error>;
+}
+
+/// Bounded TCP operations restricted to the local loopback interface.
+interface network {
+    /// Opaque listener or stream handle.
+    type handle = u64;
+
+    /// Result of binding a loopback listener. Port zero requests an ephemeral port.
+    record listener {
+        handle: handle,
+        port: u16,
+    }
+
+    /// One nonblocking stream read.
+    record read-result {
+        data: list<u8>,
+        eof: bool,
+    }
+
+    /// Failure while using a host-owned loopback TCP resource.
+    variant error {
+        access-not-active,
+        permission-denied,
+        invalid-port,
+        limit-exceeded,
+        unknown-handle,
+        wrong-kind,
+        would-block,
+        message-too-large,
+        unavailable,
+    }
+
+    /// Binds a nonblocking IPv4 TCP listener to 127.0.0.1 only.
+    listen-loopback: func(port: u16) -> result<listener, error>;
+
+    /// Opens a TCP connection to 127.0.0.1 only.
+    connect-loopback: func(port: u16) -> result<handle, error>;
+
+    /// Accepts one pending stream without blocking.
+    accept: func(listener: handle) -> result<option<handle>, error>;
+
+    /// Reads at most `max-bytes` without blocking.
+    read: func(socket: handle, max-bytes: u32) -> result<read-result, error>;
+
+    /// Writes at most one bounded payload; partial writes return their byte count.
+    write: func(socket: handle, data: list<u8>) -> result<u32, error>;
+
+    /// Closes one listener or stream owned by the current component.
+    close: func(handle: handle) -> result<_, error>;
+}
+
+/// Bounded outbound HTTPS reads available only with an explicit host grant.
+interface http-fetch {
+    /// One completed response after safe redirect handling.
+    record response {
+        status: u16,
+        final-url: string,
+        content-type: option<string>,
+        body: list<u8>,
+    }
+
+    /// Failure while performing one bounded HTTPS fetch.
+    variant error {
+        access-not-active,
+        permission-denied,
+        invalid-url,
+        forbidden-destination,
+        too-many-redirects,
+        response-too-large,
+        timeout,
+        unavailable,
+    }
+
+    /// Performs an HTTPS GET. The host validates every redirect destination and
+    /// bounds the response body before returning it to the guest.
+    get: func(url: string, max-bytes: u32) -> result<response, error>;
+}
+
+/// Generic access to the local immutable RTW artifact store.
+interface artifact-store {
+    /// Identity returned after validated RTW bytes enter the CAS.
+    record imported-artifact {
+        digest: string,
+        content: string,
+    }
+
+    /// Failure while importing an RTW artifact.
+    variant error {
+        access-not-active,
+        permission-denied,
+        message-too-large,
+        invalid-artifact,
+        rejected,
+        unavailable,
+    }
+
+    /// Validates and imports RTW bytes without selecting them for activation.
+    import-rtw: func(bytes: list<u8>) -> result<imported-artifact, error>;
+}
+
+
+/// Generic access to the immutable raw asset store.
+interface asset-store {
+    /// Immutable identity returned after bytes enter the asset CAS.
+    record asset-ref {
+        digest: string,
+        size: u64,
+        media-type: string,
+    }
+
+    /// Failure while importing one raw asset.
+    variant error {
+        access-not-active,
+        permission-denied,
+        message-too-large,
+        invalid-asset,
+        rejected,
+        unavailable,
+    }
+
+    /// Imports exact bytes under a canonical media type and returns an AssetRef.
+    /// Intended for small payloads that fit comfortably inside one callback budget.
+    import-asset: func(bytes: list<u8>, media-type: string) -> result<asset-ref, error>;
+
+    /// Starts one bounded host-owned streaming asset upload.
+    /// The declared size reserves quota but does not allocate the complete buffer eagerly.
+    begin-upload: func(media-type: string, expected-size: u64) -> result<u64, error>;
+
+    /// Appends one bounded chunk to an existing streaming upload.
+    append-upload: func(handle: u64, bytes: list<u8>) -> result<_, error>;
+
+    /// Finalizes an exactly-sized upload into the immutable asset store.
+    finish-upload: func(handle: u64) -> result<asset-ref, error>;
+
+    /// Cancels one streaming upload and releases its host-owned staging state.
+    cancel-upload: func(handle: u64) -> result<_, error>;
+}
+
+/// Generic bounded ephemeral user-selected resources.
+///
+/// Resources exist only for the current HostRuntime and are never enumerated or
+/// persisted into artifact/asset stores. Exact refs are bearer capabilities passed
+/// through semantic service/UI flows.
+interface user-resources {
+    /// Opaque exact reference to one ephemeral user-selected resource.
+    record resource-ref {
+        id: string,
+        size: u64,
+        media-type: string,
+        name: option<string>,
+    }
+
+    /// Failure while importing, reading, or releasing one ephemeral resource.
+    variant error {
+        access-not-active,
+        permission-denied,
+        invalid-resource,
+        not-found,
+        queue-full,
+        message-too-large,
+        rejected,
+        unavailable,
+    }
+
+    /// Creates one bounded HostRuntime-local resource. Requires `user-resource-import`.
+    import-resource: func(
+        bytes: list<u8>,
+        media-type: string,
+        name: option<string>,
+    ) -> result<resource-ref, error>;
+
+    /// Starts one bounded HostRuntime-local streaming resource upload.
+    begin-upload: func(
+        media-type: string,
+        name: option<string>,
+        expected-size: u64,
+    ) -> result<u64, error>;
+
+    /// Appends one bounded chunk to an existing resource upload.
+    append-upload: func(handle: u64, bytes: list<u8>) -> result<_, error>;
+
+    /// Finalizes one exactly-sized upload and returns its opaque resource ref.
+    finish-upload: func(handle: u64) -> result<resource-ref, error>;
+
+    /// Cancels one in-flight resource upload and releases its staging bytes.
+    cancel-upload: func(handle: u64) -> result<_, error>;
+
+    /// Reads exact bytes for one ref. Requires `user-resource-read`.
+    read-resource: func(
+        reference: resource-ref,
+        maximum-bytes: u64,
+    ) -> result<list<u8>, error>;
+
+    /// Releases one exact resource early. Requires `user-resource-read`.
+    release-resource: func(reference: resource-ref) -> result<_, error>;
+}
+
+/// Generic persistent user-content library reads.
+interface user-content {
+    /// One logical library item pointing at an immutable RTW revision.
+    record entry {
+        id: string,
+        content: string,
+        revision: string,
+    }
+
+    /// One item plus its bounded root content descriptor.
+    record document {
+        metadata: entry,
+        descriptor: list<u8>,
+    }
+
+    /// Failure while reading or requesting generic user-content mutations.
+    variant error {
+        access-not-active,
+        permission-denied,
+        invalid-id,
+        invalid-content,
+        not-found,
+        queue-full,
+        limit-exceeded,
+        message-too-large,
+        rejected,
+        unavailable,
+    }
+
+    /// Host-generated identity for one accepted deferred write request.
+    record accepted-write {
+        operation-id: string,
+    }
+
+    /// Current state of one owner-scoped deferred write request.
+    variant write-state {
+        pending,
+        succeeded(entry),
+        failed(string),
+    }
+
+    /// Lists logical items, optionally restricted to one exact versioned content type.
+    /// Requires `user-content-read`.
+    list-items: func(content: option<string>) -> result<list<entry>, error>;
+
+    /// Reads one bounded root descriptor by logical library identity.
+    /// Requires `user-content-read`.
+    read: func(id: string) -> result<document, error>;
+
+    /// Queues validation/publication of one complete RTW content revision.
+    /// Requires `user-content-write`; execution happens after the guest callback unwinds.
+    request-import: func(rtw: list<u8>) -> result<accepted-write, error>;
+
+    /// Queues replacement of one logical item with a complete RTW revision.
+    /// Requires `user-content-write`; content type cannot change.
+    request-replace: func(id: string, rtw: list<u8>) -> result<accepted-write, error>;
+
+    /// Reads owner-scoped status for one accepted write request.
+    /// Requires `user-content-write`.
+    write-status: func(operation-id: string) -> result<write-state, error>;
+}
+
+/// Generic persistent-world catalog and deferred runtime lifecycle control.
+interface world-sessions {
+    use asset-store.{asset-ref};
+
+    /// One persistent world plus host-owned catalog metadata and runtime lifecycle status.
+    record summary {
+        world-id: string,
+        title: string,
+        description: option<string>,
+        cover: option<asset-ref>,
+        commit-position: u64,
+        active: bool,
+        pending-active: option<bool>,
+        last-error: option<string>,
+    }
+
+    /// Failure while reading or mutating world-session lifecycle state.
+    variant error {
+        access-not-active,
+        permission-denied,
+        invalid-world-id,
+        not-found,
+        queue-full,
+        limit-exceeded,
+        message-too-large,
+        rejected,
+        unavailable,
+    }
+
+    /// Lists persistent worlds. Requires `world-session-read`.
+    list-worlds: func() -> result<list<summary>, error>;
+
+    /// Creates one empty persistent world. Requires `world-session-write`.
+    create: func() -> result<summary, error>;
+
+    /// Replaces human-facing catalog metadata. Requires `world-session-write`.
+    set-metadata: func(world-id: string, title: string, description: option<string>, cover: option<asset-ref>) -> result<summary, error>;
+
+    /// Deletes one stopped persistent World. Requires `world-session-write`.
+    delete: func(world-id: string) -> result<_, error>;
+
+    /// Requests active/inactive runtime state. Requires `world-session-write`.
+    /// The request is applied after the current guest callback unwinds, during a
+    /// later host runtime pump; `pending-active` exposes the accepted desired state.
+    set-active: func(world-id: string, active: bool) -> result<_, error>;
+}
+
+/// Deferred submission of commands to authoritative worlds.
+interface world-commands {
+    /// Role on whose behalf the host-authenticated principal requests the command.
+    variant actor {
+        /// The authenticated principal acts directly.
+        principal,
+        /// The authenticated principal acts through one world entity.
+        entity(string),
+    }
+
+    /// One bounded command request. Principal, CommandId, and correlation are host-owned.
+    record request {
+        world-id: string,
+        schema: string,
+        actor: actor,
+        expected-position: option<u64>,
+        payload-json: list<u8>,
+    }
+
+    /// Stable identities allocated before the deferred request enters the host queue.
+    record accepted {
+        command-id: string,
+        correlation-id: string,
+    }
+
+    /// Failure while validating or accepting a deferred world command.
+    variant error {
+        access-not-active,
+        permission-denied,
+        invalid-world-id,
+        invalid-schema,
+        invalid-actor,
+        invalid-payload,
+        not-found,
+        world-not-active,
+        queue-full,
+        limit-exceeded,
+        message-too-large,
+        rejected,
+        unavailable,
+    }
+
+    /// Queues one command for authoritative execution after the current guest callback unwinds.
+    /// Requires `world-command-submit`. The guest never supplies an authenticated PrincipalId.
+    submit: func(request: request) -> result<accepted, error>;
+}
+
+/// Deferred policy-filtered reads from active authoritative Worlds.
+interface world-projections {
+    /// One bounded projection request. Principal is always Host-owned.
+    record request {
+        world-id: string,
+        schema: string,
+        input-json: list<u8>,
+    }
+
+    /// Host-generated identity for one accepted owner-scoped projection operation.
+    record accepted {
+        operation-id: string,
+    }
+
+    /// One immutable schema-validated projection view.
+    record view {
+        world-id: string,
+        snapshot-position: u64,
+        schema: string,
+        value-json: list<u8>,
+    }
+
+    /// Current state of one owner-scoped deferred projection operation.
+    variant read-state {
+        pending,
+        succeeded(view),
+        failed(string),
+    }
+
+    /// Failure while validating or inspecting a projection read.
+    variant error {
+        access-not-active,
+        permission-denied,
+        invalid-world-id,
+        invalid-schema,
+        invalid-input,
+        not-found,
+        world-not-active,
+        queue-full,
+        limit-exceeded,
+        message-too-large,
+        rejected,
+        unavailable,
+    }
+
+    /// Queues one Principal-filtered Projection evaluation after the callback unwinds.
+    /// Requires `world-projection-read`.
+    request-read: func(request: request) -> result<accepted, error>;
+
+    /// Reads owner-scoped status for one accepted Projection evaluation.
+    /// Requires `world-projection-read`.
+    read-status: func(operation-id: string) -> result<read-state, error>;
+}
+
+/// Owner-scoped non-authoritative persistent preferences.
+interface preferences {
+    /// Failure while accessing one bounded preference value.
+    variant error {
+        access-not-active,
+        invalid-preference,
+        message-too-large,
+        quota-exceeded,
+        unavailable,
+        rejected,
+    }
+
+    /// Reads one UTF-8 value owned by the current component principal.
+    get: func(key: string) -> result<option<string>, error>;
+
+    /// Persists one UTF-8 value owned by the current component principal.
+    set: func(key: string, value: string) -> result<_, error>;
+
+    /// Deletes one preference owned by the current component principal.
+    delete: func(key: string) -> result<_, error>;
+}
+
+/// Generic mutation/read boundary for the host baseline composition.
+interface composition {
+    /// One exact activation selected in the host profile.
+    record activation {
+        subject: string,
+        content: string,
+        name: string,
+        version: option<string>,
+        digest: string,
+        instance-id: string,
+        scope-id: string,
+        enabled: bool,
+        world-default: bool,
+    }
+
+    /// Failure while reading or mutating profile selection.
+    variant error {
+        access-not-active,
+        permission-denied,
+        invalid-digest,
+        not-found,
+        unsupported-content,
+        rejected,
+        unavailable,
+    }
+
+    /// Lists exact baseline selections. Requires composition-read.
+    list-activations: func() -> result<list<activation>, error>;
+
+    /// Selects one already-imported exact artifact in the baseline profile.
+    /// An absent enabled override preserves existing state and enables new selections.
+    select-artifact: func(
+        digest: string,
+        enabled: option<bool>,
+    ) -> result<activation, error>;
+
+    /// Changes persisted enabled state. Changes take effect on a later bootstrap.
+    set-enabled: func(subject: string, enabled: bool) -> result<_, error>;
+
+    /// Compatibility helper that adds or removes this exact baseline selection from
+    /// the independent default-World recipe. Existing Worlds remain pinned.
+    set-world-default: func(subject: string, world-default: bool) -> result<_, error>;
+
+    /// Removes a persisted baseline selection and related policy references.
+    /// Running instances are not torn down implicitly.
+    remove-activation: func(subject: string) -> result<_, error>;
+
+
+}
+
+
+/// Generic mutation/read boundary for one explicit host composition scope.
+interface scoped-composition {
+    use composition.{activation, error};
+
+    list-activations: func(scope-id: string) -> result<list<activation>, error>;
+    select-artifact: func(
+        scope-id: string,
+        digest: string,
+        enabled: option<bool>,
+    ) -> result<activation, error>;
+    set-enabled: func(
+        scope-id: string,
+        subject: string,
+        enabled: bool,
+    ) -> result<_, error>;
+
+    /// Selects one provider component for a versioned contract in this exact scope.
+    /// The host validates that the provider instance belongs to the same scope.
+    set-preferred-provider: func(
+        scope-id: string,
+        contract-id: string,
+        contract-version: u32,
+        provider-instance-id: string,
+        provider-component-id: string,
+    ) -> result<_, error>;
+
+    /// Clears one explicit provider choice in this exact scope.
+    clear-preferred-provider: func(
+        scope-id: string,
+        contract-id: string,
+        contract-version: u32,
+    ) -> result<_, error>;
+
+    remove-activation: func(scope-id: string, subject: string) -> result<_, error>;
+}
+
+/// Administrative runtime permission policy for exact baseline components.
+interface runtime-policy {
+    /// Runtime permissions requested by one component in an exact artifact.
+    record component-request {
+        component-id: string,
+        requested: list<string>,
+    }
+
+    /// Read-only runtime policy metadata for one exact imported artifact.
+    record artifact-policy {
+        subject: string,
+        name: string,
+        version: string,
+        components: list<component-request>,
+    }
+
+    /// Requested and granted permissions for one exact component principal.
+    record component-policy {
+        scope-id: string,
+        instance-id: string,
+        component-id: string,
+        requested: list<string>,
+        granted: list<string>,
+    }
+
+    /// Failure while reading or mutating runtime permission policy.
+    variant error {
+        access-not-active,
+        permission-denied,
+        invalid-permission,
+        not-found,
+        message-too-large,
+        rejected,
+        unavailable,
+    }
+
+    /// Inspects one imported exact artifact before composition mutation.
+    /// Requires runtime-policy-read.
+    inspect-artifact: func(digest: string) -> result<artifact-policy, error>;
+
+    /// Lists baseline component permission policy. Requires runtime-policy-read.
+    list-components: func() -> result<list<component-policy>, error>;
+
+    /// Grants one manifest-requested permission. Requires runtime-policy-write.
+    grant: func(
+        scope-id: string,
+        instance-id: string,
+        component-id: string,
+        permission: string,
+    ) -> result<_, error>;
+
+    /// Revokes one persisted permission. Requires runtime-policy-write.
+    revoke: func(
+        scope-id: string,
+        instance-id: string,
+        component-id: string,
+        permission: string,
+    ) -> result<_, error>;
+}
+
+/// Administrative runtime-permission policy for one explicit composition scope.
+interface scoped-runtime-policy {
+    use runtime-policy.{component-policy, error};
+
+    list-components: func(scope-id: string) -> result<list<component-policy>, error>;
+}
+
+/// Dynamic execution targets published by an active runtime-provider component.
+interface execution-targets {
+    /// A host-owned, read-only view of one validated RTW artifact.
+    resource artifact-source {
+        /// Returns canonical regular-file paths in stable order.
+        ///
+        /// The host bounds the encoded path list before returning it to the guest.
+        paths: func() -> result<list<string>, artifact-error>;
+
+        /// Resolves an entry relative to the extension manifest directory.
+        resolve-component-entry: func(entry: string) -> result<string, artifact-error>;
+
+        /// Resolves an entry relative to another file in the same artifact.
+        resolve-relative: func(base-file: string, entry: string) -> result<string, artifact-error>;
+
+        /// Reads one canonical regular file with host-owned archive limits.
+        read: func(path: string) -> result<list<u8>, artifact-error>;
+    }
+
+    /// Failure while using the bounded artifact view.
+    variant artifact-error {
+        invalid-path,
+        not-found,
+        message-too-large,
+        unavailable,
+    }
+
+    /// Failure while publishing one versioned execution target.
+    variant registration-error {
+        runtime-not-active,
+        invalid-target,
+        target-conflict,
+    }
+
+    /// Publishes one target owned by the current component activation.
+    register-target: func(target: string) -> result<_, registration-error>;
+}
+
+/// Read-only secrets capability available only while guest code is executing.
+interface secrets {
+    /// A secret-read failure that does not disclose values or host internals.
+    variant error {
+        access-not-active,
+        invalid-path,
+        access-denied,
+        not-found,
+        unavailable,
+    }
+
+    /// Reads one host-granted secret path.
+    ///
+    /// The host derives extension and component identity from the instance; the
+    /// guest cannot supply another owner. This interface intentionally has no
+    /// list, store, or delete operation.
+    read: func(path: string) -> result<string, error>;
+}
+
+
+/// Generic service transport available while guest code is executing.
+interface services {
+    /// Transport-level routing failure.
+    variant error {
+        unavailable,
+        not-consumer,
+        not-service-contract,
+        unsupported-resolution,
+        cyclic-call,
+        provider-busy,
+        provider-failed,
+        request-too-large,
+        response-too-large,
+    }
+
+    /// Opaque caller-bound selection of one provider for a `multiple` service contract.
+    type provider-handle = u64;
+
+    /// Calls the provider selected for a versioned `single` service contract.
+    call: func(
+        contract: string,
+        version: u32,
+        payload: list<u8>,
+    ) -> result<list<u8>, error>;
+
+    /// Lists eligible providers for a versioned `multiple` service contract.
+    list-providers: func(
+        contract: string,
+        version: u32,
+    ) -> result<list<provider-handle>, error>;
+
+    /// Calls one provider previously returned by `list-providers`.
+    call-provider: func(
+        provider: provider-handle,
+        payload: list<u8>,
+    ) -> result<list<u8>, error>;
+}
+
+/// Portable UI operations available to a component during registration or execution.
+interface portable-ui {
+    /// Renderer-neutral placement hint for a surface.
+    enum placement-hint {
+        primary,
+        secondary,
+        sidebar,
+        settings,
+        dialog,
+        status,
+        overlay,
+    }
+
+    /// Portable UI boundary failure.
+    variant error {
+        unavailable,
+        registration-not-active,
+        duplicate-surface,
+        duplicate-layer,
+        duplicate-world-presentation,
+        invalid-payload,
+        message-too-large,
+        unsupported-capability(string),
+        rejected,
+    }
+
+    /// Renderer-neutral shell activity metadata associated with one or more surfaces.
+    record activity {
+        id: string,
+        label: string,
+        icon-slot: option<string>,
+    }
+
+    /// Registers one static portable UI surface during guest `register`.
+    register-surface: func(
+        id: string,
+        placement: placement-hint,
+        semantic-contract: option<string>,
+        semantic-version: option<u32>,
+        activity: option<activity>,
+        traits: list<string>,
+        required-capabilities: list<string>,
+    ) -> result<_, error>;
+
+    /// Registers this component's renderer capabilities during guest `register`.
+    ///
+    /// Selection remains host-owned composition policy. Registering a descriptor
+    /// does not make this component the active UI Layer.
+    register-layer: func(
+        protocol-major: u32,
+        capabilities: list<string>,
+    ) -> result<_, error>;
+
+    /// Registers the initial portable surface for this component when selected as a
+    /// World presentation provider. Optional semantic intent is a versioned contract key;
+    /// both intent fields must be present together or absent together.
+    register-world-presentation: func(
+        entry-surface-id: string,
+        intent-contract: option<string>,
+        intent-version: option<u32>,
+    ) -> result<_, error>;
+
+    /// Mounts a serialized `UiSurfaceSnapshot` during active guest execution.
+    mount-surface: func(snapshot-json: list<u8>) -> result<_, error>;
+
+    /// Applies a serialized `UiPatchBatch` during active guest execution.
+    patch-surface: func(batch-json: list<u8>) -> result<_, error>;
+
+    /// Unmounts one owned surface during active guest execution.
+    unmount-surface: func(surface-id: string) -> result<_, error>;
+}
+
+/// Renderer-facing operations available to the selected active UI Layer.
+interface ui-layer {
+    /// Failure while reading presentation state or submitting semantic input.
+    variant error {
+        access-not-active,
+        not-active-layer,
+        invalid-payload,
+        message-too-large,
+        queue-full,
+        unavailable,
+        rejected,
+    }
+
+    /// Returns the current visible presentation as serialized JSON.
+    presentation-surfaces: func() -> result<list<u8>, error>;
+
+    /// Exact verified bytes for one immutable asset already referenced by the visible presentation.
+    record presented-asset {
+        media-type: string,
+        bytes: list<u8>,
+    }
+
+    /// Reads an asset only when this exact active UI Layer can currently see an asset-image node
+    /// carrying the requested digest. This never exposes host filesystem or CAS paths.
+    read-presented-asset: func(digest: string) -> result<presented-asset, error>;
+
+    /// Returns renderer-session World focus state as serialized JSON.
+    presentation-state: func() -> result<list<u8>, error>;
+
+    /// Queues one World as the desired focus of this exact UI Layer session.
+    /// The Host resolves lifecycle/composition only after the current callback unwinds.
+    request-world-focus: func(world-id: string) -> result<_, error>;
+
+    /// Clears the focused-World scope of this exact UI Layer session.
+    /// World lifecycle state is not changed.
+    clear-world-focus: func() -> result<_, error>;
+
+    /// Queues one serialized `UiActionEvent` for Engine validation and dispatch.
+    dispatch-action: func(action-json: list<u8>) -> result<_, error>;
+}
+
+/// Optional callback surface for components that schedule background tasks.
+interface task-handler {
+    /// Executes one due periodic task under its owning component principal.
+    on-task: func(handle: u64);
+}
+
+/// Optional callbacks implemented only by components that publish execution targets.
+interface target-provider {
+    use execution-targets.{artifact-source};
+
+    record component-descriptor {
+        id: string,
+        kind: string,
+        target: string,
+        entry: option<string>,
+        required: bool,
+    }
+
+    type component-handle = u64;
+
+    variant error {
+        invalid-descriptor,
+        unknown-component,
+        rejected,
+        unavailable,
+    }
+
+    /// Creates provider-local state from a validated artifact view.
+    /// The borrowed artifact resource is valid only for this callback.
+    load-component: func(
+        target: string,
+        descriptor: component-descriptor,
+        source: borrow<artifact-source>,
+    ) -> result<component-handle, error>;
+
+    /// Collects declarations for the hosted component before activation.
+    register-component: func(handle: component-handle) -> result<_, error>;
+
+    /// Activates the hosted component under the dependent component principal.
+    start-component: func(handle: component-handle) -> result<_, error>;
+
+    /// Deactivates the hosted component while preserving restartable provider state.
+    stop-component: func(handle: component-handle) -> result<_, error>;
+
+    /// Permanently releases provider-local state after the proxy is unloaded.
+    drop-component: func(handle: component-handle) -> result<_, error>;
+
+    /// Handles one subscribed runtime event for the dependent component.
+    handle-event: func(
+        handle: component-handle,
+        topic: string,
+        payload: list<u8>,
+    ) -> result<_, error>;
+
+    /// Handles one validated portable UI action for the dependent component.
+    handle-ui-action: func(handle: component-handle, action-json: list<u8>) -> result<_, error>;
+
+    /// Handles one service request for a contract provided by the dependent component.
+    handle-service: func(
+        handle: component-handle,
+        contract: string,
+        version: u32,
+        payload: list<u8>,
+    ) -> result<list<u8>, error>;
+}
+
+/// Guest lifecycle and event handlers implemented by the WASM plugin.
+interface guest {
+    /// Initial plugin registration callback.
+    register: func();
+
+    /// Called when the plugin is activated by the engine.
+    start: func();
+
+    /// Deactivates the plugin while preserving its guest instance for a later restart.
+    ///
+    /// The host revokes runtime effects after this callback. Full guest-state
+    /// disposal happens when the component is unloaded, not on `stop` alone.
+    stop: func();
+
+    /// Dispatches a subscribed event payload to the plugin.
+    on-event: func(topic: string, payload: list<u8>);
+
+    /// Handles one validated semantic action for a surface owned by this component.
+    handle-ui-action: func(action-json: list<u8>);
+
+    /// Handles one unary request for a contract provided by this component.
+    ///
+    /// Domain-level errors are encoded by the versioned contract itself. A
+    /// trap or host execution failure is reported to the caller as provider-failed.
+    handle-service: func(
+        contract: string,
+        version: u32,
+        payload: list<u8>,
+    ) -> list<u8>;
+}
+
+/// The plugin world contract combining host imports and guest exports.
+world plugin {
+    import host;
+    import runtime-context;
+    import registration;
+    import world-registration;
+    import runtime-effects;
+    import runtime-tasks;
+    import network;
+    import http-fetch;
+    import artifact-store;
+    import asset-store;
+    import user-resources;
+    import user-content;
+    import world-sessions;
+    import world-commands;
+    import world-projections;
+    import preferences;
+    import composition;
+    import scoped-composition;
+    import runtime-policy;
+    import scoped-runtime-policy;
+    import execution-targets;
+    import secrets;
+    import services;
+    import portable-ui;
+    import ui-layer;
+    export guest;
+}
+
+/// Optional typed view of the same instance for runtime-provider callbacks.
+world target-provider-plugin {
+    import execution-targets;
+    export target-provider;
+}
+
+/// Optional typed view of the same instance for cooperative task callbacks.
+world task-plugin {
+    export task-handler;
+}
+
+/// Combined authoring world for an ordinary WASM component with background tasks.
+world task-runtime-plugin {
+    import host;
+    import runtime-context;
+    import registration;
+    import world-registration;
+    import runtime-effects;
+    import runtime-tasks;
+    import network;
+    import http-fetch;
+    import artifact-store;
+    import asset-store;
+    import user-resources;
+    import user-content;
+    import world-sessions;
+    import world-commands;
+    import world-projections;
+    import preferences;
+    import composition;
+    import scoped-composition;
+    import runtime-policy;
+    import scoped-runtime-policy;
+    import execution-targets;
+    import secrets;
+    import services;
+    import portable-ui;
+    import ui-layer;
+    export guest;
+    export task-handler;
+}
+
+/// Combined authoring world for a WASM runtime-provider component.
+world runtime-provider-plugin {
+    import host;
+    import runtime-context;
+    import registration;
+    import world-registration;
+    import runtime-effects;
+    import runtime-tasks;
+    import network;
+    import http-fetch;
+    import artifact-store;
+    import asset-store;
+    import user-resources;
+    import user-content;
+    import world-sessions;
+    import world-commands;
+    import world-projections;
+    import preferences;
+    import composition;
+    import scoped-composition;
+    import runtime-policy;
+    import scoped-runtime-policy;
+    import execution-targets;
+    import secrets;
+    import services;
+    import portable-ui;
+    import ui-layer;
+    export guest;
+    export target-provider;
+}
+
+/// Combined authoring world for a runtime provider that also schedules tasks.
+world runtime-provider-task-plugin {
+    import host;
+    import runtime-context;
+    import registration;
+    import world-registration;
+    import runtime-effects;
+    import runtime-tasks;
+    import network;
+    import http-fetch;
+    import artifact-store;
+    import asset-store;
+    import user-resources;
+    import user-content;
+    import world-sessions;
+    import world-commands;
+    import world-projections;
+    import preferences;
+    import composition;
+    import scoped-composition;
+    import runtime-policy;
+    import scoped-runtime-policy;
+    import execution-targets;
+    import secrets;
+    import services;
+    import portable-ui;
+    import ui-layer;
+    export guest;
+    export target-provider;
+    export task-handler;
+}

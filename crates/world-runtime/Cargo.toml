@@ -1,0 +1,24 @@
+[package]
+name = "rintawa-world-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+description = "Single-writer authoritative world command runtime for Rintawa"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+rintawa-sdk = { path = "../sdk" }
+rintawa-storage = { path = "../storage" }
+rintawa-world = { path = "../world" }
+
+[dev-dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

@@ -4,24 +4,18 @@ on:
   push:
     branches: [ main, dev ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, dev ]
 
 jobs:
   lint:
     name: Lint & Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@v5
         with:
-          components: rustfmt, clippy
+          fetch-depth: 0
       
-      - name: Check formatting
-        run: cargo fmt --all --check
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
       
-      - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      
-      - name: Run tests
-        run: cargo test --workspace --all-features
+      - name: Verify workspace
+        run: bash scripts/check.sh

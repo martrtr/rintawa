@@ -1,0 +1,18 @@
+[package]
+name = "rintawa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+rintawa-host = { path = "../../crates/host" }
+rintawa-sdk = { path = "../../crates/sdk" }

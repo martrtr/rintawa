@@ -1,5 +1,5 @@
 [package]
-name = "taverna-extension-engine"
+name = "rintawa-extension-engine"
 
 version.workspace = true
 edition.workspace = true
@@ -8,14 +8,21 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
-description = "Extension engine for Taverna"
+description = "Extension engine for Rintawa"
 
 [dependencies]
 anyhow.workspace = true
+keyring = "4.2.0"
 serde.workspace = true
 serde_json.workspace = true
+reqwest.workspace = true
+url.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 toml.workspace = true
+tempfile.workspace = true
+wasmtime.workspace = true
 
-taverna-sdk = { path = "../sdk" }
+rintawa-artifacts = { path = "../artifacts" }
+rintawa-sdk = { path = "../sdk" }
+rintawa-ui-runtime = { path = "../ui-runtime" }

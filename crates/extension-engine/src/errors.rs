@@ -1,0 +1,329 @@
+//! Error types for the Rintawa Extension Engine.
+
+use std::io;
+
+use rintawa_artifacts::RtwError;
+use rintawa_sdk::{
+    errors::ExtensionError, manifest::ManifestValidationError, secrets::SecretAccessError,
+    ui::UiError,
+};
+use thiserror::Error;
+
+use crate::{activation::ActivationPlanError, artifact_host::RtwComponentHostError};
+
+/// One component failure observed while stopping or rolling back an extension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentStopFailure {
+    /// ID of the component whose `stop` callback failed.
+    pub component_id: String,
+    /// Failure message returned by the component.
+    pub reason: String,
+}
+
+/// Errors that can occur during Extension Engine operations.
+#[derive(Debug, Error)]
+pub enum EngineError {
+    /// An I/O error occurred during file operations.
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+
+    /// The specified directory for extensions is invalid.
+    #[error("invalid extensions directory: `{0}`")]
+    InvalidDirectory(String),
+
+    /// A manifest or component path resolves outside its extension directory.
+    #[error("extension path `{path}` escapes extension root `{root}`")]
+    ExtensionPathEscapesRoot {
+        /// Requested or resolved extension-owned path.
+        path: String,
+        /// Canonical extension directory that must contain the path.
+        root: String,
+    },
+
+    /// An RTW artifact could not be validated or read.
+    #[error("RTW artifact error: {0}")]
+    Artifact(#[from] RtwError),
+
+    /// The RTW root content type is not the built-in extension schema.
+    #[error("unsupported RTW content type for extension loading: `{0}`")]
+    UnsupportedExtensionArtifactContent(String),
+
+    /// The extension descriptor inside an RTW artifact is not UTF-8 text.
+    #[error("extension manifest `{0}` must be valid UTF-8")]
+    ExtensionManifestEncoding(String),
+
+    /// The extension descriptor exceeds the loader-owned metadata size limit.
+    #[error("extension manifest `{path}` is {actual} bytes, exceeding the {maximum}-byte limit")]
+    ExtensionManifestTooLarge {
+        /// Manifest path inside the RTW artifact.
+        path: String,
+        /// Declared uncompressed manifest size.
+        actual: u64,
+        /// Maximum accepted descriptor size.
+        maximum: u64,
+    },
+
+    /// The artifact declares a required component target this loader cannot host.
+    #[error("required component `{component_id}` uses unsupported target `{target}`")]
+    UnsupportedRequiredComponentTarget {
+        /// Required component that could not be instantiated.
+        component_id: String,
+        /// Execution target for which no host is available on this loader path.
+        target: String,
+    },
+
+    /// A component target host identifier is not a canonical versioned target.
+    #[error("component target host identifier must be a canonical versioned execution target")]
+    InvalidComponentHostTarget,
+
+    /// A component target already has a host or is reserved by the built-in runtime.
+    #[error("component target host `{0}` is already registered or reserved")]
+    DuplicateComponentHostTarget(String),
+
+    /// An execution-target host owner is not an active loaded component.
+    #[error(
+        "component `{component_id}` in extension instance `{instance_id}` cannot own an execution target because it is not active"
+    )]
+    ExecutionTargetOwnerInactive {
+        /// Runtime instance containing the target-host owner.
+        instance_id: String,
+        /// Component expected to own the target host.
+        component_id: String,
+    },
+
+    /// One or more registered extension instances still depend on this runtime provider.
+    #[error(
+        "extension instance `{provider_instance_id}` cannot stop while execution-target dependents remain registered: {dependents:?}"
+    )]
+    ExecutionTargetProviderInUse {
+        /// Provider runtime instance that owns one or more execution targets.
+        provider_instance_id: String,
+        /// Registered dependent instances that were instantiated through the provider.
+        dependents: Vec<String>,
+    },
+
+    /// A target host failed while creating a component from the RTW artifact.
+    #[error("component `{component_id}` target `{target}` failed to load: {source}")]
+    ComponentHostFailed {
+        /// Component that failed to load.
+        component_id: String,
+        /// Target host selected for the component.
+        target: String,
+        /// Target-host failure.
+        #[source]
+        source: Box<RtwComponentHostError>,
+    },
+
+    /// An error occurred while parsing an extension manifest.
+    #[error("failed to parse manifest: {0}")]
+    ManifestParse(#[from] toml::de::Error),
+
+    /// An extension manifest is structurally valid but violates a semantic invariant.
+    #[error("invalid extension manifest: {0}")]
+    ManifestValidation(#[from] ManifestValidationError),
+
+    /// An error occurred while serializing configuration state.
+    #[error("failed to serialize state: {0}")]
+    StateSerialize(#[from] toml::ser::Error),
+
+    /// A host secret configuration or policy operation failed.
+    #[error("secret operation failed: {0}")]
+    SecretAccess(#[from] SecretAccessError),
+
+    /// A requested secret grant does not correspond to the extension manifest.
+    #[error(
+        "secret grant `{pattern}` was not requested by component `{component_id}` in extension `{extension_id}`"
+    )]
+    SecretPermissionNotRequested {
+        /// ID of the extension requesting secret access.
+        extension_id: String,
+        /// ID of the component requesting secret access.
+        component_id: String,
+        /// Requested grant pattern that policy attempted to approve.
+        pattern: String,
+    },
+
+    /// A host attempted to grant access to an undeclared component.
+    #[error("component `{component_id}` was not found in extension `{extension_id}`")]
+    SecretComponentNotFound {
+        /// ID of the extension containing the component.
+        extension_id: String,
+        /// ID of the missing component.
+        component_id: String,
+    },
+
+    /// A requested runtime capability was not declared by the component manifest.
+    #[error(
+        "runtime permission `{permission}` was not requested by component `{component_id}` in extension `{extension_id}`"
+    )]
+    RuntimePermissionNotRequested {
+        /// Logical extension containing the component.
+        extension_id: String,
+        /// Component for which policy attempted to grant access.
+        component_id: String,
+        /// Exact runtime permission policy attempted to approve.
+        permission: String,
+    },
+
+    /// Runtime permission policy referenced a component absent from the manifest.
+    #[error(
+        "component `{component_id}` was not found in extension `{extension_id}` for runtime permission policy"
+    )]
+    RuntimePermissionComponentNotFound {
+        /// Logical extension containing the component.
+        extension_id: String,
+        /// Missing component identifier.
+        component_id: String,
+    },
+
+    /// The host-owned runtime permission policy store is unavailable.
+    #[error("runtime permission policy is unavailable")]
+    RuntimePermissionUnavailable,
+
+    /// A WASM component artifact exceeded the host-owned byte limit.
+    #[error(
+        "WASM component `{component_id}` is at least {observed_bytes} bytes, exceeding the {maximum_bytes}-byte limit"
+    )]
+    WasmArtifactTooLarge {
+        /// ID of the component whose artifact was rejected.
+        component_id: String,
+        /// Number of bytes observed before loading stopped.
+        observed_bytes: usize,
+        /// Maximum artifact size accepted by the host in bytes.
+        maximum_bytes: usize,
+    },
+
+    /// An SDK-level lifecycle or registration error.
+    #[error("extension SDK error: {0}")]
+    Sdk(#[from] ExtensionError),
+
+    /// An error occurred during Wasmtime runtime operations.
+    #[error("WASM runtime error: {0}")]
+    WasmRuntime(#[from] wasmtime::Error),
+
+    /// Portable UI registration, lifecycle, patching, or action validation failed.
+    #[error("portable UI error: {0}")]
+    Ui(#[from] UiError),
+
+    /// The internal service-routing state is unavailable.
+    #[error("service runtime is unavailable")]
+    ServiceRuntimeUnavailable,
+
+    /// The requested activation composition cannot produce a valid start order.
+    #[error(transparent)]
+    ActivationPlan(#[from] ActivationPlanError),
+
+    /// An extension attempted to define a contract reserved to the platform host.
+    #[error(
+        "platform contract `{contract}` in scope `{scope_id}` cannot be defined by an extension"
+    )]
+    PlatformContractDefinitionReserved {
+        /// Reserved contract key.
+        contract: String,
+        /// Runtime scope containing the platform definition.
+        scope_id: String,
+    },
+
+    /// The platform attempted to reserve a contract already defined by an extension.
+    #[error(
+        "cannot reserve platform contract `{contract}` in scope `{scope_id}` after an extension defined it"
+    )]
+    PlatformContractReservationConflict {
+        /// Contract that can no longer be reserved safely.
+        contract: String,
+        /// Runtime scope containing the conflicting extension definition.
+        scope_id: String,
+    },
+
+    /// Active contract definitions disagree about one contract's resolution policy.
+    #[error("conflicting definitions for contract `{contract}`: `{existing}` versus `{incoming}`")]
+    ContractDefinitionConflict {
+        /// Contract whose definitions disagree.
+        contract: String,
+        /// Previously registered resolution policy.
+        existing: String,
+        /// Incoming resolution policy.
+        incoming: String,
+    },
+
+    /// The specified extension was not found in the engine.
+    #[error("extension `{0}` not found")]
+    ExtensionNotFound(String),
+
+    /// The specified extension is already registered in the engine.
+    #[error("extension `{0}` is already registered")]
+    ExtensionAlreadyExists(String),
+
+    /// The specified extension runtime instance was not found in the engine.
+    #[error("extension instance `{0}` not found")]
+    ExtensionInstanceNotFound(String),
+
+    /// The specified extension runtime instance is already registered.
+    #[error("extension instance `{0}` is already registered")]
+    ExtensionInstanceAlreadyExists(String),
+
+    /// A host attempted to dispatch an invalid runtime event topic.
+    #[error("runtime event topic must not be empty")]
+    InvalidRuntimeEventTopic,
+
+    /// A host attempted to dispatch an invalid runtime signal topic.
+    #[error("runtime signal topic must not be empty")]
+    InvalidRuntimeSignalTopic,
+
+    /// A component failed while handling a validated portable UI action.
+    #[error(
+        "component `{component_id}` in extension `{extension_id}` failed UI action `{action_id}`: {reason}"
+    )]
+    UiActionFailed {
+        /// ID of the extension owning the component.
+        extension_id: String,
+        /// ID of the component handling the action.
+        component_id: String,
+        /// Semantic action identifier.
+        action_id: String,
+        /// Failure returned by the component.
+        reason: String,
+    },
+
+    /// A component failed during a lifecycle transition.
+    #[error("component `{component_id}` in extension `{extension_id}` failed: {reason}")]
+    LifecycleFailed {
+        /// ID of the extension owning the component.
+        extension_id: String,
+        /// ID of the failed component.
+        component_id: String,
+        /// Failure message detailing the cause.
+        reason: String,
+    },
+
+    /// One or more component `stop` callbacks failed after host cleanup completed.
+    #[error("one or more components in extension `{extension_id}` failed to stop: {failures:?}")]
+    StopFailed {
+        /// ID of the extension being stopped.
+        extension_id: String,
+        /// Component failures collected while stopping in reverse lifecycle order.
+        failures: Vec<ComponentStopFailure>,
+    },
+
+    /// Startup failed and one or more rollback `stop` callbacks failed as well.
+    #[error(
+        "component `{component_id}` in extension `{extension_id}` failed to start: {start_reason}; startup rollback failures: {rollback_failures:?}"
+    )]
+    StartupRollbackFailed {
+        /// ID of the extension whose startup failed.
+        extension_id: String,
+        /// ID of the component whose `start` callback failed.
+        component_id: String,
+        /// Failure returned by the component's `start` callback.
+        start_reason: String,
+        /// Stop failures collected while rolling back the failed startup.
+        rollback_failures: Vec<ComponentStopFailure>,
+    },
+
+    /// The extension is in an invalid lifecycle state for the operation.
+    #[error("extension `{0}` is in an invalid state for this operation")]
+    InvalidState(String),
+}
+
+/// A specialized [`Result`] type for Extension Engine operations.
+pub type EngineResult<T = ()> = Result<T, EngineError>;

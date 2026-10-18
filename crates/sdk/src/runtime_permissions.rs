@@ -1,0 +1,186 @@
+//! Host-controlled runtime permissions requested by extension components.
+
+use std::{fmt, str::FromStr};
+
+use serde::{Deserialize, Serialize};
+
+/// Coarse runtime capability that a component may request from the host.
+///
+/// A manifest request never grants access by itself. The host must explicitly
+/// approve the exact permission for the concrete component principal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimePermission {
+    /// Allows owner-scoped cooperative background task scheduling.
+    BackgroundTask,
+    /// Allows binding a TCP listener only on the local loopback interface.
+    LoopbackListen,
+    /// Allows opening a TCP connection only to the local loopback interface.
+    LoopbackConnect,
+    /// Allows bounded outbound HTTPS GET requests through the host HTTP client.
+    HttpFetch,
+    /// Allows importing validated RTW bytes into the local immutable artifact store.
+    ArtifactImport,
+    /// Allows importing bounded immutable raw assets into the local asset store.
+    AssetImport,
+    /// Allows creating bounded ephemeral user-selected resources for semantic import workflows.
+    UserResourceImport,
+    /// Allows reading exact opaque ephemeral resources explicitly passed to the component.
+    UserResourceRead,
+    /// Allows reading the persistent generic user-content library and descriptors.
+    UserContentRead,
+    /// Allows requesting deferred validated imports/replacements in the user-content library.
+    UserContentWrite,
+    /// Allows reading the persistent world catalog and runtime lifecycle status.
+    WorldSessionRead,
+    /// Allows creating worlds and requesting active/inactive world lifecycle transitions.
+    WorldSessionWrite,
+    /// Allows submitting bounded authoritative commands as the host-authenticated principal.
+    WorldCommandSubmit,
+    /// Allows requesting Principal-filtered views from active authoritative Worlds.
+    WorldProjectionRead,
+    /// Allows reading the selected host composition without mutating it.
+    CompositionRead,
+    /// Allows changing exact artifact selections and enabled state in host composition.
+    CompositionWrite,
+    /// Allows inspecting requested/granted runtime permission policy for baseline components.
+    RuntimePolicyRead,
+    /// Allows granting/revoking requested runtime permissions for exact baseline components.
+    RuntimePolicyWrite,
+}
+
+impl fmt::Display for RuntimePermission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BackgroundTask => formatter.write_str("background-task"),
+            Self::LoopbackListen => formatter.write_str("loopback-listen"),
+            Self::LoopbackConnect => formatter.write_str("loopback-connect"),
+            Self::HttpFetch => formatter.write_str("http-fetch"),
+            Self::ArtifactImport => formatter.write_str("artifact-import"),
+            Self::AssetImport => formatter.write_str("asset-import"),
+            Self::UserResourceImport => formatter.write_str("user-resource-import"),
+            Self::UserResourceRead => formatter.write_str("user-resource-read"),
+            Self::UserContentRead => formatter.write_str("user-content-read"),
+            Self::UserContentWrite => formatter.write_str("user-content-write"),
+            Self::WorldSessionRead => formatter.write_str("world-session-read"),
+            Self::WorldSessionWrite => formatter.write_str("world-session-write"),
+            Self::WorldCommandSubmit => formatter.write_str("world-command-submit"),
+            Self::WorldProjectionRead => formatter.write_str("world-projection-read"),
+            Self::CompositionRead => formatter.write_str("composition-read"),
+            Self::CompositionWrite => formatter.write_str("composition-write"),
+            Self::RuntimePolicyRead => formatter.write_str("runtime-policy-read"),
+            Self::RuntimePolicyWrite => formatter.write_str("runtime-policy-write"),
+        }
+    }
+}
+
+/// Error returned when textual runtime permission policy is not recognized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePermissionParseError(String);
+
+impl fmt::Display for RuntimePermissionParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "unknown runtime permission `{}`", self.0)
+    }
+}
+
+impl std::error::Error for RuntimePermissionParseError {}
+
+impl FromStr for RuntimePermission {
+    type Err = RuntimePermissionParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "background-task" => Ok(Self::BackgroundTask),
+            "loopback-listen" => Ok(Self::LoopbackListen),
+            "loopback-connect" => Ok(Self::LoopbackConnect),
+            "http-fetch" => Ok(Self::HttpFetch),
+            "artifact-import" => Ok(Self::ArtifactImport),
+            "asset-import" => Ok(Self::AssetImport),
+            "user-resource-import" => Ok(Self::UserResourceImport),
+            "user-resource-read" => Ok(Self::UserResourceRead),
+            "user-content-read" => Ok(Self::UserContentRead),
+            "user-content-write" => Ok(Self::UserContentWrite),
+            "world-session-read" => Ok(Self::WorldSessionRead),
+            "world-session-write" => Ok(Self::WorldSessionWrite),
+            "world-command-submit" => Ok(Self::WorldCommandSubmit),
+            "world-projection-read" => Ok(Self::WorldProjectionRead),
+            "composition-read" => Ok(Self::CompositionRead),
+            "composition-write" => Ok(Self::CompositionWrite),
+            "runtime-policy-read" => Ok(Self::RuntimePolicyRead),
+            "runtime-policy-write" => Ok(Self::RuntimePolicyWrite),
+            _ => Err(RuntimePermissionParseError(value.to_string())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_round_trip_asset_import_permission() {
+        assert_eq!(RuntimePermission::AssetImport.to_string(), "asset-import");
+        assert_eq!(
+            "asset-import".parse::<RuntimePermission>(),
+            Ok(RuntimePermission::AssetImport)
+        );
+    }
+
+    #[test]
+    fn test_should_round_trip_user_resource_permissions() {
+        for permission in [
+            RuntimePermission::UserResourceImport,
+            RuntimePermission::UserResourceRead,
+        ] {
+            let text = permission.to_string();
+            assert_eq!(text.parse::<RuntimePermission>(), Ok(permission));
+        }
+    }
+
+    #[test]
+    fn test_should_round_trip_user_content_permissions() {
+        for permission in [
+            RuntimePermission::UserContentRead,
+            RuntimePermission::UserContentWrite,
+        ] {
+            let text = permission.to_string();
+            assert_eq!(text.parse::<RuntimePermission>(), Ok(permission));
+        }
+    }
+
+    #[test]
+    fn test_should_round_trip_world_session_permissions() {
+        for permission in [
+            RuntimePermission::WorldSessionRead,
+            RuntimePermission::WorldSessionWrite,
+        ] {
+            let text = permission.to_string();
+            assert_eq!(text.parse::<RuntimePermission>(), Ok(permission));
+        }
+    }
+
+    #[test]
+    fn test_should_round_trip_world_projection_read_permission() {
+        assert_eq!(
+            RuntimePermission::WorldProjectionRead.to_string(),
+            "world-projection-read"
+        );
+        assert_eq!(
+            "world-projection-read".parse::<RuntimePermission>(),
+            Ok(RuntimePermission::WorldProjectionRead)
+        );
+    }
+
+    #[test]
+    fn test_should_round_trip_world_command_submit_permission() {
+        assert_eq!(
+            RuntimePermission::WorldCommandSubmit.to_string(),
+            "world-command-submit"
+        );
+        assert_eq!(
+            "world-command-submit".parse::<RuntimePermission>(),
+            Ok(RuntimePermission::WorldCommandSubmit)
+        );
+    }
+}

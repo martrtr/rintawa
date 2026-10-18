@@ -1,0 +1,516 @@
+//! Portable UI and UI-layer WASM host adapters.
+
+use std::io::Write;
+
+use rintawa_sdk::{
+    contracts::{ContractKey, ContractVersion},
+    ui::{
+        UiActionEvent, UiActionPayload, UiActivityContribution, UiActivityId, UiCapabilityId,
+        UiError, UiIconSlotId, UiLayerDescriptor, UiNodeKind, UiPatchBatch, UiPlacementHint,
+        UiSurfaceContribution, UiSurfaceId, UiSurfaceSnapshot, UiSurfaceTraitId,
+        WorldPresentationDescriptor,
+    },
+    world::WorldId,
+};
+use tracing::warn;
+
+use crate::{
+    HostAccessError, UserResourceRef,
+    runtime::wasm::{
+        PortableUiError, PortableUiHost, UiLayerError, UiLayerHost, WasmHostState, WitActivity,
+        WitPlacementHint, WitPresentedAsset,
+    },
+};
+
+#[derive(Debug)]
+struct UiSurfaceRegistrationRequest {
+    id: String,
+    placement: WitPlacementHint,
+    semantic_contract: Option<String>,
+    semantic_version: Option<u32>,
+    activity: Option<WitActivity>,
+    traits: Vec<String>,
+    required_capabilities: Vec<String>,
+}
+
+#[derive(Default)]
+struct JsonSizeCounter {
+    bytes: usize,
+}
+
+impl Write for JsonSizeCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buffer.len());
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl WasmHostState {
+    fn queue_ui_surface(
+        &mut self,
+        request: UiSurfaceRegistrationRequest,
+    ) -> Result<(), PortableUiError> {
+        let UiSurfaceRegistrationRequest {
+            id,
+            placement,
+            semantic_contract,
+            semantic_version,
+            activity,
+            traits,
+            required_capabilities,
+        } = request;
+        let semantic = match (semantic_contract, semantic_version) {
+            (Some(contract), Some(version)) => {
+                Some(ContractKey::new(contract, ContractVersion::new(version)))
+            }
+            (None, None) => None,
+            _ => return Err(PortableUiError::InvalidPayload),
+        };
+        let activity = match activity {
+            Some(activity) => {
+                if activity.id.trim().is_empty()
+                    || activity.label.trim().is_empty()
+                    || activity
+                        .icon_slot
+                        .as_deref()
+                        .is_some_and(|slot| slot.trim().is_empty())
+                {
+                    return Err(PortableUiError::InvalidPayload);
+                }
+                Some(UiActivityContribution {
+                    id: UiActivityId::new(activity.id),
+                    label: activity.label,
+                    icon_slot: activity.icon_slot.map(UiIconSlotId::new),
+                })
+            }
+            None => None,
+        };
+        if traits.iter().any(|trait_id| trait_id.trim().is_empty()) {
+            return Err(PortableUiError::InvalidPayload);
+        }
+        let Some(scope) = self.registration_scope.as_mut() else {
+            return Err(PortableUiError::RegistrationNotActive);
+        };
+        let id = UiSurfaceId::new(id);
+        if !scope.ui_surface_ids.insert(id.clone()) {
+            return Err(PortableUiError::DuplicateSurface);
+        }
+        let placement = match placement {
+            WitPlacementHint::Primary => UiPlacementHint::Primary,
+            WitPlacementHint::Secondary => UiPlacementHint::Secondary,
+            WitPlacementHint::Sidebar => UiPlacementHint::Sidebar,
+            WitPlacementHint::Settings => UiPlacementHint::Settings,
+            WitPlacementHint::Dialog => UiPlacementHint::Dialog,
+            WitPlacementHint::Status => UiPlacementHint::Status,
+            WitPlacementHint::Overlay => UiPlacementHint::Overlay,
+        };
+        scope.ui_surfaces.push(UiSurfaceContribution {
+            id,
+            placement,
+            semantic,
+            activity,
+            traits: traits.into_iter().map(UiSurfaceTraitId::new).collect(),
+            required_capabilities: required_capabilities
+                .into_iter()
+                .map(UiCapabilityId::new)
+                .collect(),
+        });
+        Ok(())
+    }
+
+    fn queue_ui_layer(
+        &mut self,
+        protocol_major: u32,
+        capabilities: Vec<String>,
+    ) -> Result<(), PortableUiError> {
+        let mut counter = JsonSizeCounter::default();
+        serde_json::to_writer(&mut counter, &(protocol_major, &capabilities))
+            .map_err(|_| PortableUiError::InvalidPayload)?;
+        self.validate_ui_message_size(counter.bytes)?;
+        let Some(scope) = self.registration_scope.as_mut() else {
+            return Err(PortableUiError::RegistrationNotActive);
+        };
+        if scope.ui_layer.is_some() {
+            return Err(PortableUiError::DuplicateLayer);
+        }
+        scope.ui_layer = Some(UiLayerDescriptor {
+            protocol_major,
+            capabilities: capabilities.into_iter().map(UiCapabilityId::new).collect(),
+        });
+        Ok(())
+    }
+
+    fn queue_world_presentation(
+        &mut self,
+        entry_surface_id: String,
+        intent_contract: Option<String>,
+        intent_version: Option<u32>,
+    ) -> Result<(), PortableUiError> {
+        let mut counter = JsonSizeCounter::default();
+        serde_json::to_writer(
+            &mut counter,
+            &(
+                entry_surface_id.as_str(),
+                intent_contract.as_deref(),
+                intent_version,
+            ),
+        )
+        .map_err(|_| PortableUiError::InvalidPayload)?;
+        self.validate_ui_message_size(counter.bytes)?;
+        if entry_surface_id.trim().is_empty() {
+            return Err(PortableUiError::InvalidPayload);
+        }
+        let presentation_intent = match (intent_contract, intent_version) {
+            (Some(contract), Some(version)) if !contract.trim().is_empty() => {
+                Some(ContractKey::new(contract, ContractVersion::new(version)))
+            }
+            (None, None) => None,
+            _ => return Err(PortableUiError::InvalidPayload),
+        };
+        let Some(scope) = self.registration_scope.as_mut() else {
+            return Err(PortableUiError::RegistrationNotActive);
+        };
+        if scope.world_presentation.is_some() {
+            return Err(PortableUiError::DuplicateWorldPresentation);
+        }
+        scope.world_presentation = Some(WorldPresentationDescriptor {
+            entry_surface_id: UiSurfaceId::new(entry_surface_id),
+            presentation_intent,
+        });
+        Ok(())
+    }
+
+    fn ui_owner(&self) -> Result<rintawa_sdk::contracts::ComponentRef, PortableUiError> {
+        self.current_execution_owner()
+            .cloned()
+            .ok_or(PortableUiError::Unavailable)
+    }
+
+    fn validate_ui_message_size(&self, message_bytes: usize) -> Result<(), PortableUiError> {
+        if message_bytes > self.max_host_message_bytes {
+            return Err(PortableUiError::MessageTooLarge);
+        }
+        Ok(())
+    }
+
+    fn validate_ui_registration_size(
+        &self,
+        request: &UiSurfaceRegistrationRequest,
+    ) -> Result<(), PortableUiError> {
+        let placement = match request.placement {
+            WitPlacementHint::Primary => "primary",
+            WitPlacementHint::Secondary => "secondary",
+            WitPlacementHint::Sidebar => "sidebar",
+            WitPlacementHint::Settings => "settings",
+            WitPlacementHint::Dialog => "dialog",
+            WitPlacementHint::Status => "status",
+            WitPlacementHint::Overlay => "overlay",
+        };
+        let activity_size = request.activity.as_ref().map(|activity| {
+            (
+                activity.id.as_str(),
+                activity.label.as_str(),
+                activity.icon_slot.as_deref(),
+            )
+        });
+        let mut counter = JsonSizeCounter::default();
+        serde_json::to_writer(
+            &mut counter,
+            &(
+                request.id.as_str(),
+                placement,
+                request.semantic_contract.as_deref(),
+                request.semantic_version,
+                activity_size,
+                &request.traits,
+                &request.required_capabilities,
+            ),
+        )
+        .map_err(|_| PortableUiError::InvalidPayload)?;
+        self.validate_ui_message_size(counter.bytes)
+    }
+
+    fn map_ui_error(error: UiError) -> PortableUiError {
+        match error {
+            UiError::UnsupportedCapability(capability) => {
+                PortableUiError::UnsupportedCapability(capability)
+            }
+            UiError::RuntimeUnavailable => PortableUiError::Unavailable,
+            _ => PortableUiError::Rejected,
+        }
+    }
+}
+
+impl PortableUiHost for WasmHostState {
+    fn register_surface(
+        &mut self,
+        id: String,
+        placement: WitPlacementHint,
+        semantic_contract: Option<String>,
+        semantic_version: Option<u32>,
+        activity: Option<WitActivity>,
+        traits: Vec<String>,
+        required_capabilities: Vec<String>,
+    ) -> Result<(), PortableUiError> {
+        let request = UiSurfaceRegistrationRequest {
+            id,
+            placement,
+            semantic_contract,
+            semantic_version,
+            activity,
+            traits,
+            required_capabilities,
+        };
+        self.validate_ui_registration_size(&request)?;
+        self.queue_ui_surface(request)
+    }
+
+    fn register_layer(
+        &mut self,
+        protocol_major: u32,
+        capabilities: Vec<String>,
+    ) -> Result<(), PortableUiError> {
+        self.queue_ui_layer(protocol_major, capabilities)
+    }
+
+    fn register_world_presentation(
+        &mut self,
+        entry_surface_id: String,
+        intent_contract: Option<String>,
+        intent_version: Option<u32>,
+    ) -> Result<(), PortableUiError> {
+        self.queue_world_presentation(entry_surface_id, intent_contract, intent_version)
+    }
+
+    fn mount_surface(&mut self, snapshot_json: Vec<u8>) -> Result<(), PortableUiError> {
+        if !self.ui_access_active {
+            return Err(PortableUiError::Unavailable);
+        }
+        self.validate_ui_message_size(snapshot_json.len())?;
+        let snapshot: UiSurfaceSnapshot =
+            serde_json::from_slice(&snapshot_json).map_err(|error| {
+                warn!(
+                    plugin = %self.component_id,
+                    error = %error,
+                    "Rejecting invalid portable UI snapshot JSON"
+                );
+                PortableUiError::InvalidPayload
+            })?;
+        let owner = self.ui_owner()?;
+        self.ui
+            .mount_surface(&owner, snapshot)
+            .map_err(Self::map_ui_error)
+    }
+
+    fn patch_surface(&mut self, batch_json: Vec<u8>) -> Result<(), PortableUiError> {
+        if !self.ui_access_active {
+            return Err(PortableUiError::Unavailable);
+        }
+        self.validate_ui_message_size(batch_json.len())?;
+        let batch: UiPatchBatch = serde_json::from_slice(&batch_json).map_err(|error| {
+            warn!(
+                plugin = %self.component_id,
+                error = %error,
+                "Rejecting invalid portable UI patch JSON"
+            );
+            PortableUiError::InvalidPayload
+        })?;
+        let owner = self.ui_owner()?;
+        self.ui
+            .apply_patches(&owner, batch)
+            .map_err(Self::map_ui_error)
+    }
+
+    fn unmount_surface(&mut self, surface_id: String) -> Result<(), PortableUiError> {
+        if !self.ui_access_active {
+            return Err(PortableUiError::Unavailable);
+        }
+        self.validate_ui_message_size(surface_id.len())?;
+        let owner = self.ui_owner()?;
+        self.ui
+            .unmount_surface(&owner, &UiSurfaceId::new(surface_id))
+            .map_err(Self::map_ui_error)
+    }
+}
+
+fn map_presented_asset_access_error(error: HostAccessError) -> UiLayerError {
+    match error {
+        HostAccessError::InvalidAsset | HostAccessError::InvalidDigest => {
+            UiLayerError::InvalidPayload
+        }
+        HostAccessError::NotFound => UiLayerError::Rejected,
+        HostAccessError::Unavailable => UiLayerError::Unavailable,
+        _ => UiLayerError::Rejected,
+    }
+}
+
+fn map_ui_layer_error(error: UiError) -> UiLayerError {
+    match error {
+        UiError::LayerNotOwner | UiError::LayerNotRegistered => UiLayerError::NotActiveLayer,
+        UiError::WorldFocusQueueFull => UiLayerError::QueueFull,
+        UiError::RuntimeUnavailable => UiLayerError::Unavailable,
+        _ => UiLayerError::Rejected,
+    }
+}
+
+impl UiLayerHost for WasmHostState {
+    fn presentation_surfaces(&mut self) -> Result<Vec<u8>, UiLayerError> {
+        if !self.ui_access_active {
+            return Err(UiLayerError::AccessNotActive);
+        }
+        let owner = self
+            .current_execution_owner()
+            .cloned()
+            .ok_or(UiLayerError::AccessNotActive)?;
+        let surfaces = self
+            .ui
+            .presentation_surfaces_for_layer(&owner)
+            .map_err(map_ui_layer_error)?;
+        let mut counter = JsonSizeCounter::default();
+        serde_json::to_writer(&mut counter, &surfaces).map_err(|_| UiLayerError::Unavailable)?;
+        if counter.bytes > self.max_host_message_bytes {
+            return Err(UiLayerError::MessageTooLarge);
+        }
+        serde_json::to_vec(&surfaces).map_err(|_| UiLayerError::Unavailable)
+    }
+
+    fn read_presented_asset(&mut self, digest: String) -> Result<WitPresentedAsset, UiLayerError> {
+        if !self.ui_access_active {
+            return Err(UiLayerError::AccessNotActive);
+        }
+        if digest.len() > self.max_host_message_bytes {
+            return Err(UiLayerError::MessageTooLarge);
+        }
+        let owner = self
+            .current_execution_owner()
+            .cloned()
+            .ok_or(UiLayerError::AccessNotActive)?;
+        let surfaces = self
+            .ui
+            .presentation_surfaces_for_layer(&owner)
+            .map_err(map_ui_layer_error)?;
+        let mut reference: Option<(u64, String)> = None;
+        for surface in surfaces {
+            for node in surface.snapshot.nodes {
+                let UiNodeKind::AssetImage(image) = node.kind else {
+                    continue;
+                };
+                if image.digest != digest {
+                    continue;
+                }
+                let candidate = (image.size, image.media_type);
+                if reference
+                    .as_ref()
+                    .is_some_and(|current| current != &candidate)
+                {
+                    return Err(UiLayerError::Rejected);
+                }
+                reference = Some(candidate);
+            }
+        }
+        let (size, media_type) = reference.ok_or(UiLayerError::Rejected)?;
+        let maximum_bytes = self.max_presented_asset_bytes;
+        let bytes = self
+            .host_access
+            .asset_store
+            .read_asset(&digest, size, &media_type, maximum_bytes)
+            .map_err(map_presented_asset_access_error)?;
+        if bytes.len() > maximum_bytes {
+            return Err(UiLayerError::MessageTooLarge);
+        }
+        Ok(WitPresentedAsset { media_type, bytes })
+    }
+
+    fn presentation_state(&mut self) -> Result<Vec<u8>, UiLayerError> {
+        if !self.ui_access_active {
+            return Err(UiLayerError::AccessNotActive);
+        }
+        let owner = self
+            .current_execution_owner()
+            .cloned()
+            .ok_or(UiLayerError::AccessNotActive)?;
+        let state = self
+            .ui
+            .presentation_state_for_layer(&owner)
+            .map_err(map_ui_layer_error)?;
+        let mut counter = JsonSizeCounter::default();
+        serde_json::to_writer(&mut counter, &state).map_err(|_| UiLayerError::Unavailable)?;
+        if counter.bytes > self.max_host_message_bytes {
+            return Err(UiLayerError::MessageTooLarge);
+        }
+        serde_json::to_vec(&state).map_err(|_| UiLayerError::Unavailable)
+    }
+
+    fn request_world_focus(&mut self, world_id: String) -> Result<(), UiLayerError> {
+        if !self.ui_access_active {
+            return Err(UiLayerError::AccessNotActive);
+        }
+        if world_id.len() > self.max_host_message_bytes {
+            return Err(UiLayerError::MessageTooLarge);
+        }
+        let world_id = world_id
+            .parse::<WorldId>()
+            .map_err(|_| UiLayerError::InvalidPayload)?;
+        let owner = self
+            .current_execution_owner()
+            .cloned()
+            .ok_or(UiLayerError::AccessNotActive)?;
+        self.ui
+            .queue_world_focus_request(&owner, world_id)
+            .map_err(map_ui_layer_error)
+    }
+
+    fn clear_world_focus(&mut self) -> Result<(), UiLayerError> {
+        if !self.ui_access_active {
+            return Err(UiLayerError::AccessNotActive);
+        }
+        let owner = self
+            .current_execution_owner()
+            .cloned()
+            .ok_or(UiLayerError::AccessNotActive)?;
+        self.ui
+            .clear_focused_world_scope(&owner)
+            .map_err(map_ui_layer_error)
+    }
+
+    fn dispatch_action(&mut self, action_json: Vec<u8>) -> Result<(), UiLayerError> {
+        if !self.ui_access_active {
+            return Err(UiLayerError::AccessNotActive);
+        }
+        if action_json.len() > self.max_host_message_bytes {
+            return Err(UiLayerError::MessageTooLarge);
+        }
+        let event: UiActionEvent =
+            serde_json::from_slice(&action_json).map_err(|_| UiLayerError::InvalidPayload)?;
+        if let UiActionPayload::Asset(asset) = &event.payload {
+            let maximum_bytes = self.max_asset_import_bytes;
+            self.host_access
+                .asset_store
+                .read_asset(&asset.digest, asset.size, &asset.media_type, maximum_bytes)
+                .map_err(map_presented_asset_access_error)?;
+        }
+        if let UiActionPayload::Resource(resource) = &event.payload {
+            let reference = UserResourceRef {
+                id: resource.id.clone(),
+                size: resource.size,
+                media_type: resource.media_type.clone(),
+                name: resource.name.clone(),
+            };
+            self.host_access
+                .user_resources
+                .read_resource(&reference, self.max_artifact_import_bytes)
+                .map_err(map_presented_asset_access_error)?;
+        }
+        let owner = self
+            .current_execution_owner()
+            .cloned()
+            .ok_or(UiLayerError::AccessNotActive)?;
+        self.ui
+            .queue_action(&owner, event)
+            .map_err(map_ui_layer_error)
+    }
+}

@@ -1,0 +1,18 @@
+[package]
+name = "rintawa-world"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+description = "Authoritative world model primitives for Rintawa"
+
+[dependencies]
+jsonschema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+rintawa-sdk = { path = "../sdk" }

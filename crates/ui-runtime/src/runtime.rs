@@ -1,0 +1,1312 @@
+//! Portable UI runtime state, presentation mounting, and action dispatch.
+
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::{Arc, RwLock},
+};
+
+use serde::Serialize;
+
+const MAX_QUEUED_ACTIONS: usize = 64;
+const MAX_QUEUED_WORLD_FOCUS_REQUESTS: usize = 64;
+const MAX_WORLD_FOCUS_DIAGNOSTIC_BYTES: usize = 2 * 1024;
+
+use rintawa_sdk::{
+    contracts::ComponentRef,
+    types::{ExtensionInstanceId, RuntimeScopeId},
+    ui::{
+        PORTABLE_UI_PROTOCOL_MAJOR, UiActionEvent, UiError, UiLayerDescriptor, UiPatch,
+        UiPatchBatch, UiPresentationContext, UiResult, UiSurfaceContribution, UiSurfaceId,
+        UiSurfaceSnapshot, WorldPresentationDescriptor,
+    },
+    world::WorldId,
+};
+
+use crate::validation::{
+    DEFAULT_MAX_PATCH_OPERATIONS, node_map, required_capabilities, validate_snapshot,
+};
+
+/// Static UI surface declaration associated with its owning component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedUiSurfaceContribution {
+    /// Component that registered the surface.
+    pub owner: ComponentRef,
+    /// Static surface metadata.
+    pub contribution: UiSurfaceContribution,
+}
+
+/// Static portable UI Layer descriptor associated with its owning component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedUiLayerDescriptor {
+    /// Component that registered the layer descriptor.
+    pub owner: ComponentRef,
+    /// Renderer capabilities offered by the component.
+    pub descriptor: UiLayerDescriptor,
+}
+
+/// World presentation descriptor paired with its host-authenticated component owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedWorldPresentationDescriptor {
+    /// Component that registered the World presentation entry point.
+    pub owner: ComponentRef,
+    /// Owner-scoped initial presentation metadata.
+    pub descriptor: WorldPresentationDescriptor,
+}
+
+/// Mounted presentation exposed to an eligible UI Layer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UiPresentationSurface {
+    /// Component that owns and updates the surface.
+    pub owner: ComponentRef,
+    /// Host-normalized context for one layer-specific presentation session.
+    ///
+    /// Host-wide inspection snapshots leave this unset because they are not attached
+    /// to one renderer session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<UiPresentationContext>,
+    /// Static surface metadata.
+    pub contribution: UiSurfaceContribution,
+    /// Current validated presentation snapshot.
+    pub snapshot: UiSurfaceSnapshot,
+}
+
+/// Validated action ready for dispatch to its owning component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiActionDispatch {
+    /// Component allowed to receive this action.
+    pub owner: ComponentRef,
+    /// Validated semantic action.
+    pub event: UiActionEvent,
+}
+
+/// Renderer action queued by an active UI Layer for Engine dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedUiAction {
+    /// Active layer that submitted the event.
+    pub layer_owner: ComponentRef,
+    /// Semantic action to validate again immediately before dispatch.
+    pub event: UiActionEvent,
+}
+
+/// Deferred request by one concrete UI Layer session to focus an authoritative World.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedWorldFocusRequest {
+    /// Active UI Layer that owns the presentation session.
+    pub layer_owner: ComponentRef,
+    /// World requested as that session's presentation focus.
+    pub world_id: WorldId,
+}
+
+/// Resolved World presentation exposed to one UI Layer session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UiFocusedWorldPresentation {
+    /// Authoritative World whose scope is imported into this presentation session.
+    pub world_id: WorldId,
+    /// Composition-selected owner descriptor for the World's initial presentation.
+    pub descriptor: WorldPresentationDescriptor,
+}
+
+/// Renderer-facing World-focus state for one concrete UI Layer session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UiLayerPresentationState {
+    /// Successfully resolved current World focus, if any.
+    pub focused_world: Option<UiFocusedWorldPresentation>,
+    /// Most recently accepted deferred focus request not yet completed by the Host.
+    pub pending_world_id: Option<WorldId>,
+    /// Bounded diagnostic for the most recent failed focus request.
+    pub last_focus_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct UiSurfaceKey {
+    instance_id: ExtensionInstanceId,
+    surface_id: UiSurfaceId,
+}
+
+impl UiSurfaceKey {
+    fn new(instance_id: ExtensionInstanceId, surface_id: UiSurfaceId) -> Self {
+        Self {
+            instance_id,
+            surface_id,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct UiExtensionInstance {
+    scope_id: RuntimeScopeId,
+    is_active: bool,
+    surfaces: HashSet<UiSurfaceId>,
+}
+
+#[derive(Clone)]
+struct FocusedPresentationScope {
+    scope_id: RuntimeScopeId,
+    world_id: WorldId,
+    descriptor: WorldPresentationDescriptor,
+}
+
+#[derive(Clone)]
+struct ActiveUiLayer {
+    owner: ComponentRef,
+    descriptor: UiLayerDescriptor,
+    capabilities: HashSet<rintawa_sdk::ui::UiCapabilityId>,
+    focused_scope: Option<FocusedPresentationScope>,
+    pending_world_id: Option<WorldId>,
+    last_focus_error: Option<String>,
+}
+
+#[derive(Default)]
+struct UiRuntimeState {
+    instances: HashMap<ExtensionInstanceId, UiExtensionInstance>,
+    registered_surfaces: HashMap<UiSurfaceKey, OwnedUiSurfaceContribution>,
+    registered_layers: HashMap<ComponentRef, UiLayerDescriptor>,
+    registered_world_presentations: HashMap<ComponentRef, WorldPresentationDescriptor>,
+    mounted_surfaces: HashMap<UiSurfaceKey, UiSurfaceSnapshot>,
+    layers: HashMap<RuntimeScopeId, ActiveUiLayer>,
+    queued_actions: VecDeque<QueuedUiAction>,
+    queued_world_focus_requests: VecDeque<QueuedWorldFocusRequest>,
+}
+
+/// Shared renderer-neutral runtime for portable surfaces and semantic actions.
+///
+/// The runtime isolates registrations and mounted surfaces by extension instance.
+/// An active UI Layer sees its own runtime scope plus at most one explicit focused-World
+/// scope imported by host presentation policy; surface ownership is never widened.
+#[derive(Clone, Default)]
+pub struct UiRuntime {
+    state: Arc<RwLock<UiRuntimeState>>,
+}
+
+impl UiRuntime {
+    /// Creates an empty portable UI runtime.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers static surface declarations for one extension runtime instance.
+    ///
+    /// Surface identifiers are local to an extension instance, so two instances
+    /// of the same logical extension may register the same surface IDs safely.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a duplicate instance, mismatched owner, or duplicate
+    /// surface identifier within the same instance.
+    pub fn register_instance(
+        &self,
+        instance_id: ExtensionInstanceId,
+        scope_id: RuntimeScopeId,
+        surfaces: Vec<OwnedUiSurfaceContribution>,
+        layers: Vec<OwnedUiLayerDescriptor>,
+    ) -> UiResult<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        if state.instances.contains_key(&instance_id) {
+            return Err(UiError::InstanceAlreadyRegistered(instance_id.to_string()));
+        }
+
+        let mut surface_ids = HashSet::new();
+        for owned in &surfaces {
+            if owned.owner.instance_id != instance_id {
+                return Err(UiError::SurfaceNotOwned(owned.contribution.id.to_string()));
+            }
+            if !surface_ids.insert(owned.contribution.id.clone()) {
+                return Err(UiError::SurfaceAlreadyRegistered(
+                    owned.contribution.id.to_string(),
+                ));
+            }
+        }
+
+        let mut layer_owners = HashSet::new();
+        for layer in &layers {
+            if layer.owner.instance_id != instance_id {
+                return Err(UiError::LayerNotOwner);
+            }
+            if !layer_owners.insert(layer.owner.clone()) {
+                return Err(UiError::LayerAlreadyRegistered);
+            }
+        }
+
+        for owned in surfaces {
+            let key = UiSurfaceKey::new(instance_id.clone(), owned.contribution.id.clone());
+            state.registered_surfaces.insert(key, owned);
+        }
+        for layer in layers {
+            state
+                .registered_layers
+                .insert(layer.owner, layer.descriptor);
+        }
+        state.instances.insert(
+            instance_id,
+            UiExtensionInstance {
+                scope_id,
+                is_active: false,
+                surfaces: surface_ids,
+            },
+        );
+        Ok(())
+    }
+
+    /// Registers one owner-scoped World presentation descriptor.
+    ///
+    /// Registration succeeds only when the referenced entry surface was already
+    /// registered by the same component owner inside this extension instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown instance, duplicate descriptor, missing entry
+    /// surface, or an entry surface owned by another component.
+    pub fn register_world_presentation(
+        &self,
+        owned: OwnedWorldPresentationDescriptor,
+    ) -> UiResult<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        if !state.instances.contains_key(&owned.owner.instance_id) {
+            return Err(UiError::InstanceNotRegistered(
+                owned.owner.instance_id.to_string(),
+            ));
+        }
+        if state
+            .registered_world_presentations
+            .contains_key(&owned.owner)
+        {
+            return Err(UiError::WorldPresentationAlreadyRegistered);
+        }
+        let key = UiSurfaceKey::new(
+            owned.owner.instance_id.clone(),
+            owned.descriptor.entry_surface_id.clone(),
+        );
+        let surface = state.registered_surfaces.get(&key).ok_or_else(|| {
+            UiError::SurfaceNotRegistered(owned.descriptor.entry_surface_id.to_string())
+        })?;
+        if surface.owner != owned.owner {
+            return Err(UiError::SurfaceNotOwned(
+                owned.descriptor.entry_surface_id.to_string(),
+            ));
+        }
+        state
+            .registered_world_presentations
+            .insert(owned.owner, owned.descriptor);
+        Ok(())
+    }
+
+    /// Returns the World presentation descriptor registered by one component owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError::WorldPresentationNotRegistered`] when no descriptor exists.
+    pub fn registered_world_presentation_descriptor(
+        &self,
+        owner: &ComponentRef,
+    ) -> UiResult<WorldPresentationDescriptor> {
+        self.state
+            .read()
+            .map_err(|_| UiError::RuntimeUnavailable)?
+            .registered_world_presentations
+            .get(owner)
+            .cloned()
+            .ok_or(UiError::WorldPresentationNotRegistered)
+    }
+
+    /// Removes one extension instance and all of its UI state.
+    pub fn unregister_instance(&self, instance_id: &ExtensionInstanceId) {
+        let mut state = match self.state.write() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(instance) = state.instances.remove(instance_id) else {
+            return;
+        };
+        for surface_id in instance.surfaces {
+            let key = UiSurfaceKey::new(instance_id.clone(), surface_id);
+            state.registered_surfaces.remove(&key);
+            state.mounted_surfaces.remove(&key);
+        }
+        state
+            .registered_layers
+            .retain(|owner, _| &owner.instance_id != instance_id);
+        state
+            .registered_world_presentations
+            .retain(|owner, _| &owner.instance_id != instance_id);
+        state.queued_actions.retain(|queued| {
+            &queued.layer_owner.instance_id != instance_id
+                && &queued.event.owner_instance_id != instance_id
+        });
+        state
+            .queued_world_focus_requests
+            .retain(|queued| &queued.layer_owner.instance_id != instance_id);
+        if state
+            .layers
+            .get(&instance.scope_id)
+            .is_some_and(|layer| &layer.owner.instance_id == instance_id)
+        {
+            state.layers.remove(&instance.scope_id);
+        }
+    }
+
+    /// Updates instance activation and revokes mounted presentation on deactivation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError::InstanceNotRegistered`] for an unknown instance.
+    pub fn set_instance_active(
+        &self,
+        instance_id: &ExtensionInstanceId,
+        is_active: bool,
+    ) -> UiResult<()> {
+        let mut state = match self.state.write() {
+            Ok(state) => state,
+            Err(poisoned) if !is_active => poisoned.into_inner(),
+            Err(_) => return Err(UiError::RuntimeUnavailable),
+        };
+        let (scope_id, surface_ids) = {
+            let instance = state
+                .instances
+                .get_mut(instance_id)
+                .ok_or_else(|| UiError::InstanceNotRegistered(instance_id.to_string()))?;
+            instance.is_active = is_active;
+            (instance.scope_id.clone(), instance.surfaces.clone())
+        };
+
+        if !is_active {
+            for surface_id in surface_ids {
+                state
+                    .mounted_surfaces
+                    .remove(&UiSurfaceKey::new(instance_id.clone(), surface_id));
+            }
+            state.queued_actions.retain(|queued| {
+                &queued.layer_owner.instance_id != instance_id
+                    && &queued.event.owner_instance_id != instance_id
+            });
+            state
+                .queued_world_focus_requests
+                .retain(|queued| &queued.layer_owner.instance_id != instance_id);
+            if state
+                .layers
+                .get(&scope_id)
+                .is_some_and(|layer| &layer.owner.instance_id == instance_id)
+            {
+                state.layers.remove(&scope_id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the statically registered descriptor for one UI Layer candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError::LayerNotRegistered`] when the component did not register a
+    /// layer descriptor.
+    pub fn registered_layer_descriptor(&self, owner: &ComponentRef) -> UiResult<UiLayerDescriptor> {
+        self.state
+            .read()
+            .map_err(|_| UiError::RuntimeUnavailable)?
+            .registered_layers
+            .get(owner)
+            .cloned()
+            .ok_or(UiError::LayerNotRegistered)
+    }
+
+    /// Attaches the statically registered descriptor for a selected layer provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::attach_layer`] or
+    /// [`UiError::LayerNotRegistered`] when no descriptor was registered.
+    pub fn attach_registered_layer(&self, owner: ComponentRef) -> UiResult<()> {
+        let descriptor = self.registered_layer_descriptor(&owner)?;
+        self.attach_layer(owner, descriptor)
+    }
+
+    /// Attaches or refreshes the selected UI Layer for its runtime scope.
+    ///
+    /// Existing mounted surfaces in the same scope are validated before the layer
+    /// becomes active. Different scopes may host different UI layers concurrently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an inactive owner, incompatible protocol version,
+    /// unsupported mounted capability, or a different layer already attached in
+    /// the same scope.
+    pub fn attach_layer(&self, owner: ComponentRef, descriptor: UiLayerDescriptor) -> UiResult<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        let instance = state
+            .instances
+            .get(&owner.instance_id)
+            .ok_or_else(|| UiError::InstanceNotRegistered(owner.instance_id.to_string()))?;
+        if !instance.is_active {
+            return Err(UiError::OwnerInactive);
+        }
+        let scope_id = instance.scope_id.clone();
+        if descriptor.protocol_major != PORTABLE_UI_PROTOCOL_MAJOR {
+            return Err(UiError::UnsupportedProtocol {
+                expected: PORTABLE_UI_PROTOCOL_MAJOR,
+                actual: descriptor.protocol_major,
+            });
+        }
+        if state
+            .layers
+            .get(&scope_id)
+            .is_some_and(|layer| layer.owner != owner)
+        {
+            return Err(UiError::LayerAlreadyAttached);
+        }
+
+        let focused_scope = state
+            .layers
+            .get(&scope_id)
+            .and_then(|layer| layer.focused_scope.clone());
+        let pending_world_id = state
+            .layers
+            .get(&scope_id)
+            .and_then(|layer| layer.pending_world_id);
+        let last_focus_error = state
+            .layers
+            .get(&scope_id)
+            .and_then(|layer| layer.last_focus_error.clone());
+        let capabilities: HashSet<_> = descriptor.capabilities.iter().cloned().collect();
+        for (key, snapshot) in &state.mounted_surfaces {
+            let Some(surface_instance) = state.instances.get(&key.instance_id) else {
+                continue;
+            };
+            let is_visible = surface_instance.scope_id == scope_id
+                || focused_scope
+                    .as_ref()
+                    .is_some_and(|focused| focused.scope_id == surface_instance.scope_id);
+            if !is_visible || !surface_instance.is_active {
+                continue;
+            }
+            let registered = state
+                .registered_surfaces
+                .get(key)
+                .ok_or_else(|| UiError::SurfaceNotRegistered(key.surface_id.to_string()))?;
+            ensure_surface_supported(&capabilities, &registered.contribution, snapshot)?;
+        }
+
+        state.layers.insert(
+            scope_id,
+            ActiveUiLayer {
+                owner,
+                descriptor,
+                capabilities,
+                focused_scope,
+                pending_world_id,
+                last_focus_error,
+            },
+        );
+        Ok(())
+    }
+
+    /// Detaches the current UI Layer in the owner's scope without deleting surfaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown instance or if another component owns the
+    /// active layer in that scope.
+    pub fn detach_layer(&self, owner: &ComponentRef) -> UiResult<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        let scope_id = state
+            .instances
+            .get(&owner.instance_id)
+            .ok_or_else(|| UiError::InstanceNotRegistered(owner.instance_id.to_string()))?
+            .scope_id
+            .clone();
+        if let Some(layer) = state.layers.get(&scope_id) {
+            if &layer.owner != owner {
+                return Err(UiError::LayerNotOwner);
+            }
+            state.layers.remove(&scope_id);
+        }
+        state
+            .queued_world_focus_requests
+            .retain(|queued| &queued.layer_owner != owner);
+        Ok(())
+    }
+
+    /// Returns the active UI Layer in one runtime scope, if attached.
+    pub fn active_layer(
+        &self,
+        scope_id: &RuntimeScopeId,
+    ) -> Option<(ComponentRef, UiLayerDescriptor)> {
+        self.state.read().ok().and_then(|state| {
+            state
+                .layers
+                .get(scope_id)
+                .map(|layer| (layer.owner.clone(), layer.descriptor.clone()))
+        })
+    }
+
+    /// Queues one deferred World-focus request for an exact active UI Layer session.
+    ///
+    /// Repeated requests from the same layer coalesce to the newest World. This API only
+    /// records presentation intent; Host orchestration resolves composition and lifecycle
+    /// after the current component callback unwinds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError::LayerNotOwner`] when the caller is not an active layer or
+    /// [`UiError::WorldFocusQueueFull`] when the bounded cross-layer queue is full.
+    pub fn queue_world_focus_request(
+        &self,
+        layer_owner: &ComponentRef,
+        world_id: WorldId,
+    ) -> UiResult<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        let layer_scope = state
+            .layers
+            .iter()
+            .find_map(|(scope_id, layer)| (&layer.owner == layer_owner).then_some(scope_id.clone()))
+            .ok_or(UiError::LayerNotOwner)?;
+
+        if let Some(request) = state
+            .queued_world_focus_requests
+            .iter_mut()
+            .find(|request| request.layer_owner == *layer_owner)
+        {
+            request.world_id = world_id;
+        } else {
+            if state.queued_world_focus_requests.len() >= MAX_QUEUED_WORLD_FOCUS_REQUESTS {
+                return Err(UiError::WorldFocusQueueFull);
+            }
+            state
+                .queued_world_focus_requests
+                .push_back(QueuedWorldFocusRequest {
+                    layer_owner: layer_owner.clone(),
+                    world_id,
+                });
+        }
+        let layer = state
+            .layers
+            .get_mut(&layer_scope)
+            .ok_or(UiError::LayerNotOwner)?;
+        layer.pending_world_id = Some(world_id);
+        layer.last_focus_error = None;
+        Ok(())
+    }
+
+    /// Drains deferred focus requests for Host orchestration after guest callbacks unwind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError::RuntimeUnavailable`] when shared state cannot be accessed.
+    pub fn drain_world_focus_requests(&self) -> UiResult<Vec<QueuedWorldFocusRequest>> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        Ok(state.queued_world_focus_requests.drain(..).collect())
+    }
+
+    /// Records a bounded failure for one completed deferred World-focus request.
+    ///
+    /// A stale failure never overwrites a newer pending request from the same layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError::LayerNotOwner`] when the presentation session no longer exists.
+    pub fn record_world_focus_failure(
+        &self,
+        layer_owner: &ComponentRef,
+        world_id: WorldId,
+        diagnostic: &str,
+    ) -> UiResult<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        let layer = state
+            .layers
+            .values_mut()
+            .find(|layer| &layer.owner == layer_owner)
+            .ok_or(UiError::LayerNotOwner)?;
+        if layer.pending_world_id == Some(world_id) {
+            layer.pending_world_id = None;
+            layer.last_focus_error = Some(bounded_world_focus_diagnostic(diagnostic));
+        }
+        Ok(())
+    }
+
+    /// Returns renderer-facing World-focus state for one active UI Layer session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError::LayerNotOwner`] when the caller is not an active layer.
+    pub fn presentation_state_for_layer(
+        &self,
+        layer_owner: &ComponentRef,
+    ) -> UiResult<UiLayerPresentationState> {
+        let state = self.state.read().map_err(|_| UiError::RuntimeUnavailable)?;
+        let layer = state
+            .layers
+            .values()
+            .find(|layer| &layer.owner == layer_owner)
+            .ok_or(UiError::LayerNotOwner)?;
+        Ok(UiLayerPresentationState {
+            focused_world: layer
+                .focused_scope
+                .as_ref()
+                .map(|focused| UiFocusedWorldPresentation {
+                    world_id: focused.world_id,
+                    descriptor: focused.descriptor.clone(),
+                }),
+            pending_world_id: layer.pending_world_id,
+            last_focus_error: layer.last_focus_error.clone(),
+        })
+    }
+
+    /// Imports one explicit focused-World scope into an active UI Layer session.
+    ///
+    /// The imported scope supplements, but never replaces, the layer's own runtime
+    /// scope. Switching focus only changes presentation visibility and does not mutate
+    /// extension or World lifecycle state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the caller is not an active layer or a mounted surface
+    /// in the focused scope requires a capability unsupported by that layer.
+    pub fn set_focused_world_scope(
+        &self,
+        layer_owner: &ComponentRef,
+        world_id: WorldId,
+        scope_id: RuntimeScopeId,
+        descriptor: WorldPresentationDescriptor,
+    ) -> UiResult<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        let layer_scope = state
+            .layers
+            .iter()
+            .find_map(|(candidate_scope, layer)| {
+                (&layer.owner == layer_owner).then_some(candidate_scope.clone())
+            })
+            .ok_or(UiError::LayerNotOwner)?;
+        if layer_scope == scope_id {
+            return Err(UiError::ScopeNotVisible);
+        }
+        let capabilities = state
+            .layers
+            .get(&layer_scope)
+            .ok_or(UiError::LayerNotOwner)?
+            .capabilities
+            .clone();
+        for (key, snapshot) in &state.mounted_surfaces {
+            let Some(instance) = state.instances.get(&key.instance_id) else {
+                continue;
+            };
+            if !instance.is_active || instance.scope_id != scope_id {
+                continue;
+            }
+            let registered = state
+                .registered_surfaces
+                .get(key)
+                .ok_or_else(|| UiError::SurfaceNotRegistered(key.surface_id.to_string()))?;
+            ensure_surface_supported(&capabilities, &registered.contribution, snapshot)?;
+        }
+        let layer = state
+            .layers
+            .get_mut(&layer_scope)
+            .ok_or(UiError::LayerNotOwner)?;
+        layer.focused_scope = Some(FocusedPresentationScope {
+            scope_id,
+            world_id,
+            descriptor,
+        });
+        if layer.pending_world_id == Some(world_id) {
+            layer.pending_world_id = None;
+        }
+        layer.last_focus_error = None;
+        Ok(())
+    }
+
+    /// Clears the focused-World scope imported by one active UI Layer session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError::LayerNotOwner`] when the caller is not an active layer.
+    pub fn clear_focused_world_scope(&self, layer_owner: &ComponentRef) -> UiResult<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        let layer_scope = state
+            .layers
+            .iter()
+            .find_map(|(scope_id, layer)| (&layer.owner == layer_owner).then_some(scope_id.clone()))
+            .ok_or(UiError::LayerNotOwner)?;
+        let layer = state
+            .layers
+            .get_mut(&layer_scope)
+            .ok_or(UiError::LayerNotOwner)?;
+        layer.focused_scope = None;
+        layer.pending_world_id = None;
+        layer.last_focus_error = None;
+        state
+            .queued_world_focus_requests
+            .retain(|request| request.layer_owner != *layer_owner);
+        Ok(())
+    }
+
+    /// Clears references to one focused World scope from every active UI Layer session.
+    ///
+    /// World lifecycle supervisors use this after deactivating a World so no renderer
+    /// session retains a stale presentation focus. Other focused World scopes are unchanged.
+    /// Cleanup recovers poisoned shared state just like instance unregistration.
+    pub fn clear_focused_world_scope_for_all_layers(&self, scope_id: &RuntimeScopeId) {
+        let mut state = match self.state.write() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for layer in state.layers.values_mut() {
+            if layer
+                .focused_scope
+                .as_ref()
+                .is_some_and(|focused| &focused.scope_id == scope_id)
+            {
+                layer.focused_scope = None;
+            }
+        }
+    }
+
+    /// Returns the World focused by one active UI Layer presentation session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError::LayerNotOwner`] when the caller is not an active layer.
+    pub fn focused_world_for_layer(&self, layer_owner: &ComponentRef) -> UiResult<Option<WorldId>> {
+        let state = self.state.read().map_err(|_| UiError::RuntimeUnavailable)?;
+        let layer = state
+            .layers
+            .values()
+            .find(|layer| &layer.owner == layer_owner)
+            .ok_or(UiError::LayerNotOwner)?;
+        Ok(layer.focused_scope.as_ref().map(|focused| focused.world_id))
+    }
+
+    /// Mounts an initial snapshot for a statically registered surface.
+    ///
+    /// A surface can be mounted while no layer is attached. If a layer exists in
+    /// the same scope, its capabilities are validated immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for ownership mismatch, duplicate mount, invalid tree,
+    /// or unsupported presentation capability.
+    pub fn mount_surface(&self, owner: &ComponentRef, snapshot: UiSurfaceSnapshot) -> UiResult<()> {
+        validate_snapshot(&snapshot)?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        let key = UiSurfaceKey::new(owner.instance_id.clone(), snapshot.surface_id.clone());
+        let registered = state
+            .registered_surfaces
+            .get(&key)
+            .ok_or_else(|| UiError::SurfaceNotRegistered(snapshot.surface_id.to_string()))?;
+        if &registered.owner != owner {
+            return Err(UiError::SurfaceNotOwned(snapshot.surface_id.to_string()));
+        }
+        if state.mounted_surfaces.contains_key(&key) {
+            return Err(UiError::SurfaceAlreadyMounted(
+                snapshot.surface_id.to_string(),
+            ));
+        }
+        let scope_id = state
+            .instances
+            .get(&owner.instance_id)
+            .ok_or_else(|| UiError::InstanceNotRegistered(owner.instance_id.to_string()))?
+            .scope_id
+            .clone();
+        for (layer_scope, layer) in &state.layers {
+            let is_visible = layer_scope == &scope_id
+                || layer
+                    .focused_scope
+                    .as_ref()
+                    .is_some_and(|focused| focused.scope_id == scope_id);
+            if is_visible {
+                ensure_surface_supported(&layer.capabilities, &registered.contribution, &snapshot)?;
+            }
+        }
+        state.mounted_surfaces.insert(key, snapshot);
+        Ok(())
+    }
+
+    /// Applies one atomic incremental patch batch to a mounted surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for ownership mismatch, stale revision, invalid patch,
+    /// invalid resulting tree, or a capability unsupported by the active layer.
+    pub fn apply_patches(&self, owner: &ComponentRef, batch: UiPatchBatch) -> UiResult<()> {
+        if batch.patches.len() > DEFAULT_MAX_PATCH_OPERATIONS {
+            return Err(UiError::PatchBatchTooLarge {
+                actual: batch.patches.len(),
+                maximum: DEFAULT_MAX_PATCH_OPERATIONS,
+            });
+        }
+
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        let key = UiSurfaceKey::new(owner.instance_id.clone(), batch.surface_id.clone());
+        let registered = state
+            .registered_surfaces
+            .get(&key)
+            .ok_or_else(|| UiError::SurfaceNotRegistered(batch.surface_id.to_string()))?;
+        if &registered.owner != owner {
+            return Err(UiError::SurfaceNotOwned(batch.surface_id.to_string()));
+        }
+        let current = state
+            .mounted_surfaces
+            .get(&key)
+            .ok_or_else(|| UiError::SurfaceNotMounted(batch.surface_id.to_string()))?;
+        if current.revision != batch.base_revision {
+            return Err(UiError::RevisionMismatch {
+                expected: current.revision,
+                actual: batch.base_revision,
+            });
+        }
+        if batch.base_revision.checked_add(1) != Some(batch.next_revision) {
+            return Err(UiError::InvalidRevision {
+                base: batch.base_revision,
+                next: batch.next_revision,
+            });
+        }
+
+        let mut next = current.clone();
+        apply_patch_operations(&mut next, &batch.patches)?;
+        next.revision = batch.next_revision;
+        validate_snapshot(&next)?;
+        let scope_id = state
+            .instances
+            .get(&owner.instance_id)
+            .ok_or_else(|| UiError::InstanceNotRegistered(owner.instance_id.to_string()))?
+            .scope_id
+            .clone();
+        for (layer_scope, layer) in &state.layers {
+            let is_visible = layer_scope == &scope_id
+                || layer
+                    .focused_scope
+                    .as_ref()
+                    .is_some_and(|focused| focused.scope_id == scope_id);
+            if is_visible {
+                ensure_surface_supported(&layer.capabilities, &registered.contribution, &next)?;
+            }
+        }
+        state.mounted_surfaces.insert(key, next);
+        Ok(())
+    }
+
+    /// Removes the current presentation snapshot for one owned surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the surface is unregistered, owned by another component,
+    /// or not currently mounted.
+    pub fn unmount_surface(&self, owner: &ComponentRef, surface_id: &UiSurfaceId) -> UiResult<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        let key = UiSurfaceKey::new(owner.instance_id.clone(), surface_id.clone());
+        let registered = state
+            .registered_surfaces
+            .get(&key)
+            .ok_or_else(|| UiError::SurfaceNotRegistered(surface_id.to_string()))?;
+        if &registered.owner != owner {
+            return Err(UiError::SurfaceNotOwned(surface_id.to_string()));
+        }
+        if state.mounted_surfaces.remove(&key).is_none() {
+            return Err(UiError::SurfaceNotMounted(surface_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Returns a stable host snapshot of all active mounted portable surfaces.
+    pub fn presentation_surfaces(&self) -> Vec<UiPresentationSurface> {
+        let Ok(state) = self.state.read() else {
+            return Vec::new();
+        };
+        collect_presentations(&state, None)
+    }
+
+    /// Returns surfaces visible to one active UI Layer presentation session.
+    ///
+    /// The result contains the layer-local scope plus its optional explicit focused-World
+    /// scope, each tagged with host-normalized presentation context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the layer instance is unknown or is not the active
+    /// layer for its scope.
+    pub fn presentation_surfaces_for_layer(
+        &self,
+        layer_owner: &ComponentRef,
+    ) -> UiResult<Vec<UiPresentationSurface>> {
+        let state = self.state.read().map_err(|_| UiError::RuntimeUnavailable)?;
+        let (scope_id, layer) = state
+            .layers
+            .iter()
+            .find(|(_, layer)| &layer.owner == layer_owner)
+            .ok_or(UiError::LayerNotOwner)?;
+        let mut contexts = HashMap::from([(scope_id.clone(), UiPresentationContext::LayerLocal)]);
+        if let Some(focused) = &layer.focused_scope {
+            contexts.insert(
+                focused.scope_id.clone(),
+                UiPresentationContext::FocusedWorld {
+                    world_id: focused.world_id,
+                },
+            );
+        }
+        Ok(collect_presentations(&state, Some(&contexts)))
+    }
+
+    /// Validates and queues one renderer action for later Engine dispatch.
+    ///
+    /// The Engine validates the event again immediately before invoking the target
+    /// component so queued work cannot bypass lifecycle or revision changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::route_action`] or
+    /// [`UiError::ActionQueueFull`] when the bounded host queue is saturated.
+    pub fn queue_action(&self, layer_owner: &ComponentRef, event: UiActionEvent) -> UiResult<()> {
+        self.route_action(layer_owner, event.clone())?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        if state.queued_actions.len() >= MAX_QUEUED_ACTIONS {
+            return Err(UiError::ActionQueueFull);
+        }
+        state.queued_actions.push_back(QueuedUiAction {
+            layer_owner: layer_owner.clone(),
+            event,
+        });
+        Ok(())
+    }
+
+    /// Drains renderer actions queued since the previous Engine pump.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiError::RuntimeUnavailable`] when shared UI state cannot be accessed.
+    pub fn drain_queued_actions(&self) -> UiResult<Vec<QueuedUiAction>> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| UiError::RuntimeUnavailable)?;
+        Ok(state.queued_actions.drain(..).collect())
+    }
+
+    /// Validates an input event from an active UI Layer and resolves its owner.
+    ///
+    /// A layer may route input only to its own runtime scope or the one explicit
+    /// focused-World scope imported into that presentation session. Instance ownership,
+    /// surface revision, node binding, enabled state, and payload checks remain unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for layer spoofing, cross-scope input, stale revisions,
+    /// inactive owners, missing nodes, unbound actions, disabled controls, or
+    /// invalid payloads.
+    pub fn route_action(
+        &self,
+        layer_owner: &ComponentRef,
+        event: UiActionEvent,
+    ) -> UiResult<UiActionDispatch> {
+        let state = self.state.read().map_err(|_| UiError::RuntimeUnavailable)?;
+        let (layer_scope, layer) = state
+            .layers
+            .iter()
+            .find(|(_, layer)| &layer.owner == layer_owner)
+            .ok_or(UiError::LayerNotOwner)?;
+
+        let target_instance = state
+            .instances
+            .get(&event.owner_instance_id)
+            .ok_or_else(|| UiError::InstanceNotRegistered(event.owner_instance_id.to_string()))?;
+        let is_visible = target_instance.scope_id == *layer_scope
+            || layer
+                .focused_scope
+                .as_ref()
+                .is_some_and(|focused| focused.scope_id == target_instance.scope_id);
+        if !is_visible {
+            return Err(UiError::ScopeNotVisible);
+        }
+        if !target_instance.is_active {
+            return Err(UiError::OwnerInactive);
+        }
+
+        let key = UiSurfaceKey::new(event.owner_instance_id.clone(), event.surface_id.clone());
+        let registered = state
+            .registered_surfaces
+            .get(&key)
+            .ok_or_else(|| UiError::SurfaceNotRegistered(event.surface_id.to_string()))?;
+        let snapshot = state
+            .mounted_surfaces
+            .get(&key)
+            .ok_or_else(|| UiError::SurfaceNotMounted(event.surface_id.to_string()))?;
+        if snapshot.revision != event.surface_revision {
+            return Err(UiError::RevisionMismatch {
+                expected: snapshot.revision,
+                actual: event.surface_revision,
+            });
+        }
+        let node = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id == event.node_id)
+            .ok_or_else(|| UiError::NodeNotFound(event.node_id.to_string()))?;
+        if !node.kind.has_action(&event.action_id) {
+            return Err(UiError::ActionNotBound {
+                surface: event.surface_id.to_string(),
+                node: event.node_id.to_string(),
+                action: event.action_id.to_string(),
+            });
+        }
+        if !node.kind.is_action_enabled(&event.action_id) {
+            return Err(UiError::ActionDisabled {
+                node: event.node_id.to_string(),
+                action: event.action_id.to_string(),
+            });
+        }
+        if !node
+            .kind
+            .accepts_action_payload(&event.action_id, &event.payload)
+        {
+            return Err(UiError::InvalidActionPayload {
+                node: event.node_id.to_string(),
+                action: event.action_id.to_string(),
+            });
+        }
+
+        Ok(UiActionDispatch {
+            owner: registered.owner.clone(),
+            event,
+        })
+    }
+}
+
+fn collect_presentations(
+    state: &UiRuntimeState,
+    visible_contexts: Option<&HashMap<RuntimeScopeId, UiPresentationContext>>,
+) -> Vec<UiPresentationSurface> {
+    let mut surfaces: Vec<_> = state
+        .mounted_surfaces
+        .iter()
+        .filter_map(|(key, snapshot)| {
+            let registered = state.registered_surfaces.get(key)?;
+            let instance = state.instances.get(&key.instance_id)?;
+            if !instance.is_active {
+                return None;
+            }
+            let context = match visible_contexts {
+                Some(contexts) => Some(contexts.get(&instance.scope_id)?.clone()),
+                None => None,
+            };
+            Some(UiPresentationSurface {
+                owner: registered.owner.clone(),
+                context,
+                contribution: registered.contribution.clone(),
+                snapshot: snapshot.clone(),
+            })
+        })
+        .collect();
+    surfaces.sort_by(|left, right| {
+        left.owner
+            .instance_id
+            .as_str()
+            .cmp(right.owner.instance_id.as_str())
+            .then_with(|| {
+                left.contribution
+                    .id
+                    .as_str()
+                    .cmp(right.contribution.id.as_str())
+            })
+    });
+    surfaces
+}
+
+fn bounded_world_focus_diagnostic(diagnostic: &str) -> String {
+    let mut end = diagnostic.len().min(MAX_WORLD_FOCUS_DIAGNOSTIC_BYTES);
+    while !diagnostic.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    diagnostic[..end].to_string()
+}
+
+fn ensure_surface_supported(
+    layer_capabilities: &HashSet<rintawa_sdk::ui::UiCapabilityId>,
+    contribution: &UiSurfaceContribution,
+    snapshot: &UiSurfaceSnapshot,
+) -> UiResult<()> {
+    for capability in contribution
+        .required_capabilities
+        .iter()
+        .cloned()
+        .chain(required_capabilities(snapshot))
+    {
+        if !layer_capabilities.contains(&capability) {
+            return Err(UiError::UnsupportedCapability(capability.to_string()));
+        }
+    }
+    Ok(())
+}
+
+fn apply_patch_operations(snapshot: &mut UiSurfaceSnapshot, patches: &[UiPatch]) -> UiResult<()> {
+    let mut nodes = node_map(snapshot)?;
+    for patch in patches {
+        match patch {
+            UiPatch::UpsertNode { node } => {
+                nodes.insert(node.id.clone(), node.clone());
+            }
+            UiPatch::RemoveNode { node_id } => {
+                if nodes.remove(node_id).is_none() {
+                    return Err(UiError::NodeNotFound(node_id.to_string()));
+                }
+            }
+            UiPatch::InsertChild {
+                parent,
+                index,
+                child,
+            } => {
+                if !nodes.contains_key(child) {
+                    return Err(UiError::NodeNotFound(child.to_string()));
+                }
+                let parent_node = nodes
+                    .get_mut(parent)
+                    .ok_or_else(|| UiError::NodeNotFound(parent.to_string()))?;
+                let children = parent_node
+                    .kind
+                    .children_mut()
+                    .ok_or_else(|| UiError::NodeNotContainer(parent.to_string()))?;
+                let requested_index = *index;
+                let index =
+                    usize::try_from(requested_index).map_err(|_| UiError::InvalidChildIndex {
+                        parent: parent.to_string(),
+                        index: requested_index,
+                    })?;
+                if index > children.len() {
+                    return Err(UiError::InvalidChildIndex {
+                        parent: parent.to_string(),
+                        index: requested_index,
+                    });
+                }
+                children.insert(index, child.clone());
+            }
+            UiPatch::RemoveChild { parent, child } => {
+                let parent_node = nodes
+                    .get_mut(parent)
+                    .ok_or_else(|| UiError::NodeNotFound(parent.to_string()))?;
+                let children = parent_node
+                    .kind
+                    .children_mut()
+                    .ok_or_else(|| UiError::NodeNotContainer(parent.to_string()))?;
+                let index = children
+                    .iter()
+                    .position(|candidate| candidate == child)
+                    .ok_or_else(|| UiError::ChildNotFound {
+                        parent: parent.to_string(),
+                        child: child.to_string(),
+                    })?;
+                children.remove(index);
+            }
+            UiPatch::MoveChild {
+                parent,
+                child,
+                index,
+            } => {
+                let parent_node = nodes
+                    .get_mut(parent)
+                    .ok_or_else(|| UiError::NodeNotFound(parent.to_string()))?;
+                let children = parent_node
+                    .kind
+                    .children_mut()
+                    .ok_or_else(|| UiError::NodeNotContainer(parent.to_string()))?;
+                let current = children
+                    .iter()
+                    .position(|candidate| candidate == child)
+                    .ok_or_else(|| UiError::ChildNotFound {
+                        parent: parent.to_string(),
+                        child: child.to_string(),
+                    })?;
+                let child = children.remove(current);
+                let requested_index = *index;
+                let index =
+                    usize::try_from(requested_index).map_err(|_| UiError::InvalidChildIndex {
+                        parent: parent.to_string(),
+                        index: requested_index,
+                    })?;
+                if index > children.len() {
+                    return Err(UiError::InvalidChildIndex {
+                        parent: parent.to_string(),
+                        index: requested_index,
+                    });
+                }
+                children.insert(index, child);
+            }
+        }
+    }
+
+    let mut rebuilt: Vec<_> = nodes.into_values().collect();
+    rebuilt.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+    snapshot.nodes = rebuilt;
+    Ok(())
+}
+
+#[cfg(test)]
+mod poison_cleanup_tests {
+    use std::thread;
+
+    use super::*;
+
+    #[test]
+    fn test_should_unregister_instance_after_ui_state_lock_is_poisoned() {
+        let runtime = UiRuntime::new();
+        let instance_id = ExtensionInstanceId::new("example.ui");
+        runtime
+            .register_instance(
+                instance_id.clone(),
+                RuntimeScopeId::new("host"),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("test UI instance should register");
+
+        let poisoner = runtime.clone();
+        let _ = thread::spawn(move || {
+            let _state = poisoner
+                .state
+                .write()
+                .expect("test UI state lock should start healthy");
+            panic!("poison UI runtime state lock");
+        })
+        .join();
+
+        runtime.unregister_instance(&instance_id);
+        let state = match runtime.state.read() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(!state.instances.contains_key(&instance_id));
+    }
+}

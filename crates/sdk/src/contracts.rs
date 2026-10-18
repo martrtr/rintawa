@@ -1,0 +1,264 @@
+//! Public types for versioned component contracts.
+
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    secrets::SecretPathPattern,
+    types::{ComponentId, ContractId, ExtensionInstanceId},
+};
+
+/// A major version of a public contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ContractVersion(u32);
+
+impl ContractVersion {
+    /// Creates a contract version.
+    pub const fn new(major: u32) -> Self {
+        Self(major)
+    }
+
+    /// Returns the major version number.
+    pub const fn major(self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for ContractVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Identifies one major version of a contract.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ContractKey {
+    /// Stable contract identifier.
+    pub id: ContractId,
+    /// Major contract version.
+    pub version: ContractVersion,
+}
+
+impl ContractKey {
+    /// Creates a contract key.
+    pub fn new(id: impl Into<ContractId>, version: ContractVersion) -> Self {
+        Self {
+            id: id.into(),
+            version,
+        }
+    }
+}
+
+impl fmt::Display for ContractKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{}", self.id, self.version)
+    }
+}
+
+/// Stable identifier of the platform-owned Host Shell role.
+pub const HOST_SHELL_CONTRACT_ID: &str = "rintawa.host.shell";
+
+/// Major version of the platform-owned Host Shell role.
+pub const HOST_SHELL_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1);
+
+/// Returns the versioned contract key used to select the primary Host Shell.
+///
+/// The Host Shell is a composition role, not an execution target. Platform hosts
+/// define this contract as a single-provider binding while extensions may provide
+/// it without owning the contract definition.
+pub fn host_shell_contract_key() -> ContractKey {
+    ContractKey::new(HOST_SHELL_CONTRACT_ID, HOST_SHELL_CONTRACT_VERSION)
+}
+
+/// Stable identifier of the platform-owned portable UI Layer role.
+pub const UI_LAYER_CONTRACT_ID: &str = "rintawa.ui.layer";
+
+/// Major version of the platform-owned portable UI Layer role.
+pub const UI_LAYER_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1);
+
+/// Returns the versioned contract key used to select the active portable UI Layer.
+///
+/// The UI Layer is a composition role. Platform hosts define it as a
+/// single-provider binding while extensions provide renderer capabilities through
+/// a separately registered [`crate::ui::UiLayerDescriptor`].
+pub fn ui_layer_contract_key() -> ContractKey {
+    ContractKey::new(UI_LAYER_CONTRACT_ID, UI_LAYER_CONTRACT_VERSION)
+}
+
+/// Stable identifier of the platform-owned World presentation role.
+pub const WORLD_PRESENTATION_CONTRACT_ID: &str = "rintawa.world.presentation";
+
+/// Major version of the platform-owned World presentation role.
+pub const WORLD_PRESENTATION_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1);
+
+/// Returns the versioned Binding used to select one World presentation provider.
+///
+/// A provider separately registers an owner-scoped
+/// [`crate::ui::WorldPresentationDescriptor`] naming its initial portable surface.
+pub fn world_presentation_contract_key() -> ContractKey {
+    ContractKey::new(
+        WORLD_PRESENTATION_CONTRACT_ID,
+        WORLD_PRESENTATION_CONTRACT_VERSION,
+    )
+}
+
+/// Identifies one component within one concrete extension runtime instance.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ComponentRef {
+    /// Opaque runtime instance that owns the component.
+    pub instance_id: ExtensionInstanceId,
+    /// Component identifier within the extension instance.
+    pub component_id: ComponentId,
+}
+
+impl ComponentRef {
+    /// Creates a component reference.
+    pub fn new(
+        instance_id: impl Into<ExtensionInstanceId>,
+        component_id: impl Into<ComponentId>,
+    ) -> Self {
+        Self {
+            instance_id: instance_id.into(),
+            component_id: component_id.into(),
+        }
+    }
+}
+
+/// Determines how providers of one contract are composed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContractResolutionPolicy {
+    /// Exactly one provider is bound to each consumer.
+    Single,
+    /// Every eligible provider is bound to each consumer.
+    Multiple,
+}
+
+impl fmt::Display for ContractResolutionPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Single => f.write_str("single"),
+            Self::Multiple => f.write_str("multiple"),
+        }
+    }
+}
+
+/// Declares how a resolved contract is used by the host.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContractProtocol {
+    /// The contract only participates in provider/consumer composition.
+    #[default]
+    Binding,
+    /// The contract exposes host-routed service operations.
+    Service,
+}
+
+impl fmt::Display for ContractProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Binding => f.write_str("binding"),
+            Self::Service => f.write_str("service"),
+        }
+    }
+}
+
+/// Defines a contract and its provider resolution policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContractDefinition {
+    /// Contract being defined.
+    pub contract: ContractKey,
+    /// Provider composition policy.
+    pub resolution: ContractResolutionPolicy,
+    /// Host interaction protocol for this contract.
+    #[serde(default)]
+    pub protocol: ContractProtocol,
+}
+
+impl ContractDefinition {
+    /// Creates a composition-only contract definition.
+    pub fn new(contract: ContractKey, resolution: ContractResolutionPolicy) -> Self {
+        Self {
+            contract,
+            resolution,
+            protocol: ContractProtocol::Binding,
+        }
+    }
+
+    /// Creates a host-routed service contract definition.
+    pub fn service(contract: ContractKey, resolution: ContractResolutionPolicy) -> Self {
+        Self {
+            contract,
+            resolution,
+            protocol: ContractProtocol::Service,
+        }
+    }
+}
+
+/// A host grant that must exist before a contract endpoint is eligible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ContractGrantRequirement {
+    /// The component must hold a host-approved secret-read grant.
+    SecretRead {
+        /// Secret path or domain required by the endpoint.
+        pattern: SecretPathPattern,
+    },
+}
+
+/// Declares that a component provides a contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContractProvider {
+    /// Contract implemented by the component.
+    pub contract: ContractKey,
+    /// Host grants required before this provider can be selected.
+    #[serde(default)]
+    pub required_grants: Vec<ContractGrantRequirement>,
+}
+
+impl ContractProvider {
+    /// Creates a provider without host-grant requirements.
+    pub fn new(contract: ContractKey) -> Self {
+        Self {
+            contract,
+            required_grants: Vec::new(),
+        }
+    }
+
+    /// Requires one host grant before this provider is eligible.
+    pub fn requiring(mut self, requirement: ContractGrantRequirement) -> Self {
+        self.required_grants.push(requirement);
+        self
+    }
+}
+
+/// Declares that a component consumes a contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContractConsumer {
+    /// Contract required by the component.
+    pub contract: ContractKey,
+    /// Whether missing resolution is a required dependency for this consumer.
+    pub required: bool,
+    /// Host grants required before this consumer endpoint is eligible.
+    #[serde(default)]
+    pub required_grants: Vec<ContractGrantRequirement>,
+}
+
+impl ContractConsumer {
+    /// Creates a consumer declaration.
+    pub fn new(contract: ContractKey, required: bool) -> Self {
+        Self {
+            contract,
+            required,
+            required_grants: Vec::new(),
+        }
+    }
+
+    /// Requires one host grant before this consumer is eligible.
+    pub fn requiring(mut self, requirement: ContractGrantRequirement) -> Self {
+        self.required_grants.push(requirement);
+        self
+    }
+}

@@ -1,0 +1,151 @@
+//! Directory scanner and loader for Rintawa extensions.
+
+use std::path::{Component as PathComponent, Path, PathBuf};
+
+use rintawa_sdk::{manifest::WASM_COMPONENT_TARGET_V1, traits::Component, types::ExtensionId};
+use tracing::{info, warn};
+
+use crate::{
+    engine::ExtensionEngine,
+    errors::{EngineError, EngineResult},
+    runtime::WasmRuntimeEngine,
+    state::{ExtensionsStateConfig, STATE_FILE_NAME},
+};
+
+/// Service responsible for discovering and loading extensions from disk.
+pub struct ExtensionLoader {
+    wasm_engine: WasmRuntimeEngine,
+}
+
+fn path_escape_error(root: &Path, path: &Path) -> EngineError {
+    EngineError::ExtensionPathEscapesRoot {
+        path: path.to_string_lossy().into_owned(),
+        root: root.to_string_lossy().into_owned(),
+    }
+}
+
+fn canonicalize_owned_path(root: &Path, path: &Path) -> EngineResult<PathBuf> {
+    let canonical = path.canonicalize()?;
+    if !canonical.starts_with(root) {
+        return Err(path_escape_error(root, &canonical));
+    }
+    Ok(canonical)
+}
+
+impl ExtensionLoader {
+    /// Creates a new extension loader instance.
+    pub fn new(wasm_engine: WasmRuntimeEngine) -> Self {
+        Self { wasm_engine }
+    }
+
+    /// Scans a directory (e.g., `rintawa/extensions`), parses manifests, and registers enabled extensions.
+    pub fn load_directory(
+        &self,
+        engine: &mut ExtensionEngine,
+        dir_path: &Path,
+    ) -> EngineResult<Vec<ExtensionId>> {
+        if !dir_path.exists() || !dir_path.is_dir() {
+            return Err(EngineError::InvalidDirectory(
+                dir_path.to_string_lossy().to_string(),
+            ));
+        }
+
+        let root = dir_path.canonicalize()?;
+        let state_path = dir_path.join(STATE_FILE_NAME);
+        let state_config = ExtensionsStateConfig::load_from_file(&state_path)?;
+
+        let mut loaded_extensions = Vec::new();
+        let mut entries = std::fs::read_dir(dir_path)?
+            .filter_map(|entry| match entry {
+                Ok(entry) => Some(entry),
+                Err(err) => {
+                    warn!(
+                        "Failed to read directory entry in {}: {err}",
+                        dir_path.display()
+                    );
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+
+        for entry in entries {
+            let path = entry.path();
+
+            if path.is_dir() {
+                let canonical_path = match canonicalize_owned_path(&root, &path) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        warn!(path = %path.display(), "Skipping extension directory: {err}");
+                        continue;
+                    }
+                };
+                let manifest_path = canonical_path.join("manifest.toml");
+                if manifest_path.exists() {
+                    match self.load_single_extension(engine, &canonical_path, &state_config) {
+                        Ok(Some(id)) => loaded_extensions.push(id),
+                        Ok(None) => {}
+                        Err(err) => {
+                            warn!(path = %canonical_path.display(), "Failed to load extension: {err}");
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(loaded_extensions)
+    }
+
+    /// Loads a single extension directory if approved by `state_config`.
+    pub fn load_single_extension(
+        &self,
+        engine: &mut ExtensionEngine,
+        ext_dir: &Path,
+        state_config: &ExtensionsStateConfig,
+    ) -> EngineResult<Option<ExtensionId>> {
+        let root = ext_dir.canonicalize()?;
+        let manifest_path = canonicalize_owned_path(&root, &root.join("manifest.toml"))?;
+        let raw_manifest = std::fs::read_to_string(&manifest_path)?;
+        let manifest = engine.parse_manifest(&raw_manifest)?;
+
+        let ext_id_str = manifest.id.as_str();
+
+        if !state_config.is_enabled(ext_id_str) {
+            info!(extension = %ext_id_str, "Skipping disabled extension");
+            return Ok(None);
+        }
+
+        let mut components: Vec<Box<dyn Component>> = Vec::new();
+
+        for comp_desc in &manifest.components {
+            if comp_desc.target.as_str() == WASM_COMPONENT_TARGET_V1 {
+                let wasm_rel_str = comp_desc.entry.as_deref().unwrap_or("runtime.wasm");
+                let wasm_rel_path = Path::new(wasm_rel_str);
+
+                if wasm_rel_path.is_absolute()
+                    || wasm_rel_path
+                        .components()
+                        .any(|component| component == PathComponent::ParentDir)
+                {
+                    return Err(path_escape_error(&root, wasm_rel_path));
+                }
+
+                let wasm_path = canonicalize_owned_path(&root, &root.join(wasm_rel_path))?;
+                let wasm_component = self
+                    .wasm_engine
+                    .load_component_from_file(comp_desc.id.clone(), &wasm_path)?;
+
+                components.push(Box::new(wasm_component));
+            } else if comp_desc.required {
+                return Err(EngineError::UnsupportedRequiredComponentTarget {
+                    component_id: comp_desc.id.to_string(),
+                    target: comp_desc.target.to_string(),
+                });
+            }
+        }
+
+        let ext_id = manifest.id.clone();
+        engine.register_extension(manifest, components)?;
+        Ok(Some(ext_id))
+    }
+}
