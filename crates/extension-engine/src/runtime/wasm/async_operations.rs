@@ -134,6 +134,39 @@ pub(crate) struct AsyncObserverRegistry {
 }
 
 impl AsyncObserverRegistry {
+    /// Releases observer capacity from expired producer operations, even when
+    /// the producer is still active but no longer receives runtime callbacks.
+    ///
+    /// The registry lock must not block on an operation mutex: producers can
+    /// hold that mutex while acquiring the registry lock during handoff.
+    fn prune_expired_leases(&self, now: Instant) -> Result<(), AsyncOperationError> {
+        let mut leases = self
+            .leases
+            .lock()
+            .map_err(|_| AsyncOperationError::Unavailable)?;
+        leases.retain(|_, lease| {
+            let Some(operation) = lease.operation.upgrade() else {
+                return false;
+            };
+            match operation.try_lock() {
+                Ok(mut owned) => {
+                    if !owned.expired(now) {
+                        return true;
+                    }
+                    if owned.delegated_reader.as_ref() == Some(&lease.reader) {
+                        owned.delegated_reader = None;
+                    }
+                    false
+                }
+                // A live writer may already hold its operation lock while
+                // waiting for this registry lock. Never introduce inversion.
+                Err(std::sync::TryLockError::WouldBlock) => true,
+                Err(std::sync::TryLockError::Poisoned(_)) => false,
+            }
+        });
+        Ok(())
+    }
+
     /// Revokes both writer-owned streams and read-only leases of a stopped reader.
     /// Release the registry lock before touching individual streams.
     pub(super) fn revoke_principal(&self, principal: &ComponentRef) {
@@ -356,6 +389,7 @@ impl AsyncOperationHost for WasmHostState {
             return Err(AsyncOperationError::InvalidState);
         }
         self.prune_async_operations();
+        self.async_observers.prune_expired_leases(Instant::now())?;
         let operation = self.owned_operation(&handle, &owner)?;
         let mut locked = operation
             .lock()
@@ -369,7 +403,6 @@ impl AsyncOperationHost for WasmHostState {
                 .leases
                 .lock()
                 .map_err(|_| AsyncOperationError::Unavailable)?;
-            leases.retain(|_, lease| lease.operation.strong_count() > 0);
             if leases.len() >= MAX_OBSERVER_LEASES {
                 return Err(AsyncOperationError::LimitExceeded);
             }
@@ -751,6 +784,92 @@ mod tests {
             state
         };
         (make("provider"), make("client"), make("intruder"))
+    }
+
+    #[test]
+    fn expired_observer_is_reaped_while_producer_still_owns_the_operation() {
+        let (mut provider, mut client, mut next_provider) = shared_states();
+        let old_handle = AsyncOperationHost::create(&mut provider).unwrap();
+        provider.service_caller = Some(ComponentRef::new("client", "runtime"));
+        let old_token =
+            AsyncOperationHost::share_with_caller(&mut provider, old_handle.clone()).unwrap();
+        AsyncOperationHost::complete(&mut provider, old_handle.clone(), vec![]).unwrap();
+        {
+            let old_operation = provider.async_operations.get(&old_handle).unwrap();
+            old_operation.lock().unwrap().terminal_since =
+                Some(Instant::now() - TERMINAL_RETENTION - Duration::from_secs(1));
+        }
+
+        // A separate producer must reclaim expired leases even though this
+        // provider has had no callback to prune its own operation store.
+        next_provider.service_caller = Some(ComponentRef::new("client", "runtime"));
+        let next_handle = AsyncOperationHost::create(&mut next_provider).unwrap();
+        let next_token =
+            AsyncOperationHost::share_with_caller(&mut next_provider, next_handle).unwrap();
+        assert!(
+            !provider
+                .async_observers
+                .leases
+                .lock()
+                .unwrap()
+                .contains_key(&old_token)
+        );
+        assert!(provider.async_operations.contains_key(&old_handle));
+        assert!(
+            provider.async_operations[&old_handle]
+                .lock()
+                .unwrap()
+                .delegated_reader
+                .is_none()
+        );
+        assert!(matches!(
+            AsyncOperationHost::poll_observer(&mut client, old_token),
+            Err(AsyncOperationError::UnknownHandle)
+        ));
+        assert!(matches!(
+            AsyncOperationHost::poll_observer(&mut client, next_token),
+            Ok(AsyncOperationEvent::Pending)
+        ));
+    }
+
+    #[test]
+    fn expired_lease_capacity_is_reclaimed_before_new_handoffs() {
+        let (mut provider, mut client, mut next_provider) = shared_states();
+        let old_handle = AsyncOperationHost::create(&mut provider).unwrap();
+        provider.service_caller = Some(ComponentRef::new("client", "runtime"));
+        let old_token =
+            AsyncOperationHost::share_with_caller(&mut provider, old_handle.clone()).unwrap();
+        AsyncOperationHost::complete(&mut provider, old_handle.clone(), vec![]).unwrap();
+        let old_operation = provider.async_operations.get(&old_handle).unwrap().clone();
+        old_operation.lock().unwrap().terminal_since =
+            Some(Instant::now() - TERMINAL_RETENTION - Duration::from_secs(1));
+
+        // Model a saturated registry retaining orphaned reader tokens. All
+        // entries still have a live producer Arc, so pruning Weak pointers
+        // alone would leave the entire capacity incorrectly occupied.
+        {
+            let mut leases = provider.async_observers.leases.lock().unwrap();
+            let saved = leases.remove(&old_token).unwrap();
+            for index in 0..MAX_OBSERVER_LEASES {
+                leases.insert(
+                    format!("expired-{index}"),
+                    ObserverLease {
+                        reader: saved.reader.clone(),
+                        owner: saved.owner.clone(),
+                        operation: Arc::downgrade(&old_operation),
+                    },
+                );
+            }
+        }
+
+        next_provider.service_caller = Some(ComponentRef::new("client", "runtime"));
+        let handle = AsyncOperationHost::create(&mut next_provider).unwrap();
+        let token = AsyncOperationHost::share_with_caller(&mut next_provider, handle).unwrap();
+        assert_eq!(provider.async_observers.leases.lock().unwrap().len(), 1);
+        assert!(matches!(
+            AsyncOperationHost::poll_observer(&mut client, token),
+            Ok(AsyncOperationEvent::Pending)
+        ));
     }
 
     #[test]
