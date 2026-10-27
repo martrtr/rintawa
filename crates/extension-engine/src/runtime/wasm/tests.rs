@@ -1435,7 +1435,7 @@ fn test_should_expose_authenticated_runtime_context_only_during_execution() {
         RuntimeContextHost::current(&mut state),
         Err(RuntimeContextError::AccessNotActive)
     ));
-    state.begin_service_execution(None);
+    state.begin_service_execution(None, false);
     let service_context = RuntimeContextHost::current(&mut state)
         .expect("service callback should retain authenticated runtime identity");
     assert_eq!(service_context.scope_id, test_scope_id().to_string());
@@ -1956,6 +1956,123 @@ fn test_should_only_attest_immediate_ui_callback_commands_not_subsequent_guest_w
     assert!(writes[0].verified_ui_action);
     assert!(!writes[1].verified_ui_action);
     assert!(!writes[2].verified_ui_action);
+}
+
+#[test]
+fn test_should_allow_effect_service_scoped_reads_without_general_host_mutations() {
+    let access = Arc::new(RecordingScopedHostAccess::default());
+    let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
+    let mut services = WasmHostServices::standalone(secrets);
+    services.host_access = HostAccessServices::new(
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+    )
+    .with_world_projection_access(access.clone())
+    .with_world_command_access(access.clone());
+    let mut state = WasmHostState::with_host_services_and_budget(
+        ComponentId::new("runtime"),
+        services,
+        false,
+        &WasmExecutionBudget::default(),
+    );
+    begin_test_registration(&mut state, ExtensionId::new("test.effect-service-reader"));
+    state.finish_registration().unwrap();
+    let owner = state.registered_owner().unwrap();
+    state
+        .runtime_permissions
+        .grant(owner.clone(), RuntimePermission::WorldProjectionRead)
+        .unwrap();
+    state
+        .runtime_permissions
+        .grant(owner, RuntimePermission::WorldCommandSubmit)
+        .unwrap();
+
+    let read = || WitWorldProjectionRequest {
+        world_id: String::from("018f0000-0000-7000-8000-000000000001"),
+        schema: String::from("example.projection@1"),
+        input_json: br#"{"conversation":"main"}"#.to_vec(),
+    };
+    let command = || WitWorldCommandRequest {
+        world_id: String::from("018f0000-0000-7000-8000-000000000001"),
+        schema: String::from("example.command@1"),
+        actor: WitWorldCommandActor::Principal,
+        expected_position: None,
+        payload_json: br#"{"message":"hello"}"#.to_vec(),
+    };
+
+    // Regular service callbacks still have no World state access.
+    state.begin_service_execution(None, false);
+    assert!(matches!(
+        WorldProjectionsHost::request_read(&mut state, read()),
+        Err(WorldProjectionError::AccessNotActive)
+    ));
+    assert!(matches!(
+        PreferencesHost::get(&mut state, String::from("policy")),
+        Err(PreferenceError::AccessNotActive)
+    ));
+    state.finish_service_execution();
+
+    // An exact Host-owned World Effect callback may request a bounded,
+    // ordinary principal-filtered projection and its own controller policy.
+    state.begin_service_execution(None, true);
+    assert!(!matches!(
+        PreferencesHost::get(&mut state, String::from("policy")),
+        Err(PreferenceError::AccessNotActive)
+    ));
+    assert!(WorldProjectionsHost::request_read(&mut state, read()).is_ok());
+    assert_eq!(state.world_projection_reads_this_execution, 1);
+    assert!(matches!(
+        PreferencesHost::set(&mut state, String::from("policy"), String::from("changed")),
+        Err(PreferenceError::AccessNotActive)
+    ));
+    assert!(matches!(
+        PreferencesHost::delete(&mut state, String::from("policy")),
+        Err(PreferenceError::AccessNotActive)
+    ));
+    assert!(matches!(
+        WorldCommandsHost::submit(&mut state, command()),
+        Err(WorldCommandError::AccessNotActive)
+    ));
+    assert_eq!(
+        access
+            .world_projection_reads
+            .lock()
+            .expect("read recording")
+            .len(),
+        1
+    );
+    assert!(
+        access
+            .world_command_writes
+            .lock()
+            .expect("command recording")
+            .is_empty()
+    );
+    state.finish_service_execution();
+
+    assert!(matches!(
+        WorldProjectionsHost::request_read(&mut state, read()),
+        Err(WorldProjectionError::AccessNotActive)
+    ));
+    assert!(matches!(
+        PreferencesHost::get(&mut state, String::from("policy")),
+        Err(PreferenceError::AccessNotActive)
+    ));
+    state.begin_service_execution(None, false);
+    assert!(matches!(
+        WorldProjectionsHost::request_read(&mut state, read()),
+        Err(WorldProjectionError::AccessNotActive)
+    ));
+    state.finish_service_execution();
+
+    state.begin_guest_execution();
+    assert!(!state.effect_service_read_active);
+    assert!(WorldProjectionsHost::request_read(&mut state, read()).is_ok());
+    state.discard_guest_execution();
 }
 
 #[test]

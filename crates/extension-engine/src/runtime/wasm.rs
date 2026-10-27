@@ -224,6 +224,9 @@ pub struct WasmHostState {
     active_tasks: HashMap<u64, ActiveWasmTask>,
     network_access_active: bool,
     host_access_active: bool,
+    /// Read-only World effect continuation may access permitted projections
+    /// and its own persisted preference, never general Host mutations.
+    effect_service_read_active: bool,
     /// True only while the dispatcher is executing a validated UI action.
     verified_ui_action_active: bool,
     http_request_access_active: bool,
@@ -418,6 +421,7 @@ impl WasmHostState {
             active_tasks: HashMap::new(),
             network_access_active: false,
             host_access_active: false,
+            effect_service_read_active: false,
             verified_ui_action_active: false,
             http_request_access_active: false,
             operation_access_active: false,
@@ -615,6 +619,7 @@ impl WasmHostState {
     }
 
     fn discard_guest_execution(&mut self) {
+        self.effect_service_read_active = false;
         self.verified_ui_action_active = false;
         self.registration_scope = None;
         self.execution_owner = None;
@@ -846,6 +851,7 @@ impl WasmHostState {
 
     /// Opens the normal guest execution scope for the provider component itself.
     fn begin_guest_execution(&mut self) {
+        self.effect_service_read_active = false;
         self.verified_ui_action_active = false;
         self.execution_owner = self.registered_owner();
         self.runtime_effects_active = true;
@@ -865,6 +871,7 @@ impl WasmHostState {
     }
 
     fn begin_delegated_guest_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
+        self.effect_service_read_active = false;
         self.verified_ui_action_active = false;
         self.execution_owner = Some(owner);
         self.runtime_effects_active = true;
@@ -884,6 +891,7 @@ impl WasmHostState {
     }
 
     fn begin_delegated_task_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
+        self.effect_service_read_active = false;
         self.verified_ui_action_active = false;
         self.execution_owner = Some(owner);
         // Runtime effects require an Engine ComponentContext for the exact owner.
@@ -922,8 +930,11 @@ impl WasmHostState {
     fn begin_service_execution(
         &mut self,
         service_caller: Option<rintawa_sdk::contracts::ComponentRef>,
+        is_world_effect: bool,
     ) {
+        self.effect_service_read_active = is_world_effect;
         self.verified_ui_action_active = false;
+        self.world_projection_reads_this_execution = 0;
         self.service_caller = service_caller;
         self.execution_owner = self.registered_owner();
         self.runtime_effects_active = false;
@@ -938,6 +949,8 @@ impl WasmHostState {
     }
 
     fn begin_delegated_service_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
+        self.effect_service_read_active = false;
+        self.verified_ui_action_active = false;
         self.execution_owner = Some(owner);
         self.runtime_effects_active = false;
         self.task_access_active = false;
@@ -951,6 +964,7 @@ impl WasmHostState {
     }
 
     fn finish_service_execution(&mut self) {
+        self.effect_service_read_active = false;
         self.execution_owner = None;
         self.service_caller = None;
         self.task_access_active = false;
@@ -966,6 +980,7 @@ impl WasmHostState {
 
     /// Closes guest access before committing its queued runtime effects.
     fn finish_guest_execution(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
+        self.effect_service_read_active = false;
         self.verified_ui_action_active = false;
         self.runtime_effects_active = false;
         self.task_access_active = false;
@@ -2390,10 +2405,11 @@ impl Component for WasmComponent {
 
         instance.store.data().validate_execution_owner(ctx)?;
         Self::set_service_request_fuel(&mut instance.store, &budget, "service request")?;
-        instance
-            .store
-            .data_mut()
-            .begin_service_execution(ctx.service_caller().cloned());
+        instance.store.data_mut().begin_service_execution(
+            ctx.service_caller().cloned(),
+            contract.id.as_str().starts_with("rintawa.world.effect.")
+                && contract.version.major() == 1,
+        );
 
         let response = instance
             .plugin

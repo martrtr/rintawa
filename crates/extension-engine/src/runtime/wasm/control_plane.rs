@@ -719,6 +719,11 @@ impl PreferencesHost for WasmHostState {
     }
 
     fn set(&mut self, key: String, value: String) -> Result<(), PreferenceError> {
+        // Durable effect service callbacks are read-only: they may inspect
+        // their own controller revision, never change it while executing.
+        if !self.host_access_active {
+            return Err(PreferenceError::AccessNotActive);
+        }
         let (scope_id, owner) = self.preference_owner()?;
         if key.len().saturating_add(value.len()) > self.max_host_message_bytes {
             return Err(PreferenceError::MessageTooLarge);
@@ -736,6 +741,9 @@ impl PreferencesHost for WasmHostState {
     }
 
     fn delete(&mut self, key: String) -> Result<(), PreferenceError> {
+        if !self.host_access_active {
+            return Err(PreferenceError::AccessNotActive);
+        }
         let (scope_id, owner) = self.preference_owner()?;
         if key.len() > self.max_host_message_bytes {
             return Err(PreferenceError::MessageTooLarge);
@@ -754,7 +762,7 @@ impl PreferencesHost for WasmHostState {
 
 impl WasmHostState {
     fn preference_owner(&self) -> Result<(RuntimeScopeId, ComponentRef), PreferenceError> {
-        if !self.host_access_active {
+        if !self.host_access_active && !self.effect_service_read_active {
             return Err(PreferenceError::AccessNotActive);
         }
         let scope_id = self
@@ -1308,7 +1316,7 @@ impl WasmHostState {
     }
 
     fn require_world_projection_read(&self) -> Result<ComponentRef, WorldProjectionError> {
-        if !self.host_access_active {
+        if !self.host_access_active && !self.effect_service_read_active {
             return Err(WorldProjectionError::AccessNotActive);
         }
         self.runtime_permission_owner(RuntimePermission::WorldProjectionRead)
