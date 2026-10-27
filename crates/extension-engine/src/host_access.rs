@@ -308,6 +308,12 @@ pub struct WorldCommandRequest {
     pub expected_position: Option<u64>,
     /// Extension-owned JSON command payload bytes.
     pub payload_json: Vec<u8>,
+    /// Trusted invocation provenance set ONLY by the WASM host callback dispatcher.
+    ///
+    /// An ordinary guest WIT WorldCommandRequest has no such field. True means
+    /// the request came directly from a validated UI action callback, not from
+    /// an event, background task, inference service or extension preference.
+    pub verified_ui_action: bool,
 }
 
 /// Stable identities allocated by the host for one accepted deferred world command.

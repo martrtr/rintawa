@@ -224,6 +224,8 @@ pub struct WasmHostState {
     active_tasks: HashMap<u64, ActiveWasmTask>,
     network_access_active: bool,
     host_access_active: bool,
+    /// True only while the dispatcher is executing a validated UI action.
+    verified_ui_action_active: bool,
     http_request_access_active: bool,
     operation_access_active: bool,
     service_caller: Option<rintawa_sdk::contracts::ComponentRef>,
@@ -416,6 +418,7 @@ impl WasmHostState {
             active_tasks: HashMap::new(),
             network_access_active: false,
             host_access_active: false,
+            verified_ui_action_active: false,
             http_request_access_active: false,
             operation_access_active: false,
             service_caller: None,
@@ -612,6 +615,7 @@ impl WasmHostState {
     }
 
     fn discard_guest_execution(&mut self) {
+        self.verified_ui_action_active = false;
         self.registration_scope = None;
         self.execution_owner = None;
         self.runtime_effects_active = false;
@@ -842,6 +846,7 @@ impl WasmHostState {
 
     /// Opens the normal guest execution scope for the provider component itself.
     fn begin_guest_execution(&mut self) {
+        self.verified_ui_action_active = false;
         self.execution_owner = self.registered_owner();
         self.runtime_effects_active = true;
         self.task_access_active = true;
@@ -860,6 +865,7 @@ impl WasmHostState {
     }
 
     fn begin_delegated_guest_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
+        self.verified_ui_action_active = false;
         self.execution_owner = Some(owner);
         self.runtime_effects_active = true;
         self.task_access_active = true;
@@ -878,6 +884,7 @@ impl WasmHostState {
     }
 
     fn begin_delegated_task_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
+        self.verified_ui_action_active = false;
         self.execution_owner = Some(owner);
         // Runtime effects require an Engine ComponentContext for the exact owner.
         // The cooperative provider pump currently has only the provider context,
@@ -916,6 +923,7 @@ impl WasmHostState {
         &mut self,
         service_caller: Option<rintawa_sdk::contracts::ComponentRef>,
     ) {
+        self.verified_ui_action_active = false;
         self.service_caller = service_caller;
         self.execution_owner = self.registered_owner();
         self.runtime_effects_active = false;
@@ -958,6 +966,7 @@ impl WasmHostState {
 
     /// Closes guest access before committing its queued runtime effects.
     fn finish_guest_execution(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
+        self.verified_ui_action_active = false;
         self.runtime_effects_active = false;
         self.task_access_active = false;
         self.network_access_active = false;
@@ -2329,6 +2338,9 @@ impl Component for WasmComponent {
             instance.store.data().validate_execution_owner(ctx)?;
             Self::set_ui_action_fuel(&mut instance.store, &budget, "UI action")?;
             instance.store.data_mut().begin_guest_execution();
+            // Only the Host-routed semantic UI callback may attest an
+            // immediate guest-submitted World command as interactive.
+            instance.store.data_mut().verified_ui_action_active = true;
 
             let action_result = instance
                 .plugin

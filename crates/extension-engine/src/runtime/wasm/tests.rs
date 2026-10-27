@@ -1896,6 +1896,66 @@ fn test_should_gate_bound_and_budget_world_command_submission() {
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0].expected_position, Some(7));
     assert_eq!(writes[0].payload_json, br#"{"value":1}"#);
+    assert!(!writes[0].verified_ui_action);
+}
+
+#[test]
+fn test_should_only_attest_immediate_ui_callback_commands_not_subsequent_guest_work() {
+    let access = Arc::new(RecordingScopedHostAccess::default());
+    let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
+    let mut services = WasmHostServices::standalone(secrets);
+    services.host_access = HostAccessServices::new(
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+    )
+    .with_world_command_access(access.clone());
+    let mut state = WasmHostState::with_host_services_and_budget(
+        ComponentId::new("runtime"),
+        services,
+        false,
+        &WasmExecutionBudget::default(),
+    );
+    begin_test_registration(&mut state, ExtensionId::new("ui.origin.test"));
+    state.finish_registration().unwrap();
+    let owner = state.registered_owner().unwrap();
+    state
+        .runtime_permissions
+        .grant(owner, RuntimePermission::WorldCommandSubmit)
+        .unwrap();
+    let request = || WitWorldCommandRequest {
+        world_id: String::from("018f0000-0000-7000-8000-000000000001"),
+        schema: String::from("example.command@1"),
+        actor: WitWorldCommandActor::Principal,
+        expected_position: None,
+        payload_json: br#"{"message":"hello"}"#.to_vec(),
+    };
+
+    state.begin_guest_execution();
+    state.verified_ui_action_active = true;
+    WorldCommandsHost::submit(&mut state, request()).unwrap();
+    state.discard_guest_execution();
+
+    state.begin_guest_execution();
+    assert!(!state.verified_ui_action_active);
+    WorldCommandsHost::submit(&mut state, request()).unwrap();
+    state.discard_guest_execution();
+
+    state.begin_guest_execution();
+    state.verified_ui_action_active = true;
+    state.begin_delegated_task_execution(state.registered_owner().unwrap());
+    assert!(!state.verified_ui_action_active);
+    WorldCommandsHost::submit(&mut state, request()).unwrap();
+    state.discard_guest_execution();
+
+    let writes = access.world_command_writes.lock().expect("recording lock");
+    assert_eq!(writes.len(), 3);
+    assert!(writes[0].verified_ui_action);
+    assert!(!writes[1].verified_ui_action);
+    assert!(!writes[2].verified_ui_action);
 }
 
 #[test]

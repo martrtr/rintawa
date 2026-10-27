@@ -616,6 +616,7 @@ impl WorldCommandsHost for WasmHostState {
                 actor,
                 expected_position: request.expected_position,
                 payload_json: request.payload_json,
+                verified_ui_action: self.verified_ui_action_active,
             })
             .map_err(map_world_command_access_error)?;
         Ok(WitAcceptedWorldCommand {

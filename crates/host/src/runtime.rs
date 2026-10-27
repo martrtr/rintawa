@@ -456,6 +456,7 @@ impl UserContentWriteRuntimeControl {
 struct DeferredWorldCommand {
     world_id: WorldId,
     command: WorldCommand,
+    admission: CommandAdmission,
 }
 
 #[derive(Clone, Default)]
@@ -468,6 +469,7 @@ impl WorldCommandRuntimeControl {
         &self,
         world_id: WorldId,
         command: WorldCommand,
+        admission: CommandAdmission,
     ) -> WorldCommandAccessResult<AcceptedWorldCommand> {
         let command_id = command.id().to_string();
         let correlation_id = command.correlation_id().to_string();
@@ -478,7 +480,11 @@ impl WorldCommandRuntimeControl {
         if queue.len() >= MAX_PENDING_WORLD_COMMAND_REQUESTS {
             return Err(WorldCommandAccessError::QueueFull);
         }
-        queue.push_back(DeferredWorldCommand { world_id, command });
+        queue.push_back(DeferredWorldCommand {
+            world_id,
+            command,
+            admission,
+        });
         Ok(AcceptedWorldCommand {
             command_id,
             correlation_id,
@@ -954,7 +960,14 @@ impl WorldCommandAccess for LocalHostAccess {
         if let Some(expected_position) = request.expected_position {
             command = command.expecting_position(expected_position);
         }
-        self.world_commands.request(world_id, command)
+        // The principal always comes from LocalHostAccess. Interactive
+        // provenance is a private WASM dispatcher attestation, not guest WIT.
+        let admission = if request.verified_ui_action {
+            CommandAdmission::Interactive
+        } else {
+            CommandAdmission::Unknown
+        };
+        self.world_commands.request(world_id, command, admission)
     }
 }
 
@@ -2779,7 +2792,7 @@ impl HostRuntime {
         for request in requests {
             let world_id = request.world_id;
             let command_id = request.command.id();
-            match self.submit_world_command(world_id, request.command) {
+            match self.submit_world_command_admitted(world_id, request.command, request.admission) {
                 Ok(outcome) => {
                     if let Err(error) = outcome.live_delivery() {
                         warn!(
@@ -4980,6 +4993,7 @@ mod tests {
                     actor: WorldCommandActor::Principal,
                     expected_position: Some(0),
                     payload_json: br#"{"value":1}"#.to_vec(),
+                    verified_ui_action: false,
                 },
             ),
             Err(WorldCommandAccessError::WorldNotActive)
@@ -4996,6 +5010,7 @@ mod tests {
                 actor: WorldCommandActor::Principal,
                 expected_position: Some(0),
                 payload_json: br#"{"value":1}"#.to_vec(),
+                verified_ui_action: false,
             },
         )
         .map_err(|error| anyhow::anyhow!("world-command submission failed: {error:?}"))?;
@@ -5004,11 +5019,29 @@ mod tests {
         assert_eq!(queued[0].command.principal(), principal);
         assert_eq!(queued[0].command.actor(), ActorRef::Principal(principal));
         assert_eq!(queued[0].command.expected_position(), Some(0));
+        assert_eq!(queued[0].admission, CommandAdmission::Unknown);
         assert_eq!(accepted.command_id, queued[0].command.id().to_string());
         assert_eq!(
             accepted.correlation_id,
             queued[0].command.correlation_id().to_string()
         );
+        let accepted_ui = WorldCommandAccess::submit_world_command(
+            &access,
+            WorldCommandRequest {
+                world_id: world.id.to_string(),
+                schema: String::from("example.command@1"),
+                actor: WorldCommandActor::Principal,
+                expected_position: None,
+                payload_json: br#"{"value":2}"#.to_vec(),
+                verified_ui_action: true,
+            },
+        )
+        .map_err(|error| anyhow::anyhow!("UI queue failed: {error:?}"))?;
+        let queued = world_commands.drain_pending()?;
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].admission, CommandAdmission::Interactive);
+        assert_eq!(queued[0].command.principal(), principal);
+        assert_eq!(accepted_ui.command_id, queued[0].command.id().to_string());
         Ok(())
     }
 
@@ -5072,6 +5105,7 @@ mod tests {
                 actor: WorldCommandActor::Principal,
                 expected_position: Some(0),
                 payload_json: br#"{"kind":"deferred"}"#.to_vec(),
+                verified_ui_action: false,
             },
         )
         .map_err(|error| anyhow::anyhow!("world-command submission failed: {error:?}"))?;
@@ -5094,6 +5128,33 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].schema, event_schema);
         assert_eq!(events[0].payload, serde_json::json!({ "kind": "deferred" }));
+        assert_eq!(events[0].provenance.admission, CommandAdmission::Unknown);
+        let accepted_ui = WorldCommandAccess::submit_world_command(
+            access.as_ref(),
+            WorldCommandRequest {
+                world_id: world.id.to_string(),
+                schema: command_schema.to_string(),
+                actor: WorldCommandActor::Principal,
+                expected_position: Some(1),
+                payload_json: br#"{"kind":"ui-action"}"#.to_vec(),
+                verified_ui_action: true,
+            },
+        )
+        .map_err(|error| anyhow::anyhow!("UI command failed: {error:?}"))?;
+        assert_eq!(host.pump_world_command_requests()?, 1);
+        let events = inspection.events_after(0, 8)?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(inspection.load_session()?.commit_position(), 2);
+        assert_eq!(events[1].payload, serde_json::json!({"kind": "ui-action"}));
+        assert_eq!(
+            events[1].provenance.command_id.to_string(),
+            accepted_ui.command_id
+        );
+        assert_eq!(events[1].provenance.principal, home.local_principal());
+        assert_eq!(
+            events[1].provenance.admission,
+            CommandAdmission::Interactive
+        );
         host.shutdown()?;
         Ok(())
     }
