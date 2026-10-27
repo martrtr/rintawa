@@ -10,7 +10,7 @@ use rintawa_world::{
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use crate::{StorageError, StorageResult};
+use crate::{StorageError, StorageResult, WorldEventCursor};
 
 use crate::sqlite::codec::{
     command_id_from_blob, correlation_id_from_blob, decode_schema_key, effect_job_id_from_blob,
@@ -274,11 +274,32 @@ pub(super) fn events_after(
     position: u64,
     limit: usize,
 ) -> StorageResult<Vec<StoredWorldEvent>> {
+    // Legacy API deliberately excludes every event at the supplied commit
+    // position, including multiple events produced by the same command.
+    events_after_cursor(
+        connection,
+        world_id,
+        Some(WorldEventCursor::after_complete_position(
+            world_id, position,
+        )),
+        limit,
+    )
+}
+
+pub(super) fn events_after_cursor(
+    connection: &Connection,
+    world_id: WorldId,
+    cursor: Option<WorldEventCursor>,
+    limit: usize,
+) -> StorageResult<Vec<StoredWorldEvent>> {
     let limit = bounded_limit(limit);
     if limit == 0 {
         return Ok(Vec::new());
     }
 
+    let (position, event_index) = cursor.map_or((0, u32::MAX), |value| {
+        (value.commit_position(), value.event_index())
+    });
     let position = position_to_sql(position)?;
     let mut statement = connection.prepare(
         "SELECT
@@ -291,20 +312,24 @@ pub(super) fn events_after(
          FROM world_events e
          JOIN world_commits c ON c.commit_position = e.commit_position
          WHERE e.commit_position > ?1
+            OR (e.commit_position = ?1 AND e.event_index > ?2)
          ORDER BY e.commit_position, e.event_index
-         LIMIT ?2",
+         LIMIT ?3",
     )?;
-    let rows = statement.query_map(params![position, limit_to_sql(limit)?], |row| {
-        Ok((
-            row.get::<_, Vec<u8>>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, String>(5)?,
-            provenance_sql_from_row(row, 6)?,
-        ))
-    })?;
+    let rows = statement.query_map(
+        params![position, i64::from(event_index), limit_to_sql(limit)?],
+        |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                provenance_sql_from_row(row, 6)?,
+            ))
+        },
+    )?;
 
     rows.map(|row| {
         let (id, commit_position, event_index, schema_id, schema_version, payload, provenance) =

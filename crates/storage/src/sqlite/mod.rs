@@ -25,7 +25,7 @@ use rintawa_world::{
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
-use crate::{ClaimedEffectJob, EffectCommitGuard, StorageError, StorageResult};
+use crate::{ClaimedEffectJob, EffectCommitGuard, StorageError, StorageResult, WorldEventCursor};
 
 use self::codec::{load_schema, load_schema_registry, schema_kind_code, world_id_from_blob};
 
@@ -398,6 +398,10 @@ impl SqliteWorldStorage {
     ///
     /// The requested batch is bounded internally to protect host memory.
     ///
+    /// CAUTION: a partial page may end inside a commit. Do not paginate by
+    /// passing its final commit position to another call; use
+    /// Self::events_after_cursor for lossless continuation instead.
+    ///
     /// # Errors
     ///
     /// Returns a storage error when persisted events cannot be decoded.
@@ -408,6 +412,38 @@ impl SqliteWorldStorage {
     ) -> StorageResult<Vec<StoredWorldEvent>> {
         let connection = self.reader()?;
         query::events_after(&connection, self.world_id, position, limit)
+    }
+
+    /// Reads a bounded page of durable World events strictly after the exact
+    /// commit position and event index cursor.
+    ///
+    /// This avoids losing events when a single commit emits more than the
+    /// requested page size. None starts at the beginning of this World's
+    /// event log. Build the next cursor using WorldEventCursor::after on
+    /// the final returned event. A foreign-World cursor fails closed.
+    ///
+    /// This is a read-only pagination primitive, not a durable consumer
+    /// acknowledgement or subscriber offset.
+    ///
+    /// # Errors
+    ///
+    /// Returns StorageError::EventCursorWorldMismatch for a cursor from
+    /// another World, or a storage error if records cannot be decoded.
+    pub fn events_after_cursor(
+        &self,
+        cursor: Option<WorldEventCursor>,
+        limit: usize,
+    ) -> StorageResult<Vec<StoredWorldEvent>> {
+        if let Some(cursor) = cursor
+            && cursor.world_id() != self.world_id
+        {
+            return Err(StorageError::EventCursorWorldMismatch {
+                expected: self.world_id,
+                found: cursor.world_id(),
+            });
+        }
+        let connection = self.reader()?;
+        query::events_after_cursor(&connection, self.world_id, cursor, limit)
     }
 
     /// Reads pending durable external effect jobs in deterministic enqueue order.

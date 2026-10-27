@@ -246,6 +246,87 @@ fn enqueue_effect(
 }
 
 #[test]
+fn test_should_paginate_every_event_within_a_commit_across_restart() -> Result<()> {
+    let (root, storage) = create_storage()?;
+    let path = root.path().join("world.sqlite");
+    let schemas = register_test_schemas(&storage)?;
+    let principal = PrincipalId::new();
+    let world_id = storage.world_id();
+
+    let mut first_transaction = WorldTransaction::new();
+    let mut expected_ids = Vec::new();
+    for index in 0..3 {
+        let event = WorldEventDraft::new(
+            schemas.event.clone(),
+            serde_json::json!({ "message": format!("first/{index}") }),
+        );
+        expected_ids.push(event.id());
+        first_transaction.push_event(event);
+    }
+    let first = direct_command(&schemas.command, principal, "first");
+    commit_current(&storage, &first, &first_transaction)?;
+    let second = direct_command(&schemas.command, principal, "second");
+    let second_event = WorldEventDraft::new(
+        schemas.event.clone(),
+        serde_json::json!({ "message": "second/0" }),
+    );
+    expected_ids.push(second_event.id());
+    let mut second_transaction = WorldTransaction::new();
+    second_transaction.push_event(second_event);
+    commit_current(&storage, &second, &second_transaction)?;
+
+    // Legacy position-only reads have never been safe as a consumer cursor:
+    // this page is cut inside the first committed transaction.
+    assert_eq!(storage.events_after(0, 1)?[0].id, expected_ids[0]);
+    assert_eq!(storage.events_after(1, 1)?[0].id, expected_ids[3]);
+
+    let first_page = storage.events_after_cursor(None, 1)?;
+    assert_eq!(first_page.len(), 1);
+    assert_eq!(first_page[0].id, expected_ids[0]);
+    assert_eq!(first_page[0].commit_position, 1);
+    assert_eq!(first_page[0].event_index, 0);
+    let mut cursor = WorldEventCursor::after(&first_page[0]);
+
+    let mut unrelated = first_page[0].clone();
+    unrelated.world_id = WorldId::new();
+    assert!(matches!(
+        storage.events_after_cursor(Some(WorldEventCursor::after(&unrelated)), 1),
+        Err(StorageError::EventCursorWorldMismatch {
+            expected,
+            found
+        }) if expected == world_id && found == unrelated.world_id
+    ));
+    assert!(storage.events_after_cursor(Some(cursor), 0)?.is_empty());
+
+    drop(storage);
+    let reopened = SqliteWorldStorage::open(&path)?;
+    assert_eq!(reopened.world_id(), world_id);
+    for (id, commit_position, event_index) in [
+        (expected_ids[1], 1_u64, 1_u32),
+        (expected_ids[2], 1, 2),
+        (expected_ids[3], 2, 0),
+    ] {
+        let page = reopened.events_after_cursor(Some(cursor), 1)?;
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, id);
+        assert_eq!(page[0].commit_position, commit_position);
+        assert_eq!(page[0].event_index, event_index);
+        assert_eq!(page[0].world_id, world_id);
+        cursor = WorldEventCursor::after(&page[0]);
+    }
+    assert!(reopened.events_after_cursor(Some(cursor), 1)?.is_empty());
+    assert_eq!(
+        reopened
+            .events_after_cursor(None, usize::MAX)?
+            .into_iter()
+            .map(|event| event.id)
+            .collect::<Vec<_>>(),
+        expected_ids
+    );
+    Ok(())
+}
+
+#[test]
 fn test_should_create_reopen_and_restore_world() -> Result<()> {
     let (root, storage) = create_storage()?;
     let world_id = storage.world_id();

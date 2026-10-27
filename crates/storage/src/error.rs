@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use rintawa_sdk::world::EffectJobId;
+use rintawa_sdk::world::{EffectJobId, WorldId};
 use thiserror::Error;
 
 /// Errors returned by persistent world storage operations.
@@ -79,6 +79,15 @@ pub enum StorageError {
     /// A persisted sequence/index cannot fit the public world-model type.
     #[error("world storage index for {0} is out of range")]
     IndexOutOfRange(&'static str),
+
+    /// An event pagination cursor belongs to a different World.
+    #[error("World event cursor scope mismatch: expected {expected}, got {found}")]
+    EventCursorWorldMismatch {
+        /// World bound to the current storage instance.
+        expected: WorldId,
+        /// Foreign World used to construct the cursor.
+        found: WorldId,
+    },
 
     /// A requested durable effect job does not exist.
     #[error("effect job {0} does not exist")]
