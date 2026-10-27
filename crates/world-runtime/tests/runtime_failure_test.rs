@@ -10,7 +10,9 @@ use std::sync::{
 use anyhow::Result;
 use rintawa_sdk::world::{PrincipalId, SchemaKey};
 use rintawa_storage::SqliteWorldStorage;
-use rintawa_world::{CommitDisposition, WorldCommand, WorldEventDraft, WorldTransaction};
+use rintawa_world::{
+    CommandAdmission, CommitDisposition, WorldCommand, WorldEventDraft, WorldTransaction,
+};
 use rintawa_world_runtime::{
     SystemError, SystemResult, WorldRuntimeBuilder, WorldRuntimeError, WorldSnapshot, WorldSystem,
 };
@@ -208,5 +210,71 @@ fn test_should_skip_system_on_identical_command_retry() -> Result<()> {
     );
     assert_eq!(evaluations.load(Ordering::SeqCst), 1);
     runtime.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn test_should_fence_runtime_origin_at_queue_ingress_and_preserve_it_on_replay() -> Result<()> {
+    let (root, storage, schemas) = create_storage()?;
+    let principal = PrincipalId::new();
+    let system = EchoSystem::new(schemas.command.clone(), schemas.event.clone());
+    let evaluations = Arc::clone(&system.evaluations);
+    let mut builder = WorldRuntimeBuilder::new(storage);
+    builder.register_system(system)?;
+    let runtime = builder.start()?;
+    let command = command(
+        &schemas.command,
+        principal,
+        serde_json::json!({ "kind": "human-avatar" }),
+    );
+    let first = runtime
+        .submit_attested(command.clone(), CommandAdmission::Interactive)?
+        .wait_outcome()?;
+    assert_eq!(first.committed_events().len(), 1);
+    assert_eq!(
+        first.committed_events()[0].provenance.admission,
+        CommandAdmission::Interactive
+    );
+    let replay = runtime
+        .submit_attested(command.clone(), CommandAdmission::Interactive)?
+        .wait_outcome()?;
+    assert_eq!(
+        replay.receipt().disposition(),
+        CommitDisposition::AlreadyCommitted
+    );
+    assert_eq!(evaluations.load(Ordering::SeqCst), 1);
+
+    // The very same immutable command cannot be relabelled as an automation.
+    assert!(matches!(
+        runtime.submit(command.clone())?.wait(),
+        Err(WorldRuntimeError::Storage(
+            rintawa_storage::StorageError::World(
+                rintawa_world::WorldError::CommandIdConflict(id)
+            )
+        )) if id == command.id()
+    ));
+
+    // A guest-controlled JSON field cannot mutate the immutable ingress tag.
+    let guest_command = common::command(
+        &schemas.command,
+        principal,
+        serde_json::json!({ "kind": "guest", "admission": "interactive" }),
+    );
+    let guest = runtime.submit(guest_command)?.wait_outcome()?;
+    assert_eq!(
+        guest.committed_events()[0].provenance.admission,
+        CommandAdmission::Unknown
+    );
+    runtime.shutdown()?;
+    let reopened = SqliteWorldStorage::open(root.path().join("world.sqlite"))?;
+    assert_eq!(reopened.events_after(0, 8)?.len(), 2);
+    assert_eq!(
+        reopened.events_after(0, 8)?[0].provenance.admission,
+        CommandAdmission::Interactive
+    );
+    assert_eq!(
+        reopened.events_after(0, 8)?[1].provenance.admission,
+        CommandAdmission::Unknown
+    );
     Ok(())
 }

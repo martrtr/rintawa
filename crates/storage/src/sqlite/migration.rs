@@ -6,7 +6,7 @@ use rusqlite::{Connection, params};
 
 use crate::{StorageError, StorageResult};
 
-pub(super) const STORAGE_SCHEMA_VERSION: u32 = 4;
+pub(super) const STORAGE_SCHEMA_VERSION: u32 = 5;
 
 pub(super) fn initialize_new(connection: &mut Connection, world_id: WorldId) -> StorageResult<()> {
     let found = storage_version(connection)?;
@@ -30,6 +30,7 @@ pub(super) fn initialize_new(connection: &mut Connection, world_id: WorldId) -> 
     migrate_to_v2(connection)?;
     migrate_to_v3(connection)?;
     migrate_to_v4(connection)?;
+    migrate_to_v5(connection)?;
     Ok(())
 }
 
@@ -68,6 +69,11 @@ pub(super) fn migrate_existing(connection: &mut Connection) -> StorageResult<()>
     if found == 3 {
         migrate_to_v4(connection)?;
         found = 4;
+    }
+
+    if found == 4 {
+        migrate_to_v5(connection)?;
+        found = 5;
     }
 
     if found != STORAGE_SCHEMA_VERSION {
@@ -384,6 +390,20 @@ fn migrate_to_v4(connection: &mut Connection) -> StorageResult<()> {
                 REFERENCES world_events(commit_position, event_index)
                 ON UPDATE RESTRICT ON DELETE RESTRICT
         );",
+    )?;
+    transaction.pragma_update(None, "user_version", 4_u32)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Adds a host-attested origin to immutable command provenance. Old committed
+/// commands retain their original digests and receive Unknown (0), not Human.
+fn migrate_to_v5(connection: &mut Connection) -> StorageResult<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "ALTER TABLE world_commits
+         ADD COLUMN admission_kind INTEGER NOT NULL DEFAULT 0
+         CHECK (admission_kind IN (0, 1, 2, 3));",
     )?;
     transaction.pragma_update(None, "user_version", STORAGE_SCHEMA_VERSION)?;
     transaction.commit()?;

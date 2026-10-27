@@ -9,9 +9,9 @@ use rintawa_sdk::world::{
     CommandId, EffectJobId, EntityId, RelationId, UnixTimeMillis, WorldEventId,
 };
 use rintawa_world::{
-    ActorRef, CausationRef, CommitDisposition, CommitReceipt, ControlScope, FacetRecord,
-    FacetTarget, WORLD_MUTATION_FORMAT_VERSION, WorldCommand, WorldError, WorldMutation,
-    WorldTransaction,
+    ActorRef, CausationRef, CommandAdmission, CommitDisposition, CommitReceipt, ControlScope,
+    FacetRecord, FacetTarget, WORLD_MUTATION_FORMAT_VERSION, WorldCommand, WorldError,
+    WorldMutation, WorldTransaction,
 };
 
 use crate::sqlite::codec::{
@@ -20,10 +20,33 @@ use crate::sqlite::codec::{
 use crate::sqlite::query;
 use crate::{EffectCommitGuard, StorageError, StorageResult};
 
-pub(super) fn command_digest(command: &WorldCommand) -> StorageResult<[u8; 32]> {
+pub(super) fn command_digest(
+    command: &WorldCommand,
+    admission: CommandAdmission,
+) -> StorageResult<[u8; 32]> {
     let canonical = canonical_json(serde_json::to_value(command)?);
     let bytes = serde_json::to_vec(&canonical)?;
-    Ok(Sha256::digest(bytes).into())
+    let old_digest = Sha256::digest(bytes);
+    // Preserve every pre-v5 digest for Unknown: existing commands keep their
+    // precise immutable identity across upgrade and duplicate replay.
+    if admission == CommandAdmission::Unknown {
+        return Ok(old_digest.into());
+    }
+    let code = admission_code(admission);
+    let mut hasher = Sha256::new();
+    hasher.update(b"rintawa.command-admission.v1\0");
+    hasher.update(old_digest);
+    hasher.update([code as u8]);
+    Ok(hasher.finalize().into())
+}
+
+fn admission_code(admission: CommandAdmission) -> i64 {
+    match admission {
+        CommandAdmission::Unknown => 0,
+        CommandAdmission::Interactive => 1,
+        CommandAdmission::Automated => 2,
+        CommandAdmission::Scripted => 3,
+    }
 }
 
 fn canonical_json(value: serde_json::Value) -> serde_json::Value {
@@ -48,8 +71,9 @@ fn canonical_json(value: serde_json::Value) -> serde_json::Value {
 pub(super) fn committed_receipt(
     connection: &Connection,
     command: &WorldCommand,
+    admission: CommandAdmission,
 ) -> StorageResult<Option<CommitReceipt>> {
-    let digest = command_digest(command)?;
+    let digest = command_digest(command, admission)?;
     load_existing_receipt(connection, command.id(), &digest)
 }
 
@@ -78,9 +102,10 @@ pub(super) fn commit(
     command: &WorldCommand,
     world_transaction: &WorldTransaction,
     evaluated_position: u64,
+    admission: CommandAdmission,
     guard: Option<&EffectCommitGuard>,
 ) -> StorageResult<CommitReceipt> {
-    let digest = command_digest(command)?;
+    let digest = command_digest(command, admission)?;
     let sql = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
     if let Some(receipt) = load_existing_receipt(&sql, command.id(), &digest)? {
@@ -133,7 +158,7 @@ pub(super) fn commit(
         .checked_add(1)
         .ok_or(WorldError::CommitPositionOverflow)?;
     let position_sql = position_to_sql(position)?;
-    insert_commit(&sql, command, &digest, position_sql)?;
+    insert_commit(&sql, command, &digest, position_sql, admission)?;
 
     for (index, mutation) in world_transaction.mutations().iter().enumerate() {
         let mutation_json = serde_json::to_string(mutation)?;
@@ -229,6 +254,7 @@ fn insert_commit(
     command: &WorldCommand,
     digest: &[u8; 32],
     position: i64,
+    admission: CommandAdmission,
 ) -> StorageResult<()> {
     let (actor_kind, actor_id) = actor_parts(command.actor());
     let (causation_kind, causation_id) = causation_parts(command.causation());
@@ -245,9 +271,9 @@ fn insert_commit(
             commit_position, command_id, command_schema_id, command_schema_version,
             principal_id, actor_kind, actor_id, causation_kind, causation_id,
             correlation_id, expected_position, effective_at_ms, recorded_at_ms,
-            command_payload_json, command_digest
+            command_payload_json, command_digest, admission_kind
          ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
          )",
         params![
             position,
@@ -265,6 +291,7 @@ fn insert_commit(
             recorded_at,
             payload,
             digest.as_slice(),
+            admission_code(admission),
         ],
     )?;
     Ok(())

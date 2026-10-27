@@ -20,9 +20,9 @@ use std::{
 
 use rintawa_sdk::world::{EffectJobId, EntityId, RelationId, SchemaKey, UnixTimeMillis, WorldId};
 use rintawa_world::{
-    CommitReceipt, EntityRecord, FacetRecord, FacetTarget, RelationRecord, SchemaDefinition,
-    SchemaRegistration, SchemaRegistry, StoredEffectJob, StoredWorldEvent, StoredWorldMutation,
-    WORLD_FORMAT_VERSION, WorldCommand, WorldSessionState, WorldTransaction,
+    CommandAdmission, CommitReceipt, EntityRecord, FacetRecord, FacetTarget, RelationRecord,
+    SchemaDefinition, SchemaRegistration, SchemaRegistry, StoredEffectJob, StoredWorldEvent,
+    StoredWorldMutation, WORLD_FORMAT_VERSION, WorldCommand, WorldSessionState, WorldTransaction,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
@@ -234,8 +234,24 @@ impl SqliteWorldStorage {
         &self,
         command: &WorldCommand,
     ) -> StorageResult<Option<CommitReceipt>> {
+        self.committed_receipt_attested(command, CommandAdmission::Unknown)
+    }
+
+    /// Looks up the original command using the Host-attested admission class.
+    ///
+    /// A repeated CommandId with another class conflicts even when the
+    /// payload and Actor are identical.
+    ///
+    /// # Errors
+    ///
+    /// Returns a command identity conflict or a storage decoding error.
+    pub fn committed_receipt_attested(
+        &self,
+        command: &WorldCommand,
+        admission: CommandAdmission,
+    ) -> StorageResult<Option<CommitReceipt>> {
         let connection = self.reader()?;
-        commit::committed_receipt(&connection, command)
+        commit::committed_receipt(&connection, command, admission)
     }
 
     /// Opens a consistent read-only snapshot of current authoritative state.
@@ -296,7 +312,31 @@ impl SqliteWorldStorage {
         transaction: &WorldTransaction,
         evaluated_position: u64,
     ) -> StorageResult<CommitReceipt> {
-        self.commit_inner(command, transaction, evaluated_position, None)
+        self.commit_inner(
+            command,
+            transaction,
+            evaluated_position,
+            CommandAdmission::Unknown,
+            None,
+        )
+    }
+
+    /// Commits one command with Host-attested ingress classification.
+    ///
+    /// Only trusted Host admission boundaries should call this method.
+    /// Guest World System requests cannot specify the admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns authority, command identity, state, or SQLite validation errors.
+    pub fn commit_attested(
+        &self,
+        command: &WorldCommand,
+        transaction: &WorldTransaction,
+        evaluated_position: u64,
+        admission: CommandAdmission,
+    ) -> StorageResult<CommitReceipt> {
+        self.commit_inner(command, transaction, evaluated_position, admission, None)
     }
 
     /// Atomically fences a durable effect claim within the World commit.
@@ -315,7 +355,13 @@ impl SqliteWorldStorage {
         evaluated_position: u64,
         guard: &EffectCommitGuard,
     ) -> StorageResult<CommitReceipt> {
-        self.commit_inner(command, transaction, evaluated_position, Some(guard))
+        self.commit_inner(
+            command,
+            transaction,
+            evaluated_position,
+            CommandAdmission::Automated,
+            Some(guard),
+        )
     }
 
     fn commit_inner(
@@ -323,6 +369,7 @@ impl SqliteWorldStorage {
         command: &WorldCommand,
         transaction: &WorldTransaction,
         evaluated_position: u64,
+        admission: CommandAdmission,
         guard: Option<&EffectCommitGuard>,
     ) -> StorageResult<CommitReceipt> {
         let mut connection = self.writer()?;
@@ -331,6 +378,7 @@ impl SqliteWorldStorage {
             command,
             transaction,
             evaluated_position,
+            admission,
             guard,
         )
     }

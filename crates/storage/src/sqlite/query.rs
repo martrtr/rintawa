@@ -4,8 +4,8 @@ use rintawa_sdk::world::{
     EffectJobId, EntityId, PrincipalId, RelationId, SchemaKey, UnixTimeMillis, WorldId,
 };
 use rintawa_world::{
-    ActorRef, CausationRef, CommandProvenance, EntityRecord, FacetRecord, FacetTarget,
-    RelationRecord, StoredEffectJob, StoredWorldEvent, StoredWorldMutation,
+    ActorRef, CausationRef, CommandAdmission, CommandProvenance, EntityRecord, FacetRecord,
+    FacetTarget, RelationRecord, StoredEffectJob, StoredWorldEvent, StoredWorldMutation,
     WORLD_MUTATION_FORMAT_VERSION, WorldMutation,
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
@@ -234,7 +234,7 @@ pub(super) fn events_at_position(
             c.command_id, c.command_schema_id, c.command_schema_version,
             c.principal_id, c.actor_kind, c.actor_id,
             c.causation_kind, c.causation_id, c.correlation_id,
-            c.effective_at_ms, c.recorded_at_ms
+            c.effective_at_ms, c.recorded_at_ms, c.admission_kind
          FROM world_events e
          JOIN world_commits c ON c.commit_position = e.commit_position
          WHERE e.commit_position = ?1
@@ -308,7 +308,7 @@ pub(super) fn events_after_cursor(
             c.command_id, c.command_schema_id, c.command_schema_version,
             c.principal_id, c.actor_kind, c.actor_id,
             c.causation_kind, c.causation_id, c.correlation_id,
-            c.effective_at_ms, c.recorded_at_ms
+            c.effective_at_ms, c.recorded_at_ms, c.admission_kind
          FROM world_events e
          JOIN world_commits c ON c.commit_position = e.commit_position
          WHERE e.commit_position > ?1
@@ -360,7 +360,7 @@ pub(super) fn effect_job_by_id(
                 c.command_id, c.command_schema_id, c.command_schema_version,
                 c.principal_id, c.actor_kind, c.actor_id,
                 c.causation_kind, c.causation_id, c.correlation_id,
-                c.effective_at_ms, c.recorded_at_ms
+                c.effective_at_ms, c.recorded_at_ms, c.admission_kind
              FROM effect_jobs j
              JOIN world_commits c ON c.commit_position = j.commit_position
              WHERE j.job_id = ?1",
@@ -423,7 +423,7 @@ pub(super) fn pending_effects(
             c.command_id, c.command_schema_id, c.command_schema_version,
             c.principal_id, c.actor_kind, c.actor_id,
             c.causation_kind, c.causation_id, c.correlation_id,
-            c.effective_at_ms, c.recorded_at_ms
+            c.effective_at_ms, c.recorded_at_ms, c.admission_kind
          FROM effect_jobs j
          JOIN world_commits c ON c.commit_position = j.commit_position
          WHERE j.status = 0
@@ -481,6 +481,7 @@ struct ProvenanceSql {
     correlation_id: Vec<u8>,
     effective_at_ms: Option<i64>,
     recorded_at_ms: i64,
+    admission_kind: i64,
 }
 
 fn provenance_sql_from_row(row: &Row<'_>, base: usize) -> rusqlite::Result<ProvenanceSql> {
@@ -496,6 +497,7 @@ fn provenance_sql_from_row(row: &Row<'_>, base: usize) -> rusqlite::Result<Prove
         correlation_id: row.get(base + 8)?,
         effective_at_ms: row.get(base + 9)?,
         recorded_at_ms: row.get(base + 10)?,
+        admission_kind: row.get(base + 11)?,
     })
 }
 
@@ -528,7 +530,19 @@ fn decode_provenance(value: ProvenanceSql) -> StorageResult<CommandProvenance> {
         }
     };
 
+    let admission = match value.admission_kind {
+        0 => CommandAdmission::Unknown,
+        1 => CommandAdmission::Interactive,
+        2 => CommandAdmission::Automated,
+        3 => CommandAdmission::Scripted,
+        code => {
+            return Err(StorageError::CorruptData(format!(
+                "unknown command admission kind code {code}"
+            )));
+        }
+    };
     Ok(CommandProvenance {
+        admission,
         command_id: command_id_from_blob(value.command_id)?,
         command_schema: decode_schema_key(value.command_schema_id, value.command_schema_version)?,
         principal,

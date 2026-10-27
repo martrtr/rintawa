@@ -281,6 +281,25 @@ pub struct StoredWorldMutation {
     pub mutation: WorldMutation,
 }
 
+/// Host-attested command ingress class at the original authoritative commit.
+///
+/// This is an audit/routing fact, never a Principal, Actor or ControlGrant.
+/// Unknown is the only safe default for legacy, arbitrary or unclassified
+/// extension-submitted commands. The Host must not infer humanness from Actor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CommandAdmission {
+    /// Legacy data or a command without verified interactive provenance.
+    #[default]
+    Unknown,
+    /// A human-authenticated interactive command admitted by trusted Host ingress.
+    Interactive,
+    /// A service or AI-controlled command admitted by trusted Host ingress.
+    Automated,
+    /// A scripted automation/integration command admitted by trusted Host ingress.
+    Scripted,
+}
+
 /// Immutable command provenance attached to committed events and effects.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandProvenance {
@@ -300,6 +319,9 @@ pub struct CommandProvenance {
     pub effective_at: Option<UnixTimeMillis>,
     /// Host-recorded commit time.
     pub recorded_at: UnixTimeMillis,
+    /// Immutable Host-attested admission; old envelopes default to Unknown.
+    #[serde(default)]
+    pub admission: CommandAdmission,
 }
 
 /// One persisted durable world-event envelope.

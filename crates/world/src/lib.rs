@@ -21,7 +21,7 @@ pub use schema::{SchemaDefinition, SchemaKind, SchemaRegistration, SchemaRegistr
 pub use session::{WORLD_FORMAT_VERSION, WorldSessionState};
 pub use state::{EntityRecord, FacetRecord, FacetTarget, RelationRecord, WorldMutation};
 pub use transaction::{
-    CommandProvenance, CommitDisposition, CommitReceipt, EffectJobDraft, StoredEffectJob,
-    StoredWorldEvent, StoredWorldMutation, WORLD_MUTATION_FORMAT_VERSION, WorldEventDraft,
-    WorldTransaction,
+    CommandAdmission, CommandProvenance, CommitDisposition, CommitReceipt, EffectJobDraft,
+    StoredEffectJob, StoredWorldEvent, StoredWorldMutation, WORLD_MUTATION_FORMAT_VERSION,
+    WorldEventDraft, WorldTransaction,
 };

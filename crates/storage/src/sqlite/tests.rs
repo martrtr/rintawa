@@ -14,9 +14,10 @@ use rintawa_sdk::{
     },
 };
 use rintawa_world::{
-    ActorRef, CommitDisposition, CommitReceipt, ControlGrant, ControlScope, EffectJobDraft,
-    EntityRecord, FacetRecord, FacetTarget, RelationRecord, SchemaDefinition, SchemaKind,
-    SchemaRegistration, WorldCommand, WorldError, WorldEventDraft, WorldMutation, WorldTransaction,
+    ActorRef, CommandAdmission, CommitDisposition, CommitReceipt, ControlGrant, ControlScope,
+    EffectJobDraft, EntityRecord, FacetRecord, FacetTarget, RelationRecord, SchemaDefinition,
+    SchemaKind, SchemaRegistration, WorldCommand, WorldError, WorldEventDraft, WorldMutation,
+    WorldTransaction,
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -477,10 +478,14 @@ fn test_should_upgrade_v3_event_history_without_losing_events() -> Result<()> {
     let event = committed_event_fixture(&storage, &schemas, 1)?.remove(0);
     let path = root.path().join("world.sqlite");
     drop(storage);
-    // Recreate the exact v3 schema shape from a known v4 test world.
-    // No consumers can exist before the v4 migration.
+    // Recreate the exact v3 schema shape from a known v5 test world.
+    // Neither event checkpoints nor admission classification existed in v3.
     let connection = Connection::open(&path)?;
-    connection.execute_batch("DROP TABLE world_event_consumers; PRAGMA user_version = 3;")?;
+    connection.execute_batch(
+        "DROP TABLE world_event_consumers;
+         ALTER TABLE world_commits DROP COLUMN admission_kind;
+         PRAGMA user_version = 3;",
+    )?;
     drop(connection);
     let reopened = SqliteWorldStorage::open(&path)?;
     let reader = reopened.reader()?;
@@ -1761,5 +1766,157 @@ fn test_should_refuse_to_overwrite_existing_world_file() -> Result<()> {
 
     let error = SqliteWorldStorage::create(&path, WorldId::new()).unwrap_err();
     assert!(matches!(error, StorageError::AlreadyExists(_)));
+    Ok(())
+}
+
+#[test]
+fn test_should_preserve_trusted_admission_across_event_effect_reopen_and_replay() -> Result<()> {
+    let (root, storage) = create_storage()?;
+    let schemas = register_test_schemas(&storage)?;
+    let principal = PrincipalId::new();
+    let kinds = [
+        CommandAdmission::Interactive,
+        CommandAdmission::Automated,
+        CommandAdmission::Scripted,
+        CommandAdmission::Unknown,
+    ];
+    for (index, admission) in kinds.into_iter().enumerate() {
+        let command = direct_command(&schemas.command, principal, &format!("source-{index}"));
+        let mut transaction = WorldTransaction::new();
+        transaction.push_event(WorldEventDraft::new(
+            schemas.event.clone(),
+            serde_json::json!({ "message": format!("event-{index}") }),
+        ));
+        transaction.push_effect(EffectJobDraft::new(
+            schemas.effect.clone(),
+            serde_json::json!({ "input": format!("work-{index}") }),
+        ));
+        let position = storage.snapshot_for_command(&command)?.position();
+        let receipt = storage.commit_attested(&command, &transaction, position, admission)?;
+        assert_eq!(receipt.disposition(), CommitDisposition::Committed);
+        assert_eq!(
+            storage
+                .committed_receipt_attested(&command, admission)?
+                .expect("receipt")
+                .position(),
+            receipt.position()
+        );
+    }
+    drop(storage);
+    let reopened = SqliteWorldStorage::open(root.path().join("world.sqlite"))?;
+    let events = reopened.events_after(0, 16)?;
+    let jobs = reopened.pending_effects(16)?;
+    assert_eq!(events.len(), kinds.len());
+    assert_eq!(jobs.len(), kinds.len());
+    for (index, admission) in kinds.into_iter().enumerate() {
+        assert_eq!(events[index].provenance.admission, admission);
+        assert_eq!(jobs[index].provenance.admission, admission);
+        assert_eq!(events[index].provenance.principal, principal);
+        assert_eq!(jobs[index].provenance.actor, ActorRef::Principal(principal));
+    }
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_replayed_command_identity_with_modified_admission() -> Result<()> {
+    let (_root, storage) = create_storage()?;
+    let schemas = register_test_schemas(&storage)?;
+    let principal = PrincipalId::new();
+    let command = direct_command(&schemas.command, principal, "first");
+    let mut output = WorldTransaction::new();
+    output.push_event(WorldEventDraft::new(
+        schemas.event.clone(),
+        serde_json::json!({"message":"first"}),
+    ));
+    let position = storage.snapshot_for_command(&command)?.position();
+    let first =
+        storage.commit_attested(&command, &output, position, CommandAdmission::Interactive)?;
+    let replay =
+        storage.commit_attested(&command, &output, u64::MAX, CommandAdmission::Interactive)?;
+    assert_eq!(replay.disposition(), CommitDisposition::AlreadyCommitted);
+    assert_eq!(replay.position(), first.position());
+    for forged in [
+        CommandAdmission::Unknown,
+        CommandAdmission::Automated,
+        CommandAdmission::Scripted,
+    ] {
+        assert!(matches!(
+            storage.committed_receipt_attested(&command, forged),
+            Err(StorageError::World(WorldError::CommandIdConflict(id))) if id == command.id()
+        ));
+        assert!(matches!(
+            storage.commit_attested(&command, &output, u64::MAX, forged),
+            Err(StorageError::World(WorldError::CommandIdConflict(id))) if id == command.id()
+        ));
+    }
+    assert_eq!(storage.events_after(0, 10)?.len(), 1);
+    assert_eq!(storage.load_session()?.commit_position(), 1);
+    Ok(())
+}
+
+#[test]
+fn test_should_migrate_existing_v4_events_to_unknown_without_changing_command_digest() -> Result<()>
+{
+    let (root, storage) = create_storage()?;
+    let schemas = register_test_schemas(&storage)?;
+    let principal = PrincipalId::new();
+    let command = direct_command(&schemas.command, principal, "before-upgrade");
+    let (transaction, _, _, _, event_id, _) = populated_transaction(&schemas);
+    let receipt = commit_current(&storage, &command, &transaction)?;
+    let path = root.path().join("world.sqlite");
+    drop(storage);
+
+    // Reconstruct a valid previous-version SQLite file with a committed
+    // immutable command. New origin metadata must not be invented during migration.
+    let connection = Connection::open(&path)?;
+    connection.execute_batch(
+        "ALTER TABLE world_commits DROP COLUMN admission_kind;
+         PRAGMA user_version = 4;",
+    )?;
+    drop(connection);
+
+    let reopened = SqliteWorldStorage::open(&path)?;
+    let version = migration::storage_version(&reopened.reader()?)?;
+    assert_eq!(version, migration::STORAGE_SCHEMA_VERSION);
+    let events = reopened.events_after(0, 8)?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].id, event_id);
+    assert_eq!(events[0].provenance.admission, CommandAdmission::Unknown);
+    let jobs = reopened.pending_effects(8)?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].provenance.admission, CommandAdmission::Unknown);
+    assert_eq!(
+        reopened
+            .committed_receipt(&command)?
+            .expect("old digest unchanged")
+            .position(),
+        receipt.position()
+    );
+    assert!(matches!(
+        reopened.committed_receipt_attested(&command, CommandAdmission::Interactive),
+        Err(StorageError::World(WorldError::CommandIdConflict(id))) if id == command.id()
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_should_refuse_invalid_committed_admission_code() -> Result<()> {
+    let (_root, storage) = create_storage()?;
+    let schemas = register_test_schemas(&storage)?;
+    let principal = PrincipalId::new();
+    let command = direct_command(&schemas.command, principal, "corruption");
+    let (transaction, _, _, _, _, _) = populated_transaction(&schemas);
+    commit_current(&storage, &command, &transaction)?;
+    let connection = Connection::open(storage.path())?;
+    connection.execute_batch("PRAGMA ignore_check_constraints = ON;")?;
+    connection.execute(
+        "UPDATE world_commits SET admission_kind = 9 WHERE commit_position = 1",
+        [],
+    )?;
+    drop(connection);
+    assert!(matches!(
+        storage.events_after(0, 4),
+        Err(StorageError::CorruptData(message)) if message.contains("admission")
+    ));
     Ok(())
 }

@@ -6543,6 +6543,7 @@ mod tests {
                 causation: None,
                 correlation_id: CorrelationId::new(),
                 effective_at: Some(UnixTimeMillis::new(1234)),
+                admission: rintawa_world::CommandAdmission::Unknown,
                 recorded_at: UnixTimeMillis::new(5678),
             },
             schema: schema.clone(),

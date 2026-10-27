@@ -13,7 +13,8 @@ use std::{
 use rintawa_sdk::world::{CommandId, SchemaKey, WorldId};
 use rintawa_storage::{EffectCommitGuard, SqliteWorldStorage};
 use rintawa_world::{
-    CommitReceipt, SchemaKind, StoredWorldEvent, WorldCommand, WorldMutation, WorldTransaction,
+    CommandAdmission, CommitReceipt, SchemaKind, StoredWorldEvent, WorldCommand, WorldMutation,
+    WorldTransaction,
 };
 
 use crate::{WorldRuntimeError, WorldRuntimeResult, WorldSnapshot, WorldSystem};
@@ -240,7 +241,24 @@ impl WorldRuntime {
     /// Returns QueueFull when bounded capacity is exhausted, or RuntimeStopped
     /// after shutdown/worker disconnect.
     pub fn submit(&self, command: WorldCommand) -> WorldRuntimeResult<WorldCommandTicket> {
-        self.submit_with_guard(command, None)
+        self.submit_with_guard(command, CommandAdmission::Unknown, None)
+    }
+
+    /// Submits an ingress command carrying a Host-authenticated admission class.
+    ///
+    /// Only the trusted Host/transport admission boundary may call this method.
+    /// WIT requests and extension-declared preferences do not supply this tag;
+    /// it never bypasses World Principal/Actor/ControlGrant authorization.
+    ///
+    /// # Errors
+    ///
+    /// Returns queue-full or stopped-runtime errors.
+    pub fn submit_attested(
+        &self,
+        command: WorldCommand,
+        admission: CommandAdmission,
+    ) -> WorldRuntimeResult<WorldCommandTicket> {
+        self.submit_with_guard(command, admission, None)
     }
 
     /// Enqueues an effect-produced command carrying its durable SQLite fencing
@@ -256,12 +274,13 @@ impl WorldRuntime {
         command: WorldCommand,
         guard: EffectCommitGuard,
     ) -> WorldRuntimeResult<WorldCommandTicket> {
-        self.submit_with_guard(command, Some(guard))
+        self.submit_with_guard(command, CommandAdmission::Automated, Some(guard))
     }
 
     fn submit_with_guard(
         &self,
         command: WorldCommand,
+        admission: CommandAdmission,
         effect_guard: Option<EffectCommitGuard>,
     ) -> WorldRuntimeResult<WorldCommandTicket> {
         let sender = self
@@ -272,6 +291,7 @@ impl WorldRuntime {
         let (response_sender, response_receiver) = mpsc::channel();
         let job = CommandJob {
             command,
+            admission,
             effect_guard,
             response: response_sender,
         };
@@ -382,6 +402,7 @@ impl WorldCommandTicket {
 
 struct CommandJob {
     command: WorldCommand,
+    admission: CommandAdmission,
     effect_guard: Option<EffectCommitGuard>,
     response: mpsc::Sender<WorldRuntimeResult<WorldCommandOutcome>>,
 }
@@ -403,7 +424,13 @@ fn worker_loop(
     receiver: Receiver<CommandJob>,
 ) {
     while let Ok(job) = receiver.recv() {
-        let result = process_command(&storage, &systems, job.command, job.effect_guard);
+        let result = process_command(
+            &storage,
+            &systems,
+            job.command,
+            job.admission,
+            job.effect_guard,
+        );
         let _ = job.response.send(result);
     }
 }
@@ -412,9 +439,10 @@ fn process_command(
     storage: &Arc<SqliteWorldStorage>,
     systems: &BTreeMap<SchemaKey, RegisteredSystem>,
     command: WorldCommand,
+    admission: CommandAdmission,
     effect_guard: Option<EffectCommitGuard>,
 ) -> WorldRuntimeResult<WorldCommandOutcome> {
-    if let Some(receipt) = storage.committed_receipt(&command)? {
+    if let Some(receipt) = storage.committed_receipt_attested(&command, admission)? {
         let events = storage.events_at_position(receipt.position())?;
         return Ok(WorldCommandOutcome::new(receipt, events));
     }
@@ -441,7 +469,7 @@ fn process_command(
         Some(guard) => {
             storage.commit_effect_follow_up(&command, &output, evaluated_position, &guard)?
         }
-        None => storage.commit(&command, &output, evaluated_position)?,
+        None => storage.commit_attested(&command, &output, evaluated_position, admission)?,
     };
     let events = storage.events_at_position(receipt.position())?;
     Ok(WorldCommandOutcome::new(receipt, events))

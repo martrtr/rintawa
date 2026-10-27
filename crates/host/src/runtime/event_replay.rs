@@ -273,6 +273,7 @@ mod tests {
                 causation: None,
                 correlation_id: CorrelationId::new(),
                 effective_at: None,
+                admission: rintawa_world::CommandAdmission::Unknown,
                 recorded_at: UnixTimeMillis::new(1),
             },
             schema,

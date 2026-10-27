@@ -327,6 +327,7 @@ mod tests {
                 correlation_id: CorrelationId::new(),
                 effective_at: None,
                 recorded_at: UnixTimeMillis::new(1),
+                admission: rintawa_world::CommandAdmission::Unknown,
             },
             schema: "rintawa.test.effect@1".parse().unwrap(),
             payload: serde_json::json!({ "input": "test" }),
