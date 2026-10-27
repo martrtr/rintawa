@@ -2,6 +2,7 @@
 
 mod codec;
 mod commit;
+mod event_consumer;
 mod migration;
 mod outbox;
 mod query;
@@ -444,6 +445,52 @@ impl SqliteWorldStorage {
         }
         let connection = self.reader()?;
         query::events_after_cursor(&connection, self.world_id, cursor, limit)
+    }
+
+    /// Reads the last strictly sequentially acknowledged WorldEvent for one
+    /// trusted, Host-owned consumer. None means it has not acknowledged any event.
+    ///
+    /// Do not expose this storage capability to arbitrary guest extensions.
+    /// Checkpoints optimize replay only; downstream work must independently
+    /// guarantee idempotent command/effect submission before acknowledging.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid consumer identifier or a SQLite/corruption error.
+    pub fn event_consumer_cursor(
+        &self,
+        consumer_id: &str,
+    ) -> StorageResult<Option<WorldEventCursor>> {
+        let connection = self.reader()?;
+        event_consumer::load_cursor(&connection, self.world_id, consumer_id)
+    }
+
+    /// Atomically acknowledges exactly the next committed WorldEvent, using an
+    /// expected cursor as a compare-and-swap fence between racing consumers.
+    ///
+    /// The event's World, identity and ordering are checked against SQLite;
+    /// arbitrary offsets, future events, and skipped events are never accepted.
+    /// Only acknowledge after durable, idempotent downstream work succeeds.
+    /// This is not transactionally coupled to that work.
+    ///
+    /// # Errors
+    ///
+    /// Refuses foreign Worlds, invalid consumers, stale checkpoint CAS or
+    /// an event which is not the exact next event in the log.
+    pub fn acknowledge_next_world_event(
+        &self,
+        consumer_id: &str,
+        expected_cursor: Option<WorldEventCursor>,
+        event: &StoredWorldEvent,
+    ) -> StorageResult<WorldEventCursor> {
+        let mut connection = self.writer()?;
+        event_consumer::acknowledge_next(
+            &mut connection,
+            self.world_id,
+            consumer_id,
+            expected_cursor,
+            event,
+        )
     }
 
     /// Reads pending durable external effect jobs in deterministic enqueue order.

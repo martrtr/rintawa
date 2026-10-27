@@ -29,6 +29,19 @@ impl WorldEventCursor {
         }
     }
 
+    /// Reconstructs an already-validated checkpoint stored in this World DB.
+    pub(crate) const fn from_stored_parts(
+        world_id: WorldId,
+        commit_position: u64,
+        event_index: u32,
+    ) -> Self {
+        Self {
+            world_id,
+            commit_position,
+            event_index,
+        }
+    }
+
     /// Legacy position-only reads must skip every event from this commit.
     pub(crate) const fn after_complete_position(world_id: WorldId, commit_position: u64) -> Self {
         Self {

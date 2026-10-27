@@ -89,6 +89,18 @@ pub enum StorageError {
         found: WorldId,
     },
 
+    /// A Host consumer identifier is empty, unbounded, or non-canonical.
+    #[error("invalid World event consumer identifier")]
+    InvalidEventConsumerId,
+
+    /// A competing consumer progressed beyond the expected checkpoint.
+    #[error("World event consumer checkpoint changed")]
+    EventConsumerCursorConflict,
+
+    /// The proposed event is not the next committed event after the checkpoint.
+    #[error("World event consumer must acknowledge the next committed event")]
+    EventConsumerEventNotNext,
+
     /// A requested durable effect job does not exist.
     #[error("effect job {0} does not exist")]
     EffectJobNotFound(EffectJobId),

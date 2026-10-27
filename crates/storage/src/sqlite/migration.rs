@@ -6,7 +6,7 @@ use rusqlite::{Connection, params};
 
 use crate::{StorageError, StorageResult};
 
-pub(super) const STORAGE_SCHEMA_VERSION: u32 = 3;
+pub(super) const STORAGE_SCHEMA_VERSION: u32 = 4;
 
 pub(super) fn initialize_new(connection: &mut Connection, world_id: WorldId) -> StorageResult<()> {
     let found = storage_version(connection)?;
@@ -29,6 +29,7 @@ pub(super) fn initialize_new(connection: &mut Connection, world_id: WorldId) -> 
     )?;
     migrate_to_v2(connection)?;
     migrate_to_v3(connection)?;
+    migrate_to_v4(connection)?;
     Ok(())
 }
 
@@ -62,6 +63,11 @@ pub(super) fn migrate_existing(connection: &mut Connection) -> StorageResult<()>
     if found == 2 {
         migrate_to_v3(connection)?;
         found = 3;
+    }
+
+    if found == 3 {
+        migrate_to_v4(connection)?;
+        found = 4;
     }
 
     if found != STORAGE_SCHEMA_VERSION {
@@ -357,6 +363,27 @@ fn migrate_to_v3(connection: &mut Connection) -> StorageResult<()> {
             ON effect_jobs(status, available_at_ms, commit_position, job_index);
         CREATE INDEX effect_jobs_lease_idx
             ON effect_jobs(status, lease_expires_at_ms, commit_position, job_index);",
+    )?;
+    transaction.pragma_update(None, "user_version", 3_u32)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Adds per-World, Host-owned durable event consumption checkpoints.
+///
+/// This table does not grant extensions raw storage access and cannot by
+/// itself guarantee an idempotent downstream effect or command.
+fn migrate_to_v4(connection: &mut Connection) -> StorageResult<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "CREATE TABLE world_event_consumers (
+            consumer_id TEXT PRIMARY KEY NOT NULL,
+            commit_position INTEGER NOT NULL CHECK (commit_position > 0),
+            event_index INTEGER NOT NULL CHECK (event_index >= 0),
+            FOREIGN KEY (commit_position, event_index)
+                REFERENCES world_events(commit_position, event_index)
+                ON UPDATE RESTRICT ON DELETE RESTRICT
+        );",
     )?;
     transaction.pragma_update(None, "user_version", STORAGE_SCHEMA_VERSION)?;
     transaction.commit()?;

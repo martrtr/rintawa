@@ -245,6 +245,260 @@ fn enqueue_effect(
     Ok(effect_id)
 }
 
+fn committed_event_fixture(
+    storage: &SqliteWorldStorage,
+    schemas: &TestSchemas,
+    count: usize,
+) -> Result<Vec<rintawa_world::StoredWorldEvent>> {
+    let mut transaction = WorldTransaction::new();
+    for index in 0..count {
+        transaction.push_event(WorldEventDraft::new(
+            schemas.event.clone(),
+            serde_json::json!({ "message": format!("event/{index}") }),
+        ));
+    }
+    let principal = PrincipalId::new();
+    commit_current(
+        storage,
+        &direct_command(&schemas.command, principal, "seed-events"),
+        &transaction,
+    )?;
+    Ok(storage.events_after_cursor(None, count)?)
+}
+
+#[test]
+fn test_should_acknowledge_only_next_event_with_expected_cursor_and_exact_identity() -> Result<()> {
+    let (root, storage) = create_storage()?;
+    let schemas = register_test_schemas(&storage)?;
+    let events = committed_event_fixture(&storage, &schemas, 3)?;
+    let consumer = "rintawa.test.worker@1";
+    let foreign = "rintawa.other.worker@1";
+    assert_eq!(storage.event_consumer_cursor(consumer)?, None);
+    assert_eq!(storage.event_consumer_cursor(foreign)?, None);
+
+    assert!(matches!(
+        storage.acknowledge_next_world_event(consumer, None, &events[2]),
+        Err(StorageError::EventConsumerEventNotNext),
+    ));
+    let mut fake = events[0].clone();
+    fake.id = rintawa_sdk::world::WorldEventId::new();
+    assert!(matches!(
+        storage.acknowledge_next_world_event(consumer, None, &fake),
+        Err(StorageError::EventConsumerEventNotNext),
+    ));
+    let cursor = storage.acknowledge_next_world_event(consumer, None, &events[0])?;
+    assert_eq!(cursor, WorldEventCursor::after(&events[0]));
+    assert_eq!(storage.event_consumer_cursor(consumer)?, Some(cursor));
+    assert_eq!(storage.event_consumer_cursor(foreign)?, None);
+
+    assert!(matches!(
+        storage.acknowledge_next_world_event(consumer, None, &events[1]),
+        Err(StorageError::EventConsumerCursorConflict),
+    ));
+    assert!(matches!(
+        storage.acknowledge_next_world_event(consumer, Some(cursor), &events[2]),
+        Err(StorageError::EventConsumerEventNotNext),
+    ));
+    assert_eq!(storage.event_consumer_cursor(consumer)?, Some(cursor));
+    let next_cursor = storage.acknowledge_next_world_event(consumer, Some(cursor), &events[1])?;
+    assert_eq!(storage.event_consumer_cursor(consumer)?, Some(next_cursor));
+
+    // A different consumer has independent progress, even in the same World.
+    let other_cursor = storage.acknowledge_next_world_event(foreign, None, &events[0])?;
+    assert_eq!(other_cursor, cursor);
+
+    let path = root.path().join("world.sqlite");
+    drop(storage);
+    let reopened = SqliteWorldStorage::open(path)?;
+    assert_eq!(reopened.event_consumer_cursor(consumer)?, Some(next_cursor));
+    let remainder = reopened.events_after_cursor(Some(next_cursor), 1)?;
+    assert_eq!(remainder[0].id, events[2].id);
+    let end = reopened.acknowledge_next_world_event(consumer, Some(next_cursor), &events[2])?;
+    assert!(reopened.events_after_cursor(Some(end), 1)?.is_empty());
+    assert!(matches!(
+        reopened.acknowledge_next_world_event(consumer, Some(end), &events[2]),
+        Err(StorageError::EventConsumerEventNotNext),
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_foreign_world_and_invalid_consumer_checkpoint_keys() -> Result<()> {
+    let (_root, storage) = create_storage()?;
+    let schemas = register_test_schemas(&storage)?;
+    let event = committed_event_fixture(&storage, &schemas, 1)?.remove(0);
+    for invalid in ["", " bad", "-leading", "hi\\there", "é", "x\n", "x x"] {
+        assert!(matches!(
+            storage.event_consumer_cursor(invalid),
+            Err(StorageError::InvalidEventConsumerId),
+        ));
+        assert!(matches!(
+            storage.acknowledge_next_world_event(invalid, None, &event),
+            Err(StorageError::InvalidEventConsumerId),
+        ));
+    }
+    let excessive = "a".repeat(257);
+    assert!(matches!(
+        storage.event_consumer_cursor(&excessive),
+        Err(StorageError::InvalidEventConsumerId),
+    ));
+    let mut unrelated = event.clone();
+    unrelated.world_id = WorldId::new();
+    assert!(matches!(
+        storage.acknowledge_next_world_event("valid.worker", None, &unrelated),
+        Err(StorageError::EventCursorWorldMismatch { .. }),
+    ));
+    assert!(matches!(
+        storage.acknowledge_next_world_event(
+            "valid.worker",
+            Some(WorldEventCursor::after(&unrelated)),
+            &event,
+        ),
+        Err(StorageError::EventCursorWorldMismatch { .. }),
+    ));
+    assert_eq!(storage.event_consumer_cursor("valid.worker")?, None);
+    Ok(())
+}
+
+#[test]
+fn test_should_fence_two_concurrent_event_consumer_acknowledgements() -> Result<()> {
+    let (root, storage) = create_storage()?;
+    let schemas = register_test_schemas(&storage)?;
+    let event = committed_event_fixture(&storage, &schemas, 1)?.remove(0);
+    let path = root.path().join("world.sqlite");
+    let barrier = Arc::new(Barrier::new(3));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let worker_barrier = Arc::clone(&barrier);
+        let worker_path = path.clone();
+        let worker_event = event.clone();
+        workers.push(std::thread::spawn(move || {
+            let connection = SqliteWorldStorage::open(worker_path)?;
+            worker_barrier.wait();
+            connection.acknowledge_next_world_event("rintawa.test.parallel", None, &worker_event)
+        }));
+    }
+    barrier.wait();
+    let mut accepted = 0;
+    let mut conflicts = 0;
+    for worker in workers {
+        match worker.join().expect("worker must not panic") {
+            Ok(cursor) => {
+                assert_eq!(cursor, WorldEventCursor::after(&event));
+                accepted += 1;
+            }
+            Err(StorageError::EventConsumerCursorConflict) => conflicts += 1,
+            Err(other) => panic!("unexpected checkpoint error: {other}"),
+        }
+    }
+    assert_eq!((accepted, conflicts), (1, 1));
+    assert_eq!(
+        storage.event_consumer_cursor("rintawa.test.parallel")?,
+        Some(WorldEventCursor::after(&event))
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_replay_controller_enqueue_once_after_crash_before_event_ack() -> Result<()> {
+    let (root, storage) = create_storage()?;
+    let schemas = register_test_schemas(&storage)?;
+    let source_principal = PrincipalId::new();
+    let controller_principal = PrincipalId::new();
+    assert_ne!(source_principal, controller_principal);
+    let event = WorldEventDraft::new(
+        schemas.event.clone(),
+        serde_json::json!({ "message": "human source" }),
+    );
+    let mut source_transaction = WorldTransaction::new();
+    source_transaction.push_event(event.clone());
+    let source_command = direct_command(&schemas.command, source_principal, "human-message");
+    commit_current(&storage, &source_command, &source_transaction)?;
+
+    let source = storage.events_after_cursor(None, 1)?.remove(0);
+    assert_eq!(source.provenance.principal, source_principal);
+    assert_eq!(source.id, event.id());
+
+    // A real Host event consumer would authenticate this *separate*
+    // controller Principal and check its World ControlGrant. This storage
+    // test only verifies exactly-once generic command/effect persistence.
+    let command_id = CommandId::new();
+    let correlation = CorrelationId::new();
+    let command = WorldCommand::with_ids(
+        command_id,
+        correlation,
+        schemas.command.clone(),
+        controller_principal,
+        ActorRef::Principal(controller_principal),
+        serde_json::json!({ "action": "enqueue-controller-effect" }),
+    )
+    .caused_by(rintawa_world::CausationRef::Event(source.id));
+    let effect_id = EffectJobId::new();
+    let mut transaction = WorldTransaction::new();
+    transaction.push_effect(EffectJobDraft::with_id(
+        effect_id,
+        schemas.effect.clone(),
+        serde_json::json!({ "input": "bounded event identity" }),
+    ));
+    let committed = commit_current(&storage, &command, &transaction)?;
+    assert_eq!(committed.disposition(), CommitDisposition::Committed);
+    assert_eq!(committed.effect_job_ids(), &[effect_id]);
+    assert_eq!(storage.event_consumer_cursor("controller.worker")?, None);
+    drop(storage);
+
+    // Simulated interruption: the job exists, but the cursor has not moved.
+    let reopened = SqliteWorldStorage::open(root.path().join("world.sqlite"))?;
+    let replay = reopened.events_after_cursor(None, 1)?;
+    assert_eq!(replay.len(), 1);
+    assert_eq!(replay[0].id, source.id);
+    let duplicate = commit_current(&reopened, &command, &transaction)?;
+    assert_eq!(duplicate.disposition(), CommitDisposition::AlreadyCommitted);
+    assert_eq!(duplicate.command_id(), command_id);
+    assert_eq!(duplicate.effect_job_ids(), &[effect_id]);
+    assert_eq!(reopened.pending_effects(10)?.len(), 1);
+    assert_eq!(
+        reopened.pending_effects(10)?[0].provenance.principal,
+        controller_principal
+    );
+
+    let cursor = reopened.acknowledge_next_world_event("controller.worker", None, &replay[0])?;
+    assert_eq!(
+        reopened.event_consumer_cursor("controller.worker")?,
+        Some(cursor)
+    );
+    assert!(reopened.events_after_cursor(Some(cursor), 1)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_should_upgrade_v3_event_history_without_losing_events() -> Result<()> {
+    let (root, storage) = create_storage()?;
+    let schemas = register_test_schemas(&storage)?;
+    let event = committed_event_fixture(&storage, &schemas, 1)?.remove(0);
+    let path = root.path().join("world.sqlite");
+    drop(storage);
+    // Recreate the exact v3 schema shape from a known v4 test world.
+    // No consumers can exist before the v4 migration.
+    let connection = Connection::open(&path)?;
+    connection.execute_batch("DROP TABLE world_event_consumers; PRAGMA user_version = 3;")?;
+    drop(connection);
+    let reopened = SqliteWorldStorage::open(&path)?;
+    let reader = reopened.reader()?;
+    assert_eq!(
+        migration::storage_version(&reader)?,
+        migration::STORAGE_SCHEMA_VERSION
+    );
+    drop(reader);
+    assert_eq!(reopened.events_after_cursor(None, 10)?[0].id, event.id);
+    assert_eq!(reopened.event_consumer_cursor("migration.worker")?, None);
+    reopened.acknowledge_next_world_event("migration.worker", None, &event)?;
+    assert_eq!(
+        reopened.event_consumer_cursor("migration.worker")?,
+        Some(WorldEventCursor::after(&event))
+    );
+    Ok(())
+}
+
 #[test]
 fn test_should_paginate_every_event_within_a_commit_across_restart() -> Result<()> {
     let (root, storage) = create_storage()?;
@@ -1490,12 +1744,13 @@ fn test_should_migrate_storage_v1_to_current_schema() -> Result<()> {
          WHERE type = 'table'
            AND name IN (
                'world_commits', 'control_grants', 'control_grant_schemas',
-               'world_mutations', 'world_events', 'effect_jobs'
+               'world_mutations', 'world_events', 'effect_jobs',
+               'world_event_consumers'
            )",
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(table_count, 6);
+    assert_eq!(table_count, 7);
     Ok(())
 }
 
