@@ -11,7 +11,9 @@
 use sha2::{Digest, Sha256};
 
 use rintawa_sdk::world::{CommandId, PrincipalId, SchemaKey, WorldId};
-use rintawa_world::{ActorRef, CausationRef, CommitDisposition, StoredWorldEvent, WorldCommand};
+use rintawa_world::{
+    ActorRef, CausationRef, CommandAdmission, CommitDisposition, StoredWorldEvent, WorldCommand,
+};
 
 use crate::runtime::HostRuntime;
 use crate::{HostError, HostResult};
@@ -21,6 +23,18 @@ pub const MAX_WORLD_EVENT_REPLAY_BATCH: usize = 16;
 const MAX_REPLAY_RULE_ID_BYTES: usize = 96;
 const ENQUEUE_COMMAND_DOMAIN: &[u8] = b"rintawa.replay.enqueue.command.v1\0";
 const CONSUMER_DOMAIN: &[u8] = b"rintawa.replay.consumer.v1\0";
+
+/// Immutable source-provenance gate for a trusted replay consumer.
+///
+/// This never infers humanness from Principal or Actor. Only committed Host
+/// admission data can satisfy InteractiveOnly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorldEventReplaySourceGate {
+    /// Generic Host rules may process any committed event.
+    All,
+    /// Only verified interactive command sources may trigger new commands.
+    InteractiveOnly,
+}
 
 /// A Host-approved and pinned event-to-command routing rule.
 ///
@@ -35,6 +49,7 @@ pub struct TrustedWorldEventConsumer {
     actor: ActorRef,
     enqueue_schema: SchemaKey,
     batch_limit: usize,
+    source_gate: WorldEventReplaySourceGate,
 }
 
 impl TrustedWorldEventConsumer {
@@ -93,7 +108,51 @@ impl TrustedWorldEventConsumer {
             actor,
             enqueue_schema,
             batch_limit,
+            source_gate: WorldEventReplaySourceGate::All,
         })
+    }
+
+    /// Constructs an exact replay rule exclusively for Host-authenticated
+    /// interactive source events. Its checkpoint differs from an unrestricted
+    /// rule even with the same World, Principal, Actor and rule ID.
+    ///
+    /// # Errors
+    ///
+    /// Rejects the same malformed rule/controller/scope policy as new().
+    pub fn interactive_only(
+        world_id: WorldId,
+        rule_id: &str,
+        principal: PrincipalId,
+        actor: ActorRef,
+        enqueue_schema: SchemaKey,
+        batch_limit: usize,
+    ) -> HostResult<Self> {
+        let mut consumer = Self::new(
+            world_id,
+            rule_id,
+            principal,
+            actor,
+            enqueue_schema,
+            batch_limit,
+        )?;
+        let mut digest = Sha256::new();
+        digest.update(b"rintawa.replay.interactive-only.v1\0");
+        digest.update(consumer.storage_consumer_id.as_bytes());
+        let key: [u8; 32] = digest.finalize().into();
+        let mut consumer_id = String::from("rintawa.replay.v2:");
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in key {
+            consumer_id.push(char::from(HEX[usize::from(byte >> 4)]));
+            consumer_id.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        consumer.storage_consumer_id = consumer_id;
+        consumer.source_gate = WorldEventReplaySourceGate::InteractiveOnly;
+        Ok(consumer)
+    }
+
+    /// Source provenance filter selected by this exact Host rule.
+    pub const fn source_gate(&self) -> WorldEventReplaySourceGate {
+        self.source_gate
     }
 
     /// Opaque storage-only checkpoint namespace owned by the bound Host rule.
@@ -224,11 +283,18 @@ impl HostRuntime {
                 return Err(HostError::MixedWorldEventBatch);
             }
             let command_id = consumer.enqueue_command_id(&event);
-            match route(&event, command_id)? {
+            let decision = if consumer.source_gate == WorldEventReplaySourceGate::InteractiveOnly
+                && event.provenance.admission != CommandAdmission::Interactive
+            {
+                WorldEventReplayDecision::Skip
+            } else {
+                route(&event, command_id)?
+            };
+            match decision {
                 WorldEventReplayDecision::Skip => {}
                 WorldEventReplayDecision::Enqueue(command) => {
                     consumer.validate_command(&event, command_id, &command)?;
-                    let dispatched = self.submit_world_command(world_id, command)?;
+                    let dispatched = self.submit_automated_world_command(world_id, command)?;
                     match dispatched.authoritative().receipt().disposition() {
                         CommitDisposition::Committed | CommitDisposition::AlreadyCommitted => {}
                     }
@@ -687,7 +753,7 @@ mod sqlite_integration_tests {
             .remove(0);
         let command_id = policy.enqueue_command_id(&event);
         if let WorldEventReplayDecision::Enqueue(command) = enqueue(&policy, &event, command_id) {
-            host.submit_world_command(world, command)?;
+            host.submit_automated_world_command(world, command)?;
         }
         assert_eq!(
             host.active_worlds[&world]
@@ -822,6 +888,167 @@ mod sqlite_integration_tests {
                 .pending_effects(8)?
                 .len(),
             1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_only_enqueue_verified_interactive_sources_and_attest_replay_as_automated()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let world = WorldId::new();
+        let human = PrincipalId::new();
+        let controller = PrincipalId::new();
+        let (mut host, source_schema, enqueue_schema) = fixture(directory.path(), world)?;
+        let consumer = TrustedWorldEventConsumer::interactive_only(
+            world,
+            "narrator.interactive@1",
+            controller,
+            ActorRef::Principal(controller),
+            enqueue_schema.clone(),
+            MAX_WORLD_EVENT_REPLAY_BATCH,
+        )?;
+        let unrestricted = policy_for(
+            world,
+            controller,
+            enqueue_schema,
+            ActorRef::Principal(controller),
+        );
+        assert_ne!(
+            consumer.storage_consumer_id(),
+            unrestricted.storage_consumer_id()
+        );
+        assert_eq!(
+            consumer.source_gate(),
+            WorldEventReplaySourceGate::InteractiveOnly
+        );
+
+        // Guest/unspecified submissions stay Unknown. They must not be accepted
+        // as human input just because Actor is Principal.
+        send_source(&mut host, world, source_schema.clone(), human)?;
+
+        let autonomous = WorldCommand::new(
+            source_schema.clone(),
+            controller,
+            ActorRef::Principal(controller),
+            serde_json::json!({"send": true}),
+        );
+        host.submit_automated_world_command(world, autonomous)?;
+
+        let interactive = WorldCommand::new(
+            source_schema.clone(),
+            human,
+            ActorRef::Principal(human),
+            serde_json::json!({"send": true}),
+        );
+        let before = host.active_worlds[&world]
+            .outbox
+            .load_session()?
+            .commit_position();
+        let error = host
+            .submit_interactive_world_command(world, PrincipalId::new(), interactive.clone())
+            .expect_err("foreign session cannot attest this command");
+        assert!(matches!(
+            error,
+            HostError::InteractiveWorldCommandPrincipalMismatch
+        ));
+        assert_eq!(
+            host.active_worlds[&world]
+                .outbox
+                .load_session()?
+                .commit_position(),
+            before,
+        );
+        host.submit_interactive_world_command(world, human, interactive)?;
+
+        let events = host.active_worlds[&world]
+            .outbox
+            .events_after_cursor(None, 12)?;
+        assert_eq!(events.len(), 6);
+        for event in &events[0..2] {
+            assert_eq!(event.provenance.admission, CommandAdmission::Unknown);
+        }
+        for event in &events[2..4] {
+            assert_eq!(event.provenance.admission, CommandAdmission::Automated);
+        }
+        for event in &events[4..6] {
+            assert_eq!(event.provenance.admission, CommandAdmission::Interactive);
+        }
+
+        let mut routed = Vec::new();
+        assert_eq!(
+            host.pump_world_event_consumer(&consumer, |event, id| {
+                routed.push(event.id);
+                Ok(enqueue(&consumer, event, id))
+            })?,
+            6
+        );
+        assert_eq!(
+            routed,
+            events[4..6]
+                .iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>()
+        );
+        let effects = host.active_worlds[&world].outbox.pending_effects(8)?;
+        assert_eq!(effects.len(), 2);
+        for effect in &effects {
+            assert_eq!(effect.provenance.admission, CommandAdmission::Automated);
+            assert_eq!(effect.provenance.principal, controller);
+        }
+        let checkpoint = host.active_worlds[&world]
+            .outbox
+            .event_consumer_cursor(consumer.storage_consumer_id())?;
+        assert_eq!(
+            checkpoint,
+            Some(rintawa_storage::WorldEventCursor::after(&events[5]))
+        );
+        drop(host);
+
+        let (mut resumed, _, _) = fixture(directory.path(), world)?;
+        assert_eq!(
+            resumed.pump_world_event_consumer(&consumer, |_event, _id| {
+                Err(HostError::InvalidWorldEventReplayPolicy)
+            })?,
+            0
+        );
+        assert_eq!(
+            resumed.active_worlds[&world]
+                .outbox
+                .pending_effects(8)?
+                .len(),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_keep_legacy_and_interactive_replay_policy_namespaces_independent()
+    -> anyhow::Result<()> {
+        let world = WorldId::new();
+        let principal = PrincipalId::new();
+        let schema: SchemaKey = "rintawa.test.replay-enqueue@1".parse()?;
+        let normal = TrustedWorldEventConsumer::new(
+            world,
+            "narrator@1",
+            principal,
+            ActorRef::Principal(principal),
+            schema.clone(),
+            1,
+        )?;
+        let selected = TrustedWorldEventConsumer::interactive_only(
+            world,
+            "narrator@1",
+            principal,
+            ActorRef::Principal(principal),
+            schema,
+            1,
+        )?;
+        assert_ne!(normal.storage_consumer_id(), selected.storage_consumer_id());
+        assert_eq!(normal.source_gate(), WorldEventReplaySourceGate::All);
+        assert_eq!(
+            selected.source_gate(),
+            WorldEventReplaySourceGate::InteractiveOnly
         );
         Ok(())
     }

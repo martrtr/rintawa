@@ -44,7 +44,8 @@ use rintawa_sdk::{
 };
 use rintawa_storage::{ClaimedEffectJob, EffectCommitGuard, SqliteWorldStorage};
 use rintawa_world::{
-    ActorRef, CommitDisposition, SchemaDefinition, SchemaKind, StoredWorldEvent, WorldCommand,
+    ActorRef, CommandAdmission, CommitDisposition, SchemaDefinition, SchemaKind, StoredWorldEvent,
+    WorldCommand,
 };
 use rintawa_world_runtime::{
     MAX_WORLD_EFFECT_DIAGNOSTIC_BYTES, ServiceWorldEffectHandler, ServiceWorldProjection,
@@ -2031,12 +2032,54 @@ impl HostRuntime {
         world_id: WorldId,
         command: WorldCommand,
     ) -> HostResult<WorldCommandDispatchOutcome> {
+        self.submit_world_command_admitted(world_id, command, CommandAdmission::Unknown)
+    }
+
+    /// Submit a command from a native, previously authenticated human session.
+    ///
+    /// The Principal comes from trusted Host ingress, never an extension
+    /// payload, current Actor, or a claimed UI action. Guest WIT never calls
+    /// this native method; guest submissions remain Unknown.
+    ///
+    /// # Errors
+    ///
+    /// Refuses Principal impersonation and normal World/runtime failures.
+    pub fn submit_interactive_world_command(
+        &mut self,
+        world_id: WorldId,
+        authenticated_principal: PrincipalId,
+        command: WorldCommand,
+    ) -> HostResult<WorldCommandDispatchOutcome> {
+        if command.principal() != authenticated_principal {
+            return Err(HostError::InteractiveWorldCommandPrincipalMismatch);
+        }
+        self.submit_world_command_admitted(world_id, command, CommandAdmission::Interactive)
+    }
+
+    // Replay and similar Host-owned autonomous work is never human input.
+    pub(crate) fn submit_automated_world_command(
+        &mut self,
+        world_id: WorldId,
+        command: WorldCommand,
+    ) -> HostResult<WorldCommandDispatchOutcome> {
+        self.submit_world_command_admitted(world_id, command, CommandAdmission::Automated)
+    }
+
+    fn submit_world_command_admitted(
+        &mut self,
+        world_id: WorldId,
+        command: WorldCommand,
+        admission: CommandAdmission,
+    ) -> HostResult<WorldCommandDispatchOutcome> {
         let authoritative = {
             let active = self
                 .active_worlds
                 .get(&world_id)
                 .ok_or(HostError::WorldNotActive(world_id))?;
-            active.runtime.submit(command)?.wait_outcome()?
+            active
+                .runtime
+                .submit_attested(command, admission)?
+                .wait_outcome()?
         };
 
         let live_delivery = if authoritative.receipt().disposition() == CommitDisposition::Committed

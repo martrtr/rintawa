@@ -46,6 +46,7 @@ pub use profile::{
 };
 pub use runtime::event_replay::{
     MAX_WORLD_EVENT_REPLAY_BATCH, TrustedWorldEventConsumer, WorldEventReplayDecision,
+    WorldEventReplaySourceGate,
 };
 pub use runtime::{
     EFFECT_JOB_LEASE_MILLIS, EFFECT_RETRY_BASE_MILLIS, EFFECT_RETRY_MAX_MILLIS, HostRuntime,
@@ -270,6 +271,9 @@ pub enum HostError {
     /// A routed command attempted to change trusted controller or source provenance.
     #[error("Host WorldEvent replay command violates its controller or source binding")]
     InvalidWorldEventReplayCommand,
+    /// Trusted interactive session and World command Principal do not match.
+    #[error("interactive World command Principal differs from authenticated session")]
+    InteractiveWorldCommandPrincipalMismatch,
     /// An RTW artifact operation failed.
     #[error(transparent)]
     Artifact(#[from] rintawa_artifacts::RtwError),
