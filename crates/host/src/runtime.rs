@@ -1,5 +1,7 @@
 //! Runtime orchestration for exact artifact activations in a local Rintawa host.
 
+pub(crate) mod event_replay;
+
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     io::{Read, Write},

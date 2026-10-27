@@ -44,6 +44,9 @@ pub use profile::{
     ActivationRecord, BaselineProfile, CompositionProfile, HttpLoopbackOriginGrant, PROFILE_SCHEMA,
     PreferredProviderSelection, RuntimePermissionGrant,
 };
+pub use runtime::event_replay::{
+    MAX_WORLD_EVENT_REPLAY_BATCH, TrustedWorldEventConsumer, WorldEventReplayDecision,
+};
 pub use runtime::{
     EFFECT_JOB_LEASE_MILLIS, EFFECT_RETRY_BASE_MILLIS, EFFECT_RETRY_MAX_MILLIS, HostRuntime,
     MAX_EFFECT_JOBS_PER_PUMP, WorldCommandDispatchOutcome,
@@ -261,6 +264,12 @@ impl std::error::Error for HostShutdownFailures {
 /// Errors returned by local host composition operations.
 #[derive(Debug, Error)]
 pub enum HostError {
+    /// The trusted Host event consumer policy violates its identity or resource bounds.
+    #[error("invalid Host WorldEvent replay policy")]
+    InvalidWorldEventReplayPolicy,
+    /// A routed command attempted to change trusted controller or source provenance.
+    #[error("Host WorldEvent replay command violates its controller or source binding")]
+    InvalidWorldEventReplayCommand,
     /// An RTW artifact operation failed.
     #[error(transparent)]
     Artifact(#[from] rintawa_artifacts::RtwError),
