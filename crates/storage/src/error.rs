@@ -2,7 +2,6 @@
 
 use std::path::PathBuf;
 
-use rintawa_sdk::world::{EffectJobId, WorldId};
 use thiserror::Error;
 
 /// Errors returned by persistent world storage operations.
@@ -63,71 +62,30 @@ pub enum StorageError {
         supported: u32,
     },
 
-    /// A persisted Core mutation encoding is newer or otherwise unsupported.
-    #[error("unsupported world mutation format version {found}; supported version is {supported}")]
-    UnsupportedMutationFormat {
-        /// Format version stored with the mutation entry.
-        found: u32,
-        /// Mutation format version supported by this runtime.
-        supported: u32,
-    },
+    /// A persisted value or index cannot fit the public world-model type.
+    #[error("world storage value for {0} is out of range")]
+    IndexOutOfRange(&'static str),
 
     /// Persisted bytes violate a world-storage invariant.
     #[error("corrupt world storage: {0}")]
     CorruptData(String),
 
-    /// A persisted sequence/index cannot fit the public world-model type.
-    #[error("world storage index for {0} is out of range")]
-    IndexOutOfRange(&'static str),
-
-    /// An event pagination cursor belongs to a different World.
-    #[error("World event cursor scope mismatch: expected {expected}, got {found}")]
-    EventCursorWorldMismatch {
-        /// World bound to the current storage instance.
-        expected: WorldId,
-        /// Foreign World used to construct the cursor.
-        found: WorldId,
+    /// A property value was stored under a different version than requested.
+    #[error("property {name} is stored at version {found}, not the requested version {expected}")]
+    StalePropertyVersion {
+        /// Unversioned property name.
+        name: String,
+        /// Version requested by the caller.
+        expected: u32,
+        /// Version actually stored.
+        found: u32,
     },
 
-    /// A Host consumer identifier is empty, unbounded, or non-canonical.
-    #[error("invalid World event consumer identifier")]
-    InvalidEventConsumerId,
-
-    /// A competing consumer progressed beyond the expected checkpoint.
-    #[error("World event consumer checkpoint changed")]
-    EventConsumerCursorConflict,
-
-    /// The proposed event is not the next committed event after the checkpoint.
-    #[error("World event consumer must acknowledge the next committed event")]
-    EventConsumerEventNotNext,
-
-    /// A requested durable effect job does not exist.
-    #[error("effect job {0} does not exist")]
-    EffectJobNotFound(EffectJobId),
-
-    /// An effect worker requested a lease that does not extend beyond the claim time.
-    #[error("effect job lease must expire after the claim time")]
-    InvalidEffectLease,
-
-    /// A previous effect claim lost authority because the job was reclaimed or cancelled.
-    #[error("effect job claim for {0} is no longer authoritative")]
-    EffectJobClaimLost(EffectJobId),
-
-    /// The effect job attempt counter cannot be incremented further.
-    #[error("effect job {0} attempt counter overflowed")]
-    EffectAttemptOverflow(EffectJobId),
-
-    /// A completed effect job cannot transition back to a worker-controlled state.
-    #[error("effect job {0} is already terminal")]
-    EffectJobTerminal(EffectJobId),
-
-    /// Worker diagnostic text exceeds the bounded durable error field.
-    #[error("effect job error is {actual_bytes} bytes, exceeding the {maximum_bytes}-byte limit")]
-    EffectErrorTooLarge {
-        /// Supplied UTF-8 byte length.
-        actual_bytes: usize,
-        /// Maximum persisted error size.
-        maximum_bytes: usize,
+    /// A legacy database cannot be converted without losing data.
+    #[error("legacy world cannot be migrated: {reason}")]
+    MigrationBlocked {
+        /// Why conversion refused to proceed.
+        reason: String,
     },
 
     /// The storage mutex became poisoned after an internal panic.

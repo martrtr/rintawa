@@ -1,576 +1,172 @@
-//! Read-side SQLite projections for current state, events, and outbox jobs.
+//! Item, relation and property reads over the four-table model.
 
-use rintawa_sdk::world::{
-    EffectJobId, EntityId, PrincipalId, RelationId, SchemaKey, UnixTimeMillis, WorldId,
-};
-use rintawa_world::{
-    ActorRef, CausationRef, CommandAdmission, CommandProvenance, EntityRecord, FacetRecord,
-    FacetTarget, RelationRecord, StoredEffectJob, StoredWorldEvent, StoredWorldMutation,
-    WORLD_MUTATION_FORMAT_VERSION, WorldMutation,
-};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rintawa_sdk::world::{ItemId, SchemaKey, WorldId};
+use rintawa_world::{ItemKind, ItemRecord, PropertyDefinition, PropertyRecord, PropertyRegistry};
+use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::{StorageError, StorageResult, WorldEventCursor};
+use crate::{StorageError, StorageResult};
 
-use crate::sqlite::codec::{
-    command_id_from_blob, correlation_id_from_blob, decode_schema_key, effect_job_id_from_blob,
-    entity_id_from_blob, event_id_from_blob, principal_id_from_blob, relation_id_from_blob,
-};
+use super::codec::{decode_property_key, item_id_from_blob};
 
-const MAX_READ_BATCH: usize = 1024;
+pub(super) fn load_world_id(connection: &Connection) -> StorageResult<WorldId> {
+    let bytes: Vec<u8> = connection
+        .query_row("SELECT id FROM world", [], |row| row.get(0))
+        .optional()?
+        .ok_or(StorageError::Uninitialized)?;
+    super::codec::world_id_from_blob(bytes)
+}
 
-pub(super) fn load_entity(
-    connection: &Connection,
-    entity_id: EntityId,
-) -> StorageResult<Option<EntityRecord>> {
+pub(super) fn load_manifest(connection: &Connection) -> StorageResult<serde_json::Value> {
+    let manifest: String = connection
+        .query_row("SELECT manifest FROM world", [], |row| row.get(0))
+        .optional()?
+        .ok_or(StorageError::Uninitialized)?;
+    Ok(serde_json::from_str(&manifest)?)
+}
+
+pub(super) fn load_item(connection: &Connection, id: ItemId) -> StorageResult<Option<ItemRecord>> {
     let row = connection
         .query_row(
-            "SELECT entity_id, schema_id, schema_version
-             FROM entities WHERE entity_id = ?1",
-            params![entity_id.into_bytes().as_slice()],
+            "SELECT type, subject, object FROM items WHERE id = ?1",
+            params![id.into_bytes().as_slice()],
             |row| {
                 Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
                 ))
             },
         )
         .optional()?;
 
-    row.map(|(id, schema_id, schema_version)| {
-        Ok(EntityRecord::new(
-            entity_id_from_blob(id)?,
-            decode_schema_key(schema_id, schema_version)?,
-        ))
-    })
-    .transpose()
-}
-
-pub(super) fn load_relation(
-    connection: &Connection,
-    relation_id: RelationId,
-) -> StorageResult<Option<RelationRecord>> {
-    let row = connection
-        .query_row(
-            "SELECT relation_id, schema_id, schema_version, from_entity_id, to_entity_id
-             FROM relations WHERE relation_id = ?1",
-            params![relation_id.into_bytes().as_slice()],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                    row.get::<_, Vec<u8>>(4)?,
-                ))
-            },
-        )
-        .optional()?;
-
-    row.map(|(id, schema_id, schema_version, from, to)| {
-        Ok(RelationRecord::new(
-            relation_id_from_blob(id)?,
-            decode_schema_key(schema_id, schema_version)?,
-            entity_id_from_blob(from)?,
-            entity_id_from_blob(to)?,
-        ))
-    })
-    .transpose()
-}
-
-pub(super) fn load_facet(
-    connection: &Connection,
-    target: FacetTarget,
-    schema: &SchemaKey,
-) -> StorageResult<Option<FacetRecord>> {
-    let payload = match target {
-        FacetTarget::World => connection
-            .query_row(
-                "SELECT payload_json FROM world_facets
-                 WHERE schema_id = ?1 AND schema_version = ?2",
-                params![schema.id().as_str(), i64::from(schema.version().get())],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?,
-        FacetTarget::Entity(entity_id) => connection
-            .query_row(
-                "SELECT payload_json FROM entity_facets
-                 WHERE entity_id = ?1 AND schema_id = ?2 AND schema_version = ?3",
-                params![
-                    entity_id.into_bytes().as_slice(),
-                    schema.id().as_str(),
-                    i64::from(schema.version().get()),
-                ],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?,
-        FacetTarget::Relation(relation_id) => connection
-            .query_row(
-                "SELECT payload_json FROM relation_facets
-                 WHERE relation_id = ?1 AND schema_id = ?2 AND schema_version = ?3",
-                params![
-                    relation_id.into_bytes().as_slice(),
-                    schema.id().as_str(),
-                    i64::from(schema.version().get()),
-                ],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?,
+    let Some((kind, subject, object)) = row else {
+        return Ok(None);
     };
+    let kind = ItemKind::from_code(kind)?;
+    let subject = subject
+        .map(|bytes| item_id_from_blob(bytes, "subject"))
+        .transpose()?;
+    let object = object
+        .map(|bytes| item_id_from_blob(bytes, "object"))
+        .transpose()?;
 
-    payload
-        .map(|payload| {
-            Ok(FacetRecord::new(
-                target,
-                schema.clone(),
-                serde_json::from_str(&payload)?,
-            ))
-        })
-        .transpose()
-}
-
-pub(super) fn principal_can_control(
-    connection: &Connection,
-    principal: PrincipalId,
-    actor_entity: EntityId,
-    command_schema: &SchemaKey,
-    position: u64,
-) -> StorageResult<bool> {
-    let allowed: i64 = connection.query_row(
-        "SELECT EXISTS(
-            SELECT 1
-            FROM control_grants g
-            WHERE g.principal_id = ?1
-              AND g.actor_entity_id = ?2
-              AND (
-                g.valid_through_position IS NULL
-                OR g.valid_through_position >= ?3
-              )
-              AND (
-                g.scope_kind = 1
-                OR (
-                    g.scope_kind = 2
-                    AND EXISTS(
-                        SELECT 1
-                        FROM control_grant_schemas s
-                        WHERE s.grant_id = g.grant_id
-                          AND s.schema_id = ?4
-                          AND s.schema_version = ?5
-                    )
-                )
-              )
-        )",
-        params![
-            principal.into_bytes().as_slice(),
-            actor_entity.into_bytes().as_slice(),
-            position_to_sql(position)?,
-            command_schema.id().as_str(),
-            i64::from(command_schema.version().get()),
-        ],
-        |row| row.get(0),
-    )?;
-    Ok(allowed != 0)
-}
-
-pub(super) fn mutations_after(
-    connection: &Connection,
-    position: u64,
-    limit: usize,
-) -> StorageResult<Vec<StoredWorldMutation>> {
-    let limit = bounded_limit(limit);
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-
-    let position = position_to_sql(position)?;
-    let mut statement = connection.prepare(
-        "SELECT commit_position, mutation_index, format_version, mutation_json
-         FROM world_mutations
-         WHERE commit_position > ?1
-         ORDER BY commit_position, mutation_index
-         LIMIT ?2",
-    )?;
-    let rows = statement.query_map(params![position, limit_to_sql(limit)?], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
-
-    rows.map(|row| {
-        let (commit_position, mutation_index, format_version, mutation_json) = row?;
-        let format_version = u32::try_from(format_version)
-            .map_err(|_| StorageError::CorruptData("invalid mutation format version".into()))?;
-        if format_version != WORLD_MUTATION_FORMAT_VERSION {
-            return Err(StorageError::UnsupportedMutationFormat {
-                found: format_version,
-                supported: WORLD_MUTATION_FORMAT_VERSION,
-            });
+    Ok(Some(match (kind, subject, object) {
+        (ItemKind::Object, _, _) => ItemRecord::object(id),
+        (ItemKind::Relation, Some(subject), Some(object)) => {
+            ItemRecord::relation(id, subject, object)
         }
-        let mutation: WorldMutation = serde_json::from_str(&mutation_json)?;
-        Ok(StoredWorldMutation {
-            commit_position: position_from_sql(commit_position)?,
-            mutation_index: index_from_sql(mutation_index, "mutation_index")?,
-            format_version,
-            mutation,
-        })
-    })
-    .collect()
-}
-
-pub(super) fn events_at_position(
-    connection: &Connection,
-    world_id: WorldId,
-    position: u64,
-) -> StorageResult<Vec<StoredWorldEvent>> {
-    let position = position_to_sql(position)?;
-    let mut statement = connection.prepare(
-        "SELECT
-            e.event_id, e.commit_position, e.event_index,
-            e.schema_id, e.schema_version, e.payload_json,
-            c.command_id, c.command_schema_id, c.command_schema_version,
-            c.principal_id, c.actor_kind, c.actor_id,
-            c.causation_kind, c.causation_id, c.correlation_id,
-            c.effective_at_ms, c.recorded_at_ms, c.admission_kind
-         FROM world_events e
-         JOIN world_commits c ON c.commit_position = e.commit_position
-         WHERE e.commit_position = ?1
-         ORDER BY e.event_index",
-    )?;
-    let rows = statement.query_map(params![position], |row| {
-        Ok((
-            row.get::<_, Vec<u8>>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, String>(5)?,
-            provenance_sql_from_row(row, 6)?,
-        ))
-    })?;
-
-    rows.map(|row| {
-        let (id, commit_position, event_index, schema_id, schema_version, payload, provenance) =
-            row?;
-        Ok(StoredWorldEvent {
-            world_id,
-            id: event_id_from_blob(id)?,
-            commit_position: position_from_sql(commit_position)?,
-            event_index: index_from_sql(event_index, "event_index")?,
-            provenance: decode_provenance(provenance)?,
-            schema: decode_schema_key(schema_id, schema_version)?,
-            payload: serde_json::from_str(&payload)?,
-        })
-    })
-    .collect()
-}
-
-pub(super) fn events_after(
-    connection: &Connection,
-    world_id: WorldId,
-    position: u64,
-    limit: usize,
-) -> StorageResult<Vec<StoredWorldEvent>> {
-    // Legacy API deliberately excludes every event at the supplied commit
-    // position, including multiple events produced by the same command.
-    events_after_cursor(
-        connection,
-        world_id,
-        Some(WorldEventCursor::after_complete_position(
-            world_id, position,
-        )),
-        limit,
-    )
-}
-
-pub(super) fn events_after_cursor(
-    connection: &Connection,
-    world_id: WorldId,
-    cursor: Option<WorldEventCursor>,
-    limit: usize,
-) -> StorageResult<Vec<StoredWorldEvent>> {
-    let limit = bounded_limit(limit);
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-
-    let (position, event_index) = cursor.map_or((0, u32::MAX), |value| {
-        (value.commit_position(), value.event_index())
-    });
-    let position = position_to_sql(position)?;
-    let mut statement = connection.prepare(
-        "SELECT
-            e.event_id, e.commit_position, e.event_index,
-            e.schema_id, e.schema_version, e.payload_json,
-            c.command_id, c.command_schema_id, c.command_schema_version,
-            c.principal_id, c.actor_kind, c.actor_id,
-            c.causation_kind, c.causation_id, c.correlation_id,
-            c.effective_at_ms, c.recorded_at_ms, c.admission_kind
-         FROM world_events e
-         JOIN world_commits c ON c.commit_position = e.commit_position
-         WHERE e.commit_position > ?1
-            OR (e.commit_position = ?1 AND e.event_index > ?2)
-         ORDER BY e.commit_position, e.event_index
-         LIMIT ?3",
-    )?;
-    let rows = statement.query_map(
-        params![position, i64::from(event_index), limit_to_sql(limit)?],
-        |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, String>(5)?,
-                provenance_sql_from_row(row, 6)?,
-            ))
-        },
-    )?;
-
-    rows.map(|row| {
-        let (id, commit_position, event_index, schema_id, schema_version, payload, provenance) =
-            row?;
-        Ok(StoredWorldEvent {
-            world_id,
-            id: event_id_from_blob(id)?,
-            commit_position: position_from_sql(commit_position)?,
-            event_index: index_from_sql(event_index, "event_index")?,
-            provenance: decode_provenance(provenance)?,
-            schema: decode_schema_key(schema_id, schema_version)?,
-            payload: serde_json::from_str(&payload)?,
-        })
-    })
-    .collect()
-}
-
-pub(super) fn effect_job_by_id(
-    connection: &Connection,
-    world_id: WorldId,
-    job_id: EffectJobId,
-) -> StorageResult<Option<StoredEffectJob>> {
-    let row = connection
-        .query_row(
-            "SELECT
-                j.job_id, j.commit_position, j.job_index,
-                j.schema_id, j.schema_version, j.payload_json, j.attempt_count,
-                c.command_id, c.command_schema_id, c.command_schema_version,
-                c.principal_id, c.actor_kind, c.actor_id,
-                c.causation_kind, c.causation_id, c.correlation_id,
-                c.effective_at_ms, c.recorded_at_ms, c.admission_kind
-             FROM effect_jobs j
-             JOIN world_commits c ON c.commit_position = j.commit_position
-             WHERE j.job_id = ?1",
-            [job_id.into_bytes().as_slice()],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, i64>(6)?,
-                    provenance_sql_from_row(row, 7)?,
-                ))
-            },
-        )
-        .optional()?;
-
-    row.map(
-        |(
-            id,
-            commit_position,
-            job_index,
-            schema_id,
-            schema_version,
-            payload,
-            attempt_count,
-            provenance,
-        )| {
-            Ok(StoredEffectJob {
-                world_id,
-                id: effect_job_id_from_blob(id)?,
-                commit_position: position_from_sql(commit_position)?,
-                job_index: index_from_sql(job_index, "job_index")?,
-                provenance: decode_provenance(provenance)?,
-                schema: decode_schema_key(schema_id, schema_version)?,
-                payload: serde_json::from_str(&payload)?,
-                attempt_count: index_from_sql(attempt_count, "attempt_count")?,
-            })
-        },
-    )
-    .transpose()
-}
-
-pub(super) fn pending_effects(
-    connection: &Connection,
-    world_id: WorldId,
-    limit: usize,
-) -> StorageResult<Vec<StoredEffectJob>> {
-    let limit = bounded_limit(limit);
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-
-    let mut statement = connection.prepare(
-        "SELECT
-            j.job_id, j.commit_position, j.job_index,
-            j.schema_id, j.schema_version, j.payload_json, j.attempt_count,
-            c.command_id, c.command_schema_id, c.command_schema_version,
-            c.principal_id, c.actor_kind, c.actor_id,
-            c.causation_kind, c.causation_id, c.correlation_id,
-            c.effective_at_ms, c.recorded_at_ms, c.admission_kind
-         FROM effect_jobs j
-         JOIN world_commits c ON c.commit_position = j.commit_position
-         WHERE j.status = 0
-         ORDER BY j.commit_position, j.job_index
-         LIMIT ?1",
-    )?;
-    let rows = statement.query_map(params![limit_to_sql(limit)?], |row| {
-        Ok((
-            row.get::<_, Vec<u8>>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, i64>(6)?,
-            provenance_sql_from_row(row, 7)?,
-        ))
-    })?;
-
-    rows.map(|row| {
-        let (
-            id,
-            commit_position,
-            job_index,
-            schema_id,
-            schema_version,
-            payload,
-            attempt_count,
-            provenance,
-        ) = row?;
-        Ok(StoredEffectJob {
-            world_id,
-            id: effect_job_id_from_blob(id)?,
-            commit_position: position_from_sql(commit_position)?,
-            job_index: index_from_sql(job_index, "job_index")?,
-            provenance: decode_provenance(provenance)?,
-            schema: decode_schema_key(schema_id, schema_version)?,
-            payload: serde_json::from_str(&payload)?,
-            attempt_count: index_from_sql(attempt_count, "attempt_count")?,
-        })
-    })
-    .collect()
-}
-
-#[derive(Debug)]
-struct ProvenanceSql {
-    command_id: Vec<u8>,
-    command_schema_id: String,
-    command_schema_version: i64,
-    principal_id: Vec<u8>,
-    actor_kind: i64,
-    actor_id: Vec<u8>,
-    causation_kind: Option<i64>,
-    causation_id: Option<Vec<u8>>,
-    correlation_id: Vec<u8>,
-    effective_at_ms: Option<i64>,
-    recorded_at_ms: i64,
-    admission_kind: i64,
-}
-
-fn provenance_sql_from_row(row: &Row<'_>, base: usize) -> rusqlite::Result<ProvenanceSql> {
-    Ok(ProvenanceSql {
-        command_id: row.get(base)?,
-        command_schema_id: row.get(base + 1)?,
-        command_schema_version: row.get(base + 2)?,
-        principal_id: row.get(base + 3)?,
-        actor_kind: row.get(base + 4)?,
-        actor_id: row.get(base + 5)?,
-        causation_kind: row.get(base + 6)?,
-        causation_id: row.get(base + 7)?,
-        correlation_id: row.get(base + 8)?,
-        effective_at_ms: row.get(base + 9)?,
-        recorded_at_ms: row.get(base + 10)?,
-        admission_kind: row.get(base + 11)?,
-    })
-}
-
-fn decode_provenance(value: ProvenanceSql) -> StorageResult<CommandProvenance> {
-    let principal = principal_id_from_blob(value.principal_id)?;
-    let actor = match value.actor_kind {
-        1 => ActorRef::Principal(principal_id_from_blob(value.actor_id)?),
-        2 => ActorRef::Entity(entity_id_from_blob(value.actor_id)?),
-        code => {
-            return Err(StorageError::CorruptData(format!(
-                "unknown actor kind code {code}"
-            )));
-        }
-    };
-
-    let causation = match (value.causation_kind, value.causation_id) {
-        (None, None) => None,
-        (Some(1), Some(id)) => Some(CausationRef::Command(command_id_from_blob(id)?)),
-        (Some(2), Some(id)) => Some(CausationRef::Event(event_id_from_blob(id)?)),
-        (Some(3), Some(id)) => Some(CausationRef::Effect(effect_job_id_from_blob(id)?)),
-        (Some(code), Some(_)) => {
-            return Err(StorageError::CorruptData(format!(
-                "unknown causation kind code {code}"
-            )));
-        }
-        _ => {
-            return Err(StorageError::CorruptData(
-                "causation kind/id presence mismatch".into(),
+        (ItemKind::Relation, _, _) => {
+            return Err(StorageError::World(
+                rintawa_world::WorldError::RelationEndpointAbsent(id),
             ));
         }
-    };
+    }))
+}
 
-    let admission = match value.admission_kind {
-        0 => CommandAdmission::Unknown,
-        1 => CommandAdmission::Interactive,
-        2 => CommandAdmission::Automated,
-        3 => CommandAdmission::Scripted,
-        code => {
-            return Err(StorageError::CorruptData(format!(
-                "unknown command admission kind code {code}"
-            )));
+pub(super) fn load_property(
+    connection: &Connection,
+    item: ItemId,
+    key: &SchemaKey,
+) -> StorageResult<Option<PropertyRecord>> {
+    let row = connection
+        .query_row(
+            "SELECT version, data FROM properties WHERE item = ?1 AND name = ?2",
+            params![item.into_bytes().as_slice(), key.id().as_str()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+
+    row.map(|(version, data)| {
+        if version != i64::from(key.version().get()) {
+            return Err(StorageError::StalePropertyVersion {
+                name: key.id().to_string(),
+                expected: key.version().get(),
+                found: u32::try_from(version).unwrap_or_default(),
+            });
         }
-    };
-    Ok(CommandProvenance {
-        admission,
-        command_id: command_id_from_blob(value.command_id)?,
-        command_schema: decode_schema_key(value.command_schema_id, value.command_schema_version)?,
-        principal,
-        actor,
-        causation,
-        correlation_id: correlation_id_from_blob(value.correlation_id)?,
-        effective_at: value.effective_at_ms.map(UnixTimeMillis::new),
-        recorded_at: UnixTimeMillis::new(value.recorded_at_ms),
+        Ok(PropertyRecord::new(
+            item,
+            key.clone(),
+            serde_json::from_str(&data)?,
+        ))
     })
+    .transpose()
 }
 
-fn bounded_limit(limit: usize) -> usize {
-    limit.min(MAX_READ_BATCH)
+pub(super) fn list_properties(
+    connection: &Connection,
+    item: ItemId,
+) -> StorageResult<Vec<PropertyRecord>> {
+    let mut statement = connection
+        .prepare("SELECT name, version, data FROM properties WHERE item = ?1 ORDER BY name")?;
+    let rows = statement.query_map(params![item.into_bytes().as_slice()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+
+    let mut properties = Vec::new();
+    for row in rows {
+        let (name, version, data) = row?;
+        let key = decode_property_key(name, version)?;
+        properties.push(PropertyRecord::new(item, key, serde_json::from_str(&data)?));
+    }
+    Ok(properties)
 }
 
-fn limit_to_sql(limit: usize) -> StorageResult<i64> {
-    i64::try_from(limit).map_err(|_| StorageError::IndexOutOfRange("query limit"))
+pub(super) fn relations_pointing_at(
+    connection: &Connection,
+    target: ItemId,
+) -> StorageResult<Vec<ItemRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT id, subject, object FROM items
+         WHERE type = 2 AND (subject = ?1 OR object = ?1) ORDER BY id",
+    )?;
+    let rows = statement.query_map(params![target.into_bytes().as_slice()], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    })?;
+
+    let mut relations = Vec::new();
+    for row in rows {
+        let (id, subject, object) = row?;
+        relations.push(ItemRecord::relation(
+            item_id_from_blob(id, "relation_id")?,
+            item_id_from_blob(subject, "subject")?,
+            item_id_from_blob(object, "object")?,
+        ));
+    }
+    Ok(relations)
 }
 
-fn position_to_sql(position: u64) -> StorageResult<i64> {
-    i64::try_from(position).map_err(|_| StorageError::IndexOutOfRange("commit_position"))
-}
+pub(super) fn load_registry(connection: &Connection) -> StorageResult<PropertyRegistry> {
+    let mut statement = connection
+        .prepare("SELECT name, version, schema FROM property_registry ORDER BY name, version")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
 
-fn position_from_sql(position: i64) -> StorageResult<u64> {
-    u64::try_from(position)
-        .map_err(|_| StorageError::CorruptData("negative world commit position".into()))
-}
-
-fn index_from_sql(index: i64, label: &'static str) -> StorageResult<u32> {
-    u32::try_from(index).map_err(|_| StorageError::CorruptData(format!("invalid {label}")))
+    let mut registry = PropertyRegistry::new();
+    for row in rows {
+        let (name, version, schema) = row?;
+        let key = decode_property_key(name, version)?;
+        let schema = serde_json::from_str(&schema)?;
+        // Provenance lives in the Host composition; the vocabulary owns the
+        // compiled definition.
+        registry.register(PropertyDefinition::new(
+            key,
+            rintawa_sdk::types::ExtensionId::new("world"),
+            schema,
+        ))?;
+    }
+    Ok(registry)
 }

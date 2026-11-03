@@ -58,7 +58,6 @@ pub use crate::ui::{
 };
 
 pub use crate::world::{
-    CommandId, ControlGrantId, CorrelationId, EffectJobId, EntityId, PrincipalId, RelationId,
-    SchemaId, SchemaIdentifierError, SchemaKey, SchemaKeyParseError, SchemaVersion,
-    SchemaVersionError, UnixTimeMillis, WorldEventId, WorldId,
+    CommandId, CorrelationId, ItemId, PrincipalId, SchemaId, SchemaIdentifierError, SchemaKey,
+    SchemaKeyParseError, SchemaVersion, SchemaVersionError, UnixTimeMillis, WorldId,
 };

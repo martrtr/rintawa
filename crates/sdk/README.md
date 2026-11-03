@@ -74,6 +74,29 @@ descriptors.
 Execution through another runtime provider does not inherit that provider's
 runtime permissions. Delegated components execute under their own principal.
 
+## World model contracts
+
+`rintawa_sdk::world` defines the feature-neutral World contract shared by the
+authoritative runtime and extensions:
+
+- opaque UUIDv7 identifiers: `WorldId`, `ItemId`, `CommandId`, `PrincipalId` and
+  `CorrelationId`;
+- versioned schema keys (`SchemaId@version`) and the `SchemaKind` categories `Property`,
+  `Command`, `Event`, `Effect` and `Projection`;
+- item and property records where every object and relation is an item, and all
+  extension data is a versioned property value on an item.
+
+`rintawa_sdk::world_system` and `rintawa_sdk::world_projection` are the transport
+contracts for ordinary extension Systems and projections. A System returns one atomic
+item/property change set plus optional best-effort signals, and a projection may read only
+the property names it owns.
+
+The model is intentionally reduced: one World per database with four tables, no durable
+command ledger or receipts, no event log or replay, no jobs/outbox, and no actor control
+grants. Runtime signals are best-effort in-process notifications, lost if the process dies
+between COMMIT and dispatch. Property names are flat identifiers, and `player`/`npc` are
+ordinary extension properties with no Core ownership semantics.
+
 ## Lifecycle
 
 The Extension Engine owns creation, ordering, rollback, and cleanup. A

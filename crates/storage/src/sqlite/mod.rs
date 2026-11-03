@@ -1,10 +1,12 @@
 //! SQLite-backed storage for one authoritative world.
+//!
+//! The database holds exactly four domain tables: `world`, `items`,
+//! `property_registry` and `properties`. There is no durable command ledger,
+//! mutation log, event log, consumer cursor, effect outbox or control grant.
 
+mod apply;
 mod codec;
-mod commit;
-mod event_consumer;
 mod migration;
-mod outbox;
 mod query;
 mod snapshot;
 
@@ -18,17 +20,14 @@ use std::{
     time::Duration,
 };
 
-use rintawa_sdk::world::{EffectJobId, EntityId, RelationId, SchemaKey, UnixTimeMillis, WorldId};
+use rintawa_sdk::world::{ItemId, SchemaKey, WorldId};
 use rintawa_world::{
-    CommandAdmission, CommitReceipt, EntityRecord, FacetRecord, FacetTarget, RelationRecord,
-    SchemaDefinition, SchemaRegistration, SchemaRegistry, StoredEffectJob, StoredWorldEvent,
-    StoredWorldMutation, WORLD_FORMAT_VERSION, WorldCommand, WorldSessionState, WorldTransaction,
+    DefinitionRegistration, ItemRecord, PropertyDefinition, PropertyRecord, PropertyRegistry,
+    WORLD_FORMAT_VERSION, WorldManifest, WorldSessionState, WorldTransaction,
 };
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 
-use crate::{ClaimedEffectJob, EffectCommitGuard, StorageError, StorageResult, WorldEventCursor};
-
-use self::codec::{load_schema, load_schema_registry, schema_kind_code, world_id_from_blob};
+use crate::{StorageError, StorageResult};
 
 pub use self::snapshot::SqliteWorldSnapshot;
 
@@ -36,10 +35,10 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// SQLite storage for exactly one authoritative world.
 ///
-/// One database file embeds one WorldId. The commit path uses SQLite IMMEDIATE
-/// transactions, while the host/runtime is still expected to expose one logical
-/// writer queue per active world. WAL permits independent read connections later
-/// without changing the public world model.
+/// One database file embeds one WorldId. Writes use SQLite `IMMEDIATE`
+/// transactions and the runtime exposes one logical writer queue per active
+/// world, so no persisted revision counter is needed. Readers open their own WAL
+/// connections and pin a snapshot.
 #[derive(Debug)]
 pub struct SqliteWorldStorage {
     path: PathBuf,
@@ -52,8 +51,8 @@ impl SqliteWorldStorage {
     ///
     /// # Errors
     ///
-    /// Returns StorageError::AlreadyExists when the destination already exists,
-    /// or another storage error when initialization cannot complete.
+    /// Returns StorageError::AlreadyExists when the destination exists, or another
+    /// storage error when initialization cannot complete.
     pub fn create(path: impl AsRef<Path>, world_id: WorldId) -> StorageResult<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -80,16 +79,16 @@ impl SqliteWorldStorage {
     ///
     /// # Errors
     ///
-    /// Returns a typed error for missing/invalid filesystem entries, unsupported
-    /// storage/world versions, corrupted metadata, migration failures, or SQLite errors.
+    /// Returns a typed error for missing entries, unsupported storage or world
+    /// versions, corrupted metadata, refused legacy conversions or SQLite errors.
     pub fn open(path: impl AsRef<Path>) -> StorageResult<Self> {
         let path = validate_existing_file(path.as_ref())?;
         let mut connection = Connection::open(&path)?;
         configure_connection(&connection)?;
-        migration::migrate_existing(&mut connection)?;
+        migration::migrate_existing(&mut connection, &path)?;
 
-        let (world_id, world_format, _) = read_world_metadata_full(&connection)?;
-        ensure_world_format(world_format)?;
+        let world_id = query::load_world_id(&connection)?;
+        ensure_world_format(&connection)?;
 
         Ok(Self {
             path,
@@ -121,96 +120,80 @@ impl SqliteWorldStorage {
         self.world_id
     }
 
-    /// Restores durable world metadata and registered schema definitions.
+    /// Restores durable world metadata and the property vocabulary.
     ///
     /// # Errors
     ///
-    /// Returns a storage or validation error if persisted data is corrupt.
+    /// Returns a storage error if persisted data is corrupt or a definition cannot
+    /// be compiled.
     pub fn load_session(&self) -> StorageResult<WorldSessionState> {
         let connection = self.reader()?;
-        let (_, world_format, commit_position) = read_world_metadata_full(&connection)?;
-        ensure_world_format(world_format)?;
-        let schemas = load_schema_registry(&connection)?;
+        ensure_world_format(&connection)?;
+        let manifest = WorldManifest::new(query::load_manifest(&connection)?);
+        let properties = query::load_registry(&connection)?;
         Ok(WorldSessionState::restore(
             self.world_id,
-            commit_position,
-            schemas,
+            manifest,
+            properties,
         ))
     }
 
-    /// Persists one immutable versioned schema definition.
+    /// Persists one immutable property definition.
     ///
-    /// Exact re-registration is idempotent. Definitions are compiled locally as
-    /// JSON Schema before publication; external schema resolution is unavailable.
+    /// Exact re-registration is idempotent; mutating an existing `(name, version)`
+    /// is rejected by SQLite. The definition is compiled locally as JSON Schema
+    /// before publication.
     ///
     /// # Errors
     ///
-    /// Returns a schema conflict/validation error, serialization error, or SQLite error.
-    pub fn register_schema(
+    /// Returns a definition conflict/validation error or a SQLite/storage error.
+    pub fn register_definition(
         &self,
-        definition: &SchemaDefinition,
-    ) -> StorageResult<SchemaRegistration> {
+        definition: &PropertyDefinition,
+    ) -> StorageResult<DefinitionRegistration> {
+        let mut registry = self.property_registry()?;
+        let registration = registry.register(definition.clone())?;
         let connection = self.writer()?;
-        if let Some(existing) = load_schema(&connection, definition.key())? {
-            let mut registry = SchemaRegistry::new();
-            registry.register(existing)?;
-            return Ok(registry.register(definition.clone())?);
-        }
-
-        let mut validation_registry = SchemaRegistry::new();
-        validation_registry.register(definition.clone())?;
-        let definition_json = serde_json::to_string(definition.definition())?;
         connection.execute(
-            "INSERT INTO world_schemas (
-                schema_id, schema_version, kind, owner_extension_id, definition_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO property_registry (name, version, schema) VALUES (?1, ?2, ?3)
+             ON CONFLICT (name, version) DO NOTHING",
             params![
                 definition.key().id().as_str(),
                 i64::from(definition.key().version().get()),
-                schema_kind_code(definition.kind()),
-                definition.owner().as_str(),
-                definition_json,
+                serde_json::to_string(definition.schema())?,
             ],
         )?;
-        Ok(SchemaRegistration::Registered)
+        Ok(registration)
     }
 
-    /// Persists a set of immutable versioned schema definitions atomically.
-    ///
-    /// Existing exact definitions are idempotent. The complete batch is validated
-    /// against both durable schemas and earlier entries in the same batch before
-    /// the transaction commits, so a conflict cannot publish a partial batch.
+    /// Persists a set of property definitions atomically.
     ///
     /// # Errors
     ///
-    /// Returns a schema conflict/validation error, serialization error, or SQLite error.
-    pub fn register_schemas(
+    /// Returns a conflict/validation error, a serialization error or a SQLite error.
+    pub fn register_definitions(
         &self,
-        definitions: &[SchemaDefinition],
-    ) -> StorageResult<Vec<SchemaRegistration>> {
+        definitions: &[PropertyDefinition],
+    ) -> StorageResult<Vec<DefinitionRegistration>> {
         if definitions.is_empty() {
             return Ok(Vec::new());
         }
 
         let mut connection = self.writer()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut registry = load_schema_registry(&transaction)?;
+        let mut registry = query::load_registry(&transaction)?;
         let mut registrations = Vec::with_capacity(definitions.len());
 
         for definition in definitions {
             let registration = registry.register(definition.clone())?;
-            if registration == SchemaRegistration::Registered {
-                let definition_json = serde_json::to_string(definition.definition())?;
+            if registration == DefinitionRegistration::Registered {
                 transaction.execute(
-                    "INSERT INTO world_schemas (
-                        schema_id, schema_version, kind, owner_extension_id, definition_json
-                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO property_registry (name, version, schema) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (name, version) DO NOTHING",
                     params![
                         definition.key().id().as_str(),
                         i64::from(definition.key().version().get()),
-                        schema_kind_code(definition.kind()),
-                        definition.owner().as_str(),
-                        definition_json,
+                        serde_json::to_string(definition.schema())?,
                     ],
                 )?;
             }
@@ -221,43 +204,7 @@ impl SqliteWorldStorage {
         Ok(registrations)
     }
 
-    /// Returns the previous receipt when an identical command already committed.
-    ///
-    /// This lookup happens before System execution so crash/retry can avoid
-    /// regenerating nondeterministic transaction output.
-    ///
-    /// # Errors
-    ///
-    /// Returns CommandIdConflict when the same ID was previously used for
-    /// different immutable command input, or a storage decoding error.
-    pub fn committed_receipt(
-        &self,
-        command: &WorldCommand,
-    ) -> StorageResult<Option<CommitReceipt>> {
-        self.committed_receipt_attested(command, CommandAdmission::Unknown)
-    }
-
-    /// Looks up the original command using the Host-attested admission class.
-    ///
-    /// A repeated CommandId with another class conflicts even when the
-    /// payload and Actor are identical.
-    ///
-    /// # Errors
-    ///
-    /// Returns a command identity conflict or a storage decoding error.
-    pub fn committed_receipt_attested(
-        &self,
-        command: &WorldCommand,
-        admission: CommandAdmission,
-    ) -> StorageResult<Option<CommitReceipt>> {
-        let connection = self.reader()?;
-        commit::committed_receipt(&connection, command, admission)
-    }
-
     /// Opens a consistent read-only snapshot of current authoritative state.
-    ///
-    /// The SQLite read transaction remains pinned for the lifetime of the
-    /// returned value while WAL writers may continue committing newer state.
     ///
     /// # Errors
     ///
@@ -266,412 +213,66 @@ impl SqliteWorldStorage {
     pub fn snapshot(&self) -> StorageResult<SqliteWorldSnapshot> {
         let connection = self.reader()?;
         connection.execute_batch("BEGIN DEFERRED TRANSACTION")?;
-        let (world_id, world_format, position) = read_world_metadata_full(&connection)?;
-        ensure_world_format(world_format)?;
-        Ok(SqliteWorldSnapshot::new(connection, world_id, position))
+        ensure_world_format(&connection)?;
+        Ok(SqliteWorldSnapshot::new(connection, self.world_id))
     }
 
-    /// Validates a command and pins the exact snapshot it must evaluate.
+    /// Applies one validated change set atomically and returns after COMMIT.
     ///
-    /// Command schema, optimistic position and Actor/ControlGrant checks are
-    /// evaluated inside the same SQLite read transaction later used by the
-    /// System, so repeated reads cannot drift across authoritative commits.
+    /// The change set has already been validated against the property vocabulary
+    /// by the caller; SQLite enforces identity, endpoint and foreign-key
+    /// invariants. Callers must not report success before this returns `Ok`.
     ///
     /// # Errors
     ///
-    /// Returns command/schema/authority/concurrency or storage errors.
-    pub fn snapshot_for_command(
-        &self,
-        command: &WorldCommand,
-    ) -> StorageResult<SqliteWorldSnapshot> {
-        let connection = self.reader()?;
-        connection.execute_batch("BEGIN DEFERRED TRANSACTION")?;
-        let position = commit::validate_command(&connection, command)?;
-        Ok(SqliteWorldSnapshot::new(
-            connection,
-            self.world_id,
-            position,
-        ))
-    }
-
-    /// Atomically commits one validated command result.
-    ///
-    /// The command identity and immutable input provide idempotency. Current-state
-    /// mutations, Core mutation log entries, semantic events, durable effects,
-    /// authority changes, provenance, and commit position are one SQLite transaction.
-    /// The evaluated position must match the current position unless the command was
-    /// already committed and is being replayed idempotently.
-    ///
-    /// # Errors
-    ///
-    /// Returns command/schema/authority/concurrency/current-state/storage errors.
-    /// No partial world change is committed on failure.
-    pub fn commit(
-        &self,
-        command: &WorldCommand,
-        transaction: &WorldTransaction,
-        evaluated_position: u64,
-    ) -> StorageResult<CommitReceipt> {
-        self.commit_inner(
-            command,
-            transaction,
-            evaluated_position,
-            CommandAdmission::Unknown,
-            None,
-        )
-    }
-
-    /// Commits one command with Host-attested ingress classification.
-    ///
-    /// Only trusted Host admission boundaries should call this method.
-    /// Guest World System requests cannot specify the admission.
-    ///
-    /// # Errors
-    ///
-    /// Returns authority, command identity, state, or SQLite validation errors.
-    pub fn commit_attested(
-        &self,
-        command: &WorldCommand,
-        transaction: &WorldTransaction,
-        evaluated_position: u64,
-        admission: CommandAdmission,
-    ) -> StorageResult<CommitReceipt> {
-        self.commit_inner(command, transaction, evaluated_position, admission, None)
-    }
-
-    /// Atomically fences a durable effect claim within the World commit.
-    ///
-    /// If the job was cancelled, reclaimed, completed, or its lease expired
-    /// during System evaluation, the entire World transaction is rejected.
-    /// Already-committed identical commands still resolve idempotently.
-    ///
-    /// # Errors
-    ///
-    /// Returns an effect claim or World commit validation/storage error.
-    pub fn commit_effect_follow_up(
-        &self,
-        command: &WorldCommand,
-        transaction: &WorldTransaction,
-        evaluated_position: u64,
-        guard: &EffectCommitGuard,
-    ) -> StorageResult<CommitReceipt> {
-        self.commit_inner(
-            command,
-            transaction,
-            evaluated_position,
-            CommandAdmission::Automated,
-            Some(guard),
-        )
-    }
-
-    fn commit_inner(
-        &self,
-        command: &WorldCommand,
-        transaction: &WorldTransaction,
-        evaluated_position: u64,
-        admission: CommandAdmission,
-        guard: Option<&EffectCommitGuard>,
-    ) -> StorageResult<CommitReceipt> {
+    /// Returns a world or storage error. No partial change is committed.
+    pub fn apply(&self, transaction: &WorldTransaction) -> StorageResult<()> {
         let mut connection = self.writer()?;
-        commit::commit(
-            &mut connection,
-            command,
-            transaction,
-            evaluated_position,
-            admission,
-            guard,
-        )
+        apply::apply(&mut connection, transaction)
     }
 
-    /// Loads one current entity by identity.
+    /// Loads one item.
     ///
     /// # Errors
     ///
     /// Returns a storage error when persisted state cannot be decoded.
-    pub fn load_entity(&self, entity_id: EntityId) -> StorageResult<Option<EntityRecord>> {
+    pub fn load_item(&self, id: ItemId) -> StorageResult<Option<ItemRecord>> {
         let connection = self.reader()?;
-        query::load_entity(&connection, entity_id)
+        query::load_item(&connection, id)
     }
 
-    /// Loads one current relation by identity.
+    /// Loads one property value.
     ///
     /// # Errors
     ///
     /// Returns a storage error when persisted state cannot be decoded.
-    pub fn load_relation(&self, relation_id: RelationId) -> StorageResult<Option<RelationRecord>> {
+    pub fn load_property(
+        &self,
+        item: ItemId,
+        key: &SchemaKey,
+    ) -> StorageResult<Option<PropertyRecord>> {
         let connection = self.reader()?;
-        query::load_relation(&connection, relation_id)
+        query::load_property(&connection, item, key)
     }
 
-    /// Loads one current facet value.
+    /// Loads every current property of one item.
     ///
     /// # Errors
     ///
     /// Returns a storage error when persisted state cannot be decoded.
-    pub fn load_facet(
-        &self,
-        target: FacetTarget,
-        schema: &SchemaKey,
-    ) -> StorageResult<Option<FacetRecord>> {
+    pub fn properties_of(&self, item: ItemId) -> StorageResult<Vec<PropertyRecord>> {
         let connection = self.reader()?;
-        query::load_facet(&connection, target, schema)
+        query::list_properties(&connection, item)
     }
 
-    /// Reads append-only Core mutations after an exclusive commit position.
-    ///
-    /// The requested batch is bounded internally to protect host memory.
+    /// Loads the property vocabulary persisted in this world.
     ///
     /// # Errors
     ///
-    /// Returns a storage error when persisted mutations cannot be decoded.
-    pub fn mutations_after(
-        &self,
-        position: u64,
-        limit: usize,
-    ) -> StorageResult<Vec<StoredWorldMutation>> {
+    /// Returns a storage error when persisted definitions cannot be decoded.
+    pub fn property_registry(&self) -> StorageResult<PropertyRegistry> {
         let connection = self.reader()?;
-        query::mutations_after(&connection, position, limit)
-    }
-
-    /// Reads durable events from one exact authoritative commit position.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage error when persisted events cannot be decoded.
-    pub fn events_at_position(&self, position: u64) -> StorageResult<Vec<StoredWorldEvent>> {
-        let connection = self.reader()?;
-        query::events_at_position(&connection, self.world_id, position)
-    }
-
-    /// Reads durable events after an exclusive commit position.
-    ///
-    /// The requested batch is bounded internally to protect host memory.
-    ///
-    /// CAUTION: a partial page may end inside a commit. Do not paginate by
-    /// passing its final commit position to another call; use
-    /// Self::events_after_cursor for lossless continuation instead.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage error when persisted events cannot be decoded.
-    pub fn events_after(
-        &self,
-        position: u64,
-        limit: usize,
-    ) -> StorageResult<Vec<StoredWorldEvent>> {
-        let connection = self.reader()?;
-        query::events_after(&connection, self.world_id, position, limit)
-    }
-
-    /// Reads a bounded page of durable World events strictly after the exact
-    /// commit position and event index cursor.
-    ///
-    /// This avoids losing events when a single commit emits more than the
-    /// requested page size. None starts at the beginning of this World's
-    /// event log. Build the next cursor using WorldEventCursor::after on
-    /// the final returned event. A foreign-World cursor fails closed.
-    ///
-    /// This is a read-only pagination primitive, not a durable consumer
-    /// acknowledgement or subscriber offset.
-    ///
-    /// # Errors
-    ///
-    /// Returns StorageError::EventCursorWorldMismatch for a cursor from
-    /// another World, or a storage error if records cannot be decoded.
-    pub fn events_after_cursor(
-        &self,
-        cursor: Option<WorldEventCursor>,
-        limit: usize,
-    ) -> StorageResult<Vec<StoredWorldEvent>> {
-        if let Some(cursor) = cursor
-            && cursor.world_id() != self.world_id
-        {
-            return Err(StorageError::EventCursorWorldMismatch {
-                expected: self.world_id,
-                found: cursor.world_id(),
-            });
-        }
-        let connection = self.reader()?;
-        query::events_after_cursor(&connection, self.world_id, cursor, limit)
-    }
-
-    /// Reads the last strictly sequentially acknowledged WorldEvent for one
-    /// trusted, Host-owned consumer. None means it has not acknowledged any event.
-    ///
-    /// Do not expose this storage capability to arbitrary guest extensions.
-    /// Checkpoints optimize replay only; downstream work must independently
-    /// guarantee idempotent command/effect submission before acknowledging.
-    ///
-    /// # Errors
-    ///
-    /// Returns an invalid consumer identifier or a SQLite/corruption error.
-    pub fn event_consumer_cursor(
-        &self,
-        consumer_id: &str,
-    ) -> StorageResult<Option<WorldEventCursor>> {
-        let connection = self.reader()?;
-        event_consumer::load_cursor(&connection, self.world_id, consumer_id)
-    }
-
-    /// Atomically acknowledges exactly the next committed WorldEvent, using an
-    /// expected cursor as a compare-and-swap fence between racing consumers.
-    ///
-    /// The event's World, identity and ordering are checked against SQLite;
-    /// arbitrary offsets, future events, and skipped events are never accepted.
-    /// Only acknowledge after durable, idempotent downstream work succeeds.
-    /// This is not transactionally coupled to that work.
-    ///
-    /// # Errors
-    ///
-    /// Refuses foreign Worlds, invalid consumers, stale checkpoint CAS or
-    /// an event which is not the exact next event in the log.
-    pub fn acknowledge_next_world_event(
-        &self,
-        consumer_id: &str,
-        expected_cursor: Option<WorldEventCursor>,
-        event: &StoredWorldEvent,
-    ) -> StorageResult<WorldEventCursor> {
-        let mut connection = self.writer()?;
-        event_consumer::acknowledge_next(
-            &mut connection,
-            self.world_id,
-            consumer_id,
-            expected_cursor,
-            event,
-        )
-    }
-
-    /// Reads pending durable external effect jobs in deterministic enqueue order.
-    ///
-    /// Delayed retries remain pending and can appear here before their next
-    /// `available_at`; workers should use `claim_next_effect` for due-job selection.
-    /// The requested batch is bounded internally to protect host memory.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage error when persisted jobs cannot be decoded.
-    pub fn pending_effects(&self, limit: usize) -> StorageResult<Vec<StoredEffectJob>> {
-        let connection = self.reader()?;
-        query::pending_effects(&connection, self.world_id, limit)
-    }
-
-    /// Returns the next time a pending retry or running lease can become claimable.
-    ///
-    /// `None` means there is currently no non-terminal durable effect job. This
-    /// lets cooperative hosts schedule the exact next wake-up without busy polling.
-    ///
-    /// # Errors
-    ///
-    /// Returns a SQLite/storage error when outbox timing metadata cannot be read.
-    pub fn next_effect_wakeup(&self) -> StorageResult<Option<UnixTimeMillis>> {
-        let connection = self.reader()?;
-        outbox::next_wakeup(&connection)
-    }
-
-    /// Atomically leases the oldest due or expired durable effect job.
-    ///
-    /// A reclaimed expired job receives a new attempt number. The returned
-    /// attempt is a fencing token: completion/retry from any older claim is
-    /// rejected after reclaim. External execution must use the stable job ID as
-    /// its idempotency key because an expired worker may still resume outside
-    /// the database transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns an invalid-lease, attempt-overflow, corruption, or SQLite error.
-    pub fn claim_next_effect(
-        &self,
-        now: UnixTimeMillis,
-        lease_expires_at: UnixTimeMillis,
-    ) -> StorageResult<Option<ClaimedEffectJob>> {
-        let mut connection = self.writer()?;
-        outbox::claim_next(&mut connection, self.world_id, now, lease_expires_at)
-    }
-
-    /// Checks whether an effect claim is still running under this fencing
-    /// attempt and its lease has not expired at the supplied Host clock.
-    ///
-    /// Returns false for cancelled, completed, reclaimed or expired claims.
-    /// This check does not replace the atomic fenced terminal transitions.
-    ///
-    /// # Errors
-    ///
-    /// Returns a SQLite/storage error if the job state cannot be read.
-    pub fn is_effect_claim_current(
-        &self,
-        job_id: EffectJobId,
-        attempt: u32,
-        now: UnixTimeMillis,
-    ) -> StorageResult<bool> {
-        let connection = self.reader()?;
-        outbox::claim_is_current(&connection, job_id, attempt, now)
-    }
-
-    /// Marks one currently leased effect job complete.
-    ///
-    /// # Errors
-    ///
-    /// Returns EffectJobClaimLost when the attempt no longer owns the lease, or
-    /// EffectJobNotFound when the durable job identity is unknown.
-    pub fn complete_effect(&self, job_id: EffectJobId, attempt: u32) -> StorageResult<()> {
-        let connection = self.writer()?;
-        outbox::complete(&connection, job_id, attempt)
-    }
-
-    /// Returns one currently leased effect job to the pending queue.
-    ///
-    /// `available_at` controls the earliest future claim and therefore lets the
-    /// worker implement backoff without sleeping while holding a lease. `diagnostic`
-    /// is durable and must already be a sanitized, non-secret summary; storage
-    /// bounds it but cannot infer provider-specific secret formats.
-    ///
-    /// # Errors
-    ///
-    /// Returns EffectJobClaimLost for stale attempts, a bounded-error failure,
-    /// EffectJobNotFound, or another storage error.
-    pub fn retry_effect(
-        &self,
-        job_id: EffectJobId,
-        attempt: u32,
-        available_at: UnixTimeMillis,
-        diagnostic: &str,
-    ) -> StorageResult<()> {
-        let connection = self.writer()?;
-        outbox::retry(&connection, job_id, attempt, available_at, diagnostic)
-    }
-
-    /// Cancels one currently leased effect job using its fencing attempt.
-    ///
-    /// This is the worker-side terminal transition. Unlike administrative
-    /// `cancel_effect`, a stale worker cannot cancel a job reclaimed by another
-    /// attempt. The diagnostic must already be sanitized and is durably bounded.
-    ///
-    /// # Errors
-    ///
-    /// Returns EffectJobClaimLost for stale attempts, EffectJobNotFound, a
-    /// bounded-error failure, or another storage error.
-    pub fn cancel_claimed_effect(
-        &self,
-        job_id: EffectJobId,
-        attempt: u32,
-        diagnostic: &str,
-    ) -> StorageResult<()> {
-        let connection = self.writer()?;
-        outbox::cancel_claimed(&connection, job_id, attempt, diagnostic)
-    }
-
-    /// Cancels a pending or running durable effect job.
-    ///
-    /// Cancellation is idempotent. Cancelling a running job invalidates its
-    /// fencing token so a late completion cannot resurrect the job.
-    ///
-    /// # Errors
-    ///
-    /// Returns EffectJobNotFound for an unknown job or EffectJobTerminal when a
-    /// completed job can no longer be cancelled.
-    pub fn cancel_effect(&self, job_id: EffectJobId) -> StorageResult<bool> {
-        let connection = self.writer()?;
-        outbox::cancel(&connection, job_id)
+        query::load_registry(&connection)
     }
 
     fn writer(&self) -> StorageResult<MutexGuard<'_, Connection>> {
@@ -719,37 +320,17 @@ fn configure_connection(connection: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
-fn ensure_world_format(found: u32) -> StorageResult<()> {
-    if found == WORLD_FORMAT_VERSION {
-        return Ok(());
+fn ensure_world_format(connection: &Connection) -> StorageResult<()> {
+    let manifest = query::load_manifest(connection)?;
+    let found = manifest
+        .get("manifest_version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::from(WORLD_FORMAT_VERSION));
+    if found > u64::from(WORLD_FORMAT_VERSION) {
+        return Err(StorageError::UnsupportedWorldFormat {
+            found: u32::try_from(found).unwrap_or(u32::MAX),
+            supported: WORLD_FORMAT_VERSION,
+        });
     }
-    Err(StorageError::UnsupportedWorldFormat {
-        found,
-        supported: WORLD_FORMAT_VERSION,
-    })
-}
-
-fn read_world_metadata_full(connection: &Connection) -> StorageResult<(WorldId, u32, u64)> {
-    let row = connection
-        .query_row(
-            "SELECT world_id, world_format_version, commit_position
-             FROM world_metadata WHERE singleton = 1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            },
-        )
-        .optional()?
-        .ok_or(StorageError::Uninitialized)?;
-
-    let world_id = world_id_from_blob(row.0)?;
-    let world_format = u32::try_from(row.1)
-        .map_err(|_| StorageError::CorruptData("invalid world format version".into()))?;
-    let commit_position = u64::try_from(row.2)
-        .map_err(|_| StorageError::CorruptData("negative world commit position".into()))?;
-    Ok((world_id, world_format, commit_position))
+    Ok(())
 }
