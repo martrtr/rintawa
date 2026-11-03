@@ -7,14 +7,12 @@ use rintawa_sdk::{
     services::ServiceCallResult,
     world::{SchemaKey, WorldId},
     world_system::{
-        WorldSystemActor, WorldSystemCausation, WorldSystemCommand, WorldSystemEffectProposal,
-        WorldSystemEntityRecord, WorldSystemEventProposal, WorldSystemFacetRecord,
-        WorldSystemFacetTarget, WorldSystemMutation, WorldSystemRelationRecord,
+        WorldSystemCausation, WorldSystemCommand, WorldSystemItemKind, WorldSystemItemRecord,
+        WorldSystemMutation, WorldSystemPropertyRecord, WorldSystemSignalProposal,
     },
 };
 use rintawa_world::{
-    ActorRef, CausationRef, EffectJobDraft, EntityRecord, FacetRecord, FacetTarget, RelationRecord,
-    WorldCommand, WorldEventDraft, WorldMutation, WorldTransaction,
+    CausationRef, ItemRecord, PropertyRecord, StateChange, WorldCommand, WorldTransaction,
 };
 
 use crate::{SystemError, SystemResult, WorldSnapshot, WorldSystem};
@@ -116,7 +114,6 @@ impl WorldSystem for ServiceWorldSystem {
         for _ in 0..MAX_WORLD_SYSTEM_SERVICE_ROUNDS {
             let envelope = WorldSystemServiceRequest {
                 world_id: snapshot.world_id(),
-                snapshot_position: snapshot.position(),
                 command: encode_command(command),
                 reads: reads.clone(),
             };
@@ -178,15 +175,8 @@ fn encode_command(command: &WorldCommand) -> WorldSystemCommand {
         id: command.id(),
         schema: command.schema().clone(),
         principal: command.principal(),
-        actor: match command.actor() {
-            ActorRef::Principal(principal) => WorldSystemActor::Principal(principal),
-            ActorRef::Entity(entity) => WorldSystemActor::Entity(entity),
-        },
-        expected_position: command.expected_position(),
         causation: command.causation().map(|causation| match causation {
             CausationRef::Command(id) => WorldSystemCausation::Command(id),
-            CausationRef::Event(id) => WorldSystemCausation::Event(id),
-            CausationRef::Effect(id) => WorldSystemCausation::Effect(id),
         }),
         correlation_id: command.correlation_id(),
         effective_at: command.effective_at_timestamp(),
@@ -199,110 +189,73 @@ fn resolve_read(
     request: WorldSystemReadRequest,
 ) -> SystemResult<WorldSystemReadResult> {
     match request {
-        WorldSystemReadRequest::Entity { entity_id } => Ok(WorldSystemReadResult::Entity {
-            entity_id,
-            value: snapshot.load_entity(entity_id)?.map(encode_entity),
+        WorldSystemReadRequest::Item { item_id } => Ok(WorldSystemReadResult::Item {
+            item_id,
+            value: snapshot.load_item(item_id)?.map(encode_item),
         }),
-        WorldSystemReadRequest::Relation { relation_id } => Ok(WorldSystemReadResult::Relation {
-            relation_id,
-            value: snapshot.load_relation(relation_id)?.map(encode_relation),
-        }),
-        WorldSystemReadRequest::Facet { target, schema } => {
-            let target = decode_facet_target(target);
-            let value = snapshot.load_facet(target, &schema)?.map(encode_facet);
-            Ok(WorldSystemReadResult::Facet {
-                target: encode_facet_target(target),
-                schema,
+        WorldSystemReadRequest::Property { item_id, key } => {
+            let value = snapshot.load_property(item_id, &key)?.map(encode_property);
+            Ok(WorldSystemReadResult::Property {
+                item_id,
+                key,
                 value,
             })
         }
     }
 }
 
-fn encode_entity(entity: EntityRecord) -> WorldSystemEntityRecord {
-    WorldSystemEntityRecord {
-        id: entity.id(),
-        schema: entity.schema().clone(),
+pub(crate) fn encode_item(item: ItemRecord) -> WorldSystemItemRecord {
+    WorldSystemItemRecord {
+        id: item.id(),
+        kind: match item.kind() {
+            rintawa_world::ItemKind::Object => WorldSystemItemKind::Object,
+            rintawa_world::ItemKind::Relation => WorldSystemItemKind::Relation,
+        },
+        subject: item.subject(),
+        object: item.object_target(),
     }
 }
 
-fn encode_relation(relation: RelationRecord) -> WorldSystemRelationRecord {
-    WorldSystemRelationRecord {
-        id: relation.id(),
-        schema: relation.schema().clone(),
-        from: relation.from(),
-        to: relation.to(),
-    }
-}
-
-fn encode_facet(facet: FacetRecord) -> WorldSystemFacetRecord {
-    WorldSystemFacetRecord {
-        target: encode_facet_target(facet.target()),
-        schema: facet.schema().clone(),
-        payload: facet.payload().clone(),
-    }
-}
-
-fn encode_facet_target(target: FacetTarget) -> WorldSystemFacetTarget {
-    match target {
-        FacetTarget::World => WorldSystemFacetTarget::World,
-        FacetTarget::Entity(entity) => WorldSystemFacetTarget::Entity(entity),
-        FacetTarget::Relation(relation) => WorldSystemFacetTarget::Relation(relation),
-    }
-}
-
-fn decode_facet_target(target: WorldSystemFacetTarget) -> FacetTarget {
-    match target {
-        WorldSystemFacetTarget::World => FacetTarget::World,
-        WorldSystemFacetTarget::Entity(entity) => FacetTarget::Entity(entity),
-        WorldSystemFacetTarget::Relation(relation) => FacetTarget::Relation(relation),
+pub(crate) fn encode_property(property: PropertyRecord) -> WorldSystemPropertyRecord {
+    WorldSystemPropertyRecord {
+        item: property.item(),
+        key: property.key().clone(),
+        data: property.data().clone(),
     }
 }
 
 fn decode_transaction(proposal: WorldSystemTransaction) -> SystemResult<WorldTransaction> {
     let mut transaction = WorldTransaction::new();
     for mutation in proposal.mutations {
-        transaction.push_mutation(decode_mutation(mutation));
+        transaction.push_change(decode_mutation(mutation));
     }
-    for WorldSystemEventProposal { schema, payload } in proposal.events {
-        transaction.push_event(WorldEventDraft::new(schema, payload));
-    }
-    for WorldSystemEffectProposal { schema, payload } in proposal.effects {
-        transaction.push_effect(EffectJobDraft::new(schema, payload));
+    for WorldSystemSignalProposal { schema, payload } in proposal.signals {
+        transaction.push_signal(rintawa_world::RuntimeSignal::new(schema, payload));
     }
     Ok(transaction)
 }
 
-fn decode_mutation(mutation: WorldSystemMutation) -> WorldMutation {
+fn decode_mutation(mutation: WorldSystemMutation) -> StateChange {
     match mutation {
-        WorldSystemMutation::CreateEntity { entity_id, schema } => WorldMutation::CreateEntity {
-            entity: EntityRecord::new(entity_id, schema),
-        },
-        WorldSystemMutation::DeleteEntity { entity_id } => {
-            WorldMutation::DeleteEntity { entity_id }
-        }
+        WorldSystemMutation::CreateObject { item_id } => StateChange::CreateObject { id: item_id },
         WorldSystemMutation::CreateRelation {
-            relation_id,
-            schema,
-            from,
-            to,
-        } => WorldMutation::CreateRelation {
-            relation: RelationRecord::new(relation_id, schema, from, to),
+            item_id,
+            subject,
+            object,
+        } => StateChange::CreateRelation {
+            id: item_id,
+            subject,
+            object,
         },
-        WorldSystemMutation::DeleteRelation { relation_id } => {
-            WorldMutation::DeleteRelation { relation_id }
+        WorldSystemMutation::DeleteItem { item_id } => StateChange::DeleteItem { id: item_id },
+        WorldSystemMutation::SetProperty { item_id, key, data } => StateChange::SetProperty {
+            item: item_id,
+            key,
+            data,
+        },
+        WorldSystemMutation::RemoveProperty { item_id, key } => {
+            StateChange::RemoveProperty { item: item_id, key }
         }
-        WorldSystemMutation::SetFacet {
-            target,
-            schema,
-            payload,
-        } => WorldMutation::SetFacet {
-            facet: FacetRecord::new(decode_facet_target(target), schema, payload),
-        },
-        WorldSystemMutation::RemoveFacet { target, schema } => WorldMutation::RemoveFacet {
-            target: decode_facet_target(target),
-            schema,
-        },
     }
 }
 

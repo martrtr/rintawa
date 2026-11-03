@@ -49,7 +49,7 @@ pub use host_access::{
     RuntimePolicyComponent, RuntimePolicyRequest, UserContentAccess, UserContentDocument,
     UserContentSummary, UserContentWriteAccess, UserContentWriteStatus, UserResourceAccess,
     UserResourceRef, WorldCommandAccess, WorldCommandAccessError, WorldCommandAccessResult,
-    WorldCommandActor, WorldCommandRequest, WorldProjectionAccess, WorldProjectionAccessError,
+    WorldCommandRequest, WorldProjectionAccess, WorldProjectionAccessError,
     WorldProjectionAccessResult, WorldProjectionReadStatus, WorldProjectionReadView,
     WorldProjectionRequest, WorldSessionAccess, WorldSessionAssetRef, WorldSessionSummary,
 };

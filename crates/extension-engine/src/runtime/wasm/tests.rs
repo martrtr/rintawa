@@ -237,7 +237,6 @@ impl WorldSessionAccess for RecordingScopedHostAccess {
             title: String::from("Recorded World"),
             description: Some(String::from("Recorded description")),
             cover: None,
-            commit_position: 7,
             active: true,
             pending_active: None,
             last_error: None,
@@ -250,7 +249,6 @@ impl WorldSessionAccess for RecordingScopedHostAccess {
             title: String::from("New World"),
             description: None,
             cover: None,
-            commit_position: 0,
             active: false,
             pending_active: None,
             last_error: None,
@@ -269,7 +267,6 @@ impl WorldSessionAccess for RecordingScopedHostAccess {
             title: title.to_string(),
             description: description.map(str::to_string),
             cover,
-            commit_position: 7,
             active: true,
             pending_active: None,
             last_error: None,
@@ -331,7 +328,6 @@ impl WorldProjectionAccess for RecordingScopedHostAccess {
         Ok(WorldProjectionReadStatus::Succeeded(
             WorldProjectionReadView {
                 world_id: String::from("018f0000-0000-7000-8000-000000000001"),
-                snapshot_position: 9,
                 schema: String::from("example.view@1"),
                 value_json: br#"{"messages":[]}"#.to_vec(),
             },
@@ -1782,7 +1778,6 @@ fn test_should_gate_world_session_catalog_and_lifecycle_requests() {
     let worlds = WorldSessionsHost::list_worlds(&mut state).unwrap();
     assert_eq!(worlds.len(), 1);
     assert_eq!(worlds[0].title, "Recorded World");
-    assert_eq!(worlds[0].commit_position, 7);
     assert!(worlds[0].active);
 
     assert!(matches!(
@@ -1795,7 +1790,6 @@ fn test_should_gate_world_session_catalog_and_lifecycle_requests() {
         .unwrap();
     let created = WorldSessionsHost::create(&mut state).unwrap();
     assert_eq!(created.title, "New World");
-    assert_eq!(created.commit_position, 0);
     let renamed = WorldSessionsHost::set_metadata(
         &mut state,
         created.world_id.clone(),
@@ -1856,8 +1850,6 @@ fn test_should_gate_bound_and_budget_world_command_submission() {
     let request = || WitWorldCommandRequest {
         world_id: String::from("018f0000-0000-7000-8000-000000000001"),
         schema: String::from("example.command@1"),
-        actor: WitWorldCommandActor::Principal,
-        expected_position: Some(7),
         payload_json: br#"{"value":1}"#.to_vec(),
     };
     assert!(matches!(
@@ -1894,7 +1886,6 @@ fn test_should_gate_bound_and_budget_world_command_submission() {
         .lock()
         .expect("test world-command lock must stay healthy");
     assert_eq!(writes.len(), 1);
-    assert_eq!(writes[0].expected_position, Some(7));
     assert_eq!(writes[0].payload_json, br#"{"value":1}"#);
     assert!(!writes[0].verified_ui_action);
 }
@@ -1929,8 +1920,6 @@ fn test_should_only_attest_immediate_ui_callback_commands_not_subsequent_guest_w
     let request = || WitWorldCommandRequest {
         world_id: String::from("018f0000-0000-7000-8000-000000000001"),
         schema: String::from("example.command@1"),
-        actor: WitWorldCommandActor::Principal,
-        expected_position: None,
         payload_json: br#"{"message":"hello"}"#.to_vec(),
     };
 
@@ -1999,8 +1988,6 @@ fn test_should_allow_effect_service_scoped_reads_without_general_host_mutations(
     let command = || WitWorldCommandRequest {
         world_id: String::from("018f0000-0000-7000-8000-000000000001"),
         schema: String::from("example.command@1"),
-        actor: WitWorldCommandActor::Principal,
-        expected_position: None,
         payload_json: br#"{"message":"hello"}"#.to_vec(),
     };
 
@@ -2142,7 +2129,6 @@ fn test_should_gate_bound_and_budget_world_projection_reads() {
     let status = WorldProjectionsHost::read_status(&mut state, accepted.operation_id).unwrap();
     match status {
         WitWorldProjectionReadState::Succeeded(view) => {
-            assert_eq!(view.snapshot_position, 9);
             assert_eq!(view.schema, "example.view@1");
             assert_eq!(view.value_json, br#"{"messages":[]}"#);
         }

@@ -1,13 +1,11 @@
 //! Runtime orchestration for exact artifact activations in a local Rintawa host.
 
-pub(crate) mod event_replay;
-
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use rintawa_artifacts::{
@@ -22,7 +20,7 @@ use rintawa_extension_engine::{
     RuntimePolicyComponent, RuntimePolicyRequest, UnresolvedContractReason, UserContentAccess,
     UserContentDocument, UserContentSummary, UserContentWriteAccess, UserContentWriteStatus,
     UserResourceAccess, UserResourceRef, WorldCommandAccess, WorldCommandAccessError,
-    WorldCommandAccessResult, WorldCommandActor, WorldCommandRequest, WorldProjectionAccess,
+    WorldCommandAccessResult, WorldCommandRequest, WorldProjectionAccess,
     WorldProjectionAccessError, WorldProjectionAccessResult, WorldProjectionReadStatus,
     WorldProjectionReadView, WorldProjectionRequest, WorldSessionAccess, WorldSessionAssetRef,
     WorldSessionSummary,
@@ -39,19 +37,14 @@ use rintawa_sdk::{
     runtime_permissions::RuntimePermission,
     runtime_signals::RuntimeSignal,
     types::{ExtensionId, ExtensionInstanceId, RuntimeScopeId},
-    world::{EffectJobId, EntityId, PrincipalId, SchemaKey, UnixTimeMillis, WorldId},
+    world::{CorrelationId, PrincipalId, SchemaId, SchemaKey, WorldId},
     world_projection::MAX_WORLD_PROJECTION_INPUT_BYTES,
 };
-use rintawa_storage::{ClaimedEffectJob, EffectCommitGuard, SqliteWorldStorage};
-use rintawa_world::{
-    ActorRef, CommandAdmission, CommitDisposition, SchemaDefinition, SchemaKind, StoredWorldEvent,
-    WorldCommand,
-};
+use rintawa_world::{PropertyDefinition, RuntimeSchemaDefinition, SchemaKind, WorldCommand};
 use rintawa_world_runtime::{
-    MAX_WORLD_EFFECT_DIAGNOSTIC_BYTES, ServiceWorldEffectHandler, ServiceWorldProjection,
-    ServiceWorldSystem, WorldCommandOutcome, WorldEffectServiceResponse, WorldProjectionView,
-    WorldRuntime, WorldRuntimeBuilder, world_effect_service_contract_key,
-    world_projection_service_contract_key, world_system_service_contract_key,
+    ServiceWorldProjection, ServiceWorldSystem, WorldCommandOutcome, WorldProjectionView,
+    WorldRuntime, WorldRuntimeBuilder, world_projection_service_contract_key,
+    world_system_service_contract_key,
 };
 
 use tempfile::NamedTempFile;
@@ -66,16 +59,6 @@ use crate::{
     world_runtime_scope_id,
 };
 
-/// Maximum durable effect jobs processed for one world in one cooperative pump.
-pub const MAX_EFFECT_JOBS_PER_PUMP: usize = 8;
-/// Lease duration assigned to one synchronous effect-handler attempt.
-pub const EFFECT_JOB_LEASE_MILLIS: i64 = 30_000;
-/// Maximum in-memory deferred claims per World.
-const MAX_DEFERRED_EFFECTS_PER_WORLD: usize = 8;
-/// Initial host-owned retry delay after a failed effect attempt.
-pub const EFFECT_RETRY_BASE_MILLIS: i64 = 1_000;
-/// Maximum host-owned retry delay regardless of attempt count.
-pub const EFFECT_RETRY_MAX_MILLIS: i64 = 60_000;
 /// Maximum deferred user-content writes accepted before a host pump drains them.
 const MAX_PENDING_USER_CONTENT_WRITES: usize = 32;
 /// Maximum total RTW bytes retained by the deferred user-content write queue.
@@ -136,7 +119,6 @@ impl WorldSessionRuntimeControl {
                 size: reference.size,
                 media_type: reference.media_type.to_string(),
             }),
-            commit_position: world.commit_position,
             active: state.active.contains(&world.id),
             pending_active: state.pending.get(&world.id).copied(),
             last_error: state.last_errors.get(&world.id).cloned(),
@@ -456,7 +438,6 @@ impl UserContentWriteRuntimeControl {
 struct DeferredWorldCommand {
     world_id: WorldId,
     command: WorldCommand,
-    admission: CommandAdmission,
 }
 
 #[derive(Clone, Default)]
@@ -469,7 +450,6 @@ impl WorldCommandRuntimeControl {
         &self,
         world_id: WorldId,
         command: WorldCommand,
-        admission: CommandAdmission,
     ) -> WorldCommandAccessResult<AcceptedWorldCommand> {
         let command_id = command.id().to_string();
         let correlation_id = command.correlation_id().to_string();
@@ -480,11 +460,7 @@ impl WorldCommandRuntimeControl {
         if queue.len() >= MAX_PENDING_WORLD_COMMAND_REQUESTS {
             return Err(WorldCommandAccessError::QueueFull);
         }
-        queue.push_back(DeferredWorldCommand {
-            world_id,
-            command,
-            admission,
-        });
+        queue.push_back(DeferredWorldCommand { world_id, command });
         Ok(AcceptedWorldCommand {
             command_id,
             correlation_id,
@@ -934,14 +910,6 @@ impl WorldCommandAccess for LocalHostAccess {
             .schema
             .parse::<SchemaKey>()
             .map_err(|_| WorldCommandAccessError::InvalidSchema)?;
-        let actor = match request.actor {
-            WorldCommandActor::Principal => ActorRef::Principal(self.local_principal),
-            WorldCommandActor::Entity(entity_id) => ActorRef::Entity(
-                entity_id
-                    .parse::<EntityId>()
-                    .map_err(|_| WorldCommandAccessError::InvalidActor)?,
-            ),
-        };
         let payload = serde_json::from_slice(&request.payload_json)
             .map_err(|_| WorldCommandAccessError::InvalidPayload)?;
         self.home()
@@ -956,18 +924,12 @@ impl WorldCommandAccess for LocalHostAccess {
             return Err(WorldCommandAccessError::WorldNotActive);
         }
 
-        let mut command = WorldCommand::new(schema, self.local_principal, actor, payload);
-        if let Some(expected_position) = request.expected_position {
-            command = command.expecting_position(expected_position);
-        }
-        // The principal always comes from LocalHostAccess. Interactive
-        // provenance is a private WASM dispatcher attestation, not guest WIT.
-        let admission = if request.verified_ui_action {
-            CommandAdmission::Interactive
-        } else {
-            CommandAdmission::Unknown
-        };
-        self.world_commands.request(world_id, command, admission)
+        // The authenticated Principal always comes from LocalHostAccess, never from
+        // the extension payload or a claimed UI action. The four-table world model
+        // has no Actor, admission class or expected position, so the Engine's
+        // `verified_ui_action` attestation no longer changes the command envelope.
+        let command = WorldCommand::new(schema, self.local_principal, payload);
+        self.world_commands.request(world_id, command)
     }
 }
 
@@ -1454,7 +1416,7 @@ fn map_host_access_error(error: HostError) -> HostAccessError {
     }
 }
 
-/// Authoritative command result plus best-effort live event delivery status.
+/// Committed command result plus best-effort post-COMMIT signal delivery status.
 #[derive(Debug)]
 pub struct WorldCommandDispatchOutcome {
     authoritative: WorldCommandOutcome,
@@ -1463,11 +1425,14 @@ pub struct WorldCommandDispatchOutcome {
 
 impl WorldCommandDispatchOutcome {
     /// Returns the durable authoritative command outcome.
+    ///
+    /// The change set represented by this value is already committed when the
+    /// outcome exists.
     pub const fn authoritative(&self) -> &WorldCommandOutcome {
         &self.authoritative
     }
 
-    /// Returns successful live subscriber callbacks, or the post-commit delivery failure.
+    /// Returns successful signal subscriber callbacks, or the post-COMMIT delivery failure.
     ///
     /// A delivery error never means that the authoritative command was rolled back.
     pub fn live_delivery(&self) -> Result<usize, &HostError> {
@@ -1482,22 +1447,11 @@ impl WorldCommandDispatchOutcome {
 
 struct ActiveWorldRuntimeParts {
     runtime: WorldRuntime,
-    outbox: SqliteWorldStorage,
-    effect_handlers: BTreeMap<SchemaKey, ServiceWorldEffectHandler>,
     projections: BTreeMap<SchemaKey, ServiceWorldProjection>,
 }
 
-struct DeferredEffectClaim {
-    claim: ClaimedEffectJob,
-    continuation: String,
-    next_poll_at: UnixTimeMillis,
-}
-
 struct ActiveWorld {
-    deferred_effects: BTreeMap<EffectJobId, DeferredEffectClaim>,
     runtime: WorldRuntime,
-    outbox: SqliteWorldStorage,
-    effect_handlers: BTreeMap<SchemaKey, ServiceWorldEffectHandler>,
     projections: BTreeMap<SchemaKey, ServiceWorldProjection>,
     signals: RuntimeSignalQueue,
     registered_instances: Vec<ExtensionInstanceId>,
@@ -1868,8 +1822,10 @@ impl HostRuntime {
 
     /// Opens one persistent world and starts its authoritative command worker.
     ///
-    /// Every persisted command schema is bound to a platform service owned by the
-    /// extension that owns that schema. Provider availability remains dynamic:
+    /// Property definitions come from the exact artifacts installed in this world's
+    /// composition overlay and are persisted in the world vocabulary. Every command
+    /// schema declared by those artifacts is bound to a platform service owned by
+    /// the extension that owns the schema. Provider availability remains dynamic:
     /// activating the world does not require every System provider to be online.
     ///
     /// # Errors
@@ -1904,67 +1860,9 @@ impl HostRuntime {
                 return Err(error);
             }
         };
-        let runtime_result: HostResult<ActiveWorldRuntimeParts> = (|| {
-            let storage = home.open_world_storage(world_id)?;
-            register_world_schema_contributions(
-                &self.engine,
-                &storage,
-                &overlay.registered_instances,
-            )?;
-            let session = storage.load_session()?;
-            let mut builder = WorldRuntimeBuilder::new(storage);
-            for definition in session
-                .schemas()
-                .iter()
-                .filter(|definition| definition.kind() == SchemaKind::Command)
-            {
-                builder.register_system(self.bind_world_system(
-                    world_id,
-                    definition.key().clone(),
-                    definition.owner().clone(),
-                )?)?;
-            }
-            let mut effect_handlers = BTreeMap::new();
-            for definition in session
-                .schemas()
-                .iter()
-                .filter(|definition| definition.kind() == SchemaKind::Effect)
-            {
-                effect_handlers.insert(
-                    definition.key().clone(),
-                    self.bind_world_effect_handler(
-                        world_id,
-                        definition.key().clone(),
-                        definition.owner().clone(),
-                    )?,
-                );
-            }
-            let mut projections = BTreeMap::new();
-            for definition in session
-                .schemas()
-                .iter()
-                .filter(|definition| definition.kind() == SchemaKind::Projection)
-            {
-                projections.insert(
-                    definition.key().clone(),
-                    self.bind_world_projection(
-                        world_id,
-                        definition.key().clone(),
-                        definition.owner().clone(),
-                    )?,
-                );
-            }
-            let outbox = home.open_world_storage(world_id)?;
-            Ok(ActiveWorldRuntimeParts {
-                runtime: builder.start()?,
-                outbox,
-                effect_handlers,
-                projections,
-            })
-        })();
-
-        let runtime_parts = match runtime_result {
-            Ok(runtime) => runtime,
+        let prepared = prepare_world_runtime(self, home, world_id, &overlay.registered_instances);
+        let runtime_parts = match prepared {
+            Ok(parts) => parts,
             Err(error) => {
                 let cleanup_failures = cleanup_instances(
                     &mut self.engine,
@@ -1985,10 +1883,7 @@ impl HostRuntime {
         self.active_worlds.insert(
             world_id,
             ActiveWorld {
-                deferred_effects: BTreeMap::new(),
                 runtime: runtime_parts.runtime,
-                outbox: runtime_parts.outbox,
-                effect_handlers: runtime_parts.effect_handlers,
                 projections: runtime_parts.projections,
                 signals: RuntimeSignalQueue::default(),
                 registered_instances: overlay.registered_instances,
@@ -2030,12 +1925,13 @@ impl HostRuntime {
         }
     }
 
-    /// Executes one command in an active world and then performs live event delivery.
+    /// Executes one command in an active world and then dispatches its signals.
     ///
-    /// The outer result covers authoritative command execution only. Once a commit
-    /// succeeds, live runtime-event delivery is reported separately inside
-    /// WorldCommandDispatchOutcome so an ephemeral delivery failure cannot make a
-    /// committed command appear rolled back. Idempotent replay is never redelivered.
+    /// The outer result covers authoritative command execution only. Once the
+    /// command transaction commits, the best-effort runtime signals attached to the
+    /// outcome are dispatched separately inside [`WorldCommandDispatchOutcome`], so an
+    /// ephemeral delivery failure can never make a committed command appear rolled
+    /// back.
     ///
     /// # Errors
     ///
@@ -2045,14 +1941,33 @@ impl HostRuntime {
         world_id: WorldId,
         command: WorldCommand,
     ) -> HostResult<WorldCommandDispatchOutcome> {
-        self.submit_world_command_admitted(world_id, command, CommandAdmission::Unknown)
+        let correlation_id = command.correlation_id();
+        let authoritative = {
+            let active = self
+                .active_worlds
+                .get(&world_id)
+                .ok_or(HostError::WorldNotActive(world_id))?;
+            active.runtime.submit(command)?.wait()?
+        };
+
+        // The change set is already durable here: the world runtime returns an
+        // outcome only after its single SQLite transaction committed. Signals are
+        // therefore dispatched strictly post-COMMIT and are best-effort by design.
+        // A crash between COMMIT and this dispatch loses them permanently, because
+        // the four-table world model has no durable event log to replay.
+        let live_delivery =
+            self.dispatch_world_signals(world_id, correlation_id, authoritative.signals());
+
+        Ok(WorldCommandDispatchOutcome {
+            authoritative,
+            live_delivery,
+        })
     }
 
     /// Submit a command from a native, previously authenticated human session.
     ///
-    /// The Principal comes from trusted Host ingress, never an extension
-    /// payload, current Actor, or a claimed UI action. Guest WIT never calls
-    /// this native method; guest submissions remain Unknown.
+    /// The Principal comes from trusted Host ingress, never an extension payload or
+    /// a claimed UI action. Guest submissions cannot call this native method.
     ///
     /// # Errors
     ///
@@ -2066,85 +1981,39 @@ impl HostRuntime {
         if command.principal() != authenticated_principal {
             return Err(HostError::InteractiveWorldCommandPrincipalMismatch);
         }
-        self.submit_world_command_admitted(world_id, command, CommandAdmission::Interactive)
+        self.submit_world_command(world_id, command)
     }
 
-    // Replay and similar Host-owned autonomous work is never human input.
-    pub(crate) fn submit_automated_world_command(
+    /// Dispatches post-COMMIT signals through the in-process runtime signal queue.
+    ///
+    /// Signals are ephemeral: they are enqueued in the active world's bounded queue
+    /// and delivered only to subscribers of the derived runtime scope. They are
+    /// never persisted and never replayed.
+    fn dispatch_world_signals(
         &mut self,
         world_id: WorldId,
-        command: WorldCommand,
-    ) -> HostResult<WorldCommandDispatchOutcome> {
-        self.submit_world_command_admitted(world_id, command, CommandAdmission::Automated)
-    }
-
-    fn submit_world_command_admitted(
-        &mut self,
-        world_id: WorldId,
-        command: WorldCommand,
-        admission: CommandAdmission,
-    ) -> HostResult<WorldCommandDispatchOutcome> {
-        let authoritative = {
-            let active = self
-                .active_worlds
-                .get(&world_id)
-                .ok_or(HostError::WorldNotActive(world_id))?;
-            active
-                .runtime
-                .submit_attested(command, admission)?
-                .wait_outcome()?
-        };
-
-        let live_delivery = if authoritative.receipt().disposition() == CommitDisposition::Committed
-        {
-            self.dispatch_world_events(authoritative.committed_events())
-        } else {
-            Ok(0)
-        };
-
-        Ok(WorldCommandDispatchOutcome {
-            authoritative,
-            live_delivery,
-        })
-    }
-
-    // Only the World effect worker may submit a claim-fenced follow-up.
-    // The SQLite writer atomically validates the claim and completes the job
-    // alongside the authoritative command, closing cancellation/reclaim races.
-    fn submit_effect_follow_up(
-        &mut self,
-        world_id: WorldId,
-        command: WorldCommand,
-        claim: &ClaimedEffectJob,
-        now: UnixTimeMillis,
-    ) -> HostResult<WorldCommandDispatchOutcome> {
-        let authoritative = {
-            let active = self
-                .active_worlds
-                .get(&world_id)
-                .ok_or(HostError::WorldNotActive(world_id))?;
-            active
-                .runtime
-                .submit_effect_follow_up(command, EffectCommitGuard::new(claim, now))?
-                .wait_outcome()?
-        };
-        let live_delivery = if authoritative.receipt().disposition() == CommitDisposition::Committed
-        {
-            self.dispatch_world_events(authoritative.committed_events())
-        } else {
-            Ok(0)
-        };
-        Ok(WorldCommandDispatchOutcome {
-            authoritative,
-            live_delivery,
-        })
+        correlation_id: CorrelationId,
+        signals: &[rintawa_world::RuntimeSignal],
+    ) -> HostResult<usize> {
+        if signals.is_empty() {
+            return Ok(0);
+        }
+        for signal in signals {
+            let payload = serde_json::to_vec(signal.payload())
+                .map_err(|source| HostError::RuntimeSignalEncode { source })?;
+            self.enqueue_runtime_signal(
+                RuntimeSignal::new(world_id, signal.schema().to_string(), payload)
+                    .with_correlation_id(correlation_id),
+            )?;
+        }
+        self.pump_runtime_signals(world_id)
     }
 
     /// Builds one schema-addressed, Principal-specific view of an active World.
     ///
     /// The projection provider receives only bounded owner-filtered reads from one
     /// pinned snapshot. It never receives SQLite handles or the raw WorldSnapshot,
-    /// and the final value is validated against the registered Projection schema.
+    /// and it may only read property names owned by its own extension.
     ///
     /// # Errors
     ///
@@ -2175,8 +2044,8 @@ impl HostRuntime {
     /// Provider resolution is pinned to the extension that owns the command schema,
     /// so another package in the same world scope cannot hijack the System role.
     /// The returned System still evaluates through the ordinary World Runtime, so
-    /// transaction validation, authority checks, optimistic position checks, and
-    /// commit ordering remain authoritative host responsibilities.
+    /// transaction validation and commit ordering remain authoritative host
+    /// responsibilities.
     ///
     /// # Errors
     ///
@@ -2205,44 +2074,24 @@ impl HostRuntime {
         ))
     }
 
-    /// Binds one exact effect schema to an extension-provided durable handler service.
-    ///
-    /// The contract is platform-owned and owner-pinned to the extension that owns
-    /// the immutable effect schema, preventing another package in the same world
-    /// scope from hijacking post-commit external work.
-    fn bind_world_effect_handler(
-        &mut self,
-        world_id: WorldId,
-        effect_schema: SchemaKey,
-        schema_owner: ExtensionId,
-    ) -> HostResult<ServiceWorldEffectHandler> {
-        let scope_id = world_runtime_scope_id(world_id);
-        let contract = world_effect_service_contract_key(&effect_schema);
-        self.engine.define_platform_service_contract_in_scope(
-            scope_id.clone(),
-            contract,
-            ContractResolutionPolicy::Single,
-        )?;
-        let caller = self
-            .engine
-            .platform_service_caller_for_extension(scope_id, schema_owner);
-        Ok(ServiceWorldEffectHandler::new(
-            world_id,
-            effect_schema,
-            move |contract: &ContractKey, request: &[u8]| caller.call(contract, request),
-        ))
-    }
-
     /// Binds one exact Projection schema to its extension-owned filtering service.
     ///
     /// Provider resolution is pinned to the immutable schema owner in the exact
     /// world scope. The service receives a Host-fixed Principal and bounded read
-    /// continuations; raw world storage remains behind the authoritative Host.
+    /// continuations, and may resolve only the property names in `owned_properties`,
+    /// so one extension cannot project another extension's feature data. Raw world
+    /// storage remains behind the authoritative Host.
+    ///
+    /// # Errors
+    ///
+    /// Returns an Extension Engine contract-definition error when the same key was
+    /// already reserved incompatibly or defined by an extension.
     fn bind_world_projection(
         &mut self,
         world_id: WorldId,
         projection_schema: SchemaKey,
         schema_owner: ExtensionId,
+        owned_properties: Vec<SchemaId>,
     ) -> HostResult<ServiceWorldProjection> {
         let scope_id = world_runtime_scope_id(world_id);
         let contract = world_projection_service_contract_key(&projection_schema);
@@ -2253,48 +2102,13 @@ impl HostRuntime {
         )?;
         let caller = self
             .engine
-            .platform_service_caller_for_extension(scope_id, schema_owner.clone());
+            .platform_service_caller_for_extension(scope_id, schema_owner);
         Ok(ServiceWorldProjection::new(
             world_id,
             projection_schema,
-            schema_owner,
+            owned_properties,
             move |contract: &ContractKey, request: &[u8]| caller.call(contract, request),
         ))
-    }
-
-    /// Delivers committed durable world events to one active runtime scope.
-    ///
-    /// Routing uses each event's exact versioned schema as the runtime topic.
-    /// The callback payload is the serialized full `StoredWorldEvent` envelope,
-    /// not only its feature payload, so subscribers retain authoritative world,
-    /// position, actor/principal, causation, and correlation metadata.
-    ///
-    /// This method does not reinterpret or mutate the durable event. Delivery is
-    /// ephemeral and may be retried from persistent world storage by a higher
-    /// world-session supervisor.
-    ///
-    /// # Errors
-    ///
-    /// Returns an encoding error or Extension Engine delivery error.
-    pub fn dispatch_world_events(&mut self, events: &[StoredWorldEvent]) -> HostResult<usize> {
-        let Some(first) = events.first() else {
-            return Ok(0);
-        };
-        if events.iter().any(|event| event.world_id != first.world_id) {
-            return Err(HostError::MixedWorldEventBatch);
-        }
-
-        let scope_id = world_runtime_scope_id(first.world_id);
-        let mut delivered = 0_usize;
-        for event in events {
-            let payload = serde_json::to_vec(event)?;
-            delivered += self.engine.dispatch_runtime_event_in_scope(
-                &scope_id,
-                &event.schema.to_string(),
-                &payload,
-            )?;
-        }
-        Ok(delivered)
     }
 
     /// Enqueues one bounded ephemeral signal for an active world's runtime scope.
@@ -2318,8 +2132,9 @@ impl HostRuntime {
     /// Drains queued runtime signals for one world in FIFO order.
     ///
     /// A dequeued signal is not retried after a callback-infrastructure failure:
-    /// RuntimeSignal is deliberately best-effort and non-durable. Work requiring
-    /// retry or restart recovery must use the durable Effect/Job outbox instead.
+    /// RuntimeSignal is deliberately best-effort and non-durable. The four-table
+    /// world model keeps no durable event log, effect job or retry outbox to
+    /// recover it from.
     ///
     /// # Errors
     ///
@@ -2354,315 +2169,6 @@ impl HostRuntime {
             delivered += self.pump_runtime_signals(world_id)?;
         }
         Ok(delivered)
-    }
-
-    /// Processes a bounded batch of due durable effect jobs for one active world.
-    ///
-    /// Provider/transport failures and invalid responses do not lose the durable
-    /// job: they are returned to pending state with host-owned exponential backoff.
-    /// A successful optional follow-up command goes through the ordinary authoritative
-    /// World Runtime before the fencing attempt is marked complete.
-    ///
-    /// # Errors
-    ///
-    /// Returns WorldNotActive or a storage/fencing failure. Ordinary handler and
-    /// command failures are durably retried rather than returned as host failures.
-    pub fn pump_effect_outbox(&mut self, world_id: WorldId) -> HostResult<usize> {
-        self.pump_effect_outbox_with_clock(world_id, current_unix_time_millis)
-    }
-
-    #[cfg(test)]
-    fn pump_effect_outbox_at(
-        &mut self,
-        world_id: WorldId,
-        now: UnixTimeMillis,
-    ) -> HostResult<usize> {
-        self.pump_effect_outbox_with_clock(world_id, || now)
-    }
-
-    fn pump_effect_outbox_with_clock<F>(
-        &mut self,
-        world_id: WorldId,
-        mut clock: F,
-    ) -> HostResult<usize>
-    where
-        F: FnMut() -> UnixTimeMillis,
-    {
-        if !self.active_worlds.contains_key(&world_id) {
-            return Err(HostError::WorldNotActive(world_id));
-        }
-        let mut handled = 0_usize;
-
-        let due = {
-            let active = self.active_worlds.get(&world_id).expect("active world");
-            let now = clock();
-            active
-                .deferred_effects
-                .iter()
-                .filter(|(_, pending)| {
-                    pending.next_poll_at <= now || pending.claim.lease_expires_at() <= now
-                })
-                .map(|(id, _)| *id)
-                .take(MAX_EFFECT_JOBS_PER_PUMP)
-                .collect::<Vec<_>>()
-        };
-
-        for job_id in due {
-            let pending = self
-                .active_worlds
-                .get_mut(&world_id)
-                .expect("active world")
-                .deferred_effects
-                .remove(&job_id)
-                .expect("selected deferred job");
-            let now = clock();
-            if now >= pending.claim.lease_expires_at()
-                || !self
-                    .active_worlds
-                    .get(&world_id)
-                    .ok_or(HostError::WorldNotActive(world_id))?
-                    .outbox
-                    .is_effect_claim_current(job_id, pending.claim.attempt(), now)?
-            {
-                handled += 1;
-                continue;
-            }
-            let response = {
-                let active = self.active_worlds.get(&world_id).expect("active world");
-                active
-                    .effect_handlers
-                    .get(&pending.claim.job().schema)
-                    .map(|handler| {
-                        handler
-                            .execute_with_continuation(&pending.claim, Some(&pending.continuation))
-                    })
-            };
-            let now = clock();
-            if now < pending.claim.lease_expires_at() {
-                if let Some(response) = response {
-                    self.resolve_effect_response(world_id, pending.claim, now, response)?;
-                } else {
-                    self.retry_effect_claim(
-                        world_id,
-                        job_id,
-                        pending.claim.attempt(),
-                        now,
-                        "deferred effect handler unavailable",
-                    )?;
-                }
-            }
-            handled += 1;
-        }
-
-        let remaining_budget = MAX_EFFECT_JOBS_PER_PUMP.saturating_sub(handled);
-        for _ in 0..remaining_budget {
-            let now = clock();
-            let lease_expires_at =
-                UnixTimeMillis::new(now.get().saturating_add(EFFECT_JOB_LEASE_MILLIS));
-            let claim = {
-                let active = self
-                    .active_worlds
-                    .get(&world_id)
-                    .ok_or(HostError::WorldNotActive(world_id))?;
-                active.outbox.claim_next_effect(now, lease_expires_at)?
-            };
-            let Some(claim) = claim else {
-                break;
-            };
-            let job_id = claim.job().id;
-            let attempt = claim.attempt();
-            let response = {
-                let active = self
-                    .active_worlds
-                    .get(&world_id)
-                    .ok_or(HostError::WorldNotActive(world_id))?;
-                match active.effect_handlers.get(&claim.job().schema) {
-                    Some(handler) => handler.execute(&claim),
-                    None => {
-                        self.retry_effect_claim(
-                            world_id,
-                            job_id,
-                            attempt,
-                            now,
-                            "effect schema is not bound to a handler contract",
-                        )?;
-                        handled += 1;
-                        continue;
-                    }
-                }
-            };
-
-            let finished_at = clock();
-            // External callbacks may outlive a lease; never apply their result
-            // after another worker can reclaim the durable attempt.
-            if finished_at.get() < claim.lease_expires_at().get() {
-                self.resolve_effect_response(world_id, claim, finished_at, response)?;
-            }
-            handled += 1;
-        }
-        Ok(handled)
-    }
-
-    /// Applies a terminal response or retains a bounded continuation for this lease.
-    fn resolve_effect_response(
-        &mut self,
-        world_id: WorldId,
-        claim: ClaimedEffectJob,
-        now: UnixTimeMillis,
-        response: rintawa_world_runtime::WorldEffectServiceResult<WorldEffectServiceResponse>,
-    ) -> HostResult<()> {
-        let job_id = claim.job().id;
-        let attempt = claim.attempt();
-        if !self
-            .active_worlds
-            .get(&world_id)
-            .ok_or(HostError::WorldNotActive(world_id))?
-            .outbox
-            .is_effect_claim_current(job_id, attempt, now)?
-        {
-            return Ok(());
-        }
-        match response {
-            Ok(WorldEffectServiceResponse::Defer {
-                continuation,
-                poll_after_millis,
-            }) => {
-                let next_poll_at =
-                    UnixTimeMillis::new(now.get().saturating_add(i64::from(poll_after_millis)));
-                let active = self
-                    .active_worlds
-                    .get(&world_id)
-                    .ok_or(HostError::WorldNotActive(world_id))?;
-                if next_poll_at.get() >= claim.lease_expires_at().get()
-                    || active.deferred_effects.len() >= MAX_DEFERRED_EFFECTS_PER_WORLD
-                {
-                    self.retry_effect_claim(
-                        world_id,
-                        job_id,
-                        attempt,
-                        now,
-                        "effect continuation exceeds bounded claim lifetime",
-                    )?;
-                } else {
-                    self.active_worlds
-                        .get_mut(&world_id)
-                        .ok_or(HostError::WorldNotActive(world_id))?
-                        .deferred_effects
-                        .insert(
-                            job_id,
-                            DeferredEffectClaim {
-                                claim,
-                                continuation,
-                                next_poll_at,
-                            },
-                        );
-                }
-            }
-            Ok(WorldEffectServiceResponse::Complete { command }) => {
-                if let Some(command) = command {
-                    match self.submit_effect_follow_up(world_id, command, &claim, now) {
-                        Ok(outcome) => {
-                            if outcome.authoritative().receipt().disposition()
-                                == CommitDisposition::AlreadyCommitted
-                            {
-                                // Older versions could commit before recording
-                                // completion. Replay heals that interrupted window.
-                                self.active_worlds
-                                    .get(&world_id)
-                                    .ok_or(HostError::WorldNotActive(world_id))?
-                                    .outbox
-                                    .complete_effect(job_id, attempt)?;
-                            }
-                            // A new commit already completed this effect atomically.
-                        }
-                        Err(HostError::WorldRuntime(
-                            rintawa_world_runtime::WorldRuntimeError::Storage(
-                                rintawa_storage::StorageError::EffectJobClaimLost(lost_id),
-                            ),
-                        )) if lost_id == job_id => {
-                            // The writer observed cancellation/reclaim after the
-                            // Host's initial read: never retry a lost claim.
-                        }
-                        Err(error) => {
-                            let diagnostic = bounded_effect_diagnostic(&format!(
-                                "effect follow-up command failed: {error}"
-                            ));
-                            self.retry_effect_claim(world_id, job_id, attempt, now, &diagnostic)?;
-                        }
-                    }
-                } else {
-                    self.active_worlds
-                        .get(&world_id)
-                        .ok_or(HostError::WorldNotActive(world_id))?
-                        .outbox
-                        .complete_effect(job_id, attempt)?;
-                }
-            }
-            Ok(WorldEffectServiceResponse::Retry { reason }) => {
-                self.retry_effect_claim(world_id, job_id, attempt, now, &reason)?;
-            }
-            Ok(WorldEffectServiceResponse::Cancel { reason }) => {
-                self.active_worlds
-                    .get(&world_id)
-                    .ok_or(HostError::WorldNotActive(world_id))?
-                    .outbox
-                    .cancel_claimed_effect(job_id, attempt, &reason)?;
-            }
-            Err(error) => {
-                let diagnostic = bounded_effect_diagnostic(&error.to_string());
-                self.retry_effect_claim(world_id, job_id, attempt, now, &diagnostic)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn retry_effect_claim(
-        &self,
-        world_id: WorldId,
-        job_id: rintawa_sdk::world::EffectJobId,
-        attempt: u32,
-        now: UnixTimeMillis,
-        diagnostic: &str,
-    ) -> HostResult<()> {
-        let active = self
-            .active_worlds
-            .get(&world_id)
-            .ok_or(HostError::WorldNotActive(world_id))?;
-        let available_at = effect_retry_at(now, attempt);
-        active
-            .outbox
-            .retry_effect(job_id, attempt, available_at, diagnostic)?;
-        Ok(())
-    }
-
-    fn pump_all_effect_outboxes(&mut self) -> HostResult<usize> {
-        let world_ids = self.active_worlds.keys().copied().collect::<Vec<_>>();
-        let mut handled = 0_usize;
-        for world_id in world_ids {
-            handled += self.pump_effect_outbox(world_id)?;
-        }
-        Ok(handled)
-    }
-
-    fn next_effect_wakeup_delay(&self, now: UnixTimeMillis) -> HostResult<Option<Duration>> {
-        let mut earliest = None;
-        for active in self.active_worlds.values() {
-            if let Some(wakeup) = active.outbox.next_effect_wakeup()? {
-                let millis = wakeup.get().saturating_sub(now.get()).max(0);
-                let delay = Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX));
-                earliest = Some(earliest.map_or(delay, |current: Duration| current.min(delay)));
-            }
-            for pending in active.deferred_effects.values() {
-                let next = pending
-                    .next_poll_at
-                    .get()
-                    .min(pending.claim.lease_expires_at().get());
-                let millis = next.saturating_sub(now.get()).max(0);
-                let delay = Duration::from_millis(millis as u64);
-                earliest = Some(earliest.map_or(delay, |current: Duration| current.min(delay)));
-            }
-        }
-        Ok(earliest)
     }
 
     fn record_world_session_result(
@@ -2792,7 +2298,7 @@ impl HostRuntime {
         for request in requests {
             let world_id = request.world_id;
             let command_id = request.command.id();
-            match self.submit_world_command_admitted(world_id, request.command, request.admission) {
+            match self.submit_world_command(world_id, request.command) {
                 Ok(outcome) => {
                     if let Err(error) = outcome.live_delivery() {
                         warn!(
@@ -2834,7 +2340,6 @@ impl HostRuntime {
                     Ok(value_json) if value_json.len() <= MAX_WORLD_PROJECTION_VIEW_BYTES => {
                         WorldProjectionReadStatus::Succeeded(WorldProjectionReadView {
                             world_id: view.world_id().to_string(),
-                            snapshot_position: view.snapshot_position(),
                             schema: view.schema().to_string(),
                             value_json,
                         })
@@ -2869,15 +2374,14 @@ impl HostRuntime {
         self.pump_world_command_requests()?;
         self.pump_world_projection_requests()?;
         self.pump_all_runtime_signals()?;
-        self.pump_all_effect_outboxes()?;
         let engine_delay = self.engine.poll_runtime()?;
         self.pump_world_session_requests()?;
         self.pump_world_focus_requests()?;
         self.pump_user_content_write_requests()?;
         self.pump_world_command_requests()?;
         self.pump_world_projection_requests()?;
-        let effect_delay = self.next_effect_wakeup_delay(current_unix_time_millis())?;
-        Ok(min_optional_duration(engine_delay, effect_delay))
+        self.pump_all_runtime_signals()?;
+        Ok(engine_delay)
     }
 
     /// Stops every active world, then unregisters baseline runtime instances.
@@ -2898,6 +2402,88 @@ impl HostRuntime {
             })))
         }
     }
+}
+
+/// Builds the single-writer command runtime for one world from installed artifacts.
+///
+/// Property definitions come from the exact installed world artifacts and are
+/// persisted in the world vocabulary. Command, event, effect and projection
+/// schemas are transient runtime API descriptions and stay in memory. Every
+/// command schema is bound to an owner-pinned platform service System, and every
+/// projection is bound to its owner-pinned filtering service.
+///
+/// # Errors
+///
+/// Returns world/storage errors, schema definition conflicts, or Engine
+/// contract-definition failures.
+fn prepare_world_runtime(
+    host: &mut HostRuntime,
+    home: &HostHome,
+    world_id: WorldId,
+    instance_ids: &[ExtensionInstanceId],
+) -> HostResult<ActiveWorldRuntimeParts> {
+    let storage = home.open_world_storage(world_id)?;
+    let schemas = installed_world_schemas(&host.engine, instance_ids)?;
+    let property_definitions: Vec<PropertyDefinition> = schemas
+        .iter()
+        .filter(|schema| schema.kind == SchemaKind::Property)
+        .map(|schema| {
+            PropertyDefinition::new(
+                schema.key.clone(),
+                schema.owner.clone(),
+                schema.definition.clone(),
+            )
+        })
+        .collect();
+    let mut builder = WorldRuntimeBuilder::new(storage);
+    for schema in schemas
+        .iter()
+        .filter(|schema| schema.kind != SchemaKind::Property)
+    {
+        builder.register_runtime_schema(RuntimeSchemaDefinition::new(
+            schema.key.clone(),
+            schema.kind,
+            schema.owner.clone(),
+            schema.definition.clone(),
+        ))?;
+    }
+    for schema in schemas
+        .iter()
+        .filter(|schema| schema.kind == SchemaKind::Command)
+    {
+        builder.register_system(host.bind_world_system(
+            world_id,
+            schema.key.clone(),
+            schema.owner.clone(),
+        )?)?;
+    }
+    let runtime = builder.start()?;
+    runtime.register_property_definitions(&property_definitions)?;
+
+    let owned_properties = owned_property_names(&property_definitions);
+    let mut projections = BTreeMap::new();
+    for schema in schemas
+        .iter()
+        .filter(|schema| schema.kind == SchemaKind::Projection)
+    {
+        projections.insert(
+            schema.key.clone(),
+            host.bind_world_projection(
+                world_id,
+                schema.key.clone(),
+                schema.owner.clone(),
+                owned_properties
+                    .get(schema.owner.as_str())
+                    .cloned()
+                    .unwrap_or_default(),
+            )?,
+        );
+    }
+
+    Ok(ActiveWorldRuntimeParts {
+        runtime,
+        projections,
+    })
 }
 
 fn bounded_user_content_write_diagnostic(value: &str) -> String {
@@ -2931,42 +2517,6 @@ fn bounded_world_session_diagnostic(value: &str) -> String {
         end = end.saturating_sub(1);
     }
     value[..end].to_string()
-}
-
-fn current_unix_time_millis() -> UnixTimeMillis {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO);
-    let millis = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
-    UnixTimeMillis::new(millis)
-}
-
-fn effect_retry_at(now: UnixTimeMillis, attempt: u32) -> UnixTimeMillis {
-    let exponent = attempt.saturating_sub(1).min(16);
-    let multiplier = 1_i64.checked_shl(exponent).unwrap_or(i64::MAX);
-    let delay = EFFECT_RETRY_BASE_MILLIS
-        .saturating_mul(multiplier)
-        .min(EFFECT_RETRY_MAX_MILLIS);
-    UnixTimeMillis::new(now.get().saturating_add(delay))
-}
-
-fn bounded_effect_diagnostic(reason: &str) -> String {
-    if reason.len() <= MAX_WORLD_EFFECT_DIAGNOSTIC_BYTES {
-        return reason.to_string();
-    }
-    let mut end = MAX_WORLD_EFFECT_DIAGNOSTIC_BYTES;
-    while !reason.is_char_boundary(end) {
-        end -= 1;
-    }
-    reason[..end].to_string()
-}
-
-fn min_optional_duration(left: Option<Duration>, right: Option<Duration>) -> Option<Duration> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
-    }
 }
 
 struct ActivatedComposition {
@@ -3174,12 +2724,31 @@ fn activate_composition(
     })
 }
 
-fn register_world_schema_contributions(
+/// One immutable world schema declared by an exact installed extension artifact.
+struct InstalledWorldSchema {
+    key: SchemaKey,
+    kind: SchemaKind,
+    owner: ExtensionId,
+    definition: serde_json::Value,
+}
+
+/// Collects the world schemas declared by the exact installed world artifacts.
+///
+/// Ownership always comes from the installed artifact manifest, never from the
+/// extension-supplied declaration. Identical repeated declarations are collapsed
+/// so one extension cannot bind the same System twice, and the result is
+/// deterministic so repeated world activation registers the same definitions in
+/// the same order.
+///
+/// # Errors
+///
+/// Returns an Engine error for an unknown runtime instance, or
+/// [`HostError::InvalidWorldSchemaJson`] when a declaration is not valid JSON.
+fn installed_world_schemas(
     engine: &ExtensionEngine,
-    storage: &SqliteWorldStorage,
     instance_ids: &[ExtensionInstanceId],
-) -> HostResult<()> {
-    let mut definitions = Vec::new();
+) -> HostResult<Vec<InstalledWorldSchema>> {
+    let mut schemas = Vec::new();
     for instance_id in instance_ids {
         for registered in engine.registered_world_schemas(instance_id)? {
             let contribution = registered.contribution();
@@ -3190,22 +2759,44 @@ fn register_world_schema_contributions(
                         source,
                     }
                 })?;
-            definitions.push(SchemaDefinition::new(
-                contribution.key().clone(),
-                contribution.kind(),
-                registered.extension_id().clone(),
+            schemas.push(InstalledWorldSchema {
+                key: contribution.key().clone(),
+                kind: contribution.kind(),
+                owner: registered.extension_id().clone(),
                 definition,
-            ));
+            });
         }
     }
 
-    definitions.sort_by(|left, right| {
-        left.key()
-            .cmp(right.key())
-            .then_with(|| left.owner().as_str().cmp(right.owner().as_str()))
+    schemas.sort_by(|left, right| {
+        left.key
+            .cmp(&right.key)
+            .then_with(|| left.owner.as_str().cmp(right.owner.as_str()))
     });
-    storage.register_schemas(&definitions)?;
-    Ok(())
+    schemas.dedup_by(|left, right| {
+        left.key == right.key && left.owner == right.owner && left.definition == right.definition
+    });
+    Ok(schemas)
+}
+
+/// Returns the exact property names each extension may read through projections.
+///
+/// Ownership is derived from the exact artifacts installed for this activation.
+/// `property_registry` stores name, version and schema only, so a property whose
+/// declaring package is not installed is not readable through that package's
+/// projection.
+fn owned_property_names(registered: &[PropertyDefinition]) -> BTreeMap<String, Vec<SchemaId>> {
+    let mut owned: BTreeMap<String, BTreeSet<SchemaId>> = BTreeMap::new();
+    for definition in registered {
+        owned
+            .entry(definition.owner().as_str().to_string())
+            .or_default()
+            .insert(definition.key().id().clone());
+    }
+    owned
+        .into_iter()
+        .map(|(owner, names)| (owner, names.into_iter().collect()))
+        .collect()
 }
 
 fn cleanup_active_world(
@@ -3374,21 +2965,20 @@ mod tests {
         manifest::ExtensionManifest,
         prelude::{Component, ComponentId, ContractResolutionPolicy, ExtensionId},
         runtime_effects::RuntimeEffect,
-        world::{
-            CommandId, CorrelationId, EffectJobId, PrincipalId, SchemaKey, UnixTimeMillis,
-            WorldEventId, WorldId,
+        world::{CorrelationId, ItemId, PrincipalId, SchemaKey, WorldId},
+        world_projection::{
+            WorldProjectionReadRequest, WorldProjectionReadResult, WorldProjectionServiceRequest,
+            WorldProjectionServiceResponse,
         },
-        world_system::{WorldSystemEventProposal, WorldSystemTransaction},
+        world_system::{WorldSystemMutation, WorldSystemSignalProposal, WorldSystemTransaction},
     };
     use rintawa_storage::SqliteWorldStorage;
     use rintawa_world::{
-        ActorRef, CausationRef, CommandProvenance, EffectJobDraft, SchemaDefinition, SchemaKind,
-        WorldCommand, WorldEventDraft, WorldTransaction,
+        PropertyDefinition, RuntimeSchemaDefinition, SchemaKind, StateChange, WorldCommand,
+        WorldTransaction,
     };
     use rintawa_world_runtime::{
-        WorldEffectServiceRequest, WorldEffectServiceResponse, WorldProjectionServiceRequest,
-        WorldProjectionServiceResponse, WorldRuntimeBuilder, WorldSystem,
-        WorldSystemServiceRequest, WorldSystemServiceResponse, world_effect_service_contract_key,
+        WorldRuntimeBuilder, WorldSystem, WorldSystemServiceRequest, WorldSystemServiceResponse,
         world_projection_service_contract_key, world_system_service_contract_key,
     };
     use std::sync::{Arc, Mutex};
@@ -3472,10 +3062,13 @@ mod tests {
         }
     }
 
+    /// Records every evaluated command and writes one item plus one property.
     struct RecordingWorldSystem {
         command_schema: SchemaKey,
-        event_schema: SchemaKey,
+        property_schema: SchemaKey,
+        signal_schema: SchemaKey,
         observed: Arc<Mutex<Vec<WorldCommand>>>,
+        created: Arc<Mutex<Vec<ItemId>>>,
     }
 
     impl WorldSystem for RecordingWorldSystem {
@@ -3496,9 +3089,24 @@ mod tests {
                     ))
                 })?
                 .push(command.clone());
+            let item = ItemId::new();
+            self.created
+                .lock()
+                .map_err(|_| {
+                    rintawa_world_runtime::SystemError::Failed(String::from(
+                        "test item observer lock poisoned",
+                    ))
+                })?
+                .push(item);
             let mut transaction = WorldTransaction::new();
-            transaction.push_event(WorldEventDraft::new(
-                self.event_schema.clone(),
+            transaction.push_change(StateChange::CreateObject { id: item });
+            transaction.push_change(StateChange::SetProperty {
+                item,
+                key: self.property_schema.clone(),
+                data: command.payload().clone(),
+            });
+            transaction.push_signal(rintawa_world::RuntimeSignal::new(
+                self.signal_schema.clone(),
                 command.payload().clone(),
             ));
             Ok(transaction)
@@ -3587,11 +3195,12 @@ mod tests {
         }
     }
 
+    /// Service-backed System that creates one object item and proposes one signal.
     struct WorldSystemProvider {
         id: ComponentId,
         contract: ContractKey,
-        event_schema: SchemaKey,
-        cancel_on_evaluate: Option<(Arc<SqliteWorldStorage>, EffectJobId)>,
+        signal_schema: SchemaKey,
+        item_id: ItemId,
     }
 
     impl Component for WorldSystemProvider {
@@ -3616,14 +3225,12 @@ mod tests {
             }
             let request: WorldSystemServiceRequest = serde_json::from_slice(request)
                 .map_err(|error| ExtensionError::Message(error.to_string()))?;
-            if let Some((storage, job_id)) = &self.cancel_on_evaluate {
-                storage
-                    .cancel_effect(*job_id)
-                    .map_err(|error| ExtensionError::Message(error.to_string()))?;
-            }
             let mut transaction = WorldSystemTransaction::new();
-            transaction.push_event(WorldSystemEventProposal {
-                schema: self.event_schema.clone(),
+            transaction.push_mutation(WorldSystemMutation::CreateObject {
+                item_id: self.item_id,
+            });
+            transaction.push_signal(WorldSystemSignalProposal {
+                schema: self.signal_schema.clone(),
                 payload: request.command().payload.clone(),
             });
             serde_json::to_vec(&WorldSystemServiceResponse::Transaction { transaction })
@@ -3631,88 +3238,13 @@ mod tests {
         }
     }
 
-    struct WorldEffectProvider {
-        id: ComponentId,
-        contract: ContractKey,
-        result_command_schema: SchemaKey,
-        remaining_retries: usize,
-        remaining_deferrals: usize,
-        should_cancel: bool,
-        observed: Arc<Mutex<Vec<WorldEffectServiceRequest>>>,
-    }
-
-    impl Component for WorldEffectProvider {
-        fn id(&self) -> &ComponentId {
-            &self.id
-        }
-
-        fn register(&mut self, ctx: &mut dyn RegistrationContext) -> ExtensionResult<()> {
-            ctx.provide_contract(ContractProvider::new(self.contract.clone()))
-        }
-
-        fn handle_service(
-            &mut self,
-            _ctx: &mut dyn ComponentContext,
-            contract: &ContractKey,
-            request: &[u8],
-        ) -> ExtensionResult<Vec<u8>> {
-            if contract != &self.contract {
-                return Err(ExtensionError::ServiceHandlerUnavailable(
-                    contract.to_string(),
-                ));
-            }
-            let request: WorldEffectServiceRequest = serde_json::from_slice(request)
-                .map_err(|error| ExtensionError::Message(error.to_string()))?;
-            self.observed
-                .lock()
-                .map_err(|_| {
-                    ExtensionError::Message(String::from("effect observer lock poisoned"))
-                })?
-                .push(request.clone());
-
-            let response = if self.should_cancel {
-                WorldEffectServiceResponse::Cancel {
-                    reason: String::from("test cancellation"),
-                }
-            } else if self.remaining_deferrals > 0 {
-                let continuation = self.remaining_deferrals.to_string();
-                self.remaining_deferrals -= 1;
-                WorldEffectServiceResponse::Defer {
-                    continuation,
-                    poll_after_millis: 250,
-                }
-            } else if self.remaining_retries > 0 {
-                self.remaining_retries -= 1;
-                WorldEffectServiceResponse::Retry {
-                    reason: String::from("temporary provider failure"),
-                }
-            } else {
-                let job = request.job();
-                let command = WorldCommand::with_ids(
-                    request.completion_command_id(),
-                    job.provenance.correlation_id,
-                    self.result_command_schema.clone(),
-                    job.provenance.principal,
-                    job.provenance.actor,
-                    serde_json::json!({
-                        "effect_job_id": job.id.to_string(),
-                        "attempt": job.attempt_count,
-                    }),
-                )
-                .caused_by(CausationRef::Effect(job.id));
-                WorldEffectServiceResponse::Complete {
-                    command: Some(command),
-                }
-            };
-            serde_json::to_vec(&response)
-                .map_err(|error| ExtensionError::Message(error.to_string()))
-        }
-    }
-
+    /// Projection provider that first requests the listed property reads and then
+    /// reports the Host-resolved results in its completed view.
     struct WorldProjectionProvider {
         id: ComponentId,
         contract: ContractKey,
         reject: bool,
+        reads: Vec<WorldProjectionReadRequest>,
         observed: Arc<Mutex<Vec<WorldProjectionServiceRequest>>>,
     }
 
@@ -3749,123 +3281,33 @@ mod tests {
                     "hijacker projection provider invoked",
                 )));
             }
+            if request.reads().is_empty() && !self.reads.is_empty() {
+                return serde_json::to_vec(&WorldProjectionServiceResponse::Read {
+                    requests: self.reads.clone(),
+                })
+                .map_err(|error| ExtensionError::Message(error.to_string()));
+            }
+            let mut properties = serde_json::Map::new();
+            for read in request.reads() {
+                if let WorldProjectionReadResult::Property { key, value, .. } = read {
+                    properties.insert(
+                        key.to_string(),
+                        match value {
+                            Some(record) => record.data().clone(),
+                            None => serde_json::Value::Null,
+                        },
+                    );
+                }
+            }
             serde_json::to_vec(&WorldProjectionServiceResponse::Complete {
                 value: serde_json::json!({
                     "provider": "owner",
                     "principal": request.principal().to_string(),
+                    "properties": properties,
                 }),
             })
             .map_err(|error| ExtensionError::Message(error.to_string()))
         }
-    }
-
-    fn enqueue_test_effect(
-        storage: &SqliteWorldStorage,
-        command_schema: &SchemaKey,
-        effect_schema: &SchemaKey,
-        principal: PrincipalId,
-    ) -> anyhow::Result<(EffectJobId, CorrelationId)> {
-        let command = WorldCommand::new(
-            command_schema.clone(),
-            principal,
-            ActorRef::Principal(principal),
-            serde_json::json!({ "kind": "enqueue-effect" }),
-        );
-        let correlation_id = command.correlation_id();
-        let effect = EffectJobDraft::new(
-            effect_schema.clone(),
-            serde_json::json!({ "input": "generate" }),
-        );
-        let effect_id = effect.id();
-        let mut transaction = WorldTransaction::new();
-        transaction.push_effect(effect);
-        let snapshot = storage.snapshot_for_command(&command)?;
-        let position = snapshot.position();
-        drop(snapshot);
-        storage.commit(&command, &transaction, position)?;
-        Ok((effect_id, correlation_id))
-    }
-
-    struct TestEffectRoutes<'a> {
-        result_owner: &'a ExtensionId,
-        result_schema: &'a SchemaKey,
-        event_schema: &'a SchemaKey,
-        effect_owner: &'a ExtensionId,
-        effect_schema: &'a SchemaKey,
-        remaining_retries: usize,
-        remaining_deferrals: usize,
-        cancel_on_evaluate: Option<(Arc<SqliteWorldStorage>, EffectJobId)>,
-        observed: Arc<Mutex<Vec<WorldEffectServiceRequest>>>,
-    }
-
-    fn register_test_effect_routes(
-        host: &mut HostRuntime,
-        world_id: WorldId,
-        routes: TestEffectRoutes<'_>,
-    ) -> anyhow::Result<()> {
-        let scope = world_runtime_scope_id(world_id);
-        let system_instance = ExtensionInstanceId::new("effect-result-system");
-        host.engine.register_extension_instance(
-            system_instance.clone(),
-            scope.clone(),
-            test_manifest(routes.result_owner.as_str()),
-            vec![Box::new(WorldSystemProvider {
-                id: ComponentId::new("runtime"),
-                contract: world_system_service_contract_key(routes.result_schema),
-                event_schema: routes.event_schema.clone(),
-                cancel_on_evaluate: routes.cancel_on_evaluate,
-            })],
-        )?;
-        host.engine.start_extension_instance(&system_instance)?;
-
-        let effect_contract = world_effect_service_contract_key(routes.effect_schema);
-        let hijacker_instance = ExtensionInstanceId::new("a-effect-hijacker");
-        host.engine.register_extension_instance(
-            hijacker_instance.clone(),
-            scope.clone(),
-            test_manifest("rintawa.effect-hijacker"),
-            vec![Box::new(WorldEffectProvider {
-                id: ComponentId::new("runtime"),
-                contract: effect_contract.clone(),
-                result_command_schema: routes.result_schema.clone(),
-                remaining_retries: 0,
-                remaining_deferrals: 0,
-                should_cancel: true,
-                observed: Arc::new(Mutex::new(Vec::new())),
-            })],
-        )?;
-        host.engine.start_extension_instance(&hijacker_instance)?;
-
-        let provider_instance = ExtensionInstanceId::new("z-effect-provider");
-        host.engine.register_extension_instance(
-            provider_instance.clone(),
-            scope,
-            test_manifest(routes.effect_owner.as_str()),
-            vec![Box::new(WorldEffectProvider {
-                id: ComponentId::new("runtime"),
-                contract: effect_contract,
-                result_command_schema: routes.result_schema.clone(),
-                remaining_retries: routes.remaining_retries,
-                remaining_deferrals: routes.remaining_deferrals,
-                should_cancel: false,
-                observed: routes.observed,
-            })],
-        )?;
-        host.engine.start_extension_instance(&provider_instance)?;
-
-        let active = host
-            .active_worlds
-            .get_mut(&world_id)
-            .ok_or(HostError::WorldNotActive(world_id))?;
-        active.registered_instances.extend([
-            system_instance.clone(),
-            hijacker_instance.clone(),
-            provider_instance.clone(),
-        ]);
-        active
-            .started_instances
-            .extend([system_instance, hijacker_instance, provider_instance]);
-        Ok(())
     }
 
     struct RejectingWorldSystemProvider {
@@ -3934,48 +3376,18 @@ mod tests {
         }
     }
 
-    struct WorldEventSubscriber {
-        id: ComponentId,
-        topic: String,
-        observed: Arc<Mutex<Vec<(String, StoredWorldEvent)>>>,
-    }
-
-    impl Component for WorldEventSubscriber {
-        fn id(&self) -> &ComponentId {
-            &self.id
-        }
-
-        fn start(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
-            ctx.register_runtime_effect(RuntimeEffect::event_subscription(self.topic.clone()))?;
-            Ok(())
-        }
-
-        fn handle_event(
-            &mut self,
-            _ctx: &mut dyn ComponentContext,
-            topic: &str,
-            payload: &[u8],
-        ) -> ExtensionResult<()> {
-            let event: StoredWorldEvent = serde_json::from_slice(payload)
-                .map_err(|error| ExtensionError::Message(error.to_string()))?;
-            self.observed
-                .lock()
-                .map_err(|_| ExtensionError::Message(String::from("event observer lock poisoned")))?
-                .push((topic.to_string(), event));
-            Ok(())
-        }
-    }
-
     #[test]
-    fn test_should_publish_registered_extension_world_schemas_atomically() -> anyhow::Result<()> {
+    fn test_should_register_installed_world_property_and_runtime_schemas() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
-        let world_id = WorldId::new();
-        let storage = SqliteWorldStorage::create(root.path().join("world.sqlite"), world_id)?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let world_id = home.create_world()?.id;
         let scope = world_runtime_scope_id(world_id);
         let owner = ExtensionId::new("rintawa.schema-owner");
         let instance = ExtensionInstanceId::new("schema-owner-instance");
-        let first: SchemaKey = "rintawa.test.extension-event@1".parse()?;
-        let second: SchemaKey = "rintawa.test.extension-facet@1".parse()?;
+        let property: SchemaKey = "rintawa.test.mood@1".parse()?;
+        let command: SchemaKey = "rintawa.test.command@1".parse()?;
+        let event: SchemaKey = "rintawa.test.event@1".parse()?;
+        let projection: SchemaKey = "rintawa.test.view@1".parse()?;
         let mut engine = ExtensionEngine::new();
 
         engine.register_extension_instance(
@@ -3986,34 +3398,74 @@ mod tests {
                 id: ComponentId::new("schemas"),
                 schemas: vec![
                     WorldSchemaContribution::new(
-                        first.clone(),
+                        property.clone(),
+                        SchemaKind::Property,
+                        r#"{"type":"object"}"#,
+                    ),
+                    WorldSchemaContribution::new(
+                        command.clone(),
+                        SchemaKind::Command,
+                        r#"{"type":"object"}"#,
+                    ),
+                    WorldSchemaContribution::new(
+                        event.clone(),
                         SchemaKind::Event,
                         r#"{"type":"object"}"#,
                     ),
                     WorldSchemaContribution::new(
-                        second.clone(),
-                        SchemaKind::Facet,
-                        r#"{"type":"string"}"#,
+                        projection.clone(),
+                        SchemaKind::Projection,
+                        r#"{"type":"object"}"#,
                     ),
                 ],
             })],
         )?;
 
-        register_world_schema_contributions(&engine, &storage, std::slice::from_ref(&instance))?;
-        let session = storage.load_session()?;
-        let first_definition = session
-            .schemas()
-            .get(&first)
-            .expect("event schema must persist");
-        assert_eq!(first_definition.owner(), &owner);
-        assert_eq!(first_definition.kind(), SchemaKind::Event);
+        let mut host = HostRuntime {
+            active_worlds: BTreeMap::new(),
+            engine,
+            started_instances: Vec::new(),
+            host_shell_provider: None,
+            ui_layer_provider: None,
+            host_access: None,
+        };
+        let parts = prepare_world_runtime(&mut host, &home, world_id, &[instance])?;
+        assert!(parts.projections.contains_key(&projection));
+
+        let inspection = home.open_world_storage(world_id)?;
+        let session = inspection.load_session()?;
+        let registered = session
+            .properties()
+            .get(&property)
+            .expect("property definition must persist in the world vocabulary");
+        // The owner is Host composition metadata and is not persisted in the
+        // world vocabulary; only the exact name, version and schema document are.
         assert_eq!(
-            session.schemas().get(&second).map(SchemaDefinition::kind),
-            Some(SchemaKind::Facet)
+            registered.schema(),
+            &serde_json::json!({ "type": "object" })
+        );
+        assert_eq!(session.properties().len(), 1);
+        assert_eq!(session.properties().get(&command), None);
+        assert_eq!(session.properties().get(&event), None);
+        assert_eq!(session.properties().get(&projection), None);
+
+        // Exact re-registration is idempotent across world restarts.
+        let repeated = PropertyDefinition::new(
+            property.clone(),
+            owner.clone(),
+            serde_json::json!({ "type": "object" }),
+        );
+        parts.runtime.register_property_definitions(&[repeated])?;
+        assert_eq!(
+            home.open_world_storage(world_id)?
+                .load_session()?
+                .properties()
+                .len(),
+            1
         );
 
-        register_world_schema_contributions(&engine, &storage, &[instance])?;
-        assert_eq!(storage.load_session()?.schemas().len(), 2);
+        parts.runtime.shutdown()?;
+        host.shutdown()?;
         Ok(())
     }
 
@@ -4021,8 +3473,8 @@ mod tests {
     fn test_should_reject_malformed_extension_schema_without_partial_publication()
     -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
-        let world_id = WorldId::new();
-        let storage = SqliteWorldStorage::create(root.path().join("world.sqlite"), world_id)?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let world_id = home.create_world()?.id;
         let scope = world_runtime_scope_id(world_id);
         let owner = ExtensionId::new("rintawa.bad-schema-owner");
         let instance = ExtensionInstanceId::new("bad-schema-owner-instance");
@@ -4039,19 +3491,34 @@ mod tests {
                 schemas: vec![
                     WorldSchemaContribution::new(
                         valid.clone(),
-                        SchemaKind::Event,
+                        SchemaKind::Property,
                         r#"{"type":"object"}"#,
                     ),
-                    WorldSchemaContribution::new(invalid.clone(), SchemaKind::Facet, "{"),
+                    WorldSchemaContribution::new(invalid.clone(), SchemaKind::Event, "{"),
                 ],
             })],
         )?;
 
+        let mut host = HostRuntime {
+            active_worlds: BTreeMap::new(),
+            engine,
+            started_instances: Vec::new(),
+            host_shell_provider: None,
+            ui_layer_provider: None,
+            host_access: None,
+        };
         assert!(matches!(
-            register_world_schema_contributions(&engine, &storage, &[instance]),
+            prepare_world_runtime(&mut host, &home, world_id, &[instance]),
             Err(HostError::InvalidWorldSchemaJson { schema, .. }) if schema == invalid
         ));
-        assert!(storage.load_session()?.schemas().is_empty());
+        assert!(
+            home.open_world_storage(world_id)?
+                .load_session()?
+                .properties()
+                .is_empty()
+        );
+        assert!(host.active_worlds.is_empty());
+        host.shutdown()?;
         Ok(())
     }
 
@@ -4310,7 +3777,6 @@ mod tests {
             title: String::from("Test World"),
             description: None,
             cover: None,
-            commit_position: 0,
         };
 
         control
@@ -4345,7 +3811,6 @@ mod tests {
                 title: String::from("Test World"),
                 description: None,
                 cover: None,
-                commit_position: 3,
             })
             .expect("world-session status must remain readable");
         assert!(!observed.active);
@@ -4392,7 +3857,6 @@ mod tests {
         let created = WorldSessionAccess::create_world(access.as_ref())
             .expect("world-session access must create an empty world");
         let world_id: WorldId = created.world_id.parse()?;
-        assert_eq!(created.commit_position, 0);
         assert!(!created.active);
         assert_eq!(created.pending_active, None);
         assert!(!host.is_world_active(world_id));
@@ -4839,21 +4303,6 @@ mod tests {
         let projection_schema: SchemaKey = "rintawa.test.deferred-view@1".parse()?;
         let owner = ExtensionId::new("rintawa.test-deferred-projection");
         let storage = home.open_world_storage(world_id)?;
-        storage.register_schema(&SchemaDefinition::new(
-            projection_schema.clone(),
-            SchemaKind::Projection,
-            owner.clone(),
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "provider": { "const": "owner" },
-                    "principal": { "type": "string" }
-                },
-                "required": ["provider", "principal"],
-                "additionalProperties": false
-            }),
-        ))?;
-        let outbox = home.open_world_storage(world_id)?;
 
         let world_sessions = WorldSessionRuntimeControl::default();
         world_sessions.record_outcome(world_id, true, None)?;
@@ -4875,8 +4324,12 @@ mod tests {
             ui_layer_provider: None,
             host_access: Some(access.clone()),
         };
-        let projection =
-            host.bind_world_projection(world_id, projection_schema.clone(), owner.clone())?;
+        let projection = host.bind_world_projection(
+            world_id,
+            projection_schema.clone(),
+            owner.clone(),
+            Vec::new(),
+        )?;
         let contract = world_projection_service_contract_key(&projection_schema);
         let scope = world_runtime_scope_id(world_id);
         let observed = Arc::new(Mutex::new(Vec::new()));
@@ -4889,6 +4342,7 @@ mod tests {
                 id: ComponentId::new("runtime"),
                 contract,
                 reject: false,
+                reads: Vec::new(),
                 observed: Arc::clone(&observed),
             })],
         )?;
@@ -4898,10 +4352,7 @@ mod tests {
         host.active_worlds.insert(
             world_id,
             ActiveWorld {
-                deferred_effects: BTreeMap::new(),
                 runtime,
-                outbox,
-                effect_handlers: BTreeMap::new(),
                 projections: BTreeMap::from([(projection_schema.clone(), projection)]),
                 signals: RuntimeSignalQueue::default(),
                 registered_instances: vec![provider_instance.clone()],
@@ -4990,13 +4441,35 @@ mod tests {
                 WorldCommandRequest {
                     world_id: world.id.to_string(),
                     schema: String::from("example.command@1"),
-                    actor: WorldCommandActor::Principal,
-                    expected_position: Some(0),
                     payload_json: br#"{"value":1}"#.to_vec(),
                     verified_ui_action: false,
                 },
             ),
             Err(WorldCommandAccessError::WorldNotActive)
+        );
+        assert_eq!(
+            WorldCommandAccess::submit_world_command(
+                &access,
+                WorldCommandRequest {
+                    world_id: world.id.to_string(),
+                    schema: String::from("not-versioned"),
+                    payload_json: br#"{"value":1}"#.to_vec(),
+                    verified_ui_action: false,
+                },
+            ),
+            Err(WorldCommandAccessError::InvalidSchema)
+        );
+        assert_eq!(
+            WorldCommandAccess::submit_world_command(
+                &access,
+                WorldCommandRequest {
+                    world_id: world.id.to_string(),
+                    schema: String::from("example.command@1"),
+                    payload_json: b"not-json".to_vec(),
+                    verified_ui_action: false,
+                },
+            ),
+            Err(WorldCommandAccessError::InvalidPayload)
         );
 
         world_sessions
@@ -5007,8 +4480,6 @@ mod tests {
             WorldCommandRequest {
                 world_id: world.id.to_string(),
                 schema: String::from("example.command@1"),
-                actor: WorldCommandActor::Principal,
-                expected_position: Some(0),
                 payload_json: br#"{"value":1}"#.to_vec(),
                 verified_ui_action: false,
             },
@@ -5016,22 +4487,25 @@ mod tests {
         .map_err(|error| anyhow::anyhow!("world-command submission failed: {error:?}"))?;
         let queued = world_commands.drain_pending()?;
         assert_eq!(queued.len(), 1);
+        // The Principal is always the authenticated local Host principal, never a
+        // guest-supplied or claimed UI-action identity.
         assert_eq!(queued[0].command.principal(), principal);
-        assert_eq!(queued[0].command.actor(), ActorRef::Principal(principal));
-        assert_eq!(queued[0].command.expected_position(), Some(0));
-        assert_eq!(queued[0].admission, CommandAdmission::Unknown);
+        assert_eq!(queued[0].command.schema().to_string(), "example.command@1");
+        assert_eq!(
+            queued[0].command.payload(),
+            &serde_json::json!({ "value": 1 })
+        );
         assert_eq!(accepted.command_id, queued[0].command.id().to_string());
         assert_eq!(
             accepted.correlation_id,
             queued[0].command.correlation_id().to_string()
         );
+
         let accepted_ui = WorldCommandAccess::submit_world_command(
             &access,
             WorldCommandRequest {
                 world_id: world.id.to_string(),
                 schema: String::from("example.command@1"),
-                actor: WorldCommandActor::Principal,
-                expected_position: None,
                 payload_json: br#"{"value":2}"#.to_vec(),
                 verified_ui_action: true,
             },
@@ -5039,8 +4513,11 @@ mod tests {
         .map_err(|error| anyhow::anyhow!("UI queue failed: {error:?}"))?;
         let queued = world_commands.drain_pending()?;
         assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].admission, CommandAdmission::Interactive);
         assert_eq!(queued[0].command.principal(), principal);
+        assert_eq!(
+            queued[0].command.payload(),
+            &serde_json::json!({ "value": 2 })
+        );
         assert_eq!(accepted_ui.command_id, queued[0].command.id().to_string());
         Ok(())
     }
@@ -5052,43 +4529,63 @@ mod tests {
         let home = HostHome::open(root.path().join("home"))?;
         let world = home.create_world()?;
         let command_schema: SchemaKey = "example.deferred-command@1".parse()?;
-        let event_schema: SchemaKey = "example.deferred-event@1".parse()?;
+        let property_schema: SchemaKey = "example.deferred-property@1".parse()?;
+        let signal_schema: SchemaKey = "example.deferred-signal@1".parse()?;
         let owner = ExtensionId::new("example.deferred-system");
         let storage = home.open_world_storage(world.id)?;
-        storage.register_schema(&SchemaDefinition::new(
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let created = Arc::new(Mutex::new(Vec::new()));
+        let mut builder = WorldRuntimeBuilder::new(storage);
+        builder.register_runtime_schema(RuntimeSchemaDefinition::new(
             command_schema.clone(),
             SchemaKind::Command,
             owner.clone(),
             serde_json::json!({ "type": "object" }),
         ))?;
-        storage.register_schema(&SchemaDefinition::new(
-            event_schema.clone(),
+        builder.register_runtime_schema(RuntimeSchemaDefinition::new(
+            signal_schema.clone(),
             SchemaKind::Event,
-            owner,
+            owner.clone(),
             serde_json::json!({ "type": "object" }),
         ))?;
-        let outbox = home.open_world_storage(world.id)?;
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let mut builder = WorldRuntimeBuilder::new(storage);
         builder.register_system(RecordingWorldSystem {
             command_schema: command_schema.clone(),
-            event_schema: event_schema.clone(),
+            property_schema: property_schema.clone(),
+            signal_schema: signal_schema.clone(),
             observed: Arc::clone(&observed),
+            created: Arc::clone(&created),
         })?;
         let runtime = builder.start()?;
+        let definition = PropertyDefinition::new(
+            property_schema.clone(),
+            owner,
+            serde_json::json!({ "type": "object" }),
+        );
+        runtime.register_property_definitions(&[definition])?;
 
+        let scope = world_runtime_scope_id(world.id);
+        let subscriber_instance = ExtensionInstanceId::new("deferred-command-subscriber");
+        let signals = Arc::new(Mutex::new(Vec::new()));
         let mut host = HostRuntime::start(&home)?;
+        host.engine.register_extension_instance(
+            subscriber_instance.clone(),
+            scope,
+            test_manifest("example.deferred-subscriber"),
+            vec![Box::new(RuntimeSignalSubscriber {
+                id: ComponentId::new("runtime"),
+                topic: signal_schema.to_string(),
+                observed: Arc::clone(&signals),
+            })],
+        )?;
+        host.engine.start_extension_instance(&subscriber_instance)?;
         host.active_worlds.insert(
             world.id,
             ActiveWorld {
-                deferred_effects: BTreeMap::new(),
                 runtime,
-                outbox,
-                effect_handlers: BTreeMap::new(),
                 projections: BTreeMap::new(),
                 signals: RuntimeSignalQueue::default(),
-                registered_instances: Vec::new(),
-                started_instances: Vec::new(),
+                registered_instances: vec![subscriber_instance.clone()],
+                started_instances: vec![subscriber_instance],
             },
         );
         host.record_world_session_result(world.id, &Ok(()))?;
@@ -5097,13 +4594,12 @@ mod tests {
             .as_ref()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("production host access must be attached"))?;
+
         let accepted = WorldCommandAccess::submit_world_command(
             access.as_ref(),
             WorldCommandRequest {
                 world_id: world.id.to_string(),
                 schema: command_schema.to_string(),
-                actor: WorldCommandActor::Principal,
-                expected_position: Some(0),
                 payload_json: br#"{"kind":"deferred"}"#.to_vec(),
                 verified_ui_action: false,
             },
@@ -5116,45 +4612,58 @@ mod tests {
             .map_err(|_| anyhow::anyhow!("test command observer lock poisoned"))?;
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].principal(), home.local_principal());
-        assert_eq!(
-            commands[0].actor(),
-            ActorRef::Principal(home.local_principal())
-        );
         assert_eq!(commands[0].id().to_string(), accepted.command_id);
         drop(commands);
+
+        let item = created
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test item observer lock poisoned"))?
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("System must create one item"))?;
         let inspection = home.open_world_storage(world.id)?;
-        assert_eq!(inspection.load_session()?.commit_position(), 1);
-        let events = inspection.events_after(0, 8)?;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].schema, event_schema);
-        assert_eq!(events[0].payload, serde_json::json!({ "kind": "deferred" }));
-        assert_eq!(events[0].provenance.admission, CommandAdmission::Unknown);
-        let accepted_ui = WorldCommandAccess::submit_world_command(
+        assert!(inspection.load_item(item)?.is_some());
+        let property = inspection
+            .load_property(item, &property_schema)?
+            .ok_or_else(|| anyhow::anyhow!("System property must be committed"))?;
+        assert_eq!(property.data(), &serde_json::json!({ "kind": "deferred" }));
+
+        // Post-COMMIT signals reach in-process subscribers of the world scope.
+        let delivered = signals
+            .lock()
+            .map_err(|_| anyhow::anyhow!("signal observer lock poisoned"))?;
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].topic(), signal_schema.to_string());
+        assert_eq!(delivered[0].payload(), br#"{"kind":"deferred"}"#);
+        assert_eq!(
+            delivered[0].correlation_id().map(|id| id.to_string()),
+            Some(accepted.correlation_id.clone())
+        );
+        drop(delivered);
+
+        // A second command with a UI-action attestation is still bound to the same
+        // authenticated Host principal and commits its own change set.
+        WorldCommandAccess::submit_world_command(
             access.as_ref(),
             WorldCommandRequest {
                 world_id: world.id.to_string(),
                 schema: command_schema.to_string(),
-                actor: WorldCommandActor::Principal,
-                expected_position: Some(1),
                 payload_json: br#"{"kind":"ui-action"}"#.to_vec(),
                 verified_ui_action: true,
             },
         )
         .map_err(|error| anyhow::anyhow!("UI command failed: {error:?}"))?;
         assert_eq!(host.pump_world_command_requests()?, 1);
-        let events = inspection.events_after(0, 8)?;
-        assert_eq!(events.len(), 2);
-        assert_eq!(inspection.load_session()?.commit_position(), 2);
-        assert_eq!(events[1].payload, serde_json::json!({"kind": "ui-action"}));
-        assert_eq!(
-            events[1].provenance.command_id.to_string(),
-            accepted_ui.command_id
-        );
-        assert_eq!(events[1].provenance.principal, home.local_principal());
-        assert_eq!(
-            events[1].provenance.admission,
-            CommandAdmission::Interactive
-        );
+        let created_items = created
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test item observer lock poisoned"))?
+            .clone();
+        assert_eq!(created_items.len(), 2);
+        let second = inspection
+            .load_property(created_items[1], &property_schema)?
+            .ok_or_else(|| anyhow::anyhow!("second System property must be committed"))?;
+        assert_eq!(second.data(), &serde_json::json!({ "kind": "ui-action" }));
+
         host.shutdown()?;
         Ok(())
     }
@@ -5165,20 +4674,9 @@ mod tests {
         let world_id = WorldId::new();
         let storage = SqliteWorldStorage::create(root.path().join("world.sqlite"), world_id)?;
         let command_schema: SchemaKey = "rintawa.test.service-command@1".parse()?;
-        let event_schema: SchemaKey = "rintawa.test.service-event@1".parse()?;
+        let signal_schema: SchemaKey = "rintawa.test.service-signal@1".parse()?;
         let owner = ExtensionId::new("rintawa.test-system");
-        storage.register_schema(&SchemaDefinition::new(
-            command_schema.clone(),
-            SchemaKind::Command,
-            owner.clone(),
-            serde_json::json!({ "type": "object" }),
-        ))?;
-        storage.register_schema(&SchemaDefinition::new(
-            event_schema.clone(),
-            SchemaKind::Event,
-            owner.clone(),
-            serde_json::json!({ "type": "object" }),
-        ))?;
+        let item_id = ItemId::new();
 
         let mut host = HostRuntime {
             active_worlds: BTreeMap::new(),
@@ -5213,14 +4711,26 @@ mod tests {
             vec![Box::new(WorldSystemProvider {
                 id: ComponentId::new("runtime"),
                 contract,
-                event_schema: event_schema.clone(),
-                cancel_on_evaluate: None,
+                signal_schema: signal_schema.clone(),
+                item_id,
             })],
         )?;
         host.engine.start_extension_instance(&provider_instance)?;
         host.started_instances.push(provider_instance);
 
         let mut builder = WorldRuntimeBuilder::new(storage);
+        builder.register_runtime_schema(RuntimeSchemaDefinition::new(
+            command_schema.clone(),
+            SchemaKind::Command,
+            ExtensionId::new("rintawa.test-system"),
+            serde_json::json!({ "type": "object" }),
+        ))?;
+        builder.register_runtime_schema(RuntimeSchemaDefinition::new(
+            signal_schema.clone(),
+            SchemaKind::Event,
+            ExtensionId::new("rintawa.test-system"),
+            serde_json::json!({ "type": "object" }),
+        ))?;
         builder.register_system(system)?;
         let world_runtime = builder.start()?;
         let principal = PrincipalId::new();
@@ -5228,18 +4738,18 @@ mod tests {
             .submit(WorldCommand::new(
                 command_schema,
                 principal,
-                ActorRef::Principal(principal),
                 serde_json::json!({ "kind": "extension-system" }),
             ))?
-            .wait_outcome()?;
+            .wait()?;
 
-        assert_eq!(outcome.receipt().position(), 1);
-        assert_eq!(outcome.committed_events().len(), 1);
-        assert_eq!(outcome.committed_events()[0].schema, event_schema);
+        assert_eq!(outcome.signals().len(), 1);
+        assert_eq!(outcome.signals()[0].schema(), &signal_schema);
         assert_eq!(
-            outcome.committed_events()[0].payload,
-            serde_json::json!({ "kind": "extension-system" })
+            outcome.signals()[0].payload(),
+            &serde_json::json!({ "kind": "extension-system" })
         );
+        let inspection = SqliteWorldStorage::open(root.path().join("world.sqlite"))?;
+        assert!(inspection.load_item(item_id)?.is_some());
 
         world_runtime.shutdown()?;
         host.shutdown()?;
@@ -5247,28 +4757,44 @@ mod tests {
     }
 
     #[test]
-    fn test_should_route_world_projection_only_to_schema_owner() -> anyhow::Result<()> {
+    fn test_should_route_world_projection_only_to_schema_owner_and_its_properties()
+    -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let path = root.path().join("world.sqlite");
         let world_id = WorldId::new();
         let storage = SqliteWorldStorage::create(&path, world_id)?;
         let projection_schema: SchemaKey = "rintawa.test.owner-view@1".parse()?;
         let owner = ExtensionId::new("rintawa.test-projection");
-        storage.register_schema(&SchemaDefinition::new(
-            projection_schema.clone(),
-            SchemaKind::Projection,
-            owner.clone(),
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "provider": { "const": "owner" },
-                    "principal": { "type": "string" }
-                },
-                "required": ["provider", "principal"],
-                "additionalProperties": false
-            }),
-        ))?;
-        let outbox = SqliteWorldStorage::open(&path)?;
+        let foreign_owner = ExtensionId::new("rintawa.other-projection");
+        let owned_property: SchemaKey = "rintawa.test.owned-property@1".parse()?;
+        let foreign_property: SchemaKey = "rintawa.test.foreign-property@1".parse()?;
+        let item = ItemId::new();
+
+        storage.register_definitions(&[
+            PropertyDefinition::new(
+                owned_property.clone(),
+                owner.clone(),
+                serde_json::json!({ "type": "object" }),
+            ),
+            PropertyDefinition::new(
+                foreign_property.clone(),
+                foreign_owner,
+                serde_json::json!({ "type": "object" }),
+            ),
+        ])?;
+        let mut transaction = WorldTransaction::new();
+        transaction.push_change(StateChange::CreateObject { id: item });
+        transaction.push_change(StateChange::SetProperty {
+            item,
+            key: owned_property.clone(),
+            data: serde_json::json!({ "owner": "self" }),
+        });
+        transaction.push_change(StateChange::SetProperty {
+            item,
+            key: foreign_property.clone(),
+            data: serde_json::json!({ "owner": "other" }),
+        });
+        storage.apply(&transaction)?;
 
         let mut host = HostRuntime {
             active_worlds: BTreeMap::new(),
@@ -5278,12 +4804,26 @@ mod tests {
             ui_layer_provider: None,
             host_access: None,
         };
-        let projection =
-            host.bind_world_projection(world_id, projection_schema.clone(), owner.clone())?;
+        let projection = host.bind_world_projection(
+            world_id,
+            projection_schema.clone(),
+            owner.clone(),
+            vec![owned_property.id().clone()],
+        )?;
         let contract = world_projection_service_contract_key(&projection_schema);
         let scope = world_runtime_scope_id(world_id);
         let hijacker_observed = Arc::new(Mutex::new(Vec::new()));
         let owner_observed = Arc::new(Mutex::new(Vec::new()));
+        let reads = vec![
+            WorldProjectionReadRequest::Property {
+                item_id: item,
+                key: owned_property.clone(),
+            },
+            WorldProjectionReadRequest::Property {
+                item_id: item,
+                key: foreign_property.clone(),
+            },
+        ];
 
         let hijacker_instance = ExtensionInstanceId::new("a-projection-hijacker");
         host.engine.register_extension_instance(
@@ -5294,6 +4834,7 @@ mod tests {
                 id: ComponentId::new("runtime"),
                 contract: contract.clone(),
                 reject: true,
+                reads: Vec::new(),
                 observed: Arc::clone(&hijacker_observed),
             })],
         )?;
@@ -5308,6 +4849,7 @@ mod tests {
                 id: ComponentId::new("runtime"),
                 contract,
                 reject: false,
+                reads,
                 observed: Arc::clone(&owner_observed),
             })],
         )?;
@@ -5317,10 +4859,7 @@ mod tests {
         host.active_worlds.insert(
             world_id,
             ActiveWorld {
-                deferred_effects: BTreeMap::new(),
                 runtime,
-                outbox,
-                effect_handlers: BTreeMap::new(),
                 projections: BTreeMap::from([(projection_schema.clone(), projection)]),
                 signals: RuntimeSignalQueue::default(),
                 registered_instances: vec![hijacker_instance.clone(), owner_instance.clone()],
@@ -5338,6 +4877,15 @@ mod tests {
         assert_eq!(view.principal(), principal);
         assert_eq!(view.value()["provider"], "owner");
         assert_eq!(view.value()["principal"], principal.to_string());
+        assert_eq!(
+            view.value()["properties"][owned_property.to_string()],
+            serde_json::json!({ "owner": "self" })
+        );
+        // Another extension's property is invisible even though the item exists.
+        assert_eq!(
+            view.value()["properties"][foreign_property.to_string()],
+            serde_json::Value::Null
+        );
         assert!(
             hijacker_observed
                 .lock()
@@ -5349,7 +4897,7 @@ mod tests {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("owner observer lock poisoned"))?
                 .len(),
-            1
+            2
         );
 
         host.deactivate_world(world_id)?;
@@ -5643,28 +5191,13 @@ mod tests {
     }
 
     #[test]
-    fn test_should_supervise_world_commit_delivery_replay_and_deactivation() -> anyhow::Result<()> {
+    fn test_should_supervise_world_activation_and_deactivation() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let home = HostHome::open(root.path().join("home"))?;
         let created = home.create_world()?;
         let world_id = created.id;
+        let principal = PrincipalId::new();
         let command_schema: SchemaKey = "rintawa.test.supervised-command@1".parse()?;
-        let event_schema: SchemaKey = "rintawa.test.supervised-event@1".parse()?;
-        let owner = ExtensionId::new("rintawa.supervised-system");
-        let storage = home.open_world_storage(world_id)?;
-        storage.register_schema(&SchemaDefinition::new(
-            command_schema.clone(),
-            SchemaKind::Command,
-            owner.clone(),
-            serde_json::json!({ "type": "object" }),
-        ))?;
-        storage.register_schema(&SchemaDefinition::new(
-            event_schema.clone(),
-            SchemaKind::Event,
-            owner.clone(),
-            serde_json::json!({ "type": "object" }),
-        ))?;
-        drop(storage);
 
         let mut host = HostRuntime::start(&home)?;
         host.activate_world(&home, world_id)?;
@@ -5674,84 +5207,18 @@ mod tests {
             Err(HostError::WorldAlreadyActive(id)) if id == world_id
         ));
 
-        let scope = world_runtime_scope_id(world_id);
-        let contract = world_system_service_contract_key(&command_schema);
-        let provider_instance = ExtensionInstanceId::new("supervised-system-provider");
-        host.engine.register_extension_instance(
-            provider_instance.clone(),
-            scope.clone(),
-            test_manifest(owner.as_str()),
-            vec![Box::new(WorldSystemProvider {
-                id: ComponentId::new("runtime"),
-                contract,
-                event_schema: event_schema.clone(),
-                cancel_on_evaluate: None,
-            })],
-        )?;
-        host.engine.start_extension_instance(&provider_instance)?;
-        host.started_instances.push(provider_instance);
-
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let subscriber_instance = ExtensionInstanceId::new("supervised-event-subscriber");
-        host.engine.register_extension_instance(
-            subscriber_instance.clone(),
-            scope,
-            test_manifest("rintawa.supervised-subscriber"),
-            vec![Box::new(WorldEventSubscriber {
-                id: ComponentId::new("runtime"),
-                topic: event_schema.to_string(),
-                observed: Arc::clone(&observed),
-            })],
-        )?;
-        host.engine.start_extension_instance(&subscriber_instance)?;
-        host.started_instances.push(subscriber_instance);
-
-        let principal = PrincipalId::new();
-        let command = WorldCommand::new(
-            command_schema.clone(),
-            principal,
-            ActorRef::Principal(principal),
-            serde_json::json!({ "kind": "supervised" }),
-        );
-        let first = host.submit_world_command(world_id, command.clone())?;
-        assert_eq!(
-            first.authoritative().receipt().disposition(),
-            CommitDisposition::Committed
-        );
-        assert_eq!(first.authoritative().receipt().position(), 1);
-        assert!(matches!(first.live_delivery(), Ok(1)));
-        assert_eq!(
-            observed
-                .lock()
-                .map_err(|_| anyhow::anyhow!("event observer lock poisoned"))?
-                .len(),
-            1
-        );
-
-        let replay = host.submit_world_command(world_id, command)?;
-        assert_eq!(
-            replay.authoritative().receipt().disposition(),
-            CommitDisposition::AlreadyCommitted
-        );
-        assert!(matches!(replay.live_delivery(), Ok(0)));
-        assert_eq!(
-            observed
-                .lock()
-                .map_err(|_| anyhow::anyhow!("event observer lock poisoned"))?
-                .len(),
-            1
-        );
+        host.poll_runtime()?;
+        assert!(host.is_world_active(world_id));
 
         host.deactivate_world(world_id)?;
         assert!(!host.is_world_active(world_id));
-        let next = WorldCommand::new(
+        let command = WorldCommand::new(
             command_schema,
             principal,
-            ActorRef::Principal(principal),
             serde_json::json!({ "kind": "after-stop" }),
         );
         assert!(matches!(
-            host.submit_world_command(world_id, next),
+            host.submit_world_command(world_id, command),
             Err(HostError::WorldNotActive(id)) if id == world_id
         ));
         assert!(matches!(
@@ -5759,734 +5226,11 @@ mod tests {
             Err(HostError::WorldNotActive(id)) if id == world_id
         ));
 
-        host.shutdown()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_retry_then_complete_owner_pinned_effect_job() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let home = HostHome::open(root.path().join("home"))?;
-        let world_id = home.create_world()?.id;
-        let seed_schema: SchemaKey = "rintawa.test.effect-seed@1".parse()?;
-        let result_schema: SchemaKey = "rintawa.test.effect-result@1".parse()?;
-        let event_schema: SchemaKey = "rintawa.test.effect-result-event@1".parse()?;
-        let effect_schema: SchemaKey = "rintawa.test.external-effect@1".parse()?;
-        let result_owner = ExtensionId::new("rintawa.effect-result-system");
-        let effect_owner = ExtensionId::new("rintawa.effect-provider");
-        let storage = home.open_world_storage(world_id)?;
-        storage.register_schemas(&[
-            SchemaDefinition::new(
-                seed_schema.clone(),
-                SchemaKind::Command,
-                ExtensionId::new("rintawa.effect-seed"),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                result_schema.clone(),
-                SchemaKind::Command,
-                result_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                event_schema.clone(),
-                SchemaKind::Event,
-                result_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                effect_schema.clone(),
-                SchemaKind::Effect,
-                effect_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-        ])?;
-        let principal = PrincipalId::new();
-        let (effect_id, correlation_id) =
-            enqueue_test_effect(&storage, &seed_schema, &effect_schema, principal)?;
-        drop(storage);
-
-        let mut host = HostRuntime::start(&home)?;
+        // A stopped world reopens from its durable four-table state.
         host.activate_world(&home, world_id)?;
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        register_test_effect_routes(
-            &mut host,
-            world_id,
-            TestEffectRoutes {
-                result_owner: &result_owner,
-                result_schema: &result_schema,
-                event_schema: &event_schema,
-                effect_owner: &effect_owner,
-                effect_schema: &effect_schema,
-                remaining_retries: 1,
-                remaining_deferrals: 0,
-                cancel_on_evaluate: None,
-                observed: Arc::clone(&observed),
-            },
-        )?;
+        assert!(host.is_world_active(world_id));
+        assert_eq!(host.active_worlds.len(), 1);
 
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(100))?,
-            1
-        );
-        let inspection = home.open_world_storage(world_id)?;
-        assert_eq!(
-            inspection.next_effect_wakeup()?,
-            Some(UnixTimeMillis::new(1_100))
-        );
-        assert_eq!(inspection.load_session()?.commit_position(), 1);
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(1_099))?,
-            0
-        );
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(1_100))?,
-            1
-        );
-        assert_eq!(inspection.load_session()?.commit_position(), 2);
-        assert!(
-            inspection
-                .claim_next_effect(UnixTimeMillis::new(2_000), UnixTimeMillis::new(3_000))?
-                .is_none()
-        );
-        let events = inspection.events_after(0, 16)?;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].schema, event_schema);
-        assert_eq!(
-            events[0].provenance.causation,
-            Some(CausationRef::Effect(effect_id))
-        );
-        assert_eq!(events[0].provenance.correlation_id, correlation_id);
-        assert_eq!(
-            observed
-                .lock()
-                .map_err(|_| anyhow::anyhow!("effect observer lock poisoned"))?
-                .len(),
-            2
-        );
-
-        host.deactivate_world(world_id)?;
-        host.shutdown()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_defer_effect_until_multiple_polls_complete() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let home = HostHome::open(root.path().join("home"))?;
-        let world_id = home.create_world()?.id;
-        let seed_schema: SchemaKey = "rintawa.test.effect-seed@1".parse()?;
-        let result_schema: SchemaKey = "rintawa.test.effect-result@1".parse()?;
-        let event_schema: SchemaKey = "rintawa.test.effect-result-event@1".parse()?;
-        let effect_schema: SchemaKey = "rintawa.test.external-effect@1".parse()?;
-        let result_owner = ExtensionId::new("rintawa.effect-result-system");
-        let effect_owner = ExtensionId::new("rintawa.effect-provider");
-        let storage = home.open_world_storage(world_id)?;
-        storage.register_schemas(&[
-            SchemaDefinition::new(
-                seed_schema.clone(),
-                SchemaKind::Command,
-                ExtensionId::new("rintawa.effect-seed"),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                result_schema.clone(),
-                SchemaKind::Command,
-                result_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                event_schema.clone(),
-                SchemaKind::Event,
-                result_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                effect_schema.clone(),
-                SchemaKind::Effect,
-                effect_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-        ])?;
-        let principal = PrincipalId::new();
-        let (effect_id, correlation_id) =
-            enqueue_test_effect(&storage, &seed_schema, &effect_schema, principal)?;
-        drop(storage);
-
-        let mut host = HostRuntime::start(&home)?;
-        host.activate_world(&home, world_id)?;
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        register_test_effect_routes(
-            &mut host,
-            world_id,
-            TestEffectRoutes {
-                result_owner: &result_owner,
-                result_schema: &result_schema,
-                event_schema: &event_schema,
-                effect_owner: &effect_owner,
-                effect_schema: &effect_schema,
-                remaining_retries: 0,
-                remaining_deferrals: 2,
-                cancel_on_evaluate: None,
-                observed: Arc::clone(&observed),
-            },
-        )?;
-
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(100))?,
-            1
-        );
-        assert_eq!(host.active_worlds[&world_id].deferred_effects.len(), 1);
-        assert_eq!(
-            host.next_effect_wakeup_delay(UnixTimeMillis::new(100))?,
-            Some(Duration::from_millis(250))
-        );
-        let inspection = home.open_world_storage(world_id)?;
-        assert_eq!(inspection.load_session()?.commit_position(), 1);
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(349))?,
-            0
-        );
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(350))?,
-            1
-        );
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(599))?,
-            0
-        );
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(600))?,
-            1
-        );
-        assert!(host.active_worlds[&world_id].deferred_effects.is_empty());
-        assert_eq!(inspection.load_session()?.commit_position(), 2);
-        let events = inspection.events_after(0, 16)?;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].provenance.correlation_id, correlation_id);
-        assert_eq!(
-            events[0].provenance.causation,
-            Some(CausationRef::Effect(effect_id))
-        );
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(1000))?,
-            0
-        );
-        let calls = observed.lock().unwrap();
-        assert_eq!(calls.len(), 3);
-        assert!(calls.iter().all(|call| call.job().id == effect_id));
-        assert!(calls.iter().all(|call| call.job().attempt_count == 1));
-        assert_eq!(calls[0].continuation(), None);
-        assert_eq!(calls[1].continuation(), Some("2"));
-        assert_eq!(calls[2].continuation(), Some("1"));
-        assert!(
-            calls
-                .iter()
-                .all(|call| call.lease_expires_at() == UnixTimeMillis::new(30100))
-        );
-        drop(calls);
-        host.deactivate_world(world_id)?;
-        host.shutdown()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_restart_deferred_effect_as_new_fenced_attempt() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let home = HostHome::open(root.path().join("home"))?;
-        let world_id = home.create_world()?.id;
-        let seed_schema: SchemaKey = "rintawa.test.effect-seed@1".parse()?;
-        let result_schema: SchemaKey = "rintawa.test.effect-result@1".parse()?;
-        let event_schema: SchemaKey = "rintawa.test.effect-result-event@1".parse()?;
-        let effect_schema: SchemaKey = "rintawa.test.external-effect@1".parse()?;
-        let result_owner = ExtensionId::new("rintawa.effect-result-system");
-        let effect_owner = ExtensionId::new("rintawa.effect-provider");
-        let storage = home.open_world_storage(world_id)?;
-        storage.register_schemas(&[
-            SchemaDefinition::new(
-                seed_schema.clone(),
-                SchemaKind::Command,
-                ExtensionId::new("rintawa.effect-seed"),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                result_schema.clone(),
-                SchemaKind::Command,
-                result_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                event_schema.clone(),
-                SchemaKind::Event,
-                result_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                effect_schema.clone(),
-                SchemaKind::Effect,
-                effect_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-        ])?;
-        let principal = PrincipalId::new();
-        let (effect_id, correlation_id) =
-            enqueue_test_effect(&storage, &seed_schema, &effect_schema, principal)?;
-        drop(storage);
-
-        let mut host = HostRuntime::start(&home)?;
-        host.activate_world(&home, world_id)?;
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        register_test_effect_routes(
-            &mut host,
-            world_id,
-            TestEffectRoutes {
-                result_owner: &result_owner,
-                result_schema: &result_schema,
-                event_schema: &event_schema,
-                effect_owner: &effect_owner,
-                effect_schema: &effect_schema,
-                remaining_retries: 0,
-                remaining_deferrals: 1,
-                cancel_on_evaluate: None,
-                observed: Arc::clone(&observed),
-            },
-        )?;
-
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(100))?,
-            1
-        );
-        assert_eq!(host.active_worlds[&world_id].deferred_effects.len(), 1);
-        host.deactivate_world(world_id)?;
-        host.shutdown()?;
-
-        let inspection = home.open_world_storage(world_id)?;
-        assert_eq!(inspection.load_session()?.commit_position(), 1);
-        let mut host = HostRuntime::start(&home)?;
-        host.activate_world(&home, world_id)?;
-        register_test_effect_routes(
-            &mut host,
-            world_id,
-            TestEffectRoutes {
-                result_owner: &result_owner,
-                result_schema: &result_schema,
-                event_schema: &event_schema,
-                effect_owner: &effect_owner,
-                effect_schema: &effect_schema,
-                remaining_retries: 0,
-                remaining_deferrals: 0,
-                cancel_on_evaluate: None,
-                observed: Arc::clone(&observed),
-            },
-        )?;
-        assert!(host.active_worlds[&world_id].deferred_effects.is_empty());
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(30_099))?,
-            0
-        );
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(30_100))?,
-            1
-        );
-        assert_eq!(inspection.load_session()?.commit_position(), 2);
-        let events = inspection.events_after(0, 16)?;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].provenance.correlation_id, correlation_id);
-        assert_eq!(
-            events[0].provenance.causation,
-            Some(CausationRef::Effect(effect_id))
-        );
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(30_300))?,
-            0
-        );
-        let calls = observed.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].job().id, effect_id);
-        assert_eq!(calls[1].job().id, effect_id);
-        assert_eq!(calls[0].job().attempt_count, 1);
-        assert_eq!(calls[1].job().attempt_count, 2);
-        assert_eq!(calls[0].continuation(), None);
-        assert_eq!(calls[1].continuation(), None);
-        drop(calls);
-
-        host.deactivate_world(world_id)?;
-        host.shutdown()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_discard_late_effect_response_and_reclaim_before_world_commit()
-    -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let home = HostHome::open(root.path().join("home"))?;
-        let world_id = home.create_world()?.id;
-        let seed_schema: SchemaKey = "rintawa.test.effect-seed@1".parse()?;
-        let result_schema: SchemaKey = "rintawa.test.effect-result@1".parse()?;
-        let event_schema: SchemaKey = "rintawa.test.effect-result-event@1".parse()?;
-        let effect_schema: SchemaKey = "rintawa.test.external-effect@1".parse()?;
-        let result_owner = ExtensionId::new("rintawa.effect-result-system");
-        let effect_owner = ExtensionId::new("rintawa.effect-provider");
-        let storage = home.open_world_storage(world_id)?;
-        storage.register_schemas(&[
-            SchemaDefinition::new(
-                seed_schema.clone(),
-                SchemaKind::Command,
-                ExtensionId::new("rintawa.effect-seed"),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                result_schema.clone(),
-                SchemaKind::Command,
-                result_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                event_schema.clone(),
-                SchemaKind::Event,
-                result_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                effect_schema.clone(),
-                SchemaKind::Effect,
-                effect_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-        ])?;
-        let principal = PrincipalId::new();
-        let (effect_id, correlation_id) =
-            enqueue_test_effect(&storage, &seed_schema, &effect_schema, principal)?;
-        drop(storage);
-
-        let mut host = HostRuntime::start(&home)?;
-        host.activate_world(&home, world_id)?;
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        register_test_effect_routes(
-            &mut host,
-            world_id,
-            TestEffectRoutes {
-                result_owner: &result_owner,
-                result_schema: &result_schema,
-                event_schema: &event_schema,
-                effect_owner: &effect_owner,
-                effect_schema: &effect_schema,
-                remaining_retries: 0,
-                remaining_deferrals: 0,
-                cancel_on_evaluate: None,
-                observed: Arc::clone(&observed),
-            },
-        )?;
-
-        // The first provider callback completes after the lease expires.
-        // Its valid-looking command must be discarded; only a new fenced
-        // attempt may create the canonical event.
-        let mut moments = [100, 100, 30_100].into_iter();
-        assert_eq!(
-            host.pump_effect_outbox_with_clock(world_id, || {
-                UnixTimeMillis::new(moments.next().unwrap_or(30_100))
-            })?,
-            2
-        );
-        let inspection = home.open_world_storage(world_id)?;
-        assert_eq!(inspection.load_session()?.commit_position(), 2);
-        let events = inspection.events_after(0, 16)?;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].payload["attempt"], 2);
-        assert_eq!(events[0].provenance.correlation_id, correlation_id);
-        assert_eq!(
-            events[0].provenance.causation,
-            Some(CausationRef::Effect(effect_id))
-        );
-        let calls = observed.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].job().attempt_count, 1);
-        assert_eq!(calls[1].job().attempt_count, 2);
-        assert!(calls.iter().all(|request| request.continuation().is_none()));
-        drop(calls);
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(30_300))?,
-            0
-        );
-        host.deactivate_world(world_id)?;
-        host.shutdown()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_not_resume_cancelled_deferred_effect() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let home = HostHome::open(root.path().join("home"))?;
-        let world_id = home.create_world()?.id;
-        let seed_schema: SchemaKey = "rintawa.test.effect-seed@1".parse()?;
-        let result_schema: SchemaKey = "rintawa.test.effect-result@1".parse()?;
-        let event_schema: SchemaKey = "rintawa.test.effect-result-event@1".parse()?;
-        let effect_schema: SchemaKey = "rintawa.test.external-effect@1".parse()?;
-        let result_owner = ExtensionId::new("rintawa.effect-result-system");
-        let effect_owner = ExtensionId::new("rintawa.effect-provider");
-        let storage = home.open_world_storage(world_id)?;
-        storage.register_schemas(&[
-            SchemaDefinition::new(
-                seed_schema.clone(),
-                SchemaKind::Command,
-                ExtensionId::new("rintawa.effect-seed"),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                result_schema.clone(),
-                SchemaKind::Command,
-                result_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                event_schema.clone(),
-                SchemaKind::Event,
-                result_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                effect_schema.clone(),
-                SchemaKind::Effect,
-                effect_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-        ])?;
-        let principal = PrincipalId::new();
-        let (effect_id, correlation_id) =
-            enqueue_test_effect(&storage, &seed_schema, &effect_schema, principal)?;
-        drop(storage);
-
-        let mut host = HostRuntime::start(&home)?;
-        host.activate_world(&home, world_id)?;
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        register_test_effect_routes(
-            &mut host,
-            world_id,
-            TestEffectRoutes {
-                result_owner: &result_owner,
-                result_schema: &result_schema,
-                event_schema: &event_schema,
-                effect_owner: &effect_owner,
-                effect_schema: &effect_schema,
-                remaining_retries: 0,
-                remaining_deferrals: 1,
-                cancel_on_evaluate: None,
-                observed: Arc::clone(&observed),
-            },
-        )?;
-
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(100))?,
-            1
-        );
-        let inspection = home.open_world_storage(world_id)?;
-        assert!(inspection.cancel_effect(effect_id)?);
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(350))?,
-            1
-        );
-        assert!(host.active_worlds[&world_id].deferred_effects.is_empty());
-        assert_eq!(inspection.load_session()?.commit_position(), 1);
-        assert!(inspection.events_after(0, 16)?.is_empty());
-        let calls = observed.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].job().provenance.correlation_id, correlation_id);
-        drop(calls);
-        host.deactivate_world(world_id)?;
-        host.shutdown()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_fence_cancellation_during_world_system_evaluation() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let home = HostHome::open(root.path().join("home"))?;
-        let world_id = home.create_world()?.id;
-        let seed_schema: SchemaKey = "rintawa.test.effect-seed@1".parse()?;
-        let result_schema: SchemaKey = "rintawa.test.effect-result@1".parse()?;
-        let event_schema: SchemaKey = "rintawa.test.effect-result-event@1".parse()?;
-        let effect_schema: SchemaKey = "rintawa.test.external-effect@1".parse()?;
-        let result_owner = ExtensionId::new("rintawa.effect-result-system");
-        let effect_owner = ExtensionId::new("rintawa.effect-provider");
-        let storage = home.open_world_storage(world_id)?;
-        storage.register_schemas(&[
-            SchemaDefinition::new(
-                seed_schema.clone(),
-                SchemaKind::Command,
-                ExtensionId::new("rintawa.effect-seed"),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                result_schema.clone(),
-                SchemaKind::Command,
-                result_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                event_schema.clone(),
-                SchemaKind::Event,
-                result_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                effect_schema.clone(),
-                SchemaKind::Effect,
-                effect_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-        ])?;
-        let principal = PrincipalId::new();
-        let (effect_id, correlation_id) =
-            enqueue_test_effect(&storage, &seed_schema, &effect_schema, principal)?;
-        drop(storage);
-
-        let mut host = HostRuntime::start(&home)?;
-        host.activate_world(&home, world_id)?;
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        register_test_effect_routes(
-            &mut host,
-            world_id,
-            TestEffectRoutes {
-                result_owner: &result_owner,
-                result_schema: &result_schema,
-                event_schema: &event_schema,
-                effect_owner: &effect_owner,
-                effect_schema: &effect_schema,
-                remaining_retries: 0,
-                remaining_deferrals: 0,
-                cancel_on_evaluate: Some((Arc::new(home.open_world_storage(world_id)?), effect_id)),
-                observed: Arc::clone(&observed),
-            },
-        )?;
-
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(100))?,
-            1
-        );
-        let inspection = home.open_world_storage(world_id)?;
-        assert_eq!(inspection.load_session()?.commit_position(), 1);
-        assert!(inspection.events_after(0, 10)?.is_empty());
-        assert!(!inspection.cancel_effect(effect_id)?);
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(300))?,
-            0
-        );
-        let calls = observed.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].job().id, effect_id);
-        assert_eq!(calls[0].job().provenance.correlation_id, correlation_id);
-        drop(calls);
-        host.deactivate_world(world_id)?;
-        host.shutdown()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_recover_effect_after_follow_up_commit_without_duplicate_world_commit()
-    -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let home = HostHome::open(root.path().join("home"))?;
-        let world_id = home.create_world()?.id;
-        let seed_schema: SchemaKey = "rintawa.test.crash-seed@1".parse()?;
-        let result_schema: SchemaKey = "rintawa.test.crash-result@1".parse()?;
-        let event_schema: SchemaKey = "rintawa.test.crash-result-event@1".parse()?;
-        let effect_schema: SchemaKey = "rintawa.test.crash-effect@1".parse()?;
-        let result_owner = ExtensionId::new("rintawa.crash-result-system");
-        let effect_owner = ExtensionId::new("rintawa.crash-effect-provider");
-        let storage = home.open_world_storage(world_id)?;
-        storage.register_schemas(&[
-            SchemaDefinition::new(
-                seed_schema.clone(),
-                SchemaKind::Command,
-                ExtensionId::new("rintawa.crash-seed"),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                result_schema.clone(),
-                SchemaKind::Command,
-                result_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                event_schema.clone(),
-                SchemaKind::Event,
-                result_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                effect_schema.clone(),
-                SchemaKind::Effect,
-                effect_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-        ])?;
-        let principal = PrincipalId::new();
-        let (effect_id, _) =
-            enqueue_test_effect(&storage, &seed_schema, &effect_schema, principal)?;
-        drop(storage);
-
-        let mut host = HostRuntime::start(&home)?;
-        host.activate_world(&home, world_id)?;
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        register_test_effect_routes(
-            &mut host,
-            world_id,
-            TestEffectRoutes {
-                result_owner: &result_owner,
-                result_schema: &result_schema,
-                event_schema: &event_schema,
-                effect_owner: &effect_owner,
-                effect_schema: &effect_schema,
-                remaining_retries: 0,
-                remaining_deferrals: 0,
-                cancel_on_evaluate: None,
-                observed: Arc::clone(&observed),
-            },
-        )?;
-
-        let claim = host.active_worlds[&world_id]
-            .outbox
-            .claim_next_effect(UnixTimeMillis::new(100), UnixTimeMillis::new(200))?
-            .expect("effect must be claimable");
-        assert_eq!(claim.attempt(), 1);
-        let response =
-            host.active_worlds[&world_id].effect_handlers[&effect_schema].execute(&claim)?;
-        let WorldEffectServiceResponse::Complete {
-            command: Some(command),
-        } = response
-        else {
-            anyhow::bail!("effect provider must complete with a command");
-        };
-        let first = host.submit_world_command(world_id, command)?;
-        assert_eq!(
-            first.authoritative().receipt().disposition(),
-            CommitDisposition::Committed
-        );
-        assert_eq!(first.authoritative().receipt().position(), 2);
-
-        // Simulate a process crash after the command commit but before complete_effect.
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(200))?,
-            1
-        );
-        let inspection = home.open_world_storage(world_id)?;
-        assert_eq!(inspection.load_session()?.commit_position(), 2);
-        assert_eq!(inspection.events_after(0, 16)?.len(), 1);
-        assert!(
-            inspection
-                .claim_next_effect(UnixTimeMillis::new(300), UnixTimeMillis::new(400))?
-                .is_none()
-        );
-        let requests = observed
-            .lock()
-            .map_err(|_| anyhow::anyhow!("effect observer lock poisoned"))?;
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].job().id, effect_id);
-        assert_eq!(requests[0].job().attempt_count, 1);
-        assert_eq!(requests[1].job().attempt_count, 2);
-        drop(requests);
-
-        host.deactivate_world(world_id)?;
         host.shutdown()?;
         Ok(())
     }
@@ -6497,7 +5241,6 @@ mod tests {
         let root = tempfile::tempdir()?;
         let world_id = WorldId::new();
         let storage = SqliteWorldStorage::create(root.path().join("world.sqlite"), world_id)?;
-        let outbox = SqliteWorldStorage::open(root.path().join("world.sqlite"))?;
         let world_runtime = WorldRuntimeBuilder::new(storage).start()?;
         let scope = world_runtime_scope_id(world_id);
         let instance = ExtensionInstanceId::new("runtime-signal-subscriber");
@@ -6521,10 +5264,7 @@ mod tests {
             active_worlds: BTreeMap::from([(
                 world_id,
                 ActiveWorld {
-                    deferred_effects: BTreeMap::new(),
                     runtime: world_runtime,
-                    outbox,
-                    effect_handlers: BTreeMap::new(),
                     projections: BTreeMap::new(),
                     signals: RuntimeSignalQueue::default(),
                     registered_instances: vec![instance.clone()],
@@ -6609,86 +5349,6 @@ mod tests {
             Err(HostError::WorldNotActive(id)) if id == world_id
         ));
         host.shutdown()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_deliver_full_durable_world_event_envelope() -> anyhow::Result<()> {
-        let world_id = WorldId::new();
-        let scope = world_runtime_scope_id(world_id);
-        let instance = ExtensionInstanceId::new("world-event-subscriber");
-        let schema: rintawa_sdk::world::SchemaKey = "rintawa.test.event@1".parse()?;
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let mut engine = ExtensionEngine::new();
-
-        engine.register_extension_instance(
-            instance.clone(),
-            scope.clone(),
-            test_manifest("world-event-subscriber"),
-            vec![Box::new(WorldEventSubscriber {
-                id: ComponentId::new("runtime"),
-                topic: schema.to_string(),
-                observed: Arc::clone(&observed),
-            })],
-        )?;
-        engine.start_extension_instance(&instance)?;
-
-        let principal = PrincipalId::new();
-        let event = StoredWorldEvent {
-            world_id,
-            id: WorldEventId::new(),
-            commit_position: 7,
-            event_index: 0,
-            provenance: CommandProvenance {
-                command_id: CommandId::new(),
-                command_schema: "rintawa.test.command@1".parse()?,
-                principal,
-                actor: ActorRef::Principal(principal),
-                causation: None,
-                correlation_id: CorrelationId::new(),
-                effective_at: Some(UnixTimeMillis::new(1234)),
-                admission: rintawa_world::CommandAdmission::Unknown,
-                recorded_at: UnixTimeMillis::new(5678),
-            },
-            schema: schema.clone(),
-            payload: serde_json::json!({ "message": "hello" }),
-        };
-
-        let mut runtime = HostRuntime {
-            active_worlds: BTreeMap::new(),
-            engine,
-            started_instances: vec![instance],
-            host_shell_provider: None,
-            ui_layer_provider: None,
-            host_access: None,
-        };
-
-        let mut foreign_event = event.clone();
-        foreign_event.world_id = WorldId::new();
-        assert!(matches!(
-            runtime.dispatch_world_events(&[event.clone(), foreign_event]),
-            Err(HostError::MixedWorldEventBatch)
-        ));
-        assert!(
-            observed
-                .lock()
-                .map_err(|_| anyhow::anyhow!("event observer lock poisoned"))?
-                .is_empty()
-        );
-
-        assert_eq!(
-            runtime.dispatch_world_events(std::slice::from_ref(&event))?,
-            1
-        );
-        let deliveries = observed
-            .lock()
-            .map_err(|_| anyhow::anyhow!("event observer lock poisoned"))?;
-        assert_eq!(deliveries.len(), 1);
-        assert_eq!(deliveries[0].0, schema.to_string());
-        assert_eq!(deliveries[0].1, event);
-        drop(deliveries);
-
-        runtime.shutdown()?;
         Ok(())
     }
 

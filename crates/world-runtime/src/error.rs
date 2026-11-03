@@ -97,9 +97,19 @@ pub enum WorldRuntimeError {
     #[error("World System for {0} panicked")]
     SystemPanicked(SchemaKey),
 
-    /// Ordinary extension Systems may not mint or revoke Core control grants.
-    #[error("World System for {0} attempted a privileged authority mutation")]
-    AuthorityMutationDenied(SchemaKey),
+    /// A System produced a change set that the world model or vocabulary rejected.
+    #[error("World System for {schema} produced an invalid transaction")]
+    InvalidTransaction {
+        /// Command schema owned by the System.
+        schema: SchemaKey,
+        /// World-model validation error.
+        #[source]
+        source: rintawa_world::WorldError,
+    },
+
+    /// The runtime session state could not be locked after an internal panic.
+    #[error("world runtime session state is unavailable")]
+    RuntimePoisoned,
 
     /// The runtime worker thread could not be spawned.
     #[error("failed to spawn world runtime worker")]
