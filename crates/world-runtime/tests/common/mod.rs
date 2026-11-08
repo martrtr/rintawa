@@ -19,8 +19,8 @@ use rintawa_sdk::{
 };
 use rintawa_storage::SqliteWorldStorage;
 use rintawa_world::{
-    PropertyDefinition, RuntimeSchemaDefinition, RuntimeSignal, SchemaKind, StateChange,
-    WorldCommand, WorldTransaction,
+    PropertyDefinition, RuntimeSchemaDefinition, SchemaKind, StateChange, WorldCommand,
+    WorldTransaction,
 };
 use rintawa_world_runtime::{
     SystemError, SystemResult, WorldRuntimeBuilder, WorldSnapshot, WorldSystem,
@@ -37,8 +37,6 @@ pub const IDENTITY: &str = "runtime-test.identity@1";
 pub const MOOD: &str = "runtime-test.mood@1";
 /// Fixture property used as a monotonically increasing sequence value.
 pub const SEQUENCE: &str = "runtime-test.sequence@1";
-/// Fixture best-effort post-COMMIT signal schema.
-pub const SIGNAL: &str = "runtime-test.changed@1";
 
 /// Canonical fixture schema keys shared by the integration-test binaries.
 #[derive(Debug, Clone)]
@@ -51,8 +49,6 @@ pub struct TestSchemas {
     pub mood: SchemaKey,
     /// Sequence property.
     pub sequence: SchemaKey,
-    /// Post-COMMIT signal schema.
-    pub signal: SchemaKey,
 }
 
 /// Parses one canonical fixture schema key.
@@ -67,7 +63,6 @@ pub fn schemas() -> TestSchemas {
         identity: key(IDENTITY),
         mood: key(MOOD),
         sequence: key(SEQUENCE),
-        signal: key(SIGNAL),
     }
 }
 
@@ -93,23 +88,39 @@ fn property_definition(key: &SchemaKey, schema: serde_json::Value) -> PropertyDe
     PropertyDefinition::new(key.clone(), ExtensionId::new(EXTENSION), schema)
 }
 
-/// Creates one empty World database with the fixture property vocabulary.
-///
-/// The persisted vocabulary is restored by [`WorldRuntimeBuilder::start`], so the
-/// tests never need to re-register definitions after a restart.
-pub fn create_storage() -> Result<(TempDir, SqliteWorldStorage, TestSchemas)> {
-    let directory = TempDir::new()?;
-    let path = directory.path().join("world.sqlite");
-    let storage = SqliteWorldStorage::create(&path, WorldId::new())?;
-    let schemas = schemas();
-    storage.register_definitions(&[
+/// Returns property definitions owned by the fixture's installed extension.
+pub fn fixture_definitions(schemas: &TestSchemas) -> Vec<PropertyDefinition> {
+    vec![
         property_definition(&schemas.identity, identity_schema()),
         property_definition(&schemas.mood, mood_schema()),
         property_definition(
             &schemas.sequence,
             serde_json::json!({ "type": "integer", "minimum": 0 }),
         ),
-    ])?;
+    ]
+}
+
+/// Binds installed definitions to their active Host-approved owner.
+///
+/// The on-disk vocabulary intentionally does not persist extension ownership.
+/// Tests that evaluate property commands must explicitly activate the bindings
+/// after reopening the World. Merely restoring the stored JSON Schema does not
+/// authorize a System to access that property.
+pub fn activate_fixture_properties(
+    runtime: &rintawa_world_runtime::WorldRuntime,
+    schemas: &TestSchemas,
+) -> Result<()> {
+    runtime.register_property_definitions(&fixture_definitions(schemas))?;
+    Ok(())
+}
+
+/// Creates one empty World database with the fixture property vocabulary.
+pub fn create_storage() -> Result<(TempDir, SqliteWorldStorage, TestSchemas)> {
+    let directory = TempDir::new()?;
+    let path = directory.path().join("world.sqlite");
+    let storage = SqliteWorldStorage::create(&path, WorldId::new())?;
+    let schemas = schemas();
+    storage.register_definitions(&fixture_definitions(&schemas))?;
     Ok((directory, storage, schemas))
 }
 
@@ -217,20 +228,14 @@ impl WorldSystem for RecordingSystem {
 pub struct ScriptedSystem {
     command_schema: SchemaKey,
     changes: Vec<StateChange>,
-    signals: Vec<RuntimeSignal>,
 }
 
 impl ScriptedSystem {
-    /// Creates a System that proposes exactly the supplied change set and signals.
-    pub fn new(
-        command_schema: SchemaKey,
-        changes: Vec<StateChange>,
-        signals: Vec<RuntimeSignal>,
-    ) -> Self {
+    /// Creates a System that proposes exactly the supplied change set.
+    pub fn new(command_schema: SchemaKey, changes: Vec<StateChange>) -> Self {
         Self {
             command_schema,
             changes,
-            signals,
         }
     }
 }
@@ -248,9 +253,6 @@ impl WorldSystem for ScriptedSystem {
         let mut transaction = WorldTransaction::new();
         for change in &self.changes {
             transaction.push_change(change.clone());
-        }
-        for signal in &self.signals {
-            transaction.push_signal(signal.clone());
         }
         Ok(transaction)
     }

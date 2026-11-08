@@ -13,7 +13,8 @@ Core owns:
 - extension execution and service routing;
 - authoritative World state, transactions and persistence;
 - generic permissions and bounded runtime capabilities;
-- renderer-neutral Portable UI and presentation routing.
+- generic host capabilities and native World Runtime boundaries;
+- no Core-owned UI renderer/protocol after the Portable UI retirement.
 
 Core does not own Chat, Characters, Narrator, AI, inventory, quests or a specific
 renderer. Standard product packages live in
@@ -126,10 +127,10 @@ per WASM loader, so distinct provider/consumer components from separate loader
 factories in the same Engine can resolve leases correctly. A real two-component
 WASM service fixture exercises this boundary, restart, cancellation and failure.
 
-The World model has **no durable effect/job identity**. A committed command may attach
-best-effort runtime signals; no job outbox, retry table or effect lease exists. Any
-external work a feature wants to perform is started by the extension after it observes a
-signal or result, and is never part of the authoritative commit.
+The World model has **no durable effect/job identity** and no built-in
+post-COMMIT signal transport. There is no job outbox, retry table or effect lease.
+Any external work must be initiated outside the authoritative transaction through
+an extension-owned interaction boundary. No automatic retry or replay is implied.
 
 ## World authority
 
@@ -149,33 +150,73 @@ The state model is deliberately small:
   inheritance path; `player`, `npc` and similar are ordinary extension properties with
   no Core ownership semantics.
 
-Commands enter a bounded single-writer runtime. A registered System evaluates a command
-against a pinned SQLite WAL snapshot and proposes one `WorldTransaction` containing an
-ordered change set and optional signals. The runtime validates the change set against
-the persisted property vocabulary and applies it as one `BEGIN IMMEDIATE` transaction, so
-items and properties of one command become visible atomically or not at all. The reply
-is produced only after COMMIT.
+Commands enter a bounded single-writer runtime. The runtime validates each command
+payload against its registered JSON Schema before the System evaluates it against a
+pinned SQLite WAL snapshot. The System proposes a `WorldTransaction` containing only
+an ordered item/property change set. The runtime validates property values against
+the persisted vocabulary and applies the changes as one `BEGIN IMMEDIATE` transaction.
+Items and properties become visible atomically or not at all; the reply is produced
+only after COMMIT.
 
 ```text
 command
   -> bounded single-writer queue
+  -> command JSON Schema validation
   -> System (pinned snapshot)
   -> WorldTransaction
        changes: create/delete item, set/remove property
-       signals: best-effort, not persisted
   -> vocabulary validation
   -> one SQLite transaction (COMMIT)
-  -> outcome + best-effort signal dispatch
+  -> committed outcome or explicit error
 ```
 
 There is no durable command ledger: a repeated command is evaluated and committed again,
 and no receipt, disposition or commit position is returned. The single-writer queue is
 the only ordering mechanism, and it is in-memory; a Host restart loses queued work.
 
-Read-side feature views use owner-pinned Projection services. A projection provider may
-read only the property names it owns; reads of any other name resolve to `None` even when
-the World stores a value. Renderer code receives validated projections, not World storage
-access.
+Read-side access uses pinned SQLite snapshots and bounded item/property queries.
+Native World snapshots can find values by exact versioned property key using the
+existing (name, version, item) index and an exclusive item-ID cursor; pages are
+limited to 256 values or 8 MiB of JSON data, whichever is reached first.
+Oversized pages return a read error rather than a truncated success. Relation
+queries can batch up to 64 target item IDs and
+page through deduplicated relation-items, again in ID order. These are direct
+read primitives, not the retired Projection service or a new extension transport.
+The authorization gate is applied to indexed property searches before querying;
+relation structure does not grant access to foreign property values. Deletion
+checks now inspect distinct affected property keys through one joined SQLite
+query instead of performing one properties lookup per adjacent relation.
+
+Each running System gets a property-scoped snapshot: its trusted command-schema owner
+comes from Host-installed runtime declarations, never from the command Principal.
+The Runtime accepts active property owner bindings only from Host-installed package
+definitions, revalidated against the durable JSON Schema. While those bindings
+are grouped by logical ExtensionId, Host rejects two different runtime instances
+of the same logical extension that both declare World schemas: otherwise the
+instances could inherit each other's property access even with distinct schema
+keys. World System calls are pinned more narrowly to the exact declaring
+instance/component, including when other same-ID components advertise the same
+service contract. This is an explicit MVP restriction, not per-item ownership.
+An absent binding denies
+read and write even when that definition is stored in SQLite. A System can neither
+read another owner's property directly, enumerate its property values, set/remove
+that property, nor delete an item if the resulting SQLite cascade would erase
+another owner's property on that item or a relation. Rejection occurs before COMMIT.
+
+Structural item/relation changes only enter through an installed, Host-bound
+command System. The Host pins the service provider to the owning extension,
+never an arbitrary same-scope package; the World Runtime validates the proposal
+and SQLite validates relation endpoints and cascades. These are composition and
+integrity boundaries, not independent per-item ownership permissions.
+
+Native Host snapshots remain unrestricted and must not be exposed to guests. There
+is no per-item owner or full graph ACL in this MVP: an item with no protected
+properties is not protected solely by its identity. A World file deliberately does
+not persist extension ownership, so future Host approval of an artifact declaring
+an identical property key and JSON Schema can establish a new active owner. Exact
+artifact admission and composition policy must therefore remain a trusted Host
+boundary. No automatic cross-extension property access is granted. The retired
+World Projection service transport is intentionally not replaced here.
 
 ### Deliberately reduced World guarantees
 
@@ -190,62 +231,60 @@ explicitly does **not** provide:
   state;
 - more than one World per database, or any cross-World state.
 
-Post-COMMIT runtime signals are best-effort in-process notifications. They are never
-persisted or replayed, and a crash between COMMIT and dispatch loses them by design.
+The dedicated World runtime-signal bridge and its subscriptions have been removed.
+The separate generic Extension Engine event callbacks remain in-process and do not
+imply durable delivery, World-change notifications or replay. After reconnecting,
+consumers must re-read authoritative World state rather than assume they received
+every notification.
 
 ## Content and files
 
 Rintawa uses separate paths for different lifecycles:
 
 - **RTW CAS** — immutable packages and content containers;
-- **User Content** — versioned logical content such as reusable Character templates;
 - **Asset Store** — immutable binary media addressed by `AssetRef`;
 - **UserResourceRef** — bounded ephemeral file ingress for picker/import workflows.
 
-Large media uses bounded streaming paths instead of Portable UI text/base64 payloads.
+A caller embedding an `AssetRef` in an extension-owned item property must import
+and verify the immutable bytes through the Asset Store **before** committing
+that property. Arbitrary property JSON is not introspected for AssetRefs by Core;
+there is no implicit CAS validation of domain-specific fields or auto-import.
+The Host separately verifies the explicitly typed World cover AssetRef before
+committing `world.manifest`. Integration tests cover both persisted references
+and opening the original bytes after a Host restart.
 
-## Portable UI
+The retired generic user-content index (`content/library.toml`) is no longer created,
+loaded or modified by the Host; pre-existing files are left on disk. The old
+`user-content` WIT interface, permissions and `content-*` CLI commands are absent.
+Packages such as the previous Character Library that import the old WIT interface
+must be migrated and rebuilt before they can run against this reduced ABI.
 
-Extensions publish semantic Portable UI surfaces, nodes and actions. They do not inject
-React, DOM or renderer-specific widgets.
+Large media uses bounded streaming paths rather than embedding unbounded bytes in messages.
 
-A UI Layer renders the visible presentation. One presentation session sees:
+## Extension interaction and presentation after the UI cut
 
-```text
-its baseline-visible surfaces
-+ surfaces from at most one explicitly focused World
-```
+Core no longer owns a Portable UI runtime, surface trees, patch models, UI action
+routing, UI Layer selection or World presentation/focus. The former `ui-runtime`
+crate, SDK UI model, WIT `portable-ui` / `ui-layer` imports and guest action
+callbacks, and their Engine/Host wiring have been removed together. The old
+platform rintawa.ui.layer@1 role is no longer defined by Host.
 
-Focus is presentation state, not World lifecycle. Multiple Worlds may remain active while
-one UI session focuses only one of them.
+This is a deliberate breaking ABI change. Installed RTWs compiled against the
+retired UI WIT/SDK must be rebuilt for a future extension-owned interaction
+protocol. Core does not supply compatibility shims or claim a working Web UI.
+World lifecycle, native authoritative commands, persistent state, CAS and
+permission checks remain independent of presentation.
 
-The active UI Layer exposes an O(1), owner-checked presentation generation. It changes
-when a visible surface is mounted, patched, unmounted or deactivated, or when that
-layer's focus/pending-focus state changes. Mutations in unrelated World scopes do not
-invalidate its generation. Web Runtime checks this token and its local management
-context revision before rebuilding the full presentation on its idle network tick.
-A newly connected renderer still receives a full snapshot during the handshake.
-Portable UI admission also enforces three renderer-neutral JSON byte budgets:
-768 KiB for one surface snapshot, 768 KiB for the complete visible surface
-envelope of each active UI Layer (including its focused World), and 16 MiB
-across all mounted snapshots retained in the Host. These values leave space
-beneath the current 1 MiB UI Layer Host message ceiling for focus and shell
-metadata. The runtime counts serialized UTF-8 JSON bytes, not Unicode characters.
-It validates an initial mount and every patched result before publication;
-it also checks deferred activation, late UI Layer attachment, and World focus
-against the currently visible aggregate. Failed admission leaves previous
-snapshots, revisions, and focus untouched. Unmount, deactivation and unregister
-release retained byte accounting. User action payloads and streamed media have
-separate budgets and never become presentation values implicitly.
-
-A World chooses its initial UI through the platform-owned
-`rintawa.world.presentation@1` binding. The selected provider must own the declared entry
-surface. World Manager therefore opens a World without knowing whether the World presents
-Chat, a visual novel, 3D UI or something else.
+A replacement interaction transport has **not** been integrated. The proposed
+Zenoh approach is an experiment that must first prove query/reply, publish/
+subscribe, authenticated ownership, World scope isolation, cancellation and
+resource bounds on real native/WASM boundaries. UI formats and component
+contributions will belong to the consuming extensions, not new Core widget DTOs.
 
 ## Standard product composition
 
-The standard experience is implemented by rtwKit packages:
+The historical standard experience was implemented by rtwKit packages.
+These packages are not verified compatible with the current reduced ABI:
 
 | Package | Responsibility |
 | --- | --- |
@@ -255,14 +294,52 @@ The standard experience is implemented by rtwKit packages:
 | rtwKit Character Library | Reusable Character templates and Tavern V2/V3 world creator |
 | rtwKit Chat | World-scoped conversations, messages, branches and Chat presentation |
 
-World creation is extensible through `rintawa.world.creator@1`. World Manager renders
-creator choices; creator providers return capability/results, not foreign UI trees.
+The historical creator-extension protocol and its UI need migration; the
+reduced Core no longer implements their presentation path.
+
+## World metadata and storage after the MVP cut
+
+A new World uses four authoritative SQLite tables. Its human-facing title,
+description and optional verified CAS cover are stored in the JSON
+world.manifest metadata object and are committed atomically. There is no
+catalog.toml sidecar and no automatic migration of older experimental World
+SQLite databases. Listing worlds reads existing state without creating
+metadata files or modifying World databases. The previous global user-content
+library and World Projection API have been retired; older RTW packages
+depending on those APIs are not supported.
+
+The following standard package composition description is historical until
+the separate interaction/UI replacement lands.
 
 ## Invariants
 
 - Product semantics and renderer-specific behavior stay outside Core.
 - Scope boundaries are explicit; there is no implicit cross-scope provider fallback.
-- World focus is presentation state, not lifecycle state.
+- A World can activate without a UI; Core has no UI presentation protocol.
 - Extensions do not receive raw filesystem paths, SQLite handles or DOM access.
 - Canonical World state changes only through authoritative commands and atomic change
-  sets; post-COMMIT signals and external work are best-effort and never canonical.
+  sets; generic in-process Engine events and external work are not World state.
+
+## Retired guest World command ingress
+
+The deprecated WIT world-commands submission endpoint, its
+world-command-submit permission, and Host deferred command queue have been
+removed. The previous endpoint returned only an accepted identifier, not the
+authoritative commit result. Native World Runtime commands continue to return
+errors or successful results after the single-writer SQLite commit; this
+refactor does not add a replacement guest transport.
+
+The persistent host-local identity.toml and its fabricated single-user
+Principal have also been removed. Component identity and exact artifact/Host
+permission approval remain separate from any future human/session identity.
+Existing legacy identity files are left untouched, but not loaded.
+
+## Retired World runtime-signal bridge
+
+The World transaction signal proposal, Host signal queue/pump and the matching
+SDK and WIT signal subscriptions have been removed together. World Systems now
+return only current-state changes, and successful native World command results
+contain a command ID after commit. The generic Extension Engine event-subscription
+mechanism is retained for existing active component callbacks and cleanup; it is
+not a substitute for durable World events and is not a new notification protocol.
+A future extension interaction transport requires separate verification.

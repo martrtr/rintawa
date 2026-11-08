@@ -2,7 +2,9 @@
 
 Rintawa is a local-first runtime for persistent Worlds composed from immutable RTW
 packages. Core provides generic package execution, scoped composition, authoritative World
-state and renderer-neutral UI infrastructure; product features are extensions.
+state and scoped extension execution. Product features and presentation are
+extension-owned. Core's experimental Portable UI runtime and World-focus
+bridge have been retired; a replacement interaction transport is not yet integrated.
 
 Standard packages and the Web experience live in
 [rtwKit](https://github.com/martrtr/rtwKit).
@@ -36,9 +38,15 @@ The World model deliberately keeps a reduced set of guarantees:
 - one World per database, with no durable command ledger or receipts, so a repeated
   command is evaluated and committed again;
 - no event log, no replay and no consumer cursors;
-- no durable jobs or outbox: post-COMMIT runtime signals are best-effort in-process
-  notifications and are lost if the process dies between COMMIT and dispatch;
-- no actor records or control grants; authority stays Host composition policy.
+- no durable jobs, outbox, or World event/signal transport; generic Extension
+  Engine event callbacks are in-process only, without World delivery guarantees;
+- no actor records or control grants; authority stays Host composition policy;
+- World Systems use owner-scoped property reads/writes, including cascade-delete
+  checks, while native Host snapshots remain trusted and unrestricted. Property
+  ownership is re-established from approved artifacts on each activation, not
+  persisted in the transferable four-table World;
+- indexed, paginated searches by versioned property key and bounded relation batch
+  reads are native World primitives; no new guest query transport is implied.
 
 ## Documentation
 

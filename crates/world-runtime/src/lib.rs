@@ -8,9 +8,7 @@
 #![warn(missing_docs, rustdoc::broken_intra_doc_links)]
 
 mod error;
-mod projection;
 mod runtime;
-mod service;
 mod snapshot;
 mod system;
 
@@ -18,25 +16,9 @@ pub use error::{
     SystemError, SystemResult, WorldReadError, WorldReadResult, WorldRuntimeError,
     WorldRuntimeResult,
 };
-pub use projection::{
-    MAX_WORLD_PROJECTION_DIAGNOSTIC_BYTES, MAX_WORLD_PROJECTION_INPUT_BYTES,
-    MAX_WORLD_PROJECTION_SERVICE_READS, MAX_WORLD_PROJECTION_SERVICE_ROUNDS,
-    ServiceWorldProjection, WORLD_PROJECTION_SERVICE_PROTOCOL_VERSION, WorldProjectionError,
-    WorldProjectionResult, WorldProjectionServiceClient,
-};
-pub use rintawa_sdk::world_projection::{
-    WorldProjectionReadRequest, WorldProjectionReadResult, WorldProjectionServiceRequest,
-    WorldProjectionServiceResponse, WorldProjectionView, world_projection_service_contract_key,
-};
 pub use runtime::{
     DEFAULT_COMMAND_QUEUE_CAPACITY, MAX_COMMAND_QUEUE_CAPACITY, WorldCommandOutcome,
     WorldCommandTicket, WorldRuntime, WorldRuntimeBuilder, WorldRuntimePolicy,
-};
-pub use service::{
-    MAX_WORLD_SYSTEM_SERVICE_READS, MAX_WORLD_SYSTEM_SERVICE_ROUNDS, ServiceWorldSystem,
-    WORLD_SYSTEM_SERVICE_PROTOCOL_VERSION, WorldSystemReadRequest, WorldSystemReadResult,
-    WorldSystemServiceClient, WorldSystemServiceRequest, WorldSystemServiceResponse,
-    world_system_service_contract_key,
 };
 pub use snapshot::WorldSnapshot;
 pub use system::WorldSystem;

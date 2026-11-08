@@ -15,7 +15,6 @@
 //! ## Modules
 //!
 //! - [`types`] — identifiers and primitive types
-//! - [`content`] — generic extension-provided RTW content-handler protocol
 //! - [`contributions`] — contribution descriptions
 //! - [`manifest`] — manifest file structure
 //! - [`traits`] — traits for component implementation
@@ -25,15 +24,12 @@
 //! - [`secrets`] — validated secret paths and redacted secret values
 //! - [`runtime_permissions`] — explicitly requested host runtime capabilities
 //! - [`world`] — feature-neutral world identifiers and schema keys
-//! - [`world_system`] — public ordinary World System service transport
-//! - [`world_projection`] — public policy-filtered World Projection service transport
 //! - [`prelude`] — commonly used imports
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, rustdoc::broken_intra_doc_links)]
 
 pub mod api;
-pub mod content;
 pub mod context;
 pub mod contracts;
 pub mod contributions;
@@ -41,14 +37,9 @@ pub mod errors;
 pub mod manifest;
 pub mod runtime_effects;
 pub mod runtime_permissions;
-pub mod runtime_signals;
 pub mod secrets;
-pub mod services;
 pub mod traits;
 pub mod types;
-pub mod ui;
 pub mod world;
-pub mod world_projection;
-pub mod world_system;
 
 pub mod prelude;

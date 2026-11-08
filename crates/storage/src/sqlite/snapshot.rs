@@ -64,6 +64,51 @@ impl SqliteWorldSnapshot {
         query::list_properties(&self.connection, item)
     }
 
+    /// Finds a bounded page of values for one exact property definition.
+    ///
+    /// Results are ordered by item UUID; pass the last returned item as the next
+    /// exclusive cursor. A page is capped at 256 records and 8 MiB of JSON.
+    /// This is an unrestricted native storage operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or malformed page-size error.
+    pub fn find_properties(
+        &self,
+        key: &SchemaKey,
+        after: Option<ItemId>,
+        limit: usize,
+    ) -> StorageResult<Vec<PropertyRecord>> {
+        query::find_properties(&self.connection, key, after, limit)
+    }
+
+    /// Reads relations adjacent to any of the given objects in one SQL query.
+    ///
+    /// Relations are returned once, in ID order, even when both endpoints are
+    /// present in the input batch. Both batch and result size are bounded.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid page/batch limits or a storage error.
+    pub fn relations_touching_any(
+        &self,
+        targets: &[ItemId],
+        after: Option<ItemId>,
+        limit: usize,
+    ) -> StorageResult<Vec<ItemRecord>> {
+        query::relations_touching_any(&self.connection, targets, after, limit)
+    }
+
+    /// Returns keys on the item and its incident relations that SQLite would
+    /// remove as part of an item deletion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pinned state contains invalid property keys.
+    pub fn property_keys_deleted_with_item(&self, item: ItemId) -> StorageResult<Vec<SchemaKey>> {
+        query::property_keys_deleted_with_item(&self.connection, item)
+    }
+
     /// Loads every relation whose subject or object is the given item.
     ///
     /// # Errors

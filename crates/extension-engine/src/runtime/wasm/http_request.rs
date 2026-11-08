@@ -818,18 +818,6 @@ mod tests {
     }
 
     #[test]
-    fn test_should_keep_http_access_separate_from_general_host_service_access() {
-        let mut state = WasmHostState::new(ComponentId::new("provider"));
-        state.instance_id = Some(ExtensionInstanceId::new("example"));
-        state.begin_service_execution(None, false);
-        assert!(state.http_request_access_active);
-        assert!(!state.host_access_active);
-        assert!(!state.network_access_active);
-        state.finish_service_execution();
-        assert!(!state.http_request_access_active);
-    }
-
-    #[test]
     fn test_should_stream_chunk_fragments_without_loss_or_duplication() {
         let mut state = state_with_owner("example");
         let (handle, sender, cancelled) = insert_fake_request(&mut state, owner("example"));

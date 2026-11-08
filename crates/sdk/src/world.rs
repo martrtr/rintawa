@@ -96,28 +96,6 @@ opaque_world_id!(
     PrincipalId,
     "Opaque globally unique identifier of one authenticated outside principal."
 );
-opaque_world_id!(
-    CorrelationId,
-    "Opaque globally unique identifier that correlates one causal operation chain."
-);
-
-/// Signed Unix timestamp in milliseconds used for durable provenance metadata.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct UnixTimeMillis(i64);
-
-impl UnixTimeMillis {
-    /// Creates a timestamp from milliseconds relative to the Unix epoch.
-    pub const fn new(value: i64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the signed millisecond value relative to the Unix epoch.
-    pub const fn get(self) -> i64 {
-        self.0
-    }
-}
-
 /// Semantic category of one versioned world schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -126,12 +104,6 @@ pub enum SchemaKind {
     Property,
     /// Schema describing one world command payload.
     Command,
-    /// Schema describing one ephemeral runtime signal payload.
-    Event,
-    /// Schema describing one best-effort external effect payload.
-    Effect,
-    /// Schema describing one extension-owned policy-filtered projection payload.
-    Projection,
 }
 
 impl fmt::Display for SchemaKind {
@@ -139,9 +111,6 @@ impl fmt::Display for SchemaKind {
         formatter.write_str(match self {
             Self::Property => "property",
             Self::Command => "command",
-            Self::Event => "event",
-            Self::Effect => "effect",
-            Self::Projection => "projection",
         })
     }
 }

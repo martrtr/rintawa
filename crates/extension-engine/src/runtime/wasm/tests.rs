@@ -3,25 +3,18 @@
 use super::*;
 use crate::{
     host_access::{
-        AcceptedUserContentWrite, AcceptedWorldCommand, AcceptedWorldProjectionRead,
         ArtifactStoreAccess, AssetStoreAccess, CompositionAccess, CompositionActivation,
         HostAccessError, HostAccessResult, ImportedArtifact, ImportedAsset, PreferenceAccess,
         RuntimeArtifactPolicy, RuntimeContextAccess, RuntimeHttpOriginGrant, RuntimePolicyAccess,
-        RuntimePolicyComponent, UserContentAccess, UserContentDocument, UserContentSummary,
-        UserContentWriteAccess, UserContentWriteStatus, UserResourceAccess, UserResourceRef,
-        WorldCommandAccess, WorldCommandAccessResult, WorldCommandRequest, WorldProjectionAccess,
-        WorldProjectionAccessError, WorldProjectionAccessResult, WorldProjectionReadStatus,
-        WorldProjectionReadView, WorldProjectionRequest, WorldSessionAccess, WorldSessionSummary,
+        RuntimePolicyComponent, UserResourceAccess, UserResourceRef, WorldSessionAccess,
+        WorldSessionSummary,
     },
     secrets::InMemorySecretVault,
-    services::ServiceInstanceRegistration,
 };
 use rintawa_sdk::{
     api::{LogLevel, LoggerApi},
-    contracts::ComponentRef,
     secrets::{SecretPath, SecretPathPattern, SecretValue},
     types::ExtensionId,
-    ui::{UiPatchBatch, UiSurfaceSnapshot},
 };
 use std::{
     net::{IpAddr, Ipv4Addr},
@@ -72,10 +65,7 @@ struct RecordingScopedHostAccess {
     http_origin_policy_reads: Mutex<Vec<String>>,
     http_origin_policy_writes: Mutex<Vec<HttpOriginPolicyWrite>>,
     user_resources: Mutex<Vec<Vec<u8>>>,
-    user_content_writes: Mutex<Vec<Vec<u8>>>,
     world_session_writes: Mutex<Vec<(String, bool)>>,
-    world_command_writes: Mutex<Vec<WorldCommandRequest>>,
-    world_projection_reads: Mutex<Vec<WorldProjectionRequest>>,
 }
 
 impl RuntimeContextAccess for RecordingScopedHostAccess {
@@ -154,82 +144,6 @@ impl UserResourceAccess for RecordingScopedHostAccess {
     }
 }
 
-impl UserContentAccess for RecordingScopedHostAccess {
-    fn list_user_content(
-        &self,
-        content: Option<&str>,
-    ) -> HostAccessResult<Vec<UserContentSummary>> {
-        if content.is_some_and(|content| content != "example.content@1") {
-            return Ok(Vec::new());
-        }
-        Ok(vec![UserContentSummary {
-            id: String::from("018f0000-0000-7000-8000-000000000010"),
-            content: String::from("example.content@1"),
-            revision: String::from(
-                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            ),
-        }])
-    }
-
-    fn read_user_content(&self, id: &str) -> HostAccessResult<UserContentDocument> {
-        if id != "018f0000-0000-7000-8000-000000000010" {
-            return Err(HostAccessError::NotFound);
-        }
-        Ok(UserContentDocument {
-            metadata: UserContentSummary {
-                id: id.to_string(),
-                content: String::from("example.content@1"),
-                revision: String::from(
-                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                ),
-            },
-            descriptor: br#"{"name":"Example"}"#.to_vec(),
-        })
-    }
-}
-
-impl UserContentWriteAccess for RecordingScopedHostAccess {
-    fn request_import(
-        &self,
-        _owner: &ComponentRef,
-        rtw: &[u8],
-    ) -> HostAccessResult<AcceptedUserContentWrite> {
-        self.user_content_writes
-            .lock()
-            .expect("test user-content lock must stay healthy")
-            .push(rtw.to_vec());
-        Ok(AcceptedUserContentWrite {
-            operation_id: String::from("018f0000-0000-7000-8000-000000000030"),
-        })
-    }
-
-    fn request_replace(
-        &self,
-        owner: &ComponentRef,
-        _id: &str,
-        rtw: &[u8],
-    ) -> HostAccessResult<AcceptedUserContentWrite> {
-        self.request_import(owner, rtw)
-    }
-
-    fn write_status(
-        &self,
-        _owner: &ComponentRef,
-        operation_id: &str,
-    ) -> HostAccessResult<UserContentWriteStatus> {
-        if operation_id != "018f0000-0000-7000-8000-000000000030" {
-            return Err(HostAccessError::NotFound);
-        }
-        Ok(UserContentWriteStatus::Succeeded(UserContentSummary {
-            id: String::from("018f0000-0000-7000-8000-000000000010"),
-            content: String::from("example.content@1"),
-            revision: String::from(
-                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            ),
-        }))
-    }
-}
-
 impl WorldSessionAccess for RecordingScopedHostAccess {
     fn list_worlds(&self) -> HostAccessResult<Vec<WorldSessionSummary>> {
         Ok(vec![WorldSessionSummary {
@@ -283,55 +197,6 @@ impl WorldSessionAccess for RecordingScopedHostAccess {
             .expect("test world-session lock must stay healthy")
             .push((world_id.to_string(), active));
         Ok(())
-    }
-}
-
-impl WorldCommandAccess for RecordingScopedHostAccess {
-    fn submit_world_command(
-        &self,
-        request: WorldCommandRequest,
-    ) -> WorldCommandAccessResult<AcceptedWorldCommand> {
-        self.world_command_writes
-            .lock()
-            .expect("test world-command lock must stay healthy")
-            .push(request);
-        Ok(AcceptedWorldCommand {
-            command_id: String::from("018f0000-0000-7000-8000-000000000020"),
-            correlation_id: String::from("018f0000-0000-7000-8000-000000000021"),
-        })
-    }
-}
-
-impl WorldProjectionAccess for RecordingScopedHostAccess {
-    fn request_projection(
-        &self,
-        _owner: &ComponentRef,
-        request: WorldProjectionRequest,
-    ) -> WorldProjectionAccessResult<AcceptedWorldProjectionRead> {
-        self.world_projection_reads
-            .lock()
-            .expect("test world-projection lock must stay healthy")
-            .push(request);
-        Ok(AcceptedWorldProjectionRead {
-            operation_id: String::from("018f0000-0000-7000-8000-000000000040"),
-        })
-    }
-
-    fn projection_status(
-        &self,
-        _owner: &ComponentRef,
-        operation_id: &str,
-    ) -> WorldProjectionAccessResult<WorldProjectionReadStatus> {
-        if operation_id != "018f0000-0000-7000-8000-000000000040" {
-            return Err(WorldProjectionAccessError::NotFound);
-        }
-        Ok(WorldProjectionReadStatus::Succeeded(
-            WorldProjectionReadView {
-                world_id: String::from("018f0000-0000-7000-8000-000000000001"),
-                schema: String::from("example.view@1"),
-                value_json: br#"{"messages":[]}"#.to_vec(),
-            },
-        ))
     }
 }
 
@@ -758,75 +623,6 @@ fn test_should_abort_failed_guest_execution_and_revoke_effects() {
     assert!(state.effect_handles.is_empty());
     assert!(!state.runtime_effects_active);
     assert!(!state.secret_access_active);
-    assert!(!state.service_access_active);
-    assert!(!state.ui_access_active);
-}
-
-#[test]
-fn test_should_enforce_wasm_ui_message_limit_for_registration_and_string_ids() {
-    let budget = WasmExecutionBudget {
-        max_host_message_bytes: 4,
-        ..WasmExecutionBudget::default()
-    };
-    let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
-    let mut state = WasmHostState::with_host_services_and_budget(
-        ComponentId::new("runtime"),
-        WasmHostServices::standalone(secrets),
-        false,
-        &budget,
-    );
-    begin_test_registration(&mut state, ExtensionId::new("example.extension"));
-
-    assert!(matches!(
-        PortableUiHost::register_surface(
-            &mut state,
-            String::from("12345"),
-            WitPlacementHint::Primary,
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-        ),
-        Err(PortableUiError::MessageTooLarge)
-    ));
-
-    state.finish_registration().unwrap();
-    state.begin_guest_execution();
-    assert!(matches!(
-        PortableUiHost::unmount_surface(&mut state, String::from("12345")),
-        Err(PortableUiError::MessageTooLarge)
-    ));
-}
-
-#[test]
-fn test_should_count_ui_registration_structure_overhead() {
-    let budget = WasmExecutionBudget {
-        max_host_message_bytes: 64,
-        ..WasmExecutionBudget::default()
-    };
-    let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
-    let mut state = WasmHostState::with_host_services_and_budget(
-        ComponentId::new("runtime"),
-        WasmHostServices::standalone(secrets),
-        false,
-        &budget,
-    );
-    begin_test_registration(&mut state, ExtensionId::new("example.extension"));
-
-    assert!(matches!(
-        PortableUiHost::register_surface(
-            &mut state,
-            String::from("x"),
-            WitPlacementHint::Primary,
-            None,
-            None,
-            None,
-            Vec::new(),
-            vec![String::new(); 32],
-        ),
-        Err(PortableUiError::MessageTooLarge)
-    ));
 }
 
 #[test]
@@ -874,7 +670,7 @@ fn test_should_stage_wasm_world_schema_registration() {
         &mut state,
         String::from("example.message"),
         1,
-        WitSchemaKind::Event,
+        WitSchemaKind::Command,
         String::from(r#"{"type":"object"}"#),
     )
     .unwrap();
@@ -883,7 +679,7 @@ fn test_should_stage_wasm_world_schema_registration() {
             &mut state,
             String::from("example.message"),
             1,
-            WitSchemaKind::Event,
+            WitSchemaKind::Command,
             String::from(r#"{"type":"object"}"#),
         ),
         Err(WorldRegistrationError::DuplicateWorldSchema)
@@ -893,7 +689,7 @@ fn test_should_stage_wasm_world_schema_registration() {
         &mut state,
         String::from("example.character-view"),
         1,
-        WitSchemaKind::Projection,
+        WitSchemaKind::Command,
         String::from(r#"{"type":"object"}"#),
     )
     .unwrap();
@@ -904,15 +700,12 @@ fn test_should_stage_wasm_world_schema_registration() {
         registrations.world_schemas[0].key().to_string(),
         "example.message@1"
     );
-    assert_eq!(registrations.world_schemas[0].kind(), SchemaKind::Event);
+    assert_eq!(registrations.world_schemas[0].kind(), SchemaKind::Command);
     assert_eq!(
         registrations.world_schemas[1].key().to_string(),
         "example.character-view@1"
     );
-    assert_eq!(
-        registrations.world_schemas[1].kind(),
-        SchemaKind::Projection
-    );
+    assert_eq!(registrations.world_schemas[1].kind(), SchemaKind::Command);
     assert_eq!(
         registrations.world_schemas[0].definition_json(),
         r#"{"type":"object"}"#
@@ -929,7 +722,6 @@ fn test_should_stage_wasm_contract_registrations() {
         String::from("example.service"),
         1,
         WitResolutionPolicy::Single,
-        WitContractProtocol::Service,
     )
     .unwrap();
     RegistrationHost::provide_contract(
@@ -965,229 +757,6 @@ fn test_should_stage_wasm_contract_registrations() {
 }
 
 #[test]
-fn test_should_stage_and_apply_wasm_portable_ui_operations() {
-    let mut state = WasmHostState::new(ComponentId::new("runtime"));
-    let extension_id = ExtensionId::new("example.extension");
-    begin_test_registration(&mut state, extension_id.clone());
-
-    PortableUiHost::register_surface(
-        &mut state,
-        String::from("example.main"),
-        WitPlacementHint::Primary,
-        None,
-        None,
-        None,
-        Vec::new(),
-        vec![String::from(rintawa_sdk::ui::UI_CAPABILITY_TEXT)],
-    )
-    .unwrap();
-    PortableUiHost::register_world_presentation(
-        &mut state,
-        String::from("example.main"),
-        Some(String::from("example.presentation")),
-        Some(1),
-    )
-    .unwrap();
-    assert!(matches!(
-        PortableUiHost::register_world_presentation(
-            &mut state,
-            String::from("example.main"),
-            None,
-            None,
-        ),
-        Err(PortableUiError::DuplicateWorldPresentation)
-    ));
-    let registrations = state.finish_registration().unwrap();
-    assert_eq!(registrations.ui_surfaces.len(), 1);
-    assert_eq!(registrations.ui_surfaces[0].id.as_str(), "example.main");
-    let presentation = registrations
-        .world_presentation
-        .as_ref()
-        .expect("World presentation descriptor should be staged");
-    assert_eq!(presentation.entry_surface_id.as_str(), "example.main");
-    assert_eq!(
-        presentation
-            .presentation_intent
-            .as_ref()
-            .map(ToString::to_string)
-            .as_deref(),
-        Some("example.presentation@1")
-    );
-
-    let owner =
-        rintawa_sdk::contracts::ComponentRef::new(test_instance_id(), ComponentId::new("runtime"));
-    state
-        .ui
-        .register_instance(
-            test_instance_id(),
-            test_scope_id(),
-            vec![rintawa_ui_runtime::OwnedUiSurfaceContribution {
-                owner: owner.clone(),
-                contribution: registrations.ui_surfaces[0].clone(),
-            }],
-            Vec::new(),
-        )
-        .unwrap();
-
-    let snapshot = UiSurfaceSnapshot {
-        surface_id: UiSurfaceId::new("example.main"),
-        revision: 1,
-        root: rintawa_sdk::ui::UiNodeId::new("root"),
-        nodes: vec![rintawa_sdk::ui::UiNode::new(
-            "root",
-            rintawa_sdk::ui::UiNodeKind::Text(rintawa_sdk::ui::UiTextNode {
-                text: String::from("hello"),
-            }),
-        )],
-    };
-    state.begin_guest_execution();
-    PortableUiHost::mount_surface(&mut state, serde_json::to_vec(&snapshot).unwrap()).unwrap();
-    state.finish_service_execution();
-    assert_eq!(state.ui.presentation_surfaces().len(), 0);
-
-    state
-        .ui
-        .set_instance_active(&test_instance_id(), true)
-        .unwrap();
-    assert_eq!(state.ui.presentation_surfaces().len(), 1);
-
-    let patch = UiPatchBatch {
-        surface_id: UiSurfaceId::new("example.main"),
-        base_revision: 1,
-        next_revision: 2,
-        patches: vec![rintawa_sdk::ui::UiPatch::UpsertNode {
-            node: rintawa_sdk::ui::UiNode::new(
-                "root",
-                rintawa_sdk::ui::UiNodeKind::Text(rintawa_sdk::ui::UiTextNode {
-                    text: String::from("updated"),
-                }),
-            ),
-        }],
-    };
-    state.begin_guest_execution();
-    PortableUiHost::patch_surface(&mut state, serde_json::to_vec(&patch).unwrap()).unwrap();
-    PortableUiHost::unmount_surface(&mut state, String::from("example.main")).unwrap();
-    state.finish_service_execution();
-    assert!(state.ui.presentation_surfaces().is_empty());
-}
-
-#[test]
-fn test_should_read_only_asset_referenced_by_active_layer_presentation() {
-    let access = Arc::new(RecordingScopedHostAccess::default());
-    let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
-    let mut services = WasmHostServices::standalone(secrets);
-    services.host_access = HostAccessServices::new(
-        access.clone(),
-        access.clone(),
-        access.clone(),
-        access.clone(),
-        access.clone(),
-        access,
-    );
-    let mut state = WasmHostState::with_host_services_and_budget(
-        ComponentId::new("runtime"),
-        services,
-        false,
-        &WasmExecutionBudget::default(),
-    );
-    begin_test_registration(&mut state, ExtensionId::new("example.layer"));
-    PortableUiHost::register_surface(
-        &mut state,
-        String::from("example.main"),
-        WitPlacementHint::Primary,
-        None,
-        None,
-        None,
-        Vec::new(),
-        vec![String::from(rintawa_sdk::ui::UI_CAPABILITY_ASSET_IMAGE)],
-    )
-    .unwrap();
-    PortableUiHost::register_layer(
-        &mut state,
-        rintawa_sdk::ui::PORTABLE_UI_PROTOCOL_MAJOR,
-        vec![String::from(rintawa_sdk::ui::UI_CAPABILITY_ASSET_IMAGE)],
-    )
-    .unwrap();
-    let registrations = state.finish_registration().unwrap();
-    let owner = ComponentRef::new(test_instance_id(), ComponentId::new("runtime"));
-    let descriptor = registrations
-        .ui_layer
-        .expect("test layer descriptor must exist");
-    state
-        .ui
-        .register_instance(
-            test_instance_id(),
-            test_scope_id(),
-            vec![rintawa_ui_runtime::OwnedUiSurfaceContribution {
-                owner: owner.clone(),
-                contribution: registrations.ui_surfaces[0].clone(),
-            }],
-            vec![rintawa_ui_runtime::OwnedUiLayerDescriptor {
-                owner: owner.clone(),
-                descriptor,
-            }],
-        )
-        .unwrap();
-    state
-        .ui
-        .set_instance_active(&test_instance_id(), true)
-        .unwrap();
-    state.ui.attach_registered_layer(owner).unwrap();
-
-    let digest =
-        String::from("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    let snapshot = UiSurfaceSnapshot {
-        surface_id: UiSurfaceId::new("example.main"),
-        revision: 1,
-        root: "asset".into(),
-        nodes: vec![rintawa_sdk::ui::UiNode::new(
-            "asset",
-            rintawa_sdk::ui::UiNodeKind::AssetImage(rintawa_sdk::ui::UiAssetImageNode {
-                digest: digest.clone(),
-                size: 4,
-                media_type: String::from("image/png"),
-                alt: String::from("Example"),
-                width: Some(64),
-                height: Some(64),
-            }),
-        )],
-    };
-    state.begin_guest_execution();
-    PortableUiHost::mount_surface(&mut state, serde_json::to_vec(&snapshot).unwrap()).unwrap();
-    state.finish_service_execution();
-
-    state.begin_guest_execution();
-    assert!(matches!(
-        UiLayerHost::read_presented_asset(
-            &mut state,
-            String::from("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",),
-        ),
-        Err(UiLayerError::Rejected)
-    ));
-    let presented = UiLayerHost::read_presented_asset(&mut state, digest).unwrap();
-    assert_eq!(presented.media_type, "image/png");
-    assert_eq!(presented.bytes, vec![1, 2, 3, 4]);
-    state.finish_service_execution();
-}
-
-#[test]
-fn test_should_reject_wasm_service_calls_outside_execution_scope() {
-    let mut state = WasmHostState::new(ComponentId::new("runtime"));
-    begin_test_registration(&mut state, ExtensionId::new("example.extension"));
-    state.finish_registration().unwrap();
-
-    assert!(matches!(
-        ServicesHost::call(
-            &mut state,
-            String::from("example.service"),
-            1,
-            b"payload".to_vec(),
-        ),
-        Err(ServiceTransportError::Unavailable)
-    ));
-}
-
-#[test]
 fn test_should_install_and_revoke_wasm_runtime_effects_with_handles() {
     let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
     begin_test_registration(&mut state, ExtensionId::new("rintawa.chat"));
@@ -1199,23 +768,15 @@ fn test_should_install_and_revoke_wasm_runtime_effects_with_handles() {
     state.begin_guest_execution();
     let event_handle =
         RuntimeEffectsHost::subscribe_event(&mut state, String::from("dialogue.message")).unwrap();
-    let signal_handle =
-        RuntimeEffectsHost::subscribe_signal(&mut state, String::from("rintawa.operation.chunk@1"))
-            .unwrap();
     state.finish_guest_execution(&mut context).unwrap();
-    assert_eq!(context.effects.len(), 2);
+    assert_eq!(context.effects.len(), 1);
     assert!(context.effects.values().any(|effect| matches!(
         effect,
         RuntimeEffect::EventSubscription { topic } if topic == "dialogue.message"
     )));
-    assert!(context.effects.values().any(|effect| matches!(
-        effect,
-        RuntimeEffect::SignalSubscription { topic } if topic == "rintawa.operation.chunk@1"
-    )));
 
     state.begin_guest_execution();
     RuntimeEffectsHost::unsubscribe_event(&mut state, event_handle).unwrap();
-    RuntimeEffectsHost::unsubscribe_signal(&mut state, signal_handle).unwrap();
     state.finish_guest_execution(&mut context).unwrap();
     assert!(context.effects.is_empty());
 }
@@ -1226,10 +787,6 @@ fn test_should_reject_wasm_effect_or_registration_outside_its_lifecycle_scope() 
 
     assert!(matches!(
         RuntimeEffectsHost::subscribe_event(&mut state, String::from("dialogue.message")),
-        Err(RuntimeEffectError::RuntimeNotActive)
-    ));
-    assert!(matches!(
-        RuntimeEffectsHost::subscribe_signal(&mut state, String::from("rintawa.operation.chunk@1")),
         Err(RuntimeEffectError::RuntimeNotActive)
     ));
     assert!(matches!(
@@ -1404,19 +961,6 @@ fn test_should_expose_authenticated_runtime_context_only_during_execution() {
     state
         .finish_registration()
         .expect("test registration should finish");
-    state
-        .services
-        .register_instance(ServiceInstanceRegistration {
-            instance_id: test_instance_id(),
-            extension_id: ExtensionId::new("context.consumer"),
-            scope_id: test_scope_id(),
-            definitions: Vec::new(),
-            providers: Vec::new(),
-            consumers: Vec::new(),
-            components: HashMap::new(),
-        })
-        .expect("test service instance should register");
-
     assert!(matches!(
         RuntimeContextHost::current(&mut state),
         Err(RuntimeContextError::AccessNotActive)
@@ -1431,12 +975,6 @@ fn test_should_expose_authenticated_runtime_context_only_during_execution() {
         RuntimeContextHost::current(&mut state),
         Err(RuntimeContextError::AccessNotActive)
     ));
-    state.begin_service_execution(None, false);
-    let service_context = RuntimeContextHost::current(&mut state)
-        .expect("service callback should retain authenticated runtime identity");
-    assert_eq!(service_context.scope_id, test_scope_id().to_string());
-    assert!(service_context.world_id.is_some());
-    state.finish_service_execution();
 }
 
 #[test]
@@ -1603,138 +1141,6 @@ fn test_should_stream_ephemeral_user_resource_with_bounded_staging() {
 }
 
 #[test]
-fn test_should_gate_and_bound_generic_user_content_reads() {
-    let access = Arc::new(RecordingScopedHostAccess::default());
-    let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
-    let mut services = WasmHostServices::standalone(secrets);
-    services.host_access = HostAccessServices::new(
-        access.clone(),
-        access.clone(),
-        access.clone(),
-        access.clone(),
-        access.clone(),
-        access.clone(),
-    )
-    .with_user_content_access(access);
-    let budget = WasmExecutionBudget {
-        max_host_message_bytes: 256,
-        ..WasmExecutionBudget::default()
-    };
-    let mut state = WasmHostState::with_host_services_and_budget(
-        ComponentId::new("runtime"),
-        services,
-        false,
-        &budget,
-    );
-    begin_test_registration(&mut state, ExtensionId::new("content.library"));
-    state.finish_registration().unwrap();
-
-    assert!(matches!(
-        UserContentHost::list_items(&mut state, Some(String::from("example.content@1"))),
-        Err(UserContentError::AccessNotActive)
-    ));
-    state.begin_guest_execution();
-    assert!(matches!(
-        UserContentHost::list_items(&mut state, Some(String::from("example.content@1"))),
-        Err(UserContentError::PermissionDenied)
-    ));
-
-    let owner = state.registered_owner().unwrap();
-    state
-        .runtime_permissions
-        .grant(owner, RuntimePermission::UserContentRead)
-        .unwrap();
-    let entries =
-        UserContentHost::list_items(&mut state, Some(String::from("example.content@1"))).unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].content, "example.content@1");
-
-    let document = UserContentHost::read(&mut state, entries[0].id.clone()).unwrap();
-    assert_eq!(document.metadata.id, entries[0].id);
-    assert_eq!(document.descriptor, br#"{"name":"Example"}"#);
-
-    assert!(matches!(
-        UserContentHost::list_items(&mut state, Some("x".repeat(257))),
-        Err(UserContentError::MessageTooLarge)
-    ));
-    assert!(matches!(
-        UserContentHost::read(&mut state, String::from("missing")),
-        Err(UserContentError::NotFound)
-    ));
-}
-
-#[test]
-fn test_should_gate_bound_and_budget_deferred_user_content_writes() {
-    let access = Arc::new(RecordingScopedHostAccess::default());
-    let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
-    let mut services = WasmHostServices::standalone(secrets);
-    services.host_access = HostAccessServices::new(
-        access.clone(),
-        access.clone(),
-        access.clone(),
-        access.clone(),
-        access.clone(),
-        access.clone(),
-    )
-    .with_user_content_access(access.clone())
-    .with_user_content_write_access(access.clone());
-    let budget = WasmExecutionBudget {
-        max_artifact_import_bytes: 8,
-        max_user_content_writes_per_execution: 2,
-        ..WasmExecutionBudget::default()
-    };
-    let mut state = WasmHostState::with_host_services_and_budget(
-        ComponentId::new("runtime"),
-        services,
-        false,
-        &budget,
-    );
-    begin_test_registration(&mut state, ExtensionId::new("content.writer"));
-    state.finish_registration().unwrap();
-
-    assert!(matches!(
-        UserContentHost::request_import(&mut state, b"rtw".to_vec()),
-        Err(UserContentError::AccessNotActive)
-    ));
-    state.begin_guest_execution();
-    assert!(matches!(
-        UserContentHost::request_import(&mut state, b"rtw".to_vec()),
-        Err(UserContentError::PermissionDenied)
-    ));
-    let owner = state.registered_owner().unwrap();
-    state
-        .runtime_permissions
-        .grant(owner, RuntimePermission::UserContentWrite)
-        .unwrap();
-    assert!(matches!(
-        UserContentHost::request_import(&mut state, vec![0; 9]),
-        Err(UserContentError::MessageTooLarge)
-    ));
-    let accepted = UserContentHost::request_import(&mut state, b"rtw".to_vec()).unwrap();
-    let status = UserContentHost::write_status(&mut state, accepted.operation_id).unwrap();
-    assert!(matches!(status, WitUserContentWriteState::Succeeded(_)));
-    assert!(
-        UserContentHost::request_replace(&mut state, String::from("logical-id"), b"rtw2".to_vec(),)
-            .is_ok()
-    );
-    assert!(matches!(
-        UserContentHost::request_import(&mut state, b"third".to_vec()),
-        Err(UserContentError::LimitExceeded)
-    ));
-    state.discard_guest_execution();
-    state.begin_guest_execution();
-    assert!(UserContentHost::request_import(&mut state, b"fresh".to_vec()).is_ok());
-    assert_eq!(
-        access
-            .user_content_writes
-            .lock()
-            .expect("test user-content lock must stay healthy")
-            .len(),
-        3
-    );
-}
-
-#[test]
 fn test_should_gate_world_session_catalog_and_lifecycle_requests() {
     let access = Arc::new(RecordingScopedHostAccess::default());
     let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
@@ -1817,329 +1223,6 @@ fn test_should_gate_world_session_catalog_and_lifecycle_requests() {
             .as_slice(),
         &[(created.world_id, true)]
     );
-}
-
-#[test]
-fn test_should_gate_bound_and_budget_world_command_submission() {
-    let access = Arc::new(RecordingScopedHostAccess::default());
-    let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
-    let mut services = WasmHostServices::standalone(secrets);
-    services.host_access = HostAccessServices::new(
-        access.clone(),
-        access.clone(),
-        access.clone(),
-        access.clone(),
-        access.clone(),
-        access.clone(),
-    )
-    .with_world_command_access(access.clone());
-    let budget = WasmExecutionBudget {
-        max_host_message_bytes: 128,
-        max_world_command_submissions_per_execution: 2,
-        ..WasmExecutionBudget::default()
-    };
-    let mut state = WasmHostState::with_host_services_and_budget(
-        ComponentId::new("runtime"),
-        services,
-        false,
-        &budget,
-    );
-    begin_test_registration(&mut state, ExtensionId::new("world.commander"));
-    state.finish_registration().unwrap();
-
-    let request = || WitWorldCommandRequest {
-        world_id: String::from("018f0000-0000-7000-8000-000000000001"),
-        schema: String::from("example.command@1"),
-        payload_json: br#"{"value":1}"#.to_vec(),
-    };
-    assert!(matches!(
-        WorldCommandsHost::submit(&mut state, request()),
-        Err(WorldCommandError::AccessNotActive)
-    ));
-
-    state.begin_guest_execution();
-    assert!(matches!(
-        WorldCommandsHost::submit(&mut state, request()),
-        Err(WorldCommandError::PermissionDenied)
-    ));
-    let owner = state.registered_owner().unwrap();
-    state
-        .runtime_permissions
-        .grant(owner, RuntimePermission::WorldCommandSubmit)
-        .unwrap();
-
-    let mut oversized = request();
-    oversized.payload_json = vec![b'x'; 129];
-    assert!(matches!(
-        WorldCommandsHost::submit(&mut state, oversized),
-        Err(WorldCommandError::MessageTooLarge)
-    ));
-    let accepted = WorldCommandsHost::submit(&mut state, request()).unwrap();
-    assert_eq!(accepted.command_id, "018f0000-0000-7000-8000-000000000020");
-    assert!(matches!(
-        WorldCommandsHost::submit(&mut state, request()),
-        Err(WorldCommandError::LimitExceeded)
-    ));
-
-    let writes = access
-        .world_command_writes
-        .lock()
-        .expect("test world-command lock must stay healthy");
-    assert_eq!(writes.len(), 1);
-    assert_eq!(writes[0].payload_json, br#"{"value":1}"#);
-    assert!(!writes[0].verified_ui_action);
-}
-
-#[test]
-fn test_should_only_attest_immediate_ui_callback_commands_not_subsequent_guest_work() {
-    let access = Arc::new(RecordingScopedHostAccess::default());
-    let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
-    let mut services = WasmHostServices::standalone(secrets);
-    services.host_access = HostAccessServices::new(
-        access.clone(),
-        access.clone(),
-        access.clone(),
-        access.clone(),
-        access.clone(),
-        access.clone(),
-    )
-    .with_world_command_access(access.clone());
-    let mut state = WasmHostState::with_host_services_and_budget(
-        ComponentId::new("runtime"),
-        services,
-        false,
-        &WasmExecutionBudget::default(),
-    );
-    begin_test_registration(&mut state, ExtensionId::new("ui.origin.test"));
-    state.finish_registration().unwrap();
-    let owner = state.registered_owner().unwrap();
-    state
-        .runtime_permissions
-        .grant(owner, RuntimePermission::WorldCommandSubmit)
-        .unwrap();
-    let request = || WitWorldCommandRequest {
-        world_id: String::from("018f0000-0000-7000-8000-000000000001"),
-        schema: String::from("example.command@1"),
-        payload_json: br#"{"message":"hello"}"#.to_vec(),
-    };
-
-    state.begin_guest_execution();
-    state.verified_ui_action_active = true;
-    WorldCommandsHost::submit(&mut state, request()).unwrap();
-    state.discard_guest_execution();
-
-    state.begin_guest_execution();
-    assert!(!state.verified_ui_action_active);
-    WorldCommandsHost::submit(&mut state, request()).unwrap();
-    state.discard_guest_execution();
-
-    state.begin_guest_execution();
-    state.verified_ui_action_active = true;
-    state.begin_delegated_task_execution(state.registered_owner().unwrap());
-    assert!(!state.verified_ui_action_active);
-    WorldCommandsHost::submit(&mut state, request()).unwrap();
-    state.discard_guest_execution();
-
-    let writes = access.world_command_writes.lock().expect("recording lock");
-    assert_eq!(writes.len(), 3);
-    assert!(writes[0].verified_ui_action);
-    assert!(!writes[1].verified_ui_action);
-    assert!(!writes[2].verified_ui_action);
-}
-
-#[test]
-fn test_should_allow_effect_service_scoped_reads_without_general_host_mutations() {
-    let access = Arc::new(RecordingScopedHostAccess::default());
-    let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
-    let mut services = WasmHostServices::standalone(secrets);
-    services.host_access = HostAccessServices::new(
-        access.clone(),
-        access.clone(),
-        access.clone(),
-        access.clone(),
-        access.clone(),
-        access.clone(),
-    )
-    .with_world_projection_access(access.clone())
-    .with_world_command_access(access.clone());
-    let mut state = WasmHostState::with_host_services_and_budget(
-        ComponentId::new("runtime"),
-        services,
-        false,
-        &WasmExecutionBudget::default(),
-    );
-    begin_test_registration(&mut state, ExtensionId::new("test.effect-service-reader"));
-    state.finish_registration().unwrap();
-    let owner = state.registered_owner().unwrap();
-    state
-        .runtime_permissions
-        .grant(owner.clone(), RuntimePermission::WorldProjectionRead)
-        .unwrap();
-    state
-        .runtime_permissions
-        .grant(owner, RuntimePermission::WorldCommandSubmit)
-        .unwrap();
-
-    let read = || WitWorldProjectionRequest {
-        world_id: String::from("018f0000-0000-7000-8000-000000000001"),
-        schema: String::from("example.projection@1"),
-        input_json: br#"{"conversation":"main"}"#.to_vec(),
-    };
-    let command = || WitWorldCommandRequest {
-        world_id: String::from("018f0000-0000-7000-8000-000000000001"),
-        schema: String::from("example.command@1"),
-        payload_json: br#"{"message":"hello"}"#.to_vec(),
-    };
-
-    // Regular service callbacks still have no World state access.
-    state.begin_service_execution(None, false);
-    assert!(matches!(
-        WorldProjectionsHost::request_read(&mut state, read()),
-        Err(WorldProjectionError::AccessNotActive)
-    ));
-    assert!(matches!(
-        PreferencesHost::get(&mut state, String::from("policy")),
-        Err(PreferenceError::AccessNotActive)
-    ));
-    state.finish_service_execution();
-
-    // An exact Host-owned World Effect callback may request a bounded,
-    // ordinary principal-filtered projection and its own controller policy.
-    state.begin_service_execution(None, true);
-    assert!(!matches!(
-        PreferencesHost::get(&mut state, String::from("policy")),
-        Err(PreferenceError::AccessNotActive)
-    ));
-    assert!(WorldProjectionsHost::request_read(&mut state, read()).is_ok());
-    assert_eq!(state.world_projection_reads_this_execution, 1);
-    assert!(matches!(
-        PreferencesHost::set(&mut state, String::from("policy"), String::from("changed")),
-        Err(PreferenceError::AccessNotActive)
-    ));
-    assert!(matches!(
-        PreferencesHost::delete(&mut state, String::from("policy")),
-        Err(PreferenceError::AccessNotActive)
-    ));
-    assert!(matches!(
-        WorldCommandsHost::submit(&mut state, command()),
-        Err(WorldCommandError::AccessNotActive)
-    ));
-    assert_eq!(
-        access
-            .world_projection_reads
-            .lock()
-            .expect("read recording")
-            .len(),
-        1
-    );
-    assert!(
-        access
-            .world_command_writes
-            .lock()
-            .expect("command recording")
-            .is_empty()
-    );
-    state.finish_service_execution();
-
-    assert!(matches!(
-        WorldProjectionsHost::request_read(&mut state, read()),
-        Err(WorldProjectionError::AccessNotActive)
-    ));
-    assert!(matches!(
-        PreferencesHost::get(&mut state, String::from("policy")),
-        Err(PreferenceError::AccessNotActive)
-    ));
-    state.begin_service_execution(None, false);
-    assert!(matches!(
-        WorldProjectionsHost::request_read(&mut state, read()),
-        Err(WorldProjectionError::AccessNotActive)
-    ));
-    state.finish_service_execution();
-
-    state.begin_guest_execution();
-    assert!(!state.effect_service_read_active);
-    assert!(WorldProjectionsHost::request_read(&mut state, read()).is_ok());
-    state.discard_guest_execution();
-}
-
-#[test]
-fn test_should_gate_bound_and_budget_world_projection_reads() {
-    let access = Arc::new(RecordingScopedHostAccess::default());
-    let secrets = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
-    let mut services = WasmHostServices::standalone(secrets);
-    services.host_access = HostAccessServices::new(
-        access.clone(),
-        access.clone(),
-        access.clone(),
-        access.clone(),
-        access.clone(),
-        access.clone(),
-    )
-    .with_world_projection_access(access.clone());
-    let budget = WasmExecutionBudget {
-        max_host_message_bytes: 128,
-        max_world_projection_reads_per_execution: 1,
-        ..WasmExecutionBudget::default()
-    };
-    let mut state = WasmHostState::with_host_services_and_budget(
-        ComponentId::new("runtime"),
-        services,
-        false,
-        &budget,
-    );
-    begin_test_registration(&mut state, ExtensionId::new("projection.consumer"));
-    state.finish_registration().unwrap();
-
-    let request = || WitWorldProjectionRequest {
-        world_id: String::from("018f0000-0000-7000-8000-000000000001"),
-        schema: String::from("example.view@1"),
-        input_json: br#"{"conversation":"main"}"#.to_vec(),
-    };
-    assert!(matches!(
-        WorldProjectionsHost::request_read(&mut state, request()),
-        Err(WorldProjectionError::AccessNotActive)
-    ));
-
-    state.begin_guest_execution();
-    assert!(matches!(
-        WorldProjectionsHost::request_read(&mut state, request()),
-        Err(WorldProjectionError::PermissionDenied)
-    ));
-    let owner = state.registered_owner().unwrap();
-    state
-        .runtime_permissions
-        .grant(owner, RuntimePermission::WorldProjectionRead)
-        .unwrap();
-
-    let mut oversized = request();
-    oversized.input_json = vec![b'x'; 256];
-    assert!(matches!(
-        WorldProjectionsHost::request_read(&mut state, oversized),
-        Err(WorldProjectionError::MessageTooLarge)
-    ));
-    let accepted = WorldProjectionsHost::request_read(&mut state, request()).unwrap();
-    assert_eq!(
-        accepted.operation_id,
-        "018f0000-0000-7000-8000-000000000040"
-    );
-    assert!(matches!(
-        WorldProjectionsHost::request_read(&mut state, request()),
-        Err(WorldProjectionError::LimitExceeded)
-    ));
-    let status = WorldProjectionsHost::read_status(&mut state, accepted.operation_id).unwrap();
-    match status {
-        WitWorldProjectionReadState::Succeeded(view) => {
-            assert_eq!(view.schema, "example.view@1");
-            assert_eq!(view.value_json, br#"{"messages":[]}"#);
-        }
-        other => panic!("unexpected projection status: {other:?}"),
-    }
-    let reads = access
-        .world_projection_reads
-        .lock()
-        .expect("test world-projection lock must stay healthy");
-    assert_eq!(reads.len(), 1);
-    assert_eq!(reads[0].schema, "example.view@1");
 }
 
 #[test]

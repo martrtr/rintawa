@@ -5,7 +5,6 @@ use std::io;
 use rintawa_artifacts::RtwError;
 use rintawa_sdk::{
     errors::ExtensionError, manifest::ManifestValidationError, secrets::SecretAccessError,
-    ui::UiError,
 };
 use thiserror::Error;
 
@@ -205,14 +204,6 @@ pub enum EngineError {
     #[error("WASM runtime error: {0}")]
     WasmRuntime(#[from] wasmtime::Error),
 
-    /// Portable UI registration, lifecycle, patching, or action validation failed.
-    #[error("portable UI error: {0}")]
-    Ui(#[from] UiError),
-
-    /// The internal service-routing state is unavailable.
-    #[error("service runtime is unavailable")]
-    ServiceRuntimeUnavailable,
-
     /// The requested activation composition cannot produce a valid start order.
     #[error(transparent)]
     ActivationPlan(#[from] ActivationPlanError),
@@ -269,25 +260,6 @@ pub enum EngineError {
     /// A host attempted to dispatch an invalid runtime event topic.
     #[error("runtime event topic must not be empty")]
     InvalidRuntimeEventTopic,
-
-    /// A host attempted to dispatch an invalid runtime signal topic.
-    #[error("runtime signal topic must not be empty")]
-    InvalidRuntimeSignalTopic,
-
-    /// A component failed while handling a validated portable UI action.
-    #[error(
-        "component `{component_id}` in extension `{extension_id}` failed UI action `{action_id}`: {reason}"
-    )]
-    UiActionFailed {
-        /// ID of the extension owning the component.
-        extension_id: String,
-        /// ID of the component handling the action.
-        component_id: String,
-        /// Semantic action identifier.
-        action_id: String,
-        /// Failure returned by the component.
-        reason: String,
-    },
 
     /// A component failed during a lifecycle transition.
     #[error("component `{component_id}` in extension `{extension_id}` failed: {reason}")]

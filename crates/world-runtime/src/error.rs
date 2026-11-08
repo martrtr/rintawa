@@ -6,6 +6,10 @@ use thiserror::Error;
 /// Read-side errors visible to a world System.
 #[derive(Debug, Error)]
 pub enum WorldReadError {
+    /// The calling System does not own this active property definition.
+    #[error("System cannot read property {0}: no active owner binding")]
+    PropertyAccessDenied(SchemaKey),
+
     /// Persistent world state could not be read.
     #[error("world snapshot read failed")]
     Storage(#[source] rintawa_storage::StorageError),

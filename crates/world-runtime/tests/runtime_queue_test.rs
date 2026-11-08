@@ -83,7 +83,6 @@ fn test_should_process_commands_in_fifo_order() -> Result<()> {
     for (command_id, ticket) in tickets {
         let outcome = ticket.wait()?;
         assert_eq!(outcome.command_id(), command_id);
-        assert!(outcome.signals().is_empty());
     }
     assert_eq!(evaluations.load(Ordering::SeqCst), 3);
     assert_eq!(*observed.lock().expect("observed lock"), vec![1, 2, 3]);
@@ -144,8 +143,8 @@ fn test_should_apply_bounded_queue_backpressure() -> Result<()> {
     };
     assert!(matches!(error, WorldRuntimeError::QueueFull));
 
-    assert!(first.wait()?.signals().is_empty());
-    assert!(second.wait()?.signals().is_empty());
+    first.wait()?;
+    second.wait()?;
     runtime.shutdown()?;
     assert_eq!(invocations.load(Ordering::SeqCst), 2);
     Ok(())

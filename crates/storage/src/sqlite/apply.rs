@@ -64,8 +64,12 @@ pub(super) fn apply(
             }
             StateChange::RemoveProperty { item, key } => {
                 sqlite.execute(
-                    "DELETE FROM properties WHERE item = ?1 AND name = ?2",
-                    params![item.into_bytes().as_slice(), key.id().as_str()],
+                    "DELETE FROM properties WHERE item = ?1 AND name = ?2 AND version = ?3",
+                    params![
+                        item.into_bytes().as_slice(),
+                        key.id().as_str(),
+                        i64::from(key.version().get())
+                    ],
                 )?;
             }
         }

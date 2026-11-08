@@ -106,29 +106,9 @@ pub enum ExtensionError {
     #[error("world schema registration is unavailable in this component context")]
     WorldSchemaRegistrationUnavailable,
 
-    /// The component registered the same portable UI surface more than once.
-    #[error("duplicate UI surface `{0}`")]
-    DuplicateUiSurface(String),
-
-    /// The component registered more than one portable UI Layer descriptor.
-    #[error("duplicate UI Layer descriptor")]
-    DuplicateUiLayerDescriptor,
-
-    /// The component registered more than one World presentation descriptor.
-    #[error("duplicate World presentation descriptor")]
-    DuplicateWorldPresentationDescriptor,
-
-    /// The host cannot register portable UI metadata in the current context.
-    #[error("UI registration is unavailable in this component context")]
-    UiRegistrationUnavailable,
-
     /// The component does not implement a handler for a subscribed runtime event.
     #[error("event handler is unavailable for topic `{0}`")]
     EventHandlerUnavailable(String),
-
-    /// The component does not implement a handler for a routed UI action.
-    #[error("UI action handler is unavailable for action `{0}`")]
-    UiActionHandlerUnavailable(String),
 
     /// The component does not implement a handler for the requested service contract.
     #[error("service handler is unavailable for contract `{0}`")]

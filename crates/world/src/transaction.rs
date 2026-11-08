@@ -1,9 +1,7 @@
-//! One in-memory atomic change set, plus explicitly best-effort runtime signals.
+//! One in-memory atomic change set.
 //!
 //! There is no durable command, mutation, event or effect log. A change set is
-//! applied in one SQLite transaction and the reply is produced only after that
-//! transaction commits. Runtime signals are drained after the commit and are
-//! deliberately lossy across a crash.
+//! applied in one SQLite transaction and the reply is produced only after commit.
 
 use std::collections::BTreeSet;
 
@@ -53,38 +51,10 @@ pub enum StateChange {
     },
 }
 
-/// One post-COMMIT, best-effort runtime signal.
-///
-/// Signals are not persisted and are never replayed. A crash between COMMIT and
-/// dispatch loses them by design.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RuntimeSignal {
-    schema: SchemaKey,
-    payload: serde_json::Value,
-}
-
-impl RuntimeSignal {
-    /// Creates one ephemeral runtime signal.
-    pub fn new(schema: SchemaKey, payload: serde_json::Value) -> Self {
-        Self { schema, payload }
-    }
-
-    /// Returns the signal schema used by in-process subscribers.
-    pub const fn schema(&self) -> &SchemaKey {
-        &self.schema
-    }
-
-    /// Returns the signal payload.
-    pub const fn payload(&self) -> &serde_json::Value {
-        &self.payload
-    }
-}
-
 /// One atomic authoritative world transaction.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorldTransaction {
     changes: Vec<StateChange>,
-    signals: Vec<RuntimeSignal>,
 }
 
 impl WorldTransaction {
@@ -98,19 +68,9 @@ impl WorldTransaction {
         self.changes.push(change);
     }
 
-    /// Adds one post-COMMIT best-effort runtime signal.
-    pub fn push_signal(&mut self, signal: RuntimeSignal) {
-        self.signals.push(signal);
-    }
-
     /// Returns current-state changes in application order.
     pub fn changes(&self) -> &[StateChange] {
         &self.changes
-    }
-
-    /// Returns the ephemeral signals proposed for this transaction.
-    pub fn signals(&self) -> &[RuntimeSignal] {
-        &self.signals
     }
 
     /// Returns whether the transaction changes no current state.
@@ -216,19 +176,5 @@ mod tests {
             transaction.validate(&registry()),
             Err(WorldError::PropertyValidationFailed { .. })
         ));
-    }
-
-    #[test]
-    fn test_should_keep_signals_separate_from_durable_state() {
-        let mut transaction = WorldTransaction::new();
-        transaction.push_change(StateChange::CreateObject { id: ItemId::new() });
-        transaction.push_signal(RuntimeSignal::new(
-            "narrator.turn@1".parse().expect("valid key"),
-            serde_json::json!({}),
-        ));
-
-        assert!(!transaction.is_empty());
-        assert_eq!(transaction.signals().len(), 1);
-        assert!(transaction.validate(&registry()).is_ok());
     }
 }

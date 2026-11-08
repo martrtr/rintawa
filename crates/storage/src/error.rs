@@ -44,21 +44,12 @@ pub enum StorageError {
     #[error("database is not an initialized Rintawa world")]
     Uninitialized,
 
-    /// The storage migration schema is newer than this runtime supports.
+    /// The storage schema version is not supported by this runtime.
     #[error("unsupported world storage schema version {found}; supported version is {supported}")]
     UnsupportedStorageSchema {
         /// Version stored in SQLite user_version.
         found: u32,
         /// Latest version supported by this runtime.
-        supported: u32,
-    },
-
-    /// The world format itself is newer or otherwise incompatible.
-    #[error("unsupported world format version {found}; supported version is {supported}")]
-    UnsupportedWorldFormat {
-        /// World format stored in metadata.
-        found: u32,
-        /// World format supported by the world crate.
         supported: u32,
     },
 
@@ -81,11 +72,31 @@ pub enum StorageError {
         found: u32,
     },
 
-    /// A legacy database cannot be converted without losing data.
-    #[error("legacy world cannot be migrated: {reason}")]
-    MigrationBlocked {
-        /// Why conversion refused to proceed.
-        reason: String,
+    /// A requested read page exceeds the bounded query policy.
+    #[error("world query page size {requested} must be between 1 and {maximum}")]
+    InvalidQueryPageSize {
+        /// Requested maximum number of results.
+        requested: usize,
+        /// Largest permitted page.
+        maximum: usize,
+    },
+
+    /// A property search page contains more JSON bytes than the read budget.
+    #[error("world property query page has {bytes} JSON bytes; maximum is {maximum}")]
+    QueryPageTooLarge {
+        /// Total encoded JSON bytes encountered in the page.
+        bytes: usize,
+        /// Maximum encoded JSON bytes permitted in one page.
+        maximum: usize,
+    },
+
+    /// A batch query supplied too many target item IDs.
+    #[error("world query batch size {requested} exceeds {maximum}")]
+    InvalidQueryBatchSize {
+        /// Number of supplied item IDs.
+        requested: usize,
+        /// Largest permitted batch.
+        maximum: usize,
     },
 
     /// The storage mutex became poisoned after an internal panic.

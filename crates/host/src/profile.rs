@@ -7,7 +7,7 @@ use std::{
 };
 
 use rintawa_artifacts::{ArtifactDigest, ContentType};
-use rintawa_extension_engine::canonical_http_loopback_origin;
+use rintawa_extension_engine::{canonical_http_loopback_origin, validate_transport_point};
 use rintawa_sdk::{
     contracts::{ComponentRef, ContractKey, ContractVersion},
     runtime_permissions::RuntimePermission,
@@ -29,6 +29,7 @@ const LEGACY_PROFILE_SCHEMA_V5: u32 = 5;
 const LEGACY_PROFILE_SCHEMA_V6: u32 = 6;
 
 const MAX_HTTP_ORIGINS_PER_COMPONENT: usize = 32;
+const MAX_AUTHORITATIVE_PROVIDERS_PER_PROFILE: usize = 64;
 const MAX_HTTP_ORIGINS_PER_PROFILE: usize = 512;
 const MAX_PREFERENCE_ENTRIES_PER_COMPONENT: usize = 256;
 const MAX_PREFERENCE_KEY_BYTES: usize = 128;
@@ -99,6 +100,43 @@ impl PreferredProviderSelection {
     }
 
     /// Returns the exact component selected as provider.
+    pub fn provider(&self) -> ComponentRef {
+        ComponentRef::new(
+            self.provider_instance_id.clone(),
+            self.provider_component_id.clone(),
+        )
+    }
+}
+
+/// One explicitly selected owner for a shared Zenoh point in a single runtime scope.
+///
+/// A selection is Host policy, not an extension preference or an alias.
+/// Unselected components remain installed and can serve independent points.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct AuthoritativeProviderSelection {
+    /// Runtime scope where the policy applies.
+    pub scope_id: RuntimeScopeId,
+    /// Exact shared Zenoh point (no wildcards).
+    pub point: String,
+    /// Chosen runtime activation.
+    pub provider_instance_id: ExtensionInstanceId,
+    /// Chosen component within the activation.
+    pub provider_component_id: ComponentId,
+}
+
+impl AuthoritativeProviderSelection {
+    /// Constructs a selection with an attested component principal.
+    pub fn new(scope_id: RuntimeScopeId, point: String, provider: ComponentRef) -> Self {
+        Self {
+            scope_id,
+            point,
+            provider_instance_id: provider.instance_id,
+            provider_component_id: provider.component_id,
+        }
+    }
+
+    /// Returns the exact selected component.
     pub fn provider(&self) -> ComponentRef {
         ComponentRef::new(
             self.provider_instance_id.clone(),
@@ -212,6 +250,9 @@ pub struct CompositionProfile {
     /// Explicit provider choices applied before activation planning.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub preferred_providers: Vec<PreferredProviderSelection>,
+    /// Authoritative Zenoh point owners (distinct from legacy contract choices).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authoritative_providers: Vec<AuthoritativeProviderSelection>,
     /// Explicit runtime capabilities approved for exact component principals.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_permissions: Vec<RuntimePermissionGrant>,
@@ -232,6 +273,7 @@ impl Default for CompositionProfile {
             schema: PROFILE_SCHEMA,
             activations: Vec::new(),
             preferred_providers: Vec::new(),
+            authoritative_providers: Vec::new(),
             runtime_permissions: Vec::new(),
             http_loopback_origins: Vec::new(),
             preferences: Vec::new(),
@@ -268,6 +310,11 @@ impl CompositionProfile {
             .iter()
             .map(|item| &item.scope_id)
             .chain(self.preferred_providers.iter().map(|item| &item.scope_id))
+            .chain(
+                self.authoritative_providers
+                    .iter()
+                    .map(|item| &item.scope_id),
+            )
             .chain(self.runtime_permissions.iter().map(|item| &item.scope_id))
             .chain(self.http_loopback_origins.iter().map(|item| &item.scope_id))
             .chain(self.preferences.iter().map(|item| &item.scope_id))
@@ -309,6 +356,20 @@ impl CompositionProfile {
                 return Err(HostError::DuplicatePreferredProviderSelection {
                     scope_id: selection.scope_id.to_string(),
                     contract: contract.to_string(),
+                });
+            }
+        }
+        if self.authoritative_providers.len() > MAX_AUTHORITATIVE_PROVIDERS_PER_PROFILE {
+            return Err(HostError::AuthoritativeProviderLimitExceeded);
+        }
+        let mut authoritative_points = HashSet::new();
+        for selection in &self.authoritative_providers {
+            validate_transport_point(&selection.point)
+                .map_err(|_| HostError::InvalidAuthoritativePoint)?;
+            if !authoritative_points.insert((selection.scope_id.clone(), &selection.point)) {
+                return Err(HostError::DuplicateAuthoritativeProviderSelection {
+                    point: selection.point.clone(),
+                    scope_id: selection.scope_id.to_string(),
                 });
             }
         }
@@ -550,6 +611,21 @@ impl CompositionProfile {
         });
     }
 
+    pub(crate) fn set_authoritative_provider(&mut self, selection: AuthoritativeProviderSelection) {
+        if let Some(existing) = self.authoritative_providers.iter_mut().find(|existing| {
+            existing.scope_id == selection.scope_id && existing.point == selection.point
+        }) {
+            *existing = selection;
+        } else {
+            self.authoritative_providers.push(selection);
+        }
+    }
+
+    pub(crate) fn clear_authoritative_provider(&mut self, scope: &RuntimeScopeId, point: &str) {
+        self.authoritative_providers
+            .retain(|entry| &entry.scope_id != scope || entry.point != point);
+    }
+
     pub(crate) fn grant_runtime_permission(&mut self, grant: RuntimePermissionGrant) {
         if !self.runtime_permissions.contains(&grant) {
             self.runtime_permissions.push(grant);
@@ -601,10 +677,6 @@ impl CompositionProfile {
         });
     }
 
-    pub(crate) fn materialize_legacy_world_defaults(&self, scope_id: RuntimeScopeId) -> Self {
-        self.materialize_matching(scope_id, |activation| activation.world_default)
-    }
-
     pub(crate) fn materialize_all(&self, scope_id: RuntimeScopeId) -> Self {
         self.materialize_matching(scope_id, |_| true)
     }
@@ -647,6 +719,21 @@ impl CompositionProfile {
                         provider_instance_id: provider_instance_id.clone(),
                         provider_component_id: selection.provider_component_id.clone(),
                     })
+            })
+            .collect();
+        let authoritative_providers = self
+            .authoritative_providers
+            .iter()
+            .map(|selection| AuthoritativeProviderSelection {
+                scope_id: scope_id.clone(),
+                point: selection.point.clone(),
+                // Preserve a missing owner as a fail-closed policy instead of
+                // silently restoring unrestricted fan-out in a new world.
+                provider_instance_id: instance_map
+                    .get(&selection.provider_instance_id)
+                    .cloned()
+                    .unwrap_or_else(|| selection.provider_instance_id.clone()),
+                provider_component_id: selection.provider_component_id.clone(),
             })
             .collect();
         let runtime_permissions = self
@@ -697,15 +784,10 @@ impl CompositionProfile {
             schema: PROFILE_SCHEMA,
             activations,
             preferred_providers,
+            authoritative_providers,
             runtime_permissions,
             http_loopback_origins,
             preferences,
-        }
-    }
-
-    pub(crate) fn clear_legacy_world_defaults(&mut self) {
-        for activation in &mut self.activations {
-            activation.world_default = false;
         }
     }
 
@@ -762,6 +844,9 @@ impl CompositionProfile {
             selection.scope_id != removed.scope_id
                 || selection.provider_instance_id != removed.instance_id
         });
+        // Keep an explicit selection even if its activation is removed.
+        // Without the selected owner the point remains unavailable until
+        // Host chooses a replacement or explicitly clears this policy.
         self.preferences.retain(|preference| {
             preference.scope_id != removed.scope_id || preference.instance_id != removed.instance_id
         });

@@ -1,5 +1,7 @@
 //! Implementation of SDK contexts provided by the Extension Engine.
 
+use std::collections::HashSet;
+
 use rintawa_sdk::{
     api::{LogLevel, LoggerApi},
     context::{ComponentContext, RegistrationContext},
@@ -8,28 +10,17 @@ use rintawa_sdk::{
     errors::{ExtensionError, ExtensionResult},
     runtime_effects::RuntimeEffect,
     secrets::{SecretPath, SecretValue},
-    services::{ServiceCallError, ServiceCallResult},
     types::{
         ComponentId, ContributionId, ExtensionId, ExtensionInstanceId, RuntimeEffectId,
         RuntimeScopeId,
     },
-    ui::{
-        UiLayerDescriptor, UiPatchBatch, UiResult, UiSurfaceContribution, UiSurfaceId,
-        UiSurfaceSnapshot, WorldPresentationDescriptor,
-    },
 };
-use std::collections::HashSet;
 use tracing::{debug, error, info, trace, warn};
-
-use rintawa_ui_runtime::{
-    OwnedUiLayerDescriptor, OwnedUiSurfaceContribution, OwnedWorldPresentationDescriptor, UiRuntime,
-};
 
 use crate::{
     composition::{OwnedContractConsumer, OwnedContractDefinition, OwnedContractProvider},
     runtime_effects::RuntimeEffectRegistry,
     secrets::SecretManager,
-    services::ServiceRuntime,
 };
 
 /// Runtime identity supplied by the host for one concrete component activation.
@@ -108,9 +99,6 @@ pub(crate) struct RegistrationBuffers<'a> {
     pub(crate) contract_definitions: &'a mut Vec<OwnedContractDefinition>,
     pub(crate) contract_providers: &'a mut Vec<OwnedContractProvider>,
     pub(crate) contract_consumers: &'a mut Vec<OwnedContractConsumer>,
-    pub(crate) ui_surfaces: &'a mut Vec<OwnedUiSurfaceContribution>,
-    pub(crate) ui_layers: &'a mut Vec<OwnedUiLayerDescriptor>,
-    pub(crate) world_presentations: &'a mut Vec<OwnedWorldPresentationDescriptor>,
 }
 
 /// Registration context provided to components during initialization.
@@ -245,58 +233,6 @@ impl<'a> RegistrationContext for EngineRegistrationContext<'a> {
             .push(OwnedContractConsumer { owner, consumer });
         Ok(())
     }
-
-    fn register_ui_surface(&mut self, surface: UiSurfaceContribution) -> ExtensionResult<()> {
-        let owner = self.identity.owner();
-        if self
-            .buffers
-            .ui_surfaces
-            .iter()
-            .any(|registered| registered.contribution.id == surface.id)
-        {
-            return Err(ExtensionError::DuplicateUiSurface(surface.id.to_string()));
-        }
-        self.buffers.ui_surfaces.push(OwnedUiSurfaceContribution {
-            owner,
-            contribution: surface,
-        });
-        Ok(())
-    }
-
-    fn register_ui_layer(&mut self, descriptor: UiLayerDescriptor) -> ExtensionResult<()> {
-        let owner = self.identity.owner();
-        if self
-            .buffers
-            .ui_layers
-            .iter()
-            .any(|registered| registered.owner == owner)
-        {
-            return Err(ExtensionError::DuplicateUiLayerDescriptor);
-        }
-        self.buffers
-            .ui_layers
-            .push(OwnedUiLayerDescriptor { owner, descriptor });
-        Ok(())
-    }
-
-    fn register_world_presentation(
-        &mut self,
-        descriptor: WorldPresentationDescriptor,
-    ) -> ExtensionResult<()> {
-        let owner = self.identity.owner();
-        if self
-            .buffers
-            .world_presentations
-            .iter()
-            .any(|registered| registered.owner == owner)
-        {
-            return Err(ExtensionError::DuplicateWorldPresentationDescriptor);
-        }
-        self.buffers
-            .world_presentations
-            .push(OwnedWorldPresentationDescriptor { owner, descriptor });
-        Ok(())
-    }
 }
 
 /// Context provided to components during start and stop execution phases.
@@ -305,8 +241,6 @@ pub struct EngineComponentContext<'a> {
     logger: EngineLogger,
     runtime_effects: &'a mut RuntimeEffectRegistry,
     secrets: &'a SecretManager,
-    services: &'a ServiceRuntime,
-    ui: &'a UiRuntime,
     execution_active: bool,
 }
 
@@ -316,8 +250,6 @@ impl<'a> EngineComponentContext<'a> {
         identity: ComponentIdentity,
         runtime_effects: &'a mut RuntimeEffectRegistry,
         secrets: &'a SecretManager,
-        services: &'a ServiceRuntime,
-        ui: &'a UiRuntime,
         execution_active: bool,
     ) -> Self {
         let logger = EngineLogger::new(identity.clone());
@@ -326,8 +258,6 @@ impl<'a> EngineComponentContext<'a> {
             logger,
             runtime_effects,
             secrets,
-            services,
-            ui,
             execution_active,
         }
     }
@@ -382,38 +312,5 @@ impl ComponentContext for EngineComponentContext<'_> {
         self.secrets
             .read_for_component(&self.identity.owner(), path)
             .map_err(ExtensionError::from)
-    }
-
-    fn call_service(
-        &mut self,
-        contract: &rintawa_sdk::contracts::ContractKey,
-        request: &[u8],
-    ) -> ServiceCallResult<Vec<u8>> {
-        if !self.execution_active {
-            return Err(ServiceCallError::Unavailable);
-        }
-        self.services
-            .call_from_execution(&self.identity.owner(), contract, request)
-    }
-
-    fn mount_ui_surface(&mut self, snapshot: UiSurfaceSnapshot) -> UiResult<()> {
-        if !self.execution_active {
-            return Err(rintawa_sdk::ui::UiError::OwnerInactive);
-        }
-        self.ui.mount_surface(&self.identity.owner(), snapshot)
-    }
-
-    fn patch_ui_surface(&mut self, batch: UiPatchBatch) -> UiResult<()> {
-        if !self.execution_active {
-            return Err(rintawa_sdk::ui::UiError::OwnerInactive);
-        }
-        self.ui.apply_patches(&self.identity.owner(), batch)
-    }
-
-    fn unmount_ui_surface(&mut self, surface_id: &UiSurfaceId) -> UiResult<()> {
-        if !self.execution_active {
-            return Err(rintawa_sdk::ui::UiError::OwnerInactive);
-        }
-        self.ui.unmount_surface(&self.identity.owner(), surface_id)
     }
 }

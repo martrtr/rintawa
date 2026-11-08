@@ -10,14 +10,17 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use rintawa_sdk::world::{CommandId, SchemaKey, WorldId};
+use rintawa_sdk::{
+    types::ExtensionId,
+    world::{CommandId, SchemaKey, WorldId},
+};
 use rintawa_storage::SqliteWorldStorage;
 use rintawa_world::{
-    DefinitionRegistration, PropertyDefinition, RuntimeSchemaDefinition, RuntimeSignal, SchemaKind,
-    SchemaRegistry, WorldCommand, WorldSessionState, WorldTransaction,
+    DefinitionRegistration, PropertyDefinition, RuntimeSchemaDefinition, SchemaKind,
+    SchemaRegistry, StateChange, WorldCommand, WorldError, WorldSessionState, WorldTransaction,
 };
 
-use crate::{WorldRuntimeError, WorldRuntimeResult, WorldSnapshot, WorldSystem};
+use crate::{SystemError, WorldRuntimeError, WorldRuntimeResult, WorldSnapshot, WorldSystem};
 
 /// Default maximum number of commands waiting for one world worker.
 pub const DEFAULT_COMMAND_QUEUE_CAPACITY: usize = 128;
@@ -84,8 +87,8 @@ impl WorldRuntimeBuilder {
 
     /// Registers one transient extension runtime-API schema.
     ///
-    /// Command and projection schemas come from exact installed packages; they are
-    /// never persisted in the world property vocabulary.
+    /// Command schemas come from exact installed packages and are compiled in
+    /// memory, independently of the durable world property vocabulary.
     ///
     /// # Errors
     ///
@@ -143,21 +146,37 @@ impl WorldRuntimeBuilder {
         let world_id = self.storage.world_id();
         let storage = Arc::new(self.storage);
         let systems = Arc::new(self.systems);
+        let schemas = Arc::new(self.schemas);
         let session = Arc::new(Mutex::new(session));
+        // Host-installed property declarations, not the on-disk JSON vocabulary,
+        // determine the current extension-to-property authority.
+        let property_owners = Arc::new(Mutex::new(Arc::new(BTreeMap::new())));
         let (sender, receiver) = mpsc::sync_channel(self.policy.command_queue_capacity());
 
         let worker_storage = Arc::clone(&storage);
         let worker_systems = Arc::clone(&systems);
+        let worker_schemas = Arc::clone(&schemas);
         let worker_session = Arc::clone(&session);
+        let worker_property_owners = Arc::clone(&property_owners);
         let worker = thread::Builder::new()
             .name(format!("rintawa-world-{world_id}"))
-            .spawn(move || worker_loop(worker_storage, worker_systems, worker_session, receiver))
+            .spawn(move || {
+                worker_loop(
+                    worker_storage,
+                    worker_systems,
+                    worker_schemas,
+                    worker_session,
+                    worker_property_owners,
+                    receiver,
+                )
+            })
             .map_err(WorldRuntimeError::WorkerSpawn)?;
 
         Ok(WorldRuntime {
             world_id,
             storage,
             session,
+            property_owners,
             sender: Some(sender),
             worker: Some(worker),
         })
@@ -169,6 +188,7 @@ pub struct WorldRuntime {
     world_id: WorldId,
     storage: Arc<SqliteWorldStorage>,
     session: Arc<Mutex<WorldSessionState>>,
+    property_owners: Arc<Mutex<Arc<BTreeMap<SchemaKey, ExtensionId>>>>,
     sender: Option<SyncSender<CommandJob>>,
     worker: Option<JoinHandle<()>>,
 }
@@ -179,7 +199,10 @@ impl WorldRuntime {
         self.world_id
     }
 
-    /// Captures a pinned read-side snapshot of current state.
+    /// Captures a trusted native Host snapshot of current state.
+    ///
+    /// This unrestricted API must never be exposed directly to an extension.
+    /// Command Systems receive a separately owner-scoped snapshot.
     ///
     /// # Errors
     ///
@@ -188,23 +211,52 @@ impl WorldRuntime {
         Ok(WorldSnapshot::new(self.storage.snapshot()?))
     }
 
-    /// Persists property definitions from exact installed packages.
+    /// Persists Host-approved property definitions and binds their active owner.
+    ///
+    /// The SQLite vocabulary deliberately contains no owner field. On every
+    /// activation Host rebinds identical stored definitions from exact installed
+    /// artifacts. A persisted JSON Schema alone never grants a running System
+    /// access. Conflicting owners for one key are rejected before any disk write.
     ///
     /// # Errors
     ///
-    /// Returns a conflict/validation error or a storage error.
+    /// Returns a definition/owner conflict, unavailable runtime state or a
+    /// storage error without partially publishing a batch.
     pub fn register_property_definitions(
         &self,
         definitions: &[PropertyDefinition],
     ) -> WorldRuntimeResult<Vec<DefinitionRegistration>> {
-        let registrations = self.storage.register_definitions(definitions)?;
+        let mut owners = self
+            .property_owners
+            .lock()
+            .map_err(|_| WorldRuntimeError::RuntimePoisoned)?;
+        let mut candidate_owners = (**owners).clone();
+        for definition in definitions {
+            if let Some(existing) =
+                candidate_owners.insert(definition.key().clone(), definition.owner().clone())
+                && existing != *definition.owner()
+            {
+                return Err(WorldError::DefinitionConflict {
+                    key: definition.key().clone(),
+                    existing_owner: existing.to_string(),
+                    incoming_owner: definition.owner().to_string(),
+                }
+                .into());
+            }
+        }
+
         let mut session = self
             .session
             .lock()
             .map_err(|_| WorldRuntimeError::RuntimePoisoned)?;
+        let mut candidate_session = session.clone();
         for definition in definitions {
-            session.register_property(definition.clone())?;
+            candidate_session.register_property(definition.clone())?;
         }
+
+        let registrations = self.storage.register_definitions(definitions)?;
+        *session = candidate_session;
+        *owners = Arc::new(candidate_owners);
         Ok(registrations)
     }
 
@@ -262,30 +314,20 @@ impl Drop for WorldRuntime {
 
 /// Result of one committed command.
 ///
-/// The change set is already durable when this value exists. Attached signals are
-/// best-effort runtime notifications drained after COMMIT; they are never replayed.
+/// The change set is already durable when this value exists.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorldCommandOutcome {
     command_id: CommandId,
-    signals: Vec<RuntimeSignal>,
 }
 
 impl WorldCommandOutcome {
-    fn new(command_id: CommandId, signals: Vec<RuntimeSignal>) -> Self {
-        Self {
-            command_id,
-            signals,
-        }
+    const fn new(command_id: CommandId) -> Self {
+        Self { command_id }
     }
 
     /// Returns the command identity that produced this outcome.
     pub const fn command_id(&self) -> CommandId {
         self.command_id
-    }
-
-    /// Returns post-COMMIT best-effort signals produced by the command.
-    pub fn signals(&self) -> &[RuntimeSignal] {
-        &self.signals
     }
 }
 
@@ -333,11 +375,20 @@ fn validate_policy(policy: WorldRuntimePolicy) -> WorldRuntimeResult<()> {
 fn worker_loop(
     storage: Arc<SqliteWorldStorage>,
     systems: Arc<BTreeMap<SchemaKey, RegisteredSystem>>,
+    schemas: Arc<SchemaRegistry>,
     session: Arc<Mutex<WorldSessionState>>,
+    property_owners: Arc<Mutex<Arc<BTreeMap<SchemaKey, ExtensionId>>>>,
     receiver: Receiver<CommandJob>,
 ) {
     while let Ok(job) = receiver.recv() {
-        let result = process_command(&storage, &systems, &session, job.command);
+        let result = process_command(
+            &storage,
+            &systems,
+            &schemas,
+            &session,
+            &property_owners,
+            job.command,
+        );
         let _ = job.response.send(result);
     }
 }
@@ -345,14 +396,28 @@ fn worker_loop(
 fn process_command(
     storage: &Arc<SqliteWorldStorage>,
     systems: &BTreeMap<SchemaKey, RegisteredSystem>,
+    schemas: &SchemaRegistry,
     session: &Mutex<WorldSessionState>,
+    property_owners: &Mutex<Arc<BTreeMap<SchemaKey, ExtensionId>>>,
     command: WorldCommand,
 ) -> WorldRuntimeResult<WorldCommandOutcome> {
+    schemas.validate_payload(command.schema(), SchemaKind::Command, command.payload())?;
     let registered = systems
         .get(command.schema())
         .ok_or_else(|| WorldRuntimeError::SystemUnavailable(command.schema().clone()))?;
 
-    let snapshot = WorldSnapshot::new(storage.snapshot()?);
+    let owner = schemas
+        .get(command.schema())
+        .ok_or_else(|| WorldError::DefinitionNotRegistered {
+            key: command.schema().clone(),
+        })?
+        .owner()
+        .clone();
+    let bindings = property_owners
+        .lock()
+        .map_err(|_| WorldRuntimeError::RuntimePoisoned)?
+        .clone();
+    let snapshot = WorldSnapshot::for_system(storage.snapshot()?, owner, bindings);
     let output = catch_unwind(AssertUnwindSafe(|| {
         registered.system.evaluate(&snapshot, &command)
     }))
@@ -362,17 +427,17 @@ fn process_command(
         source,
     })?;
 
-    validate_output(command.schema(), session, &output)?;
+    validate_output(command.schema(), session, &snapshot, &output)?;
 
     let command_id = command.id();
-    let signals = output.signals().to_vec();
     storage.apply(&output)?;
-    Ok(WorldCommandOutcome::new(command_id, signals))
+    Ok(WorldCommandOutcome::new(command_id))
 }
 
 fn validate_output(
     schema: &SchemaKey,
     session: &Mutex<WorldSessionState>,
+    snapshot: &WorldSnapshot,
     transaction: &WorldTransaction,
 ) -> WorldRuntimeResult<()> {
     let session = session
@@ -384,5 +449,30 @@ fn validate_output(
             schema: schema.clone(),
             source,
         })?;
+
+    for change in transaction.changes() {
+        let denied = match change {
+            StateChange::SetProperty { key, .. } if !snapshot.permits_property(key) => {
+                Some((key.clone(), "set"))
+            }
+            StateChange::RemoveProperty { key, .. } if !snapshot.permits_property(key) => {
+                Some((key.clone(), "remove"))
+            }
+            StateChange::DeleteItem { id } => snapshot
+                .foreign_property_on_delete(*id)
+                .map_err(|error| WorldRuntimeError::SystemFailed {
+                    schema: schema.clone(),
+                    source: SystemError::Read(error),
+                })?
+                .map(|key| (key, "delete")),
+            _ => None,
+        };
+        if let Some((key, operation)) = denied {
+            return Err(WorldRuntimeError::InvalidTransaction {
+                schema: schema.clone(),
+                source: WorldError::PropertyAccessDenied { key, operation },
+            });
+        }
+    }
     Ok(())
 }

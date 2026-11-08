@@ -5,18 +5,13 @@
 
 use crate::{
     api::LoggerApi,
-    contracts::{ComponentRef, ContractConsumer, ContractDefinition, ContractProvider},
+    contracts::{ContractConsumer, ContractDefinition, ContractProvider},
     contributions::ContributionDescriptor,
     contributions::WorldSchemaContribution,
     errors::ExtensionResult,
     runtime_effects::RuntimeEffect,
     secrets::{SecretPath, SecretValue},
-    services::{ServiceCallError, ServiceCallResult, ServiceProviderHandle},
     types::{ComponentId, ExtensionId, ExtensionInstanceId, RuntimeEffectId, RuntimeScopeId},
-    ui::{
-        UiLayerDescriptor, UiPatchBatch, UiResult, UiSurfaceContribution, UiSurfaceId,
-        UiSurfaceSnapshot, WorldPresentationDescriptor,
-    },
 };
 
 /// The context available to a component during execution.
@@ -35,14 +30,6 @@ pub trait ComponentContext {
 
     /// Returns the ID of this component.
     fn component_id(&self) -> &ComponentId;
-
-    /// Authenticated immediate caller while handling a routed service request.
-    ///
-    /// This is supplied by the Host and is never derived from untrusted
-    /// service payloads. Outside routed callbacks, it is absent.
-    fn service_caller(&self) -> Option<&ComponentRef> {
-        None
-    }
 
     /// Returns the logger API for this component.
     fn logger(&self) -> &dyn LoggerApi;
@@ -90,78 +77,6 @@ pub trait ComponentContext {
         Err(crate::errors::ExtensionError::SecretAccess(
             crate::secrets::SecretAccessError::AccessDenied,
         ))
-    }
-
-    /// Calls one provider selected for a versioned contract.
-    ///
-    /// # Errors
-    ///
-    /// Returns a transport-level [`ServiceCallError`] when no usable provider
-    /// exists, the caller is not a declared consumer, or provider execution fails.
-    fn call_service(
-        &mut self,
-        _contract: &crate::contracts::ContractKey,
-        _request: &[u8],
-    ) -> ServiceCallResult<Vec<u8>> {
-        Err(ServiceCallError::Unavailable)
-    }
-
-    /// Lists eligible providers for one `Multiple` service contract.
-    ///
-    /// Returned handles are opaque, caller-bound, and lifecycle-sensitive. A
-    /// topology or provider-policy change may invalidate them immediately.
-    ///
-    /// # Errors
-    ///
-    /// Returns a transport-level [`ServiceCallError`] when the caller is not a
-    /// declared consumer, the contract is not a `Multiple` service, no provider
-    /// is available, or the bounded provider list cannot be represented.
-    fn list_service_providers(
-        &mut self,
-        _contract: &crate::contracts::ContractKey,
-    ) -> ServiceCallResult<Vec<ServiceProviderHandle>> {
-        Err(ServiceCallError::Unavailable)
-    }
-
-    /// Calls one provider previously selected from a `Multiple` service contract.
-    ///
-    /// # Errors
-    ///
-    /// Returns a transport-level [`ServiceCallError`] when the handle is stale,
-    /// belongs to another caller, or provider execution fails.
-    fn call_service_provider(
-        &mut self,
-        _provider: ServiceProviderHandle,
-        _request: &[u8],
-    ) -> ServiceCallResult<Vec<u8>> {
-        Err(ServiceCallError::Unavailable)
-    }
-
-    /// Mounts the initial presentation snapshot for one statically registered surface.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`crate::ui::UiError`] when the surface cannot be mounted.
-    fn mount_ui_surface(&mut self, _snapshot: UiSurfaceSnapshot) -> UiResult<()> {
-        Err(crate::ui::UiError::RuntimeUnavailable)
-    }
-
-    /// Applies one incremental patch batch to an owned mounted surface.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`crate::ui::UiError`] when the patch batch is invalid or cannot be applied.
-    fn patch_ui_surface(&mut self, _batch: UiPatchBatch) -> UiResult<()> {
-        Err(crate::ui::UiError::RuntimeUnavailable)
-    }
-
-    /// Removes the current presentation snapshot for an owned surface.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`crate::ui::UiError`] when the surface is unavailable or not owned by the caller.
-    fn unmount_ui_surface(&mut self, _surface_id: &UiSurfaceId) -> UiResult<()> {
-        Err(crate::ui::UiError::RuntimeUnavailable)
     }
 }
 
@@ -219,43 +134,5 @@ pub trait RegistrationContext: ComponentContext {
     /// schema key was already declared by this extension instance.
     fn register_world_schema(&mut self, _schema: WorldSchemaContribution) -> ExtensionResult<()> {
         Err(crate::errors::ExtensionError::WorldSchemaRegistrationUnavailable)
-    }
-
-    /// Registers one static portable UI surface owned by this component.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the current host context cannot register UI metadata.
-    fn register_ui_surface(&mut self, _surface: UiSurfaceContribution) -> ExtensionResult<()> {
-        Err(crate::errors::ExtensionError::UiRegistrationUnavailable)
-    }
-
-    /// Registers this component as a renderer for the portable UI protocol.
-    ///
-    /// The component must separately provide the platform `rintawa.ui.layer@1`
-    /// binding. The host selects one provider through normal composition policy
-    /// before attaching its descriptor.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the current host context cannot register UI metadata.
-    fn register_ui_layer(&mut self, _descriptor: UiLayerDescriptor) -> ExtensionResult<()> {
-        Err(crate::errors::ExtensionError::UiRegistrationUnavailable)
-    }
-
-    /// Registers the initial World presentation entry point owned by this component.
-    ///
-    /// The component must separately provide the platform-owned
-    /// `rintawa.world.presentation@1` Binding. The host validates that the declared
-    /// entry surface is statically registered by the same owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the current host context cannot register UI metadata.
-    fn register_world_presentation(
-        &mut self,
-        _descriptor: WorldPresentationDescriptor,
-    ) -> ExtensionResult<()> {
-        Err(crate::errors::ExtensionError::UiRegistrationUnavailable)
     }
 }

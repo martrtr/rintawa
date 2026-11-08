@@ -26,27 +26,11 @@ impl Component for ScopedComponent {
             "example.shared",
             ContributionKind::capability(),
         ))?;
-        ctx.register_ui_surface(UiSurfaceContribution::new(
-            "example.main",
-            UiPlacementHint::Primary,
-        ))?;
         Ok(())
     }
 
     fn start(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
         ctx.register_runtime_effect(RuntimeEffect::event_subscription("example.event"))?;
-        ctx.mount_ui_surface(UiSurfaceSnapshot {
-            surface_id: UiSurfaceId::new("example.main"),
-            revision: 1,
-            root: UiNodeId::new("root"),
-            nodes: vec![UiNode::new(
-                "root",
-                UiNodeKind::Text(UiTextNode {
-                    text: ctx.runtime_scope_id().to_string(),
-                }),
-            )],
-        })
-        .map_err(|error| ExtensionError::Message(error.to_string()))?;
         Ok(())
     }
 }
@@ -62,7 +46,7 @@ fn manifest() -> ExtensionManifest {
 }
 
 #[test]
-fn test_same_logical_extension_is_isolated_between_runtime_scopes() -> Result<()> {
+fn test_should_isolate_same_extension_between_runtime_scopes() -> Result<()> {
     let mut engine = ExtensionEngine::new();
     let instance_a = ExtensionInstanceId::new("shared@world-a");
     let instance_b = ExtensionInstanceId::new("shared@world-b");
@@ -104,18 +88,6 @@ fn test_same_logical_extension_is_isolated_between_runtime_scopes() -> Result<()
             .is_some()
     );
 
-    let surfaces = engine.portable_ui_surfaces();
-    assert_eq!(surfaces.len(), 2);
-    assert!(
-        surfaces
-            .iter()
-            .any(|surface| surface.owner.instance_id == instance_a)
-    );
-    assert!(
-        surfaces
-            .iter()
-            .any(|surface| surface.owner.instance_id == instance_b)
-    );
     assert_eq!(engine.active_runtime_effect_principals().len(), 2);
 
     engine.stop_extension_instance(&instance_a)?;
@@ -138,9 +110,6 @@ fn test_same_logical_extension_is_isolated_between_runtime_scopes() -> Result<()
             .active_contribution_owner_in_scope(&scope_b, &ContributionId::new("example.shared"))
             .is_some()
     );
-    let surfaces = engine.portable_ui_surfaces();
-    assert_eq!(surfaces.len(), 1);
-    assert_eq!(surfaces[0].owner.instance_id, instance_b);
     let effects = engine.active_runtime_effect_principals();
     assert_eq!(effects.len(), 1);
     assert_eq!(effects[0].1.instance_id, instance_b);

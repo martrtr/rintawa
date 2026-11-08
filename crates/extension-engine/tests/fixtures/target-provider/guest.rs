@@ -19,8 +19,6 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
 
     fn on_event(_topic: String, _payload: Vec<u8>) {}
 
-    fn handle_ui_action(_action_json: Vec<u8>) {}
-
     fn handle_service(_contract: String, _version: u32, _payload: Vec<u8>) -> Vec<u8> {
         Vec::new()
     }
@@ -99,17 +97,6 @@ impl exports::rintawa::engine::target_provider::Guest for Fixture {
             return Err(Error::Rejected);
         }
         Ok(())
-    }
-
-    fn handle_ui_action(
-        handle: u64,
-        _action_json: Vec<u8>,
-    ) -> Result<(), exports::rintawa::engine::target_provider::Error> {
-        if handle == 7 {
-            Ok(())
-        } else {
-            Err(exports::rintawa::engine::target_provider::Error::UnknownComponent)
-        }
     }
 
     fn handle_service(

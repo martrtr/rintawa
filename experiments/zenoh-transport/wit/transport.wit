@@ -1,0 +1,29 @@
+package rintawa:transport-probe@0.1.0;
+
+/// Deliberately minimal host-mediated experiment; not a production Rintawa ABI.
+interface broker {
+    enum error {
+        denied,
+        invalid-name,
+        too-large,
+        unavailable,
+    }
+
+    declare-queryable: func(name: string) -> result<_, error>;
+    subscribe: func(name: string) -> result<_, error>;
+    publish: func(name: string, payload: list<u8>) -> result<_, error>;
+    query-public: func(name: string, payload: list<u8>) -> result<list<list<u8>>, error>;
+    /// Send one incremental reply to the current query, without buffering the stream.
+    reply: func(payload: list<u8>) -> result<_, error>;
+}
+
+interface guest {
+    start: func();
+    on-query: func(payload: list<u8>) -> list<u8>;
+    on-event: func(payload: list<u8>);
+}
+
+world transport-probe {
+    import broker;
+    export guest;
+}

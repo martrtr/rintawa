@@ -13,7 +13,7 @@ use std::sync::{
 use anyhow::Result;
 use rintawa_sdk::world::{ItemId, PrincipalId, SchemaKey};
 use rintawa_storage::SqliteWorldStorage;
-use rintawa_world::{RuntimeSignal, StateChange, WorldCommand, WorldError, WorldTransaction};
+use rintawa_world::{StateChange, WorldCommand, WorldError, WorldTransaction};
 use rintawa_world_runtime::{
     SystemError, SystemResult, WorldRuntimeError, WorldSnapshot, WorldSystem,
 };
@@ -201,12 +201,7 @@ fn test_should_reject_empty_change_set_without_commit() -> Result<()> {
     let (root, storage, schemas) = create_storage()?;
     let path = root.path().join("world.sqlite");
     let principal = PrincipalId::new();
-    let signal = RuntimeSignal::new(
-        schemas.signal.clone(),
-        serde_json::json!({ "ignored": true }),
-    );
-    // Signals alone are best-effort post-COMMIT notifications, never a change.
-    let system = ScriptedSystem::new(schemas.command.clone(), Vec::new(), vec![signal]);
+    let system = ScriptedSystem::new(schemas.command.clone(), Vec::new());
     let mut builder = runtime_builder(storage, &[&schemas.command])?;
     builder.register_system(system)?;
     let runtime = builder.start()?;
@@ -214,7 +209,7 @@ fn test_should_reject_empty_change_set_without_commit() -> Result<()> {
     let ticket = runtime.submit(command(
         &schemas.command,
         principal,
-        serde_json::json!({ "kind": "signal-only" }),
+        serde_json::json!({ "kind": "empty-output" }),
     ))?;
     let error = ticket.wait().expect_err("empty change set must not commit");
     match error {

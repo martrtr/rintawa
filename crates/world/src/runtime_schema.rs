@@ -1,7 +1,6 @@
 //! Transient extension runtime-API schemas.
 //!
-//! Command, projection and runtime-signal schemas describe extension-provided
-//! operation payloads. They are compiled in memory from exact installed packages
+//! Command schemas describe extension-provided operation payloads. They are compiled in memory from exact installed packages
 //! and are deliberately **not** persisted in `property_registry`, which holds
 //! property definitions only.
 

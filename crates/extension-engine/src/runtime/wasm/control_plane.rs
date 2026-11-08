@@ -1,4 +1,4 @@
-//! WASM adapters for host-owned artifact, user-content, preference, policy, and composition access.
+//! WASM adapters for host-owned artifact, preference, policy, and composition access.
 
 use rintawa_sdk::{
     contracts::ComponentRef, runtime_permissions::RuntimePermission, types::RuntimeScopeId,
@@ -6,23 +6,17 @@ use rintawa_sdk::{
 
 use crate::{
     host_access::{
-        CompositionActivation, HostAccessError, RuntimePolicyComponent, UserContentDocument,
-        UserContentSummary, UserContentWriteStatus, UserResourceRef, WorldCommandAccessError,
-        WorldCommandRequest, WorldProjectionAccessError, WorldProjectionReadStatus,
-        WorldProjectionRequest, WorldSessionAssetRef, WorldSessionSummary,
+        CompositionActivation, HostAccessError, RuntimePolicyComponent, UserResourceRef,
+        WorldSessionAssetRef, WorldSessionSummary,
     },
     runtime::wasm::{
         ArtifactStoreError, ArtifactStoreHost, AssetStoreError, AssetStoreHost, CompositionError,
         CompositionHost, PreferenceError, PreferencesHost, RuntimePermissionCheck,
         RuntimePolicyError, RuntimePolicyHost, ScopedCompositionHost, ScopedRuntimePolicyHost,
-        UserContentError, UserContentHost, UserResourceError, UserResourcesHost, WasmHostState,
-        WitAcceptedUserContentWrite, WitAcceptedWorldCommand, WitAcceptedWorldProjectionRead,
-        WitAssetRef, WitCompositionActivation, WitImportedArtifact, WitRuntimeArtifactPolicy,
-        WitRuntimeHttpOriginGrant, WitRuntimePolicyComponent, WitRuntimePolicyRequest,
-        WitUserContentDocument, WitUserContentEntry, WitUserContentWriteState, WitUserResourceRef,
-        WitWorldCommandRequest, WitWorldProjectionReadState, WitWorldProjectionRequest,
-        WitWorldProjectionView, WitWorldSummary, WorldCommandError, WorldCommandsHost,
-        WorldProjectionError, WorldProjectionsHost, WorldSessionError, WorldSessionsHost,
+        UserResourceError, UserResourcesHost, WasmHostState, WitAssetRef, WitCompositionActivation,
+        WitImportedArtifact, WitRuntimeArtifactPolicy, WitRuntimeHttpOriginGrant,
+        WitRuntimePolicyComponent, WitRuntimePolicyRequest, WitUserResourceRef, WitWorldSummary,
+        WorldSessionError, WorldSessionsHost,
     },
 };
 
@@ -397,102 +391,11 @@ fn map_user_resource_access_error(error: HostAccessError) -> UserResourceError {
         | HostAccessError::InvalidArtifact
         | HostAccessError::InvalidDigest
         | HostAccessError::InvalidWorldId
-        | HostAccessError::InvalidUserContentId
-        | HostAccessError::InvalidContentType
         | HostAccessError::UnsupportedContent
         | HostAccessError::InvalidPermission
         | HostAccessError::InvalidPreference
         | HostAccessError::PreferenceQuotaExceeded
         | HostAccessError::Rejected => UserResourceError::Rejected,
-    }
-}
-
-impl UserContentHost for WasmHostState {
-    fn list_items(
-        &mut self,
-        content: Option<String>,
-    ) -> Result<Vec<WitUserContentEntry>, UserContentError> {
-        self.require_user_content_read()?;
-        if content
-            .as_ref()
-            .is_some_and(|content| content.len() > self.max_host_message_bytes)
-        {
-            return Err(UserContentError::MessageTooLarge);
-        }
-        let entries = self
-            .host_access
-            .user_content
-            .list_user_content(content.as_deref())
-            .map_err(map_user_content_access_error)?;
-        self.bound_user_content_entries(entries)
-    }
-
-    fn read(&mut self, id: String) -> Result<WitUserContentDocument, UserContentError> {
-        self.require_user_content_read()?;
-        if id.len() > self.max_host_message_bytes {
-            return Err(UserContentError::MessageTooLarge);
-        }
-        let document = self
-            .host_access
-            .user_content
-            .read_user_content(&id)
-            .map_err(map_user_content_access_error)?;
-        self.bound_user_content_document(document)
-    }
-
-    fn request_import(
-        &mut self,
-        rtw: Vec<u8>,
-    ) -> Result<WitAcceptedUserContentWrite, UserContentError> {
-        let owner = self.require_user_content_write()?;
-        if rtw.len() > self.max_artifact_import_bytes {
-            return Err(UserContentError::MessageTooLarge);
-        }
-        self.consume_user_content_write_budget()?;
-        let accepted = self
-            .host_access
-            .user_content_write
-            .request_import(&owner, &rtw)
-            .map_err(map_user_content_access_error)?;
-        Ok(WitAcceptedUserContentWrite {
-            operation_id: accepted.operation_id,
-        })
-    }
-
-    fn request_replace(
-        &mut self,
-        id: String,
-        rtw: Vec<u8>,
-    ) -> Result<WitAcceptedUserContentWrite, UserContentError> {
-        let owner = self.require_user_content_write()?;
-        if id.len() > self.max_host_message_bytes || rtw.len() > self.max_artifact_import_bytes {
-            return Err(UserContentError::MessageTooLarge);
-        }
-        self.consume_user_content_write_budget()?;
-        let accepted = self
-            .host_access
-            .user_content_write
-            .request_replace(&owner, &id, &rtw)
-            .map_err(map_user_content_access_error)?;
-        Ok(WitAcceptedUserContentWrite {
-            operation_id: accepted.operation_id,
-        })
-    }
-
-    fn write_status(
-        &mut self,
-        operation_id: String,
-    ) -> Result<WitUserContentWriteState, UserContentError> {
-        let owner = self.require_user_content_write()?;
-        if operation_id.len() > self.max_host_message_bytes {
-            return Err(UserContentError::MessageTooLarge);
-        }
-        let status = self
-            .host_access
-            .user_content_write
-            .write_status(&owner, &operation_id)
-            .map_err(map_user_content_access_error)?;
-        self.bound_user_content_write_status(status)
     }
 }
 
@@ -580,113 +483,6 @@ impl WorldSessionsHost for WasmHostState {
     }
 }
 
-impl WorldCommandsHost for WasmHostState {
-    fn submit(
-        &mut self,
-        request: WitWorldCommandRequest,
-    ) -> Result<WitAcceptedWorldCommand, WorldCommandError> {
-        self.require_world_command_submit()?;
-        self.consume_world_command_submission_budget()?;
-        let message_bytes = request
-            .world_id
-            .len()
-            .saturating_add(request.schema.len())
-            .saturating_add(request.payload_json.len());
-        if message_bytes > self.max_host_message_bytes {
-            return Err(WorldCommandError::MessageTooLarge);
-        }
-
-        let accepted = self
-            .host_access
-            .world_commands
-            .submit_world_command(WorldCommandRequest {
-                world_id: request.world_id,
-                schema: request.schema,
-                payload_json: request.payload_json,
-                verified_ui_action: self.verified_ui_action_active,
-            })
-            .map_err(map_world_command_access_error)?;
-        Ok(WitAcceptedWorldCommand {
-            command_id: accepted.command_id,
-            correlation_id: accepted.correlation_id,
-        })
-    }
-}
-
-impl WorldProjectionsHost for WasmHostState {
-    fn request_read(
-        &mut self,
-        request: WitWorldProjectionRequest,
-    ) -> Result<WitAcceptedWorldProjectionRead, WorldProjectionError> {
-        let owner = self.require_world_projection_read()?;
-        let message_bytes = request
-            .world_id
-            .len()
-            .saturating_add(request.schema.len())
-            .saturating_add(request.input_json.len());
-        if message_bytes > self.max_host_message_bytes {
-            return Err(WorldProjectionError::MessageTooLarge);
-        }
-        self.consume_world_projection_read_budget()?;
-        let accepted = self
-            .host_access
-            .world_projections
-            .request_projection(
-                &owner,
-                WorldProjectionRequest {
-                    world_id: request.world_id,
-                    schema: request.schema,
-                    input_json: request.input_json,
-                },
-            )
-            .map_err(map_world_projection_access_error)?;
-        Ok(WitAcceptedWorldProjectionRead {
-            operation_id: accepted.operation_id,
-        })
-    }
-
-    fn read_status(
-        &mut self,
-        operation_id: String,
-    ) -> Result<WitWorldProjectionReadState, WorldProjectionError> {
-        let owner = self.require_world_projection_read()?;
-        if operation_id.len() > self.max_host_message_bytes {
-            return Err(WorldProjectionError::MessageTooLarge);
-        }
-        let status = self
-            .host_access
-            .world_projections
-            .projection_status(&owner, &operation_id)
-            .map_err(map_world_projection_access_error)?;
-        match status {
-            WorldProjectionReadStatus::Pending => Ok(WitWorldProjectionReadState::Pending),
-            WorldProjectionReadStatus::Succeeded(view) => {
-                let message_bytes = view
-                    .world_id
-                    .len()
-                    .saturating_add(view.schema.len())
-                    .saturating_add(view.value_json.len());
-                if message_bytes > self.max_host_message_bytes {
-                    return Err(WorldProjectionError::MessageTooLarge);
-                }
-                Ok(WitWorldProjectionReadState::Succeeded(
-                    WitWorldProjectionView {
-                        world_id: view.world_id,
-                        schema: view.schema,
-                        value_json: view.value_json,
-                    },
-                ))
-            }
-            WorldProjectionReadStatus::Failed(reason) => {
-                if reason.len() > self.max_host_message_bytes {
-                    return Err(WorldProjectionError::MessageTooLarge);
-                }
-                Ok(WitWorldProjectionReadState::Failed(reason))
-            }
-        }
-    }
-}
-
 impl PreferencesHost for WasmHostState {
     fn get(&mut self, key: String) -> Result<Option<String>, PreferenceError> {
         let (scope_id, owner) = self.preference_owner()?;
@@ -748,7 +544,7 @@ impl PreferencesHost for WasmHostState {
 
 impl WasmHostState {
     fn preference_owner(&self) -> Result<(RuntimeScopeId, ComponentRef), PreferenceError> {
-        if !self.host_access_active && !self.effect_service_read_active {
+        if !self.host_access_active {
             return Err(PreferenceError::AccessNotActive);
         }
         let scope_id = self
@@ -1213,140 +1009,6 @@ impl ScopedCompositionHost for WasmHostState {
 }
 
 impl WasmHostState {
-    fn require_user_content_read(&self) -> Result<(), UserContentError> {
-        if !self.host_access_active {
-            return Err(UserContentError::AccessNotActive);
-        }
-        self.runtime_permission_owner(RuntimePermission::UserContentRead)
-            .map(|_| ())
-            .map_err(|error| match error {
-                RuntimePermissionCheck::Denied => UserContentError::PermissionDenied,
-                RuntimePermissionCheck::Unavailable => UserContentError::Unavailable,
-            })
-    }
-
-    fn require_user_content_write(&self) -> Result<ComponentRef, UserContentError> {
-        if !self.host_access_active {
-            return Err(UserContentError::AccessNotActive);
-        }
-        self.runtime_permission_owner(RuntimePermission::UserContentWrite)
-            .map_err(|error| match error {
-                RuntimePermissionCheck::Denied => UserContentError::PermissionDenied,
-                RuntimePermissionCheck::Unavailable => UserContentError::Unavailable,
-            })
-    }
-
-    fn consume_user_content_write_budget(&mut self) -> Result<(), UserContentError> {
-        if self.user_content_writes_this_execution >= self.max_user_content_writes_per_execution {
-            return Err(UserContentError::LimitExceeded);
-        }
-        self.user_content_writes_this_execution =
-            self.user_content_writes_this_execution.saturating_add(1);
-        Ok(())
-    }
-
-    fn bound_user_content_entries(
-        &self,
-        entries: Vec<UserContentSummary>,
-    ) -> Result<Vec<WitUserContentEntry>, UserContentError> {
-        let message_bytes = entries.iter().fold(0_usize, |total, entry| {
-            total
-                .saturating_add(entry.id.len())
-                .saturating_add(entry.content.len())
-                .saturating_add(entry.revision.len())
-        });
-        if message_bytes > self.max_host_message_bytes {
-            return Err(UserContentError::MessageTooLarge);
-        }
-        Ok(entries.into_iter().map(to_wit_user_content_entry).collect())
-    }
-
-    fn bound_user_content_document(
-        &self,
-        document: UserContentDocument,
-    ) -> Result<WitUserContentDocument, UserContentError> {
-        let message_bytes = document
-            .metadata
-            .id
-            .len()
-            .saturating_add(document.metadata.content.len())
-            .saturating_add(document.metadata.revision.len())
-            .saturating_add(document.descriptor.len());
-        if message_bytes > self.max_host_message_bytes {
-            return Err(UserContentError::MessageTooLarge);
-        }
-        Ok(WitUserContentDocument {
-            metadata: to_wit_user_content_entry(document.metadata),
-            descriptor: document.descriptor,
-        })
-    }
-
-    fn bound_user_content_write_status(
-        &self,
-        status: UserContentWriteStatus,
-    ) -> Result<WitUserContentWriteState, UserContentError> {
-        match status {
-            UserContentWriteStatus::Pending => Ok(WitUserContentWriteState::Pending),
-            UserContentWriteStatus::Succeeded(entry) => {
-                let entry = self.bound_user_content_entries(vec![entry])?;
-                let entry = entry.into_iter().next().ok_or(UserContentError::Rejected)?;
-                Ok(WitUserContentWriteState::Succeeded(entry))
-            }
-            UserContentWriteStatus::Failed(diagnostic) => {
-                if diagnostic.len() > self.max_host_message_bytes {
-                    return Err(UserContentError::MessageTooLarge);
-                }
-                Ok(WitUserContentWriteState::Failed(diagnostic))
-            }
-        }
-    }
-
-    fn require_world_projection_read(&self) -> Result<ComponentRef, WorldProjectionError> {
-        if !self.host_access_active && !self.effect_service_read_active {
-            return Err(WorldProjectionError::AccessNotActive);
-        }
-        self.runtime_permission_owner(RuntimePermission::WorldProjectionRead)
-            .map_err(|error| match error {
-                RuntimePermissionCheck::Denied => WorldProjectionError::PermissionDenied,
-                RuntimePermissionCheck::Unavailable => WorldProjectionError::Unavailable,
-            })
-    }
-
-    fn consume_world_projection_read_budget(&mut self) -> Result<(), WorldProjectionError> {
-        if self.world_projection_reads_this_execution
-            >= self.max_world_projection_reads_per_execution
-        {
-            return Err(WorldProjectionError::LimitExceeded);
-        }
-        self.world_projection_reads_this_execution =
-            self.world_projection_reads_this_execution.saturating_add(1);
-        Ok(())
-    }
-
-    fn require_world_command_submit(&self) -> Result<(), WorldCommandError> {
-        if !self.host_access_active {
-            return Err(WorldCommandError::AccessNotActive);
-        }
-        self.runtime_permission_owner(RuntimePermission::WorldCommandSubmit)
-            .map(|_| ())
-            .map_err(|error| match error {
-                RuntimePermissionCheck::Denied => WorldCommandError::PermissionDenied,
-                RuntimePermissionCheck::Unavailable => WorldCommandError::Unavailable,
-            })
-    }
-
-    fn consume_world_command_submission_budget(&mut self) -> Result<(), WorldCommandError> {
-        if self.world_command_submissions_this_execution
-            >= self.max_world_command_submissions_per_execution
-        {
-            return Err(WorldCommandError::LimitExceeded);
-        }
-        self.world_command_submissions_this_execution = self
-            .world_command_submissions_this_execution
-            .saturating_add(1);
-        Ok(())
-    }
-
     fn require_world_session_permission(
         &self,
         permission: RuntimePermission,
@@ -1503,60 +1165,6 @@ fn to_wit_composition_activation(activation: CompositionActivation) -> WitCompos
         world_default: activation.world_default,
     }
 }
-
-fn to_wit_user_content_entry(entry: UserContentSummary) -> WitUserContentEntry {
-    WitUserContentEntry {
-        id: entry.id,
-        content: entry.content,
-        revision: entry.revision,
-    }
-}
-
-fn map_world_projection_access_error(error: WorldProjectionAccessError) -> WorldProjectionError {
-    match error {
-        WorldProjectionAccessError::InvalidWorldId => WorldProjectionError::InvalidWorldId,
-        WorldProjectionAccessError::InvalidSchema => WorldProjectionError::InvalidSchema,
-        WorldProjectionAccessError::InvalidInput => WorldProjectionError::InvalidInput,
-        WorldProjectionAccessError::NotFound => WorldProjectionError::NotFound,
-        WorldProjectionAccessError::WorldNotActive => WorldProjectionError::WorldNotActive,
-        WorldProjectionAccessError::QueueFull => WorldProjectionError::QueueFull,
-        WorldProjectionAccessError::Rejected => WorldProjectionError::Rejected,
-        WorldProjectionAccessError::Unavailable => WorldProjectionError::Unavailable,
-    }
-}
-
-fn map_world_command_access_error(error: WorldCommandAccessError) -> WorldCommandError {
-    match error {
-        WorldCommandAccessError::InvalidWorldId => WorldCommandError::InvalidWorldId,
-        WorldCommandAccessError::InvalidSchema => WorldCommandError::InvalidSchema,
-        WorldCommandAccessError::InvalidPayload => WorldCommandError::InvalidPayload,
-        WorldCommandAccessError::NotFound => WorldCommandError::NotFound,
-        WorldCommandAccessError::WorldNotActive => WorldCommandError::WorldNotActive,
-        WorldCommandAccessError::QueueFull => WorldCommandError::QueueFull,
-        WorldCommandAccessError::Rejected => WorldCommandError::Rejected,
-        WorldCommandAccessError::Unavailable => WorldCommandError::Unavailable,
-    }
-}
-
-fn map_user_content_access_error(error: HostAccessError) -> UserContentError {
-    match error {
-        HostAccessError::InvalidUserContentId => UserContentError::InvalidId,
-        HostAccessError::InvalidContentType => UserContentError::InvalidContent,
-        HostAccessError::NotFound => UserContentError::NotFound,
-        HostAccessError::QueueFull => UserContentError::QueueFull,
-        HostAccessError::Unavailable => UserContentError::Unavailable,
-        HostAccessError::Rejected
-        | HostAccessError::InvalidArtifact
-        | HostAccessError::InvalidAsset
-        | HostAccessError::InvalidDigest
-        | HostAccessError::InvalidWorldId
-        | HostAccessError::UnsupportedContent
-        | HostAccessError::InvalidPermission
-        | HostAccessError::InvalidPreference
-        | HostAccessError::PreferenceQuotaExceeded => UserContentError::Rejected,
-    }
-}
-
 fn map_world_session_access_error(error: HostAccessError) -> WorldSessionError {
     match error {
         HostAccessError::InvalidWorldId => WorldSessionError::InvalidWorldId,
@@ -1566,8 +1174,6 @@ fn map_world_session_access_error(error: HostAccessError) -> WorldSessionError {
         HostAccessError::InvalidArtifact
         | HostAccessError::InvalidAsset
         | HostAccessError::InvalidDigest
-        | HostAccessError::InvalidUserContentId
-        | HostAccessError::InvalidContentType
         | HostAccessError::UnsupportedContent
         | HostAccessError::InvalidPermission
         | HostAccessError::InvalidPreference
@@ -1584,8 +1190,6 @@ fn map_artifact_store_access_error(error: HostAccessError) -> ArtifactStoreError
         HostAccessError::Unavailable => ArtifactStoreError::Unavailable,
         HostAccessError::NotFound
         | HostAccessError::InvalidWorldId
-        | HostAccessError::InvalidUserContentId
-        | HostAccessError::InvalidContentType
         | HostAccessError::QueueFull
         | HostAccessError::InvalidAsset
         | HostAccessError::UnsupportedContent
@@ -1604,8 +1208,6 @@ fn map_asset_store_access_error(error: HostAccessError) -> AssetStoreError {
         HostAccessError::Unavailable => AssetStoreError::Unavailable,
         HostAccessError::InvalidArtifact
         | HostAccessError::InvalidWorldId
-        | HostAccessError::InvalidUserContentId
-        | HostAccessError::InvalidContentType
         | HostAccessError::QueueFull
         | HostAccessError::NotFound
         | HostAccessError::UnsupportedContent
@@ -1625,8 +1227,6 @@ fn map_preference_access_error(error: HostAccessError) -> PreferenceError {
         | HostAccessError::InvalidAsset
         | HostAccessError::InvalidDigest
         | HostAccessError::InvalidWorldId
-        | HostAccessError::InvalidUserContentId
-        | HostAccessError::InvalidContentType
         | HostAccessError::QueueFull
         | HostAccessError::NotFound
         | HostAccessError::UnsupportedContent
@@ -1644,8 +1244,6 @@ fn map_runtime_policy_access_error(error: HostAccessError) -> RuntimePolicyError
         | HostAccessError::InvalidAsset
         | HostAccessError::InvalidDigest
         | HostAccessError::InvalidWorldId
-        | HostAccessError::InvalidUserContentId
-        | HostAccessError::InvalidContentType
         | HostAccessError::QueueFull
         | HostAccessError::UnsupportedContent
         | HostAccessError::InvalidPreference
@@ -1663,8 +1261,6 @@ fn map_composition_access_error(error: HostAccessError) -> CompositionError {
         HostAccessError::UnsupportedContent => CompositionError::UnsupportedContent,
         HostAccessError::InvalidAsset
         | HostAccessError::InvalidWorldId
-        | HostAccessError::InvalidUserContentId
-        | HostAccessError::InvalidContentType
         | HostAccessError::QueueFull
         | HostAccessError::InvalidPermission
         | HostAccessError::InvalidPreference

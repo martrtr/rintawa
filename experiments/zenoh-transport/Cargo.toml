@@ -1,0 +1,13 @@
+[package]
+name = "rintawa-zenoh-transport-probe"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+zenoh = { version = "=1.10.2", default-features = false, features = ["auth_usrpwd", "transport_tcp"] }
+wasmtime = { version = "=29.0.1", features = ["component-model"] }
+wit-component = "=0.247.0"

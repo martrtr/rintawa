@@ -12,14 +12,14 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use rintawa_sdk::world::{ItemId, PrincipalId, SchemaKey, WorldId};
 use rintawa_storage::{SqliteWorldStorage, StorageError};
-use rintawa_world::{
-    ItemKind, RuntimeSignal, StateChange, WorldCommand, WorldError, WorldTransaction,
-};
+use rintawa_world::{ItemKind, StateChange, WorldCommand, WorldError, WorldTransaction};
 use rintawa_world_runtime::{
     SystemError, SystemResult, WorldRuntimeError, WorldSnapshot, WorldSystem,
 };
 
-use common::{ScriptedSystem, command, create_storage, key, runtime_builder};
+use common::{
+    ScriptedSystem, activate_fixture_properties, command, create_storage, key, runtime_builder,
+};
 
 /// What one evaluation observed in its pinned snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,26 +104,17 @@ fn test_should_commit_items_and_properties_atomically() -> Result<()> {
             data: serde_json::json!({ "level": 3 }),
         },
     ];
-    let signal = RuntimeSignal::new(
-        schemas.signal.clone(),
-        serde_json::json!({ "item": alice.to_string() }),
-    );
-    let system = ScriptedSystem::new(schemas.command.clone(), changes, vec![signal]);
+    let system = ScriptedSystem::new(schemas.command.clone(), changes);
 
     let mut builder = runtime_builder(storage, &[&schemas.command])?;
     builder.register_system(system)?;
     let runtime = builder.start()?;
+    activate_fixture_properties(&runtime, &schemas)?;
 
     let submitted = command(&schemas.command, principal, serde_json::json!({}));
     let command_id = submitted.id();
     let outcome = runtime.submit(submitted)?.wait()?;
     assert_eq!(outcome.command_id(), command_id);
-    assert_eq!(outcome.signals().len(), 1);
-    assert_eq!(outcome.signals()[0].schema(), &schemas.signal);
-    assert_eq!(
-        outcome.signals()[0].payload()["item"],
-        alice.to_string().as_str()
-    );
 
     let snapshot = runtime.snapshot()?;
     assert_eq!(snapshot.world_id(), runtime.world_id());
@@ -173,11 +164,12 @@ fn test_should_roll_back_when_a_later_property_is_invalid() -> Result<()> {
             data: serde_json::json!({ "level": 99 }),
         },
     ];
-    let system = ScriptedSystem::new(schemas.command.clone(), changes, Vec::new());
+    let system = ScriptedSystem::new(schemas.command.clone(), changes);
 
     let mut builder = runtime_builder(storage, &[&schemas.command])?;
     builder.register_system(system)?;
     let runtime = builder.start()?;
+    activate_fixture_properties(&runtime, &schemas)?;
 
     let ticket = runtime.submit(command(
         &schemas.command,
@@ -225,11 +217,12 @@ fn test_should_reject_unregistered_property_before_commit() -> Result<()> {
             data: serde_json::json!({ "value": true }),
         },
     ];
-    let system = ScriptedSystem::new(schemas.command.clone(), changes, Vec::new());
+    let system = ScriptedSystem::new(schemas.command.clone(), changes);
 
     let mut builder = runtime_builder(storage, &[&schemas.command])?;
     builder.register_system(system)?;
     let runtime = builder.start()?;
+    activate_fixture_properties(&runtime, &schemas)?;
 
     let ticket = runtime.submit(command(
         &schemas.command,
@@ -275,11 +268,12 @@ fn test_should_roll_back_when_storage_rejects_a_later_change() -> Result<()> {
             object: missing,
         },
     ];
-    let system = ScriptedSystem::new(schemas.command.clone(), changes, Vec::new());
+    let system = ScriptedSystem::new(schemas.command.clone(), changes);
 
     let mut builder = runtime_builder(storage, &[&schemas.command])?;
     builder.register_system(system)?;
     let runtime = builder.start()?;
+    activate_fixture_properties(&runtime, &schemas)?;
 
     let ticket = runtime.submit(command(
         &schemas.command,
@@ -341,6 +335,7 @@ fn test_should_evaluate_against_pinned_snapshot() -> Result<()> {
     let mut builder = runtime_builder(storage, &[&schemas.command])?;
     builder.register_system(system)?;
     let runtime = builder.start()?;
+    activate_fixture_properties(&runtime, &schemas)?;
 
     let mut tickets = Vec::new();
     for next in [1, 2] {

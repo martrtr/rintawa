@@ -5,17 +5,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{DefinitionRegistration, PropertyDefinition, PropertyRegistry, WorldResult};
 
-/// Current on-disk world format understood by this runtime.
-///
-/// Format 6 is the four-table item/property model with no durable command ledger,
-/// commit position, event log, consumer cursors, job outbox or control grants.
-pub const WORLD_FORMAT_VERSION: u32 = 6;
-
 /// The single JSON manifest embedded in `world.manifest`.
 ///
-/// The manifest is Host-owned world composition data. World-level values that used
-/// to live in `world_facets` are carried in the documented `world_facets` section
-/// of this document rather than in a fifth table.
+/// The manifest is the authoritative document for world metadata.
+/// Host-owned title, description and cover live in its metadata object; local
+/// composition approvals remain independent from this transferable World.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct WorldManifest(serde_json::Value);

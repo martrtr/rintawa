@@ -42,6 +42,11 @@ SDK. Additional execution targets are not hard-coded product features: the
 bootstrap architecture is designed so extensions can provide new versioned
 targets.
 
+The experimental Portable UI SDK model, World-presentation and UI Layer
+WIT interfaces have been removed during the architecture rebuild.
+Older RTWs compiled against them are incompatible. There is no UI compatibility
+shim or implemented replacement interaction transport in Core yet.
+
 Presentation technology is likewise outside this SDK. A shell, UI layer, TUI,
 3D frontend, or Web frontend should advertise the role it provides through
 versioned contracts independently of its execution target. For example, the
@@ -79,23 +84,31 @@ runtime permissions. Delegated components execute under their own principal.
 `rintawa_sdk::world` defines the feature-neutral World contract shared by the
 authoritative runtime and extensions:
 
-- opaque UUIDv7 identifiers: `WorldId`, `ItemId`, `CommandId`, `PrincipalId` and
-  `CorrelationId`;
-- versioned schema keys (`SchemaId@version`) and the `SchemaKind` categories `Property`,
-  `Command`, `Event`, `Effect` and `Projection`;
+- opaque UUIDv7 identifiers: `WorldId`, `ItemId`, `CommandId` and `PrincipalId`;
+- versioned schema keys (`SchemaId@version`) and the `SchemaKind` categories
+  `Property` and `Command`;
 - item and property records where every object and relation is an item, and all
   extension data is a versioned property value on an item.
 
-`rintawa_sdk::world_system` and `rintawa_sdk::world_projection` are the transport
-contracts for ordinary extension Systems and projections. A System returns one atomic
-item/property change set plus optional best-effort signals, and a projection may read only
-the property names it owns.
+`rintawa_sdk::world_system` defines the bounded service transport for ordinary
+extension Systems. A System returns one atomic item/property change set and no
+post-COMMIT signal or event proposal. No dedicated World Projection or World signal
+transport is part of this MVP. The active command System may read or modify only
+properties whose versioned definitions are bound to that System's extension owner
+by the Host. Deleting items is also rejected if its SQLite cascade would erase
+foreign-owned property data. A matching stored JSON Schema is not authorization;
+owner bindings are rebuilt from installed artifacts on every World activation.
+Native World read snapshots now offer bounded keyset lookup of properties by exact
+versioned name (256 entries and 8 MiB JSON per page) and bounded relation batch
+reads (64 inputs, 256 results); these are not exposed as a
+replacement WIT Projection or generic extension query transport.
 
 The model is intentionally reduced: one World per database with four tables, no durable
 command ledger or receipts, no event log or replay, no jobs/outbox, and no actor control
-grants. Runtime signals are best-effort in-process notifications, lost if the process dies
-between COMMIT and dispatch. Property names are flat identifiers, and `player`/`npc` are
-ordinary extension properties with no Core ownership semantics.
+grants. The World runtime-signal bridge has been retired. Generic in-process
+Extension Engine event subscriptions remain separate and offer no World-change
+delivery or replay guarantees. Property names are flat identifiers, and
+`player`/`npc` are ordinary extension properties with no Core ownership semantics.
 
 ## Lifecycle
 

@@ -11,12 +11,9 @@
 // in a host process that fails fast on any of them.
 #![allow(clippy::result_large_err)]
 
-mod identity;
 mod profile;
 mod runtime;
-mod runtime_signal;
-mod user_content;
-mod world_catalog;
+mod world_metadata;
 
 use std::{
     fmt,
@@ -29,35 +26,27 @@ use rintawa_artifacts::{
 };
 use rintawa_extension_engine::{
     ActivationPlanError, DeferredExecutionTarget, EngineError, ExtensionEngine, RtwExtensionLoader,
-    UnresolvedContractReason, canonical_http_loopback_origin,
+    TransportError, UnresolvedContractReason, canonical_http_loopback_origin,
+    validate_transport_point,
 };
 use rintawa_sdk::{
     contracts::{ComponentRef, ContractKey},
     runtime_permissions::RuntimePermission,
     types::{ComponentId, ExtensionInstanceId, RuntimeScopeId},
-    ui::WorldPresentationDescriptor,
-    world::{PrincipalId, SchemaKey, WorldId},
+    world::WorldId,
 };
 use rintawa_storage::SqliteWorldStorage;
-use rintawa_world::WorldSessionState;
+use rintawa_world::{WorldManifest, WorldSessionState};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub use identity::HOST_IDENTITY_SCHEMA;
 pub use profile::{
-    ActivationRecord, BaselineProfile, CompositionProfile, HttpLoopbackOriginGrant, PROFILE_SCHEMA,
-    PreferredProviderSelection, RuntimePermissionGrant,
+    ActivationRecord, AuthoritativeProviderSelection, BaselineProfile, CompositionProfile,
+    HttpLoopbackOriginGrant, PROFILE_SCHEMA, PreferredProviderSelection, RuntimePermissionGrant,
 };
-pub use runtime::{HostRuntime, WorldCommandDispatchOutcome};
-pub use runtime_signal::{
-    DEFAULT_RUNTIME_SIGNAL_QUEUE_CAPACITY, MAX_RUNTIME_SIGNAL_MESSAGE_BYTES,
-    MAX_RUNTIME_SIGNAL_TOPIC_BYTES,
-};
-pub use user_content::{USER_CONTENT_LIBRARY_SCHEMA, UserContentEntry, UserContentId};
-pub use world_catalog::{
-    MAX_WORLD_TITLE_BYTES, WORLD_CATALOG_METADATA_FILE, WORLD_CATALOG_METADATA_SCHEMA,
-    WorldCatalogMetadata,
-};
+pub use runtime::HostRuntime;
+use world_metadata::WorldMetadata;
+pub use world_metadata::{MAX_WORLD_DESCRIPTION_BYTES, MAX_WORLD_TITLE_BYTES};
 
 /// Stable runtime scope used by the pre-world/bootstrap composition.
 pub const HOST_SCOPE: &str = "host";
@@ -78,7 +67,6 @@ pub const BASELINE_PROFILE_FILE: &str = "baseline.toml";
 /// File name of the composition recipe materialized into newly created Worlds.
 pub const DEFAULT_WORLD_PROFILE_FILE: &str = "default-world.toml";
 const EXTENSION_CONTENT_V1: &str = "rintawa.extension@1";
-const HOST_IDENTITY_FILE: &str = "identity.toml";
 const WORLD_DATABASE_FILE: &str = "world.sqlite";
 const WORLD_COMPOSITION_FILE: &str = "composition.toml";
 const WORLD_ID_CREATION_ATTEMPTS: usize = 8;
@@ -280,12 +268,6 @@ pub enum HostError {
     /// Authoritative world command runtime failed.
     #[error(transparent)]
     WorldRuntime(#[from] rintawa_world_runtime::WorldRuntimeError),
-    /// A Principal-specific world projection could not be built safely.
-    #[error(transparent)]
-    WorldProjection(#[from] rintawa_world_runtime::WorldProjectionError),
-    /// No registered Projection schema is available under this exact key.
-    #[error("world projection `{0}` is not available in the active world")]
-    WorldProjectionUnavailable(SchemaKey),
     /// A filesystem operation failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -326,43 +308,15 @@ pub enum HostError {
         /// Maximum accepted UTF-8 byte length.
         maximum_bytes: usize,
     },
-    /// A World catalog metadata sidecar is absent where one was explicitly requested.
-    #[error("world catalog metadata file `{0}` is missing")]
-    WorldCatalogMetadataMissing(PathBuf),
-    /// A World catalog metadata path is not a safe regular file.
-    #[error("invalid world catalog metadata file `{0}`")]
-    InvalidWorldCatalogMetadataFile(PathBuf),
-    /// Persisted World catalog metadata could not be decoded.
-    #[error("invalid world catalog metadata: {source}")]
-    WorldCatalogMetadataDecode {
-        /// TOML decoding failure.
-        #[source]
-        source: toml::de::Error,
-    },
-    /// World catalog metadata could not be encoded.
-    #[error("failed to encode world catalog metadata: {source}")]
-    WorldCatalogMetadataEncode {
-        /// TOML encoding failure.
-        #[source]
-        source: toml::ser::Error,
-    },
-    /// Persisted World catalog metadata uses a newer schema.
-    #[error("unsupported world catalog metadata schema {0}")]
-    UnsupportedWorldCatalogMetadataSchema(u32),
+    /// A World manifest has invalid or absent human-facing metadata.
+    #[error("invalid World manifest metadata: {0}")]
+    InvalidWorldMetadata(String),
     /// A world runtime is already active in this host process.
     #[error("world `{0}` is already active")]
     WorldAlreadyActive(WorldId),
     /// A world runtime is not active in this host process.
     #[error("world `{0}` is not active")]
     WorldNotActive(WorldId),
-    /// The selected World presentation entry surface is not currently mounted.
-    #[error("world `{world_id}` presentation entry surface `{surface_id}` is not mounted")]
-    WorldPresentationEntryUnavailable {
-        /// Active World whose presentation could not be focused.
-        world_id: WorldId,
-        /// Exact owner-scoped entry surface declared by the selected provider.
-        surface_id: String,
-    },
     /// Persisted composition policy contains a record for another runtime scope.
     #[error("composition scope mismatch: expected `{expected_scope}`, found `{actual_scope}`")]
     CompositionScopeMismatch {
@@ -394,56 +348,31 @@ pub enum HostError {
         #[source]
         source: serde_json::Error,
     },
-    /// An ephemeral runtime signal used an empty or oversized routing topic.
-    #[error("runtime signal topic must be non-empty and within host bounds")]
-    InvalidRuntimeSignalTopic,
-    /// Shared deferred user-content write control state became unavailable.
-    #[error("user-content deferred write control is unavailable")]
-    UserContentWriteControlUnavailable,
+    /// Multiple runtime instances of one logical extension declared World schemas.
+    #[error(
+        "extension {extension_id} declares World schemas from multiple instances {first} and {second}"
+    )]
+    AmbiguousWorldExtensionInstance {
+        /// Logical extension owning more than one World schema instance.
+        extension_id: String,
+        /// First runtime instance.
+        first: String,
+        /// Second runtime instance.
+        second: String,
+    },
+    /// Different registered components declared the same World schema identity.
+    #[error("world schema {schema} has ambiguous declaring components {first} and {second}")]
+    AmbiguousWorldSchemaDeclaration {
+        /// Conflicting versioned World schema.
+        schema: rintawa_sdk::world::SchemaKey,
+        /// First registered instance/component principal.
+        first: String,
+        /// Second registered instance/component principal.
+        second: String,
+    },
     /// Shared deferred world-session lifecycle control state became unavailable.
     #[error("world-session lifecycle control is unavailable")]
     WorldSessionControlUnavailable,
-    /// Shared deferred world-command control state became unavailable.
-    #[error("world-command deferred control is unavailable")]
-    WorldCommandControlUnavailable,
-    /// Shared deferred world-projection control state became unavailable.
-    #[error("world-projection deferred control is unavailable")]
-    WorldProjectionControlUnavailable,
-    /// An active world's bounded ephemeral signal queue has no remaining capacity.
-    #[error("runtime signal queue for world `{0}` is full")]
-    RuntimeSignalQueueFull(WorldId),
-    /// A runtime signal envelope exceeded the host message bound.
-    #[error("runtime signal envelope is {actual_bytes} bytes; maximum is {maximum_bytes}")]
-    RuntimeSignalMessageTooLarge {
-        /// Encoded envelope size observed by the host.
-        actual_bytes: usize,
-        /// Maximum encoded envelope size accepted by the host.
-        maximum_bytes: usize,
-    },
-    /// A runtime signal envelope could not be serialized for extension delivery.
-    #[error("failed to encode runtime signal envelope: {source}")]
-    RuntimeSignalEncode {
-        /// Serialization failure from the host envelope codec.
-        #[source]
-        source: serde_json::Error,
-    },
-    /// Host identity metadata path is not a safe regular file.
-    #[error("invalid host identity file `{path}`: {reason}")]
-    InvalidHostIdentityFile {
-        /// Rejected host identity path.
-        path: PathBuf,
-        /// Identity storage invariant that was violated.
-        reason: &'static str,
-    },
-    /// Persisted host identity metadata could not be decoded.
-    #[error("invalid host identity metadata: {0}")]
-    HostIdentityDecode(toml::de::Error),
-    /// Host identity metadata could not be encoded.
-    #[error("failed to encode host identity metadata: {0}")]
-    HostIdentityEncode(toml::ser::Error),
-    /// Persisted host identity schema is newer than this host understands.
-    #[error("unsupported host identity schema {0}")]
-    UnsupportedHostIdentitySchema(u32),
     /// Persisted host state could not be decoded.
     #[error("invalid host profile: {0}")]
     ProfileDecode(#[from] toml::de::Error),
@@ -466,6 +395,26 @@ pub enum HostError {
         /// Contract selected more than once.
         contract: String,
     },
+    /// One authoritative Zenoh point was selected twice in one scope.
+    #[error("duplicate authoritative provider selection for point {point} in scope {scope_id}")]
+    DuplicateAuthoritativeProviderSelection {
+        /// Runtime scope containing the selection.
+        scope_id: String,
+        /// Zenoh point selected more than once.
+        point: String,
+    },
+    /// The selected Zenoh point name contains unsupported characters.
+    #[error("invalid authoritative transport point")]
+    InvalidAuthoritativePoint,
+    /// Too many authoritative point selections in a composition.
+    #[error("authoritative transport selection limit exceeded")]
+    AuthoritativeProviderLimitExceeded,
+    /// A selected component is not present in the installed RTW artifact.
+    #[error("authoritative provider component {0} is not present in the installed package")]
+    AuthoritativeProviderComponentNotFound(String),
+    /// The selected point cannot be admitted by the engine.
+    #[error("transport selection rejected: {0}")]
+    Transport(#[from] TransportError),
     /// The baseline profile contains the same runtime capability approval more than once.
     #[error(
         "duplicate runtime permission `{permission}` for component `{component_id}` in instance `{instance_id}` scope `{scope_id}`"
@@ -588,85 +537,6 @@ pub enum HostError {
     /// A persisted activation uses a content type for which this host has no handler.
     #[error("no activation handler is available for RTW content `{0}`")]
     UnsupportedContent(String),
-    /// The generic user-content library path is not a regular host-owned file.
-    #[error("invalid user-content library file `{0}`")]
-    InvalidUserContentLibraryFile(PathBuf),
-    /// The persisted generic user-content library uses an unsupported schema.
-    #[error("unsupported user-content library schema {0}")]
-    UnsupportedUserContentLibrarySchema(u32),
-    /// The persisted generic user-content library contains a duplicate logical ID.
-    #[error("duplicate user-content library id `{0}`")]
-    DuplicateUserContentId(UserContentId),
-    /// The requested logical user-content item is absent from the library index.
-    #[error("user-content item `{0}` is not present in the library")]
-    UserContentNotFound(UserContentId),
-    /// An edit attempted to change the versioned content type of one logical item.
-    #[error("user-content item `{id}` has type `{expected}`, not `{actual}`")]
-    UserContentTypeMismatch {
-        /// Stable logical content identity.
-        id: UserContentId,
-        /// Existing versioned content type.
-        expected: String,
-        /// Rejected replacement content type.
-        actual: String,
-    },
-    /// The persisted user-content library could not be decoded.
-    #[error("invalid user-content library: {source}")]
-    UserContentLibraryDecode {
-        /// TOML decoding failure.
-        #[source]
-        source: toml::de::Error,
-    },
-    /// The user-content library could not be encoded for persistence.
-    #[error("failed to encode user-content library: {source}")]
-    UserContentLibraryEncode {
-        /// TOML encoding failure.
-        #[source]
-        source: toml::ser::Error,
-    },
-    /// A content-handler request could not be serialized.
-    #[error("failed to encode RTW content-handler request for `{content}`: {source}")]
-    ContentHandlerRequestEncode {
-        /// Exact versioned RTW content type.
-        content: String,
-        /// JSON encoding failure.
-        #[source]
-        source: serde_json::Error,
-    },
-    /// The selected content-handler service could not complete validation.
-    #[error("RTW content handler for `{content}` is unavailable: {source}")]
-    ContentHandlerCall {
-        /// Exact versioned RTW content type.
-        content: String,
-        /// Generic service transport failure.
-        #[source]
-        source: rintawa_sdk::services::ServiceCallError,
-    },
-    /// A content handler returned malformed protocol bytes.
-    #[error("RTW content handler for `{content}` returned an invalid response: {source}")]
-    ContentHandlerResponseDecode {
-        /// Exact versioned RTW content type.
-        content: String,
-        /// JSON decoding failure.
-        #[source]
-        source: serde_json::Error,
-    },
-    /// A content handler rejected an immutable RTW descriptor.
-    #[error("RTW content `{content}` was rejected by its handler: {diagnostic}")]
-    UserContentRejected {
-        /// Exact versioned RTW content type.
-        content: String,
-        /// Bounded handler diagnostic.
-        diagnostic: String,
-    },
-    /// A content handler returned a rejection diagnostic above the protocol bound.
-    #[error("RTW content handler diagnostic for `{content}` exceeds {maximum_bytes} bytes")]
-    ContentHandlerDiagnosticTooLarge {
-        /// Exact versioned RTW content type.
-        content: String,
-        /// Maximum accepted UTF-8 byte length.
-        maximum_bytes: usize,
-    },
 }
 
 /// Result type used by local host composition operations.
@@ -732,7 +602,7 @@ enum PersistedCompositionScope {
 pub struct WorldSummary {
     /// Stable authoritative world identity.
     pub id: WorldId,
-    /// Human-facing host-owned catalog title.
+    /// Human-facing title stored in world.manifest.
     pub title: String,
     /// Optional human-facing description.
     pub description: Option<String>,
@@ -740,26 +610,13 @@ pub struct WorldSummary {
     pub cover: Option<rintawa_artifacts::AssetRef>,
 }
 
-/// One resolved entry point for an active World's presentation in a concrete UI session.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorldPresentationTarget {
-    /// Active authoritative World being presented.
-    pub world_id: WorldId,
-    /// Exact active component selected by the World's composition policy.
-    pub provider: ComponentRef,
-    /// Owner-scoped entry surface and optional semantic intent registered by the provider.
-    pub descriptor: WorldPresentationDescriptor,
-}
-
 /// Persistent local Rintawa home containing CAS bytes, worlds, and baseline composition.
 pub struct HostHome {
     root: PathBuf,
     store: ArtifactStore,
     asset_store: AssetStore,
-    local_principal: PrincipalId,
     profile_path: PathBuf,
     default_world_profile_path: PathBuf,
-    user_content_path: PathBuf,
     worlds_directory: PathBuf,
 }
 
@@ -771,39 +628,26 @@ impl HostHome {
         let root = root.canonicalize()?;
         let store = ArtifactStore::open(root.join("artifacts"), RtwLimits::default())?;
         let asset_store = AssetStore::open(root.join("assets"), MAX_ASSET_BYTES)?;
-        let local_principal =
-            identity::load_or_create_local_principal(&root.join(HOST_IDENTITY_FILE))?;
         let profiles_directory = root.join("profiles");
         ensure_real_directory(&profiles_directory)?;
         let profile_path = profiles_directory.join(BASELINE_PROFILE_FILE);
         let default_world_profile_path = profiles_directory.join(DEFAULT_WORLD_PROFILE_FILE);
-        let content_directory = root.join("content");
-        ensure_real_directory(&content_directory)?;
-        let user_content_path = content_directory.join("library.toml");
         let worlds_directory = root.join("worlds");
         ensure_real_directory(&worlds_directory)?;
         let home = Self {
             root,
             store,
             asset_store,
-            local_principal,
             profile_path,
             default_world_profile_path,
-            user_content_path,
             worlds_directory,
         };
-        home.migrate_legacy_world_defaults()?;
         Ok(home)
     }
 
     /// Returns the canonical local Rintawa home path.
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    /// Returns the stable authenticated Principal of this local single-user host.
-    pub const fn local_principal(&self) -> PrincipalId {
-        self.local_principal
     }
 
     /// Returns the immutable artifact store.
@@ -834,20 +678,18 @@ impl HostHome {
             }
 
             let database = directory.join(WORLD_DATABASE_FILE);
-            let creation: HostResult<WorldSummary> =
-                match SqliteWorldStorage::create(&database, world_id) {
-                    Ok(storage) => (|| {
-                        let state = storage.load_session()?;
-                        drop(storage);
-                        let metadata = WorldCatalogMetadata::new("New World", None)?;
-                        metadata.save(&directory.join(WORLD_CATALOG_METADATA_FILE))?;
-                        let scope_id = world_runtime_scope_id(world_id);
-                        let profile = default_world.materialize_all(scope_id);
-                        self.save_world_composition(world_id, &profile)?;
-                        Ok(world_summary(&state, metadata))
-                    })(),
-                    Err(error) => Err(error.into()),
-                };
+            let creation: HostResult<WorldSummary> = (|| {
+                let metadata = WorldMetadata::new("New World", None, None)?;
+                let manifest = metadata.write_to_manifest(&WorldManifest::default())?;
+                let storage =
+                    SqliteWorldStorage::create_with_manifest(&database, world_id, &manifest)?;
+                let state = storage.load_session()?;
+                drop(storage);
+                let scope_id = world_runtime_scope_id(world_id);
+                let profile = default_world.materialize_all(scope_id);
+                self.save_world_composition(world_id, &profile)?;
+                world_summary(&state)
+            })();
             match creation {
                 Ok(summary) => return Ok(summary),
                 Err(error) => {
@@ -877,7 +719,7 @@ impl HostHome {
         entries.sort_by_key(std::fs::DirEntry::file_name);
 
         let mut worlds = Vec::with_capacity(entries.len());
-        for (index, entry) in entries.into_iter().enumerate() {
+        for entry in entries {
             let directory = entry.path();
             validate_world_directory(&directory)?;
             let name =
@@ -894,47 +736,37 @@ impl HostHome {
                         path: directory.clone(),
                         reason: "directory name must be a canonical WorldId",
                     })?;
-            let storage = open_world_database(&directory, world_id)?;
-            let metadata_path = directory.join(WORLD_CATALOG_METADATA_FILE);
-            let metadata = match WorldCatalogMetadata::load(&metadata_path) {
-                Ok(metadata) => metadata,
-                Err(HostError::WorldCatalogMetadataMissing(_)) => {
-                    let metadata = WorldCatalogMetadata::new(format!("World {}", index + 1), None)?;
-                    metadata.save(&metadata_path)?;
-                    metadata
-                }
-                Err(error) => return Err(error),
-            };
-            worlds.push(world_summary(&storage.load_session()?, metadata));
+            let state = read_world_session(&directory, world_id)?;
+            worlds.push(world_summary(&state)?);
         }
 
         worlds.sort_by_key(|world| world.id);
         Ok(worlds)
     }
 
-    /// Updates host-owned human-facing metadata for one persistent World.
+    /// Updates human-facing metadata atomically in world.manifest.
     ///
     /// The cover, when supplied, must already exist in the immutable host asset store.
     ///
     /// # Errors
     ///
-    /// Returns an error when the World is absent, title is invalid, cover verification fails,
-    /// or the metadata sidecar cannot be persisted atomically.
-    pub fn update_world_catalog_metadata(
+    /// Returns a storage or validation error if the update cannot be committed.
+    pub fn update_world_metadata(
         &self,
         world_id: WorldId,
         title: impl Into<String>,
         description: Option<String>,
         cover: Option<rintawa_artifacts::AssetRef>,
     ) -> HostResult<WorldSummary> {
-        let directory = self.worlds_directory.join(world_id.to_string());
         let storage = self.open_world_storage(world_id)?;
         if let Some(reference) = &cover {
             self.asset_store.verify(reference)?;
         }
-        let metadata = WorldCatalogMetadata::new(title, cover)?.with_description(description)?;
-        metadata.save(&directory.join(WORLD_CATALOG_METADATA_FILE))?;
-        Ok(world_summary(&storage.load_session()?, metadata))
+        let metadata = WorldMetadata::new(title, description, cover)?;
+        let current = storage.load_session()?;
+        let manifest = metadata.write_to_manifest(current.manifest())?;
+        storage.update_manifest(&manifest)?;
+        world_summary(&storage.load_session()?)
     }
 
     /// Deletes one inactive persistent World including its exact world composition.
@@ -953,21 +785,12 @@ impl HostHome {
         Ok(())
     }
 
-    /// Reads host-owned human-facing metadata for one persistent World.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the World or metadata sidecar is absent or invalid.
-    pub fn load_world_catalog_metadata(
-        &self,
-        world_id: WorldId,
-    ) -> HostResult<WorldCatalogMetadata> {
-        let directory = self.worlds_directory.join(world_id.to_string());
-        self.open_world_storage(world_id)?;
-        WorldCatalogMetadata::load(&directory.join(WORLD_CATALOG_METADATA_FILE))
+    pub(crate) fn open_world_storage(&self, world_id: WorldId) -> HostResult<SqliteWorldStorage> {
+        let directory = self.existing_world_directory(world_id)?;
+        open_world_database(&directory, world_id)
     }
 
-    pub(crate) fn open_world_storage(&self, world_id: WorldId) -> HostResult<SqliteWorldStorage> {
+    fn existing_world_directory(&self, world_id: WorldId) -> HostResult<PathBuf> {
         let directory = self.worlds_directory.join(world_id.to_string());
         match std::fs::symlink_metadata(&directory) {
             Ok(_) => {}
@@ -977,7 +800,7 @@ impl HostHome {
             Err(error) => return Err(error.into()),
         }
         validate_world_directory(&directory)?;
-        open_world_database(&directory, world_id)
+        Ok(directory)
     }
 
     /// Loads durable metadata for one persistent world.
@@ -987,7 +810,8 @@ impl HostHome {
     /// Returns WorldNotFound when the world directory is absent, or a storage
     /// integrity/version error when the world cannot be opened safely.
     pub fn load_world_state(&self, world_id: WorldId) -> HostResult<WorldSessionState> {
-        Ok(self.open_world_storage(world_id)?.load_session()?)
+        let directory = self.existing_world_directory(world_id)?;
+        read_world_session(&directory, world_id)
     }
 
     /// Loads the baseline pre-world composition.
@@ -1007,31 +831,6 @@ impl HostHome {
     fn save_default_world_recipe(&self, profile: &CompositionProfile) -> HostResult<()> {
         profile.validate_scope(&RuntimeScopeId::new(DEFAULT_WORLD_SCOPE))?;
         profile.save(&self.default_world_profile_path)
-    }
-
-    fn migrate_legacy_world_defaults(&self) -> HostResult<()> {
-        let host_scope = RuntimeScopeId::new(HOST_SCOPE);
-        let default_scope = RuntimeScopeId::new(DEFAULT_WORLD_SCOPE);
-        let mut baseline = BaselineProfile::load(&self.profile_path)?;
-        baseline.validate_scope(&host_scope)?;
-        if !baseline
-            .activations
-            .iter()
-            .any(|activation| activation.world_default)
-        {
-            return Ok(());
-        }
-
-        if self.default_world_profile_path.exists() {
-            let recipe = CompositionProfile::load(&self.default_world_profile_path)?;
-            recipe.validate_scope(&default_scope)?;
-        } else {
-            let recipe = baseline.materialize_legacy_world_defaults(default_scope);
-            recipe.save(&self.default_world_profile_path)?;
-        }
-
-        baseline.clear_legacy_world_defaults();
-        baseline.save(&self.profile_path)
     }
 
     /// Loads the exact composition overlay persisted with one world.
@@ -1358,6 +1157,20 @@ impl HostHome {
                 ),
             ));
         }
+        for selection in baseline
+            .authoritative_providers
+            .iter()
+            .filter(|selection| selection.provider_instance_id == activation.instance_id)
+        {
+            recipe.set_authoritative_provider(AuthoritativeProviderSelection::new(
+                default_scope.clone(),
+                selection.point.clone(),
+                ComponentRef::new(
+                    selected.instance_id.clone(),
+                    selection.provider_component_id.clone(),
+                ),
+            ));
+        }
         self.save_default_world_recipe(&recipe)
     }
 
@@ -1647,6 +1460,76 @@ impl HostHome {
     ///
     /// The provider instance must already be installed in the same runtime scope.
     /// Provider capability itself is validated during composition activation.
+    /// Chooses the only component allowed to declare one scoped Zenoh point.
+    ///
+    /// This is machine-local Host policy, not a guest-controlled preference.
+    /// A disabled provider remains selected; it never silently falls back.
+    ///
+    /// # Errors
+    /// Rejects invalid names, missing package/components, and storage errors.
+    pub fn set_authoritative_transport_provider(
+        &self,
+        scope_id: RuntimeScopeId,
+        point: &str,
+        provider: ComponentRef,
+    ) -> HostResult<()> {
+        validate_transport_point(point).map_err(|_| HostError::InvalidAuthoritativePoint)?;
+        let mut profile = self.load_composition_for_scope(&scope_id)?;
+        let activation = profile
+            .activations
+            .iter()
+            .find(|entry| entry.instance_id == provider.instance_id)
+            .ok_or_else(|| {
+                HostError::PreferredProviderActivationNotFound(provider.instance_id.to_string())
+            })?;
+        if activation.scope_id != scope_id {
+            return Err(HostError::PreferredProviderScopeMismatch {
+                instance_id: provider.instance_id.to_string(),
+                selected_scope: scope_id.to_string(),
+                actual_scope: activation.scope_id.to_string(),
+            });
+        }
+        let manifest = RtwExtensionLoader::new().read_stored_manifest(
+            &ExtensionEngine::new(),
+            &self.store,
+            &activation.artifact,
+        )?;
+        if !manifest
+            .components
+            .iter()
+            .any(|component| component.id == provider.component_id)
+        {
+            return Err(HostError::AuthoritativeProviderComponentNotFound(
+                provider.component_id.to_string(),
+            ));
+        }
+        profile.set_authoritative_provider(AuthoritativeProviderSelection::new(
+            scope_id.clone(),
+            point.to_owned(),
+            provider,
+        ));
+        self.save_composition_for_scope(&scope_id, &profile)
+    }
+
+    /// Removes a persisted point selection, restoring ordinary Zenoh fan-out.
+    ///
+    /// # Errors
+    /// Returns a profile or filesystem error if the composition cannot be updated.
+    pub fn clear_authoritative_transport_provider(
+        &self,
+        scope_id: &RuntimeScopeId,
+        point: &str,
+    ) -> HostResult<()> {
+        validate_transport_point(point).map_err(|_| HostError::InvalidAuthoritativePoint)?;
+        let mut profile = self.load_composition_for_scope(scope_id)?;
+        profile.clear_authoritative_provider(scope_id, point);
+        self.save_composition_for_scope(scope_id, &profile)
+    }
+
+    /// Persists the selected implementation of a legacy versioned contract.
+    ///
+    /// # Errors
+    /// Rejects unknown instances and invalid profile changes.
     pub fn set_preferred_provider(
         &self,
         scope_id: RuntimeScopeId,
@@ -1810,11 +1693,24 @@ fn open_world_database(directory: &Path, directory_id: WorldId) -> HostResult<Sq
     Ok(storage)
 }
 
-fn world_summary(state: &WorldSessionState, metadata: WorldCatalogMetadata) -> WorldSummary {
-    WorldSummary {
+fn read_world_session(directory: &Path, directory_id: WorldId) -> HostResult<WorldSessionState> {
+    validate_world_directory(directory)?;
+    let state = SqliteWorldStorage::load_session_read_only(directory.join(WORLD_DATABASE_FILE))?;
+    if state.id() != directory_id {
+        return Err(HostError::WorldDirectoryIdMismatch {
+            directory_id,
+            database_id: state.id(),
+        });
+    }
+    Ok(state)
+}
+
+fn world_summary(state: &WorldSessionState) -> HostResult<WorldSummary> {
+    let metadata = WorldMetadata::from_manifest(state.manifest())?;
+    Ok(WorldSummary {
         id: state.id(),
         title: metadata.title().to_string(),
         description: metadata.description().map(str::to_string),
         cover: metadata.cover().cloned(),
-    }
+    })
 }

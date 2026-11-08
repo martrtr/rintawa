@@ -15,28 +15,23 @@ use rintawa_sdk::{
     context::{ComponentContext, RegistrationContext},
     contracts::{
         ContractConsumer, ContractDefinition, ContractGrantRequirement, ContractKey,
-        ContractProtocol, ContractProvider, ContractResolutionPolicy, ContractVersion,
+        ContractProvider, ContractResolutionPolicy, ContractVersion,
     },
     contributions::{ContributionDescriptor, ContributionKind, WorldSchemaContribution},
     errors::{ExtensionError, ExtensionResult},
     runtime_effects::RuntimeEffect,
     runtime_permissions::RuntimePermission,
     secrets::{SecretAccessError, SecretPath, SecretPathPattern},
-    services::{ServiceCallError, ServiceProviderHandle},
     traits::Component,
     types::{ComponentId, ExtensionId, ExtensionInstanceId, RuntimeEffectId, RuntimeScopeId},
-    ui::{
-        UiActionEvent, UiLayerDescriptor, UiSurfaceContribution, UiSurfaceId,
-        WorldPresentationDescriptor,
-    },
     world::{SchemaKey, SchemaKind},
 };
-use rintawa_ui_runtime::UiRuntime;
 use tracing::{debug, error, info, trace, warn};
 use wasmtime::{
     Engine, Store, StoreLimits, Trap,
     component::{Component as WasmtimeComponent, Instance, Linker, Resource, ResourceTable},
 };
+use zenoh::Wait;
 
 use crate::{
     errors::{EngineError, EngineResult},
@@ -44,21 +39,17 @@ use crate::{
     host_access::HostAccessServices,
     runtime_permissions::RuntimePermissionManager,
     secrets::SecretManager,
-    services::ServiceRuntime,
+    transport::{MAX_PAYLOAD_BYTES, Transport, TransportError, validate_transport_point},
 };
 
-mod async_operations;
 mod budget;
 mod control_plane;
 mod http_request;
 mod network;
 mod target_provider;
-mod ui;
 
 pub use crate::runtime::wasm::budget::WasmExecutionBudget;
 
-pub(crate) use crate::runtime::wasm::async_operations::AsyncObserverRegistry;
-use crate::runtime::wasm::async_operations::OwnedAsyncOperation;
 use crate::runtime::wasm::http_request::OwnedHttpRequest;
 use crate::runtime::wasm::network::OwnedNetworkHandle;
 use crate::runtime::wasm::target_provider::{WasmExecutionTargetHost, WasmTargetProviderEndpoint};
@@ -70,6 +61,7 @@ use crate::runtime::wasm::network::{
 
 const TARGET_PROVIDER_EXPORT_NAME: &str = "rintawa:engine/target-provider@0.0.1";
 const TASK_HANDLER_EXPORT_NAME: &str = "rintawa:engine/task-handler@0.0.1";
+const TRANSPORT_HANDLER_EXPORT_NAME: &str = "rintawa:engine/transport-handler@0.0.1";
 
 // Generated WIT bindings expose protocol names verbatim and are not hand-documented.
 #[allow(missing_docs)]
@@ -99,6 +91,16 @@ mod target_provider_bindings {
     });
 }
 
+// Transport handler export is optional for ordinary WASM plugins.
+#[allow(missing_docs)]
+mod transport_bindings {
+    wasmtime::component::bindgen!({
+        path: "wit/engine.wit",
+        world: "transport-handler-plugin",
+        async: false,
+    });
+}
+
 // Generated task bindings are documented by the source WIT contract.
 #[allow(missing_docs)]
 mod task_bindings {
@@ -116,11 +118,6 @@ use bindings::rintawa::engine::{
         ImportedArtifact as WitImportedArtifact,
     },
     asset_store::{AssetRef as WitAssetRef, Error as AssetStoreError, Host as AssetStoreHost},
-    async_operations::{
-        DataChunk as AsyncOperationData, Error as AsyncOperationError,
-        Event as AsyncOperationEvent, Host as AsyncOperationHost,
-        ProgressUpdate as AsyncOperationProgress,
-    },
     composition::{
         Activation as WitCompositionActivation, Error as CompositionError, Host as CompositionHost,
     },
@@ -138,14 +135,10 @@ use bindings::rintawa::engine::{
         Error as NetworkError, Host as NetworkHost, Listener as WitNetworkListener,
         ReadResult as WitNetworkReadResult,
     },
-    portable_ui::{
-        Activity as WitActivity, Error as PortableUiError, Host as PortableUiHost,
-        PlacementHint as WitPlacementHint,
-    },
     preferences::{Error as PreferenceError, Host as PreferencesHost},
     registration::{
-        ContractProtocol as WitContractProtocol, Error as RegistrationError,
-        Host as RegistrationHost, ResolutionPolicy as WitResolutionPolicy,
+        Error as RegistrationError, Host as RegistrationHost,
+        ResolutionPolicy as WitResolutionPolicy,
     },
     runtime_context::{
         Context as WitRuntimeContext, Error as RuntimeContextError, Host as RuntimeContextHost,
@@ -160,24 +153,9 @@ use bindings::rintawa::engine::{
     scoped_composition::Host as ScopedCompositionHost,
     scoped_runtime_policy::Host as ScopedRuntimePolicyHost,
     secrets::{Error as SecretError, Host as SecretsHost},
-    services::{Error as ServiceTransportError, Host as ServicesHost},
-    ui_layer::{Error as UiLayerError, Host as UiLayerHost, PresentedAsset as WitPresentedAsset},
-    user_content::{
-        AcceptedWrite as WitAcceptedUserContentWrite, Document as WitUserContentDocument,
-        Entry as WitUserContentEntry, Error as UserContentError, Host as UserContentHost,
-        WriteState as WitUserContentWriteState,
-    },
+    transport::{Error as TransportApiError, Host as TransportHost},
     user_resources::{
         Error as UserResourceError, Host as UserResourcesHost, ResourceRef as WitUserResourceRef,
-    },
-    world_commands::{
-        Accepted as WitAcceptedWorldCommand, Error as WorldCommandError, Host as WorldCommandsHost,
-        Request as WitWorldCommandRequest,
-    },
-    world_projections::{
-        Accepted as WitAcceptedWorldProjectionRead, Error as WorldProjectionError,
-        Host as WorldProjectionsHost, ReadState as WitWorldProjectionReadState,
-        Request as WitWorldProjectionRequest, View as WitWorldProjectionView,
     },
     world_registration::{
         Error as WorldRegistrationError, Host as WorldRegistrationHost, SchemaKind as WitSchemaKind,
@@ -188,6 +166,7 @@ use bindings::rintawa::engine::{
 };
 use target_provider_bindings::TargetProviderPlugin;
 use task_bindings::TaskPlugin;
+use transport_bindings::TransportHandlerPlugin;
 
 #[derive(Debug)]
 struct PendingAssetUpload {
@@ -224,16 +203,8 @@ pub struct WasmHostState {
     active_tasks: HashMap<u64, ActiveWasmTask>,
     network_access_active: bool,
     host_access_active: bool,
-    /// Read-only World effect continuation may access permitted projections
-    /// and its own persisted preference, never general Host mutations.
-    effect_service_read_active: bool,
     /// True only while the dispatcher is executing a validated UI action.
-    verified_ui_action_active: bool,
     http_request_access_active: bool,
-    operation_access_active: bool,
-    service_caller: Option<rintawa_sdk::contracts::ComponentRef>,
-    async_operations: HashMap<String, Arc<Mutex<OwnedAsyncOperation>>>,
-    async_observers: Arc<AsyncObserverRegistry>,
     next_network_handle: u64,
     network_handles: HashMap<u64, OwnedNetworkHandle>,
     http_requests: HashMap<u64, OwnedHttpRequest>,
@@ -252,12 +223,13 @@ pub struct WasmHostState {
     max_http_request_header_bytes: usize,
     max_http_request_chunk_bytes: usize,
     secrets: SecretManager,
-    services: ServiceRuntime,
-    ui: UiRuntime,
+    transport: Transport,
     host_access: HostAccessServices,
     secret_access_active: bool,
-    service_access_active: bool,
-    ui_access_active: bool,
+    transport_access_active: bool,
+    pending_transport_points: Vec<String>,
+    transport_queries_this_execution: usize,
+    transport_publications_this_execution: usize,
     max_host_message_bytes: usize,
     max_artifact_read_bytes: usize,
     max_artifact_import_bytes: usize,
@@ -266,15 +238,8 @@ pub struct WasmHostState {
     asset_uploads: HashMap<u64, PendingAssetUpload>,
     next_user_resource_upload_handle: u64,
     user_resource_uploads: HashMap<u64, PendingUserResourceUpload>,
-    max_presented_asset_bytes: usize,
-    max_user_content_writes_per_execution: usize,
-    user_content_writes_this_execution: usize,
     max_world_session_mutations_per_execution: usize,
     world_session_mutations_this_execution: usize,
-    max_world_command_submissions_per_execution: usize,
-    world_command_submissions_this_execution: usize,
-    max_world_projection_reads_per_execution: usize,
-    world_projection_reads_this_execution: usize,
     execution_target_registration_active: bool,
     pending_execution_targets: Vec<String>,
     resource_limits: StoreLimits,
@@ -294,10 +259,6 @@ struct WasmRegistrationScope {
     provider_keys: HashSet<ContractKey>,
     consumers: Vec<ContractConsumer>,
     consumer_keys: HashSet<ContractKey>,
-    ui_surfaces: Vec<UiSurfaceContribution>,
-    ui_surface_ids: HashSet<UiSurfaceId>,
-    ui_layer: Option<UiLayerDescriptor>,
-    world_presentation: Option<WorldPresentationDescriptor>,
 }
 
 struct WasmRegistrations {
@@ -306,9 +267,6 @@ struct WasmRegistrations {
     definitions: Vec<ContractDefinition>,
     providers: Vec<ContractProvider>,
     consumers: Vec<ContractConsumer>,
-    ui_surfaces: Vec<UiSurfaceContribution>,
-    ui_layer: Option<UiLayerDescriptor>,
-    world_presentation: Option<WorldPresentationDescriptor>,
 }
 
 /// A guest request that is committed through the Engine-owned effect registry.
@@ -347,22 +305,18 @@ enum RuntimePermissionCheck {
 #[derive(Clone)]
 struct WasmHostServices {
     secrets: SecretManager,
-    services: ServiceRuntime,
-    ui: UiRuntime,
+    transport: Transport,
     runtime_permissions: RuntimePermissionManager,
     host_access: HostAccessServices,
-    async_observers: Arc<AsyncObserverRegistry>,
 }
 
 impl WasmHostServices {
     fn standalone(secrets: SecretManager) -> Self {
         Self {
-            services: ServiceRuntime::new(secrets.clone()),
+            transport: Transport::default(),
             secrets,
-            ui: UiRuntime::new(),
             runtime_permissions: RuntimePermissionManager::default(),
             host_access: HostAccessServices::unavailable(),
-            async_observers: Arc::new(AsyncObserverRegistry::default()),
         }
     }
 }
@@ -396,11 +350,9 @@ impl WasmHostState {
     ) -> Self {
         let WasmHostServices {
             secrets,
-            services,
-            ui,
+            transport,
             runtime_permissions,
             host_access,
-            async_observers,
         } = host_services;
         Self {
             component_id,
@@ -421,13 +373,7 @@ impl WasmHostState {
             active_tasks: HashMap::new(),
             network_access_active: false,
             host_access_active: false,
-            effect_service_read_active: false,
-            verified_ui_action_active: false,
             http_request_access_active: false,
-            operation_access_active: false,
-            service_caller: None,
-            async_operations: HashMap::new(),
-            async_observers,
             next_network_handle: 0,
             network_handles: HashMap::new(),
             http_requests: HashMap::new(),
@@ -446,12 +392,13 @@ impl WasmHostState {
             max_http_request_header_bytes: budget.max_http_request_header_bytes,
             max_http_request_chunk_bytes: budget.max_http_request_chunk_bytes,
             secrets,
-            services,
-            ui,
+            transport,
             host_access,
             secret_access_active: false,
-            service_access_active: false,
-            ui_access_active: false,
+            transport_access_active: false,
+            pending_transport_points: Vec::new(),
+            transport_queries_this_execution: 0,
+            transport_publications_this_execution: 0,
             max_host_message_bytes: budget.max_host_message_bytes,
             max_artifact_read_bytes: budget.max_artifact_read_bytes,
             max_artifact_import_bytes: budget.max_artifact_import_bytes,
@@ -460,18 +407,9 @@ impl WasmHostState {
             asset_uploads: HashMap::new(),
             next_user_resource_upload_handle: 0,
             user_resource_uploads: HashMap::new(),
-            max_presented_asset_bytes: budget.max_presented_asset_bytes,
-            max_user_content_writes_per_execution: budget.max_user_content_writes_per_execution,
-            user_content_writes_this_execution: 0,
             max_world_session_mutations_per_execution: budget
                 .max_world_session_mutations_per_execution,
             world_session_mutations_this_execution: 0,
-            max_world_command_submissions_per_execution: budget
-                .max_world_command_submissions_per_execution,
-            world_command_submissions_this_execution: 0,
-            max_world_projection_reads_per_execution: budget
-                .max_world_projection_reads_per_execution,
-            world_projection_reads_this_execution: 0,
             execution_target_registration_active: false,
             pending_execution_targets: Vec::new(),
             resource_limits: budget.store_limits(),
@@ -508,10 +446,6 @@ impl WasmHostState {
             provider_keys: HashSet::new(),
             consumers: Vec::new(),
             consumer_keys: HashSet::new(),
-            ui_surfaces: Vec::new(),
-            ui_surface_ids: HashSet::new(),
-            ui_layer: None,
-            world_presentation: None,
         });
         self.extension_id = Some(extension_id);
         self.instance_id = Some(instance_id);
@@ -526,10 +460,7 @@ impl WasmHostState {
         self.network_access_active = false;
         self.host_access_active = false;
         self.http_request_access_active = false;
-        self.operation_access_active = false;
         self.secret_access_active = false;
-        self.service_access_active = false;
-        self.ui_access_active = false;
         self.execution_target_registration_active = false;
         if self.registration_scope.is_some() {
             return Err(ExtensionError::Message(String::from(
@@ -547,10 +478,6 @@ impl WasmHostState {
             provider_keys: HashSet::new(),
             consumers: Vec::new(),
             consumer_keys: HashSet::new(),
-            ui_surfaces: Vec::new(),
-            ui_surface_ids: HashSet::new(),
-            ui_layer: None,
-            world_presentation: None,
         });
         Ok(())
     }
@@ -570,9 +497,6 @@ impl WasmHostState {
             definitions: scope.definitions,
             providers: scope.providers,
             consumers: scope.consumers,
-            ui_surfaces: scope.ui_surfaces,
-            ui_layer: scope.ui_layer,
-            world_presentation: scope.world_presentation,
         })
     }
 
@@ -619,8 +543,6 @@ impl WasmHostState {
     }
 
     fn discard_guest_execution(&mut self) {
-        self.effect_service_read_active = false;
-        self.verified_ui_action_active = false;
         self.registration_scope = None;
         self.execution_owner = None;
         self.runtime_effects_active = false;
@@ -628,19 +550,14 @@ impl WasmHostState {
         self.network_access_active = false;
         self.host_access_active = false;
         self.http_request_access_active = false;
-        self.operation_access_active = false;
-        self.service_caller = None;
-        self.user_content_writes_this_execution = 0;
         self.world_session_mutations_this_execution = 0;
-        self.world_command_submissions_this_execution = 0;
-        self.world_projection_reads_this_execution = 0;
         self.pending_effects.clear();
         self.pending_revocations.clear();
         self.secret_access_active = false;
-        self.service_access_active = false;
-        self.ui_access_active = false;
+        self.transport_access_active = false;
         self.execution_target_registration_active = false;
         self.pending_execution_targets.clear();
+        self.pending_transport_points.clear();
     }
 
     fn queue_world_schema(
@@ -706,7 +623,6 @@ impl WasmHostState {
         &mut self,
         contract: ContractKey,
         resolution: ContractResolutionPolicy,
-        protocol: ContractProtocol,
     ) -> Result<(), RegistrationError> {
         let Some(scope) = self.registration_scope.as_mut() else {
             return Err(RegistrationError::RegistrationNotActive);
@@ -717,7 +633,6 @@ impl WasmHostState {
         scope.definitions.push(ContractDefinition {
             contract,
             resolution,
-            protocol,
         });
         Ok(())
     }
@@ -776,10 +691,6 @@ impl WasmHostState {
         self.subscribe_runtime_effect(RuntimeEffect::event_subscription(topic))
     }
 
-    fn subscribe_signal(&mut self, topic: String) -> Result<String, RuntimeEffectError> {
-        self.subscribe_runtime_effect(RuntimeEffect::signal_subscription(topic))
-    }
-
     fn subscribe_runtime_effect(
         &mut self,
         effect: RuntimeEffect,
@@ -787,10 +698,7 @@ impl WasmHostState {
         if !self.runtime_effects_active {
             return Err(RuntimeEffectError::RuntimeNotActive);
         }
-        let topic = match &effect {
-            RuntimeEffect::EventSubscription { topic }
-            | RuntimeEffect::SignalSubscription { topic } => topic,
-        };
+        let RuntimeEffect::EventSubscription { topic } = &effect;
         if topic.trim().is_empty() {
             return Err(RuntimeEffectError::InvalidTopic);
         }
@@ -814,10 +722,6 @@ impl WasmHostState {
     }
 
     fn unsubscribe_event(&mut self, handle: String) -> Result<(), RuntimeEffectError> {
-        self.unsubscribe_runtime_effect(handle)
-    }
-
-    fn unsubscribe_signal(&mut self, handle: String) -> Result<(), RuntimeEffectError> {
         self.unsubscribe_runtime_effect(handle)
     }
 
@@ -851,48 +755,36 @@ impl WasmHostState {
 
     /// Opens the normal guest execution scope for the provider component itself.
     fn begin_guest_execution(&mut self) {
-        self.effect_service_read_active = false;
-        self.verified_ui_action_active = false;
         self.execution_owner = self.registered_owner();
         self.runtime_effects_active = true;
         self.task_access_active = true;
         self.network_access_active = true;
         self.host_access_active = true;
         self.http_request_access_active = true;
-        self.operation_access_active = true;
-        self.user_content_writes_this_execution = 0;
         self.world_session_mutations_this_execution = 0;
-        self.world_command_submissions_this_execution = 0;
-        self.world_projection_reads_this_execution = 0;
         self.secret_access_active = true;
-        self.service_access_active = true;
-        self.ui_access_active = true;
+        self.transport_access_active = true;
+        self.transport_queries_this_execution = 0;
+        self.transport_publications_this_execution = 0;
         self.execution_target_registration_active = false;
     }
 
     fn begin_delegated_guest_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
-        self.effect_service_read_active = false;
-        self.verified_ui_action_active = false;
         self.execution_owner = Some(owner);
         self.runtime_effects_active = true;
         self.task_access_active = true;
         self.network_access_active = true;
         self.host_access_active = true;
         self.http_request_access_active = true;
-        self.operation_access_active = true;
-        self.user_content_writes_this_execution = 0;
         self.world_session_mutations_this_execution = 0;
-        self.world_command_submissions_this_execution = 0;
-        self.world_projection_reads_this_execution = 0;
         self.secret_access_active = true;
-        self.service_access_active = true;
-        self.ui_access_active = true;
+        self.transport_access_active = true;
+        self.transport_queries_this_execution = 0;
+        self.transport_publications_this_execution = 0;
         self.execution_target_registration_active = false;
     }
 
     fn begin_delegated_task_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
-        self.effect_service_read_active = false;
-        self.verified_ui_action_active = false;
         self.execution_owner = Some(owner);
         // Runtime effects require an Engine ComponentContext for the exact owner.
         // The cooperative provider pump currently has only the provider context,
@@ -902,14 +794,11 @@ impl WasmHostState {
         self.network_access_active = true;
         self.host_access_active = true;
         self.http_request_access_active = true;
-        self.operation_access_active = true;
-        self.user_content_writes_this_execution = 0;
         self.world_session_mutations_this_execution = 0;
-        self.world_command_submissions_this_execution = 0;
-        self.world_projection_reads_this_execution = 0;
         self.secret_access_active = true;
-        self.service_access_active = true;
-        self.ui_access_active = true;
+        self.transport_access_active = true;
+        self.transport_queries_this_execution = 0;
+        self.transport_publications_this_execution = 0;
         self.execution_target_registration_active = false;
     }
 
@@ -921,76 +810,40 @@ impl WasmHostState {
         self.begin_guest_execution();
         self.execution_target_registration_active = true;
         self.pending_execution_targets.clear();
+        self.pending_transport_points.clear();
     }
 
     fn take_pending_execution_targets(&mut self) -> Vec<String> {
         std::mem::take(&mut self.pending_execution_targets)
     }
 
-    fn begin_service_execution(
-        &mut self,
-        service_caller: Option<rintawa_sdk::contracts::ComponentRef>,
-        is_world_effect: bool,
-    ) {
-        self.effect_service_read_active = is_world_effect;
-        self.verified_ui_action_active = false;
-        self.world_projection_reads_this_execution = 0;
-        self.service_caller = service_caller;
+    fn take_pending_transport_points(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_transport_points)
+    }
+
+    /// Query callbacks are not lifecycle callbacks and cannot commit
+    /// component effects or borrow privileged host entrypoints.
+    fn begin_transport_query_execution(&mut self) {
+        self.discard_guest_execution();
         self.execution_owner = self.registered_owner();
-        self.runtime_effects_active = false;
-        self.task_access_active = false;
-        self.network_access_active = false;
-        self.host_access_active = false;
-        self.http_request_access_active = true;
-        self.operation_access_active = true;
-        self.secret_access_active = true;
-        self.service_access_active = true;
-        self.ui_access_active = true;
+        self.transport_access_active = true;
+        self.transport_queries_this_execution = 0;
+        self.transport_publications_this_execution = 0;
     }
 
-    fn begin_delegated_service_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
-        self.effect_service_read_active = false;
-        self.verified_ui_action_active = false;
-        self.execution_owner = Some(owner);
-        self.runtime_effects_active = false;
-        self.task_access_active = false;
-        self.network_access_active = false;
-        self.host_access_active = false;
-        self.http_request_access_active = true;
-        self.operation_access_active = true;
-        self.secret_access_active = true;
-        self.service_access_active = true;
-        self.ui_access_active = true;
-    }
-
-    fn finish_service_execution(&mut self) {
-        self.effect_service_read_active = false;
-        self.execution_owner = None;
-        self.service_caller = None;
-        self.task_access_active = false;
-        self.network_access_active = false;
-        self.host_access_active = false;
-        self.http_request_access_active = false;
-        self.operation_access_active = false;
-        self.secret_access_active = false;
-        self.service_access_active = false;
-        self.ui_access_active = false;
-        self.execution_target_registration_active = false;
+    fn finish_transport_query_execution(&mut self) {
+        self.discard_guest_execution();
     }
 
     /// Closes guest access before committing its queued runtime effects.
     fn finish_guest_execution(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
-        self.effect_service_read_active = false;
-        self.verified_ui_action_active = false;
         self.runtime_effects_active = false;
         self.task_access_active = false;
         self.network_access_active = false;
         self.host_access_active = false;
         self.http_request_access_active = false;
-        self.operation_access_active = false;
         self.secret_access_active = false;
-        self.service_access_active = false;
-        self.ui_access_active = false;
+        self.transport_access_active = false;
         self.execution_target_registration_active = false;
 
         let result = self.commit_runtime_effects(ctx);
@@ -1138,9 +991,6 @@ impl WasmHostState {
             .retain(|_, resource| &resource.owner != owner);
         self.http_requests
             .retain(|_, request| &request.owner != owner);
-        self.async_operations
-            .retain(|_, operation| operation.lock().is_ok_and(|locked| &locked.owner != owner));
-        self.async_observers.revoke_principal(owner);
     }
 
     fn next_task_due_in(&self, now: Instant) -> Option<Duration> {
@@ -1322,12 +1172,12 @@ impl HostOperations for WasmHostState {
 
 impl RuntimeContextHost for WasmHostState {
     fn current(&mut self) -> Result<WitRuntimeContext, RuntimeContextError> {
-        let owner = self
-            .current_execution_owner()
+        self.current_execution_owner()
             .ok_or(RuntimeContextError::AccessNotActive)?;
         let scope_id = self
-            .services
-            .component_scope_id(owner)
+            .scope_id
+            .as_ref()
+            .cloned()
             .ok_or(RuntimeContextError::Rejected)?;
         let world_id = self
             .host_access
@@ -1358,19 +1208,6 @@ impl RuntimeEffectsHost for WasmHostState {
 
     fn unsubscribe_event(&mut self, handle: String) -> Result<(), RuntimeEffectError> {
         self.unsubscribe_event(handle)
-    }
-
-    fn subscribe_signal(&mut self, topic: String) -> Result<String, RuntimeEffectError> {
-        debug!(
-            plugin = %self.component_id,
-            topic = %topic,
-            "WASM plugin subscribed to runtime signal"
-        );
-        self.subscribe_signal(topic)
-    }
-
-    fn unsubscribe_signal(&mut self, handle: String) -> Result<(), RuntimeEffectError> {
-        self.unsubscribe_signal(handle)
     }
 }
 
@@ -1449,20 +1286,14 @@ impl RegistrationHost for WasmHostState {
         name: String,
         version: u32,
         resolution: WitResolutionPolicy,
-        protocol: WitContractProtocol,
     ) -> Result<(), RegistrationError> {
         let resolution = match resolution {
             WitResolutionPolicy::Single => ContractResolutionPolicy::Single,
             WitResolutionPolicy::Multiple => ContractResolutionPolicy::Multiple,
         };
-        let protocol = match protocol {
-            WitContractProtocol::Binding => ContractProtocol::Binding,
-            WitContractProtocol::Service => ContractProtocol::Service,
-        };
         self.queue_contract_definition(
             ContractKey::new(name, ContractVersion::new(version)),
             resolution,
-            protocol,
         )
     }
 
@@ -1532,91 +1363,150 @@ impl WorldRegistrationHost for WasmHostState {
         let kind = match kind {
             WitSchemaKind::Property => SchemaKind::Property,
             WitSchemaKind::Command => SchemaKind::Command,
-            WitSchemaKind::Event => SchemaKind::Event,
-            WitSchemaKind::Effect => SchemaKind::Effect,
-            WitSchemaKind::Projection => SchemaKind::Projection,
         };
         self.queue_world_schema(WorldSchemaContribution::new(key, kind, definition_json))
     }
 }
 
-impl ServicesHost for WasmHostState {
-    fn call(
-        &mut self,
-        contract: String,
-        version: u32,
-        payload: Vec<u8>,
-    ) -> Result<Vec<u8>, ServiceTransportError> {
-        if !self.service_access_active {
-            return Err(ServiceTransportError::Unavailable);
+impl TransportHost for WasmHostState {
+    fn declare(&mut self, point: String) -> Result<(), TransportApiError> {
+        // A provider target executing for a dependent principal must not
+        // borrow this provider's World scope to publish a queryable.
+        if !self.execution_target_registration_active
+            || self.current_execution_owner() != self.registered_owner().as_ref()
+        {
+            return Err(TransportApiError::AccessNotActive);
         }
-        let caller = self
-            .current_execution_owner()
-            .cloned()
-            .ok_or(ServiceTransportError::Unavailable)?;
-        let contract = ContractKey::new(contract, ContractVersion::new(version));
-        self.services
-            .call_from_execution(&caller, &contract, &payload)
-            .map_err(map_service_transport_error)
+        validate_transport_point(&point).map_err(map_transport_error)?;
+        let scope = self
+            .scope_id
+            .as_ref()
+            .ok_or(TransportApiError::AccessNotActive)?;
+        let owner = self
+            .registered_owner()
+            .ok_or(TransportApiError::AccessNotActive)?;
+        self.transport
+            .check_declaration(&owner, scope, &point)
+            .map_err(map_transport_error)?;
+        if self
+            .pending_transport_points
+            .iter()
+            .any(|name| name == &point)
+        {
+            return Err(TransportApiError::Duplicate);
+        }
+        if self.pending_transport_points.len() >= 16 {
+            return Err(TransportApiError::LimitExceeded);
+        }
+        self.pending_transport_points.push(point);
+        Ok(())
     }
 
-    fn list_providers(
-        &mut self,
-        contract: String,
-        version: u32,
-    ) -> Result<Vec<u64>, ServiceTransportError> {
-        if !self.service_access_active {
-            return Err(ServiceTransportError::Unavailable);
+    fn publish(&mut self, point: String, payload: Vec<u8>) -> Result<(), TransportApiError> {
+        if !self.transport_access_active
+            || self.execution_target_registration_active
+            || self.current_execution_owner() != self.registered_owner().as_ref()
+        {
+            return Err(TransportApiError::AccessNotActive);
         }
-        let caller = self
-            .current_execution_owner()
-            .cloned()
-            .ok_or(ServiceTransportError::Unavailable)?;
-        let contract = ContractKey::new(contract, ContractVersion::new(version));
-        self.services
-            .list_providers_from_execution(&caller, &contract)
-            .map(|providers| {
-                providers
-                    .into_iter()
-                    .map(ServiceProviderHandle::raw)
-                    .collect()
-            })
-            .map_err(map_service_transport_error)
+        if self.transport_publications_this_execution >= 32 {
+            return Err(TransportApiError::LimitExceeded);
+        }
+        self.transport_publications_this_execution += 1;
+        let scope = self
+            .scope_id
+            .as_ref()
+            .ok_or(TransportApiError::AccessNotActive)?;
+        let owner = self
+            .registered_owner()
+            .ok_or(TransportApiError::AccessNotActive)?;
+        self.transport
+            .publish(&owner, scope, &point, &payload)
+            .map_err(map_transport_error)
     }
 
-    fn call_provider(
-        &mut self,
-        provider: u64,
-        payload: Vec<u8>,
-    ) -> Result<Vec<u8>, ServiceTransportError> {
-        if !self.service_access_active {
-            return Err(ServiceTransportError::Unavailable);
+    fn subscribe(&mut self, point: String) -> Result<u64, TransportApiError> {
+        if !self.transport_access_active
+            || self.current_execution_owner() != self.registered_owner().as_ref()
+        {
+            return Err(TransportApiError::AccessNotActive);
         }
-        let caller = self
-            .current_execution_owner()
-            .cloned()
-            .ok_or(ServiceTransportError::Unavailable)?;
-        self.services
-            .call_provider_from_execution(
-                &caller,
-                ServiceProviderHandle::from_raw(provider),
-                &payload,
-            )
-            .map_err(map_service_transport_error)
+        let scope = self
+            .scope_id
+            .as_ref()
+            .ok_or(TransportApiError::AccessNotActive)?;
+        let owner = self
+            .registered_owner()
+            .ok_or(TransportApiError::AccessNotActive)?;
+        self.transport
+            .subscribe(&owner, scope, &point)
+            .map_err(map_transport_error)
+    }
+
+    fn poll(&mut self, handle: u64) -> Result<Vec<Vec<u8>>, TransportApiError> {
+        if !self.transport_access_active
+            || self.current_execution_owner() != self.registered_owner().as_ref()
+        {
+            return Err(TransportApiError::AccessNotActive);
+        }
+        let owner = self
+            .registered_owner()
+            .ok_or(TransportApiError::AccessNotActive)?;
+        self.transport
+            .poll(&owner, handle)
+            .map_err(map_transport_error)
+    }
+
+    fn unsubscribe(&mut self, handle: u64) -> Result<(), TransportApiError> {
+        if !self.transport_access_active
+            || self.current_execution_owner() != self.registered_owner().as_ref()
+        {
+            return Err(TransportApiError::AccessNotActive);
+        }
+        let owner = self
+            .registered_owner()
+            .ok_or(TransportApiError::AccessNotActive)?;
+        self.transport
+            .unsubscribe(&owner, handle)
+            .map_err(map_transport_error)
+    }
+
+    fn query(
+        &mut self,
+        point: String,
+        payload: Vec<u8>,
+    ) -> Result<Vec<Vec<u8>>, TransportApiError> {
+        if !self.transport_access_active
+            || self.current_execution_owner() != self.registered_owner().as_ref()
+        {
+            return Err(TransportApiError::AccessNotActive);
+        }
+        let scope_id = self
+            .scope_id
+            .clone()
+            .ok_or(TransportApiError::AccessNotActive)?;
+        // A callback may make nested calls, but cannot make unbounded
+        // blocking host imports without consuming WASM fuel.
+        if self.transport_queries_this_execution >= 8 {
+            return Err(TransportApiError::LimitExceeded);
+        }
+        self.transport_queries_this_execution += 1;
+        self.transport
+            .query(&scope_id, &point, &payload)
+            .map_err(map_transport_error)
     }
 }
 
-fn map_service_transport_error(error: ServiceCallError) -> ServiceTransportError {
+fn map_transport_error(error: TransportError) -> TransportApiError {
     match error {
-        ServiceCallError::Unavailable => ServiceTransportError::Unavailable,
-        ServiceCallError::NotConsumer => ServiceTransportError::NotConsumer,
-        ServiceCallError::NotServiceContract => ServiceTransportError::NotServiceContract,
-        ServiceCallError::UnsupportedResolution => ServiceTransportError::UnsupportedResolution,
-        ServiceCallError::CyclicCall => ServiceTransportError::CyclicCall,
-        ServiceCallError::ProviderBusy => ServiceTransportError::ProviderBusy,
-        ServiceCallError::ProviderFailed => ServiceTransportError::ProviderFailed,
-        ServiceCallError::RequestTooLarge => ServiceTransportError::RequestTooLarge,
-        ServiceCallError::ResponseTooLarge => ServiceTransportError::ResponseTooLarge,
+        TransportError::Inactive => TransportApiError::AccessNotActive,
+        TransportError::InvalidName => TransportApiError::InvalidName,
+        TransportError::Duplicate => TransportApiError::Duplicate,
+        TransportError::LimitExceeded => TransportApiError::LimitExceeded,
+        TransportError::Unavailable => TransportApiError::Unavailable,
+        TransportError::UnknownSubscription => TransportApiError::UnknownSubscription,
+        TransportError::NotSelected => TransportApiError::NotSelected,
+        TransportError::ActiveConflict => TransportApiError::Unavailable,
     }
 }
 
@@ -1682,21 +1572,17 @@ impl WasmRuntimeEngine {
 
     pub(crate) fn with_host_services(
         secrets: SecretManager,
-        services: ServiceRuntime,
-        ui: UiRuntime,
+        transport: Transport,
         execution_targets: ExecutionTargetRegistry,
         runtime_permissions: RuntimePermissionManager,
         host_access: HostAccessServices,
-        async_observers: Arc<AsyncObserverRegistry>,
     ) -> EngineResult<Self> {
         Self::with_host_services_and_budget(
             WasmHostServices {
                 secrets,
-                services,
-                ui,
+                transport,
                 runtime_permissions,
                 host_access,
-                async_observers,
             },
             execution_targets,
             WasmExecutionBudget::default(),
@@ -1741,6 +1627,10 @@ impl WasmRuntimeEngine {
             .component_type()
             .get_export(&self.engine, TASK_HANDLER_EXPORT_NAME)
             .is_some();
+        let transport_handler_available = component
+            .component_type()
+            .get_export(&self.engine, TRANSPORT_HANDLER_EXPORT_NAME)
+            .is_some();
         let mut linker = Linker::new(&self.engine);
 
         Plugin::add_to_linker(&mut linker, |state: &mut WasmHostState| state)?;
@@ -1753,6 +1643,7 @@ impl WasmRuntimeEngine {
             host_services: self.host_services.clone(),
             execution_targets: self.execution_targets.clone(),
             task_handler_available,
+            transport_handler_available,
             budget: self.budget.clone(),
             active: false,
             runtime: Arc::new(Mutex::new(WasmSharedRuntime {
@@ -1812,6 +1703,7 @@ pub struct WasmComponent {
     host_services: WasmHostServices,
     execution_targets: ExecutionTargetRegistry,
     task_handler_available: bool,
+    transport_handler_available: bool,
     budget: WasmExecutionBudget,
     active: bool,
     runtime: Arc<Mutex<WasmSharedRuntime>>,
@@ -1832,6 +1724,77 @@ impl WasmComponent {
             Err(ExtensionError::Message(format!(
                 "WASM component is not active during {operation}"
             )))
+        }
+    }
+
+    fn respond_to_transport_query(
+        runtime: &Arc<Mutex<WasmSharedRuntime>>,
+        budget: &WasmExecutionBudget,
+        point: &str,
+        query: zenoh::query::Query,
+    ) {
+        let result = (|| -> ExtensionResult<Vec<u8>> {
+            let payload = query
+                .payload()
+                .map(|payload| payload.to_bytes().into_owned())
+                .unwrap_or_default();
+            if payload.len() > MAX_PAYLOAD_BYTES {
+                return Err(ExtensionError::HostMessageTooLarge {
+                    operation: "transport request",
+                    actual_bytes: payload.len(),
+                    maximum_bytes: MAX_PAYLOAD_BYTES,
+                });
+            }
+            // A Store is never re-entered: busy callbacks fail instead of
+            // deadlocking Zenoh or the extension lifecycle.
+            let mut state = runtime.try_lock().map_err(|_| {
+                ExtensionError::Message(String::from("WASM transport provider is busy"))
+            })?;
+            let instance = state.instance.as_mut().ok_or_else(|| {
+                ExtensionError::Message(String::from("WASM transport provider is stopped"))
+            })?;
+            // Bound WASM query execution to the short Zenoh deadline.
+            // The full service fuel allowance can leave a Store busy after timeout.
+            Self::set_callback_fuel(&mut instance.store, budget, "transport query")?;
+            instance.store.data_mut().begin_transport_query_execution();
+            let response = instance
+                .transport_handler
+                .as_ref()
+                .ok_or_else(|| {
+                    ExtensionError::Message(String::from("WASM transport handler is unavailable"))
+                })
+                .and_then(|handler| {
+                    handler
+                        .rintawa_engine_transport_handler()
+                        .call_on_query(&mut instance.store, point, &payload)
+                        .map_err(|error| Self::execution_error("transport query", error))
+                });
+            instance.store.data_mut().finish_transport_query_execution();
+            if response.is_err() {
+                // A trapped Component Model instance cannot be re-entered.
+                // Keep the Host running, but require an explicit component reload.
+                state.instance = None;
+                state.failed_lifecycle_callback = Some("transport query");
+            }
+            let response = response?;
+            if response.len() > MAX_PAYLOAD_BYTES {
+                return Err(ExtensionError::HostMessageTooLarge {
+                    operation: "transport reply",
+                    actual_bytes: response.len(),
+                    maximum_bytes: MAX_PAYLOAD_BYTES,
+                });
+            }
+            Ok(response)
+        })();
+        let reply = match result {
+            Ok(bytes) => query.reply(query.key_expr().as_str(), bytes).wait(),
+            Err(error) => {
+                warn!(%error, %point, "WASM queryable failed to handle a request");
+                query.reply_err(b"provider failed".to_vec()).wait()
+            }
+        };
+        if let Err(error) = reply {
+            debug!(%error, %point, "Zenoh request was no longer awaiting a reply");
         }
     }
 
@@ -1864,6 +1827,7 @@ struct WasmInstance {
     plugin: Plugin,
     target_provider: Option<TargetProviderPlugin>,
     task_handler: Option<TaskPlugin>,
+    transport_handler: Option<TransportHandlerPlugin>,
 }
 
 fn apply_wasm_registrations(
@@ -1884,15 +1848,6 @@ fn apply_wasm_registrations(
     }
     for consumer in registrations.consumers {
         ctx.consume_contract(consumer)?;
-    }
-    for surface in registrations.ui_surfaces {
-        ctx.register_ui_surface(surface)?;
-    }
-    if let Some(layer) = registrations.ui_layer {
-        ctx.register_ui_layer(layer)?;
-    }
-    if let Some(presentation) = registrations.world_presentation {
-        ctx.register_world_presentation(presentation)?;
     }
     Ok(())
 }
@@ -1949,6 +1904,7 @@ impl WasmComponent {
                 plugin,
                 target_provider: None,
                 task_handler: None,
+                transport_handler: None,
             });
         }
 
@@ -1981,22 +1937,6 @@ impl WasmComponent {
         operation: &'static str,
     ) -> ExtensionResult<()> {
         Self::set_fuel(store, budget.fuel_per_runtime_task, operation)
-    }
-
-    fn set_service_request_fuel(
-        store: &mut Store<WasmHostState>,
-        budget: &WasmExecutionBudget,
-        operation: &'static str,
-    ) -> ExtensionResult<()> {
-        Self::set_fuel(store, budget.fuel_per_service_request, operation)
-    }
-
-    fn set_ui_action_fuel(
-        store: &mut Store<WasmHostState>,
-        budget: &WasmExecutionBudget,
-        operation: &'static str,
-    ) -> ExtensionResult<()> {
-        Self::set_fuel(store, budget.fuel_per_ui_action, operation)
     }
 
     fn execution_error(operation: &'static str, error: wasmtime::Error) -> ExtensionError {
@@ -2072,10 +2012,6 @@ impl Component for WasmComponent {
         &self.id
     }
 
-    fn service_message_limit(&self) -> Option<usize> {
-        Some(self.budget.max_service_message_bytes)
-    }
-
     fn register(&mut self, ctx: &mut dyn RegistrationContext) -> ExtensionResult<()> {
         let budget = self.budget.clone();
         let registrations = {
@@ -2109,6 +2045,7 @@ impl Component for WasmComponent {
         let budget = self.budget.clone();
         let mut guest_failed = false;
         let mut pending_targets = Vec::new();
+        let mut pending_transport_points = Vec::new();
         let mut runtime = self.runtime()?;
         let result = {
             let instance = self.ensure_instance(&mut runtime)?;
@@ -2133,7 +2070,27 @@ impl Component for WasmComponent {
                 Err(error)
             } else {
                 pending_targets = instance.store.data_mut().take_pending_execution_targets();
-                if pending_targets.is_empty() {
+                pending_transport_points =
+                    instance.store.data_mut().take_pending_transport_points();
+                if !pending_transport_points.is_empty() && !self.transport_handler_available {
+                    Err(ExtensionError::Message(String::from(
+                        "WASM component declared queryables without transport-handler exports",
+                    )))
+                } else if !pending_transport_points.is_empty() {
+                    match TransportHandlerPlugin::new(&mut instance.store, &instance.instance) {
+                        Ok(handler) => {
+                            instance.transport_handler = Some(handler);
+                            if pending_targets.is_empty() {
+                                Ok(())
+                            } else {
+                                WasmTargetProviderEndpoint::ensure_target_provider(instance)
+                            }
+                        }
+                        Err(error) => Err(ExtensionError::Message(format!(
+                            "could not bind WASM transport handler: {error}"
+                        ))),
+                    }
+                } else if pending_targets.is_empty() {
                     Ok(())
                 } else {
                     WasmTargetProviderEndpoint::ensure_target_provider(instance)
@@ -2147,6 +2104,33 @@ impl Component for WasmComponent {
         }
         drop(runtime);
         result?;
+
+        if !pending_transport_points.is_empty() {
+            let owner = rintawa_sdk::contracts::ComponentRef::new(
+                ctx.extension_instance_id().clone(),
+                ctx.component_id().clone(),
+            );
+            for point in pending_transport_points {
+                let callback_runtime = self.runtime.clone();
+                let callback_budget = self.budget.clone();
+                let callback_point = point.clone();
+                self.host_services
+                    .transport
+                    .declare(&owner, ctx.runtime_scope_id(), &point, move |query| {
+                        Self::respond_to_transport_query(
+                            &callback_runtime,
+                            &callback_budget,
+                            &callback_point,
+                            query,
+                        );
+                    })
+                    .map_err(|error| {
+                        ExtensionError::Message(format!(
+                            "could not declare WASM transport point: {error}"
+                        ))
+                    })?;
+            }
+        }
 
         if pending_targets.is_empty() {
             self.active = true;
@@ -2332,96 +2316,6 @@ impl Component for WasmComponent {
             runtime.failed_lifecycle_callback = Some("runtime task");
         }
         result
-    }
-
-    fn handle_ui_action(
-        &mut self,
-        ctx: &mut dyn ComponentContext,
-        event: &UiActionEvent,
-    ) -> ExtensionResult<()> {
-        let payload = serde_json::to_vec(event).map_err(|error| {
-            ExtensionError::Message(format!("could not encode UI action: {error}"))
-        })?;
-        self.validate_inbound_message("UI action", payload.len())?;
-        let budget = self.budget.clone();
-        let mut guest_failed = false;
-        let mut runtime = self.runtime()?;
-        let result = {
-            let instance = self.ensure_instance(&mut runtime)?;
-            instance.store.data().validate_execution_owner(ctx)?;
-            Self::set_ui_action_fuel(&mut instance.store, &budget, "UI action")?;
-            instance.store.data_mut().begin_guest_execution();
-            // Only the Host-routed semantic UI callback may attest an
-            // immediate guest-submitted World command as interactive.
-            instance.store.data_mut().verified_ui_action_active = true;
-
-            let action_result = instance
-                .plugin
-                .rintawa_engine_guest()
-                .call_handle_ui_action(&mut instance.store, &payload)
-                .map_err(|error| Self::execution_error("UI action", error));
-
-            if let Err(error) = action_result {
-                guest_failed = true;
-                Err(instance.store.data_mut().abort_guest_execution(ctx, error))
-            } else if let Err(error) = instance.store.data_mut().finish_guest_execution(ctx) {
-                guest_failed = true;
-                Err(instance.store.data_mut().abort_guest_execution(ctx, error))
-            } else {
-                Ok(())
-            }
-        };
-
-        if guest_failed {
-            runtime.instance = None;
-            runtime.failed_lifecycle_callback = Some("UI action");
-            return result.map_err(|error| ExtensionError::ComponentRuntimeInvalidated {
-                operation: "UI action",
-                reason: error.to_string(),
-            });
-        }
-        result
-    }
-
-    fn handle_service(
-        &mut self,
-        ctx: &mut dyn ComponentContext,
-        contract: &ContractKey,
-        request: &[u8],
-    ) -> ExtensionResult<Vec<u8>> {
-        self.validate_inbound_message("service contract", contract.id.as_str().len())?;
-        if request.len() > self.budget.max_service_message_bytes {
-            return Err(ExtensionError::HostMessageTooLarge {
-                operation: "service request",
-                actual_bytes: request.len(),
-                maximum_bytes: self.budget.max_service_message_bytes,
-            });
-        }
-        let budget = self.budget.clone();
-        let mut runtime = self.runtime()?;
-        let instance = self.ensure_instance(&mut runtime)?;
-
-        instance.store.data().validate_execution_owner(ctx)?;
-        Self::set_service_request_fuel(&mut instance.store, &budget, "service request")?;
-        instance.store.data_mut().begin_service_execution(
-            ctx.service_caller().cloned(),
-            contract.id.as_str().starts_with("rintawa.world.effect.")
-                && contract.version.major() == 1,
-        );
-
-        let response = instance
-            .plugin
-            .rintawa_engine_guest()
-            .call_handle_service(
-                &mut instance.store,
-                contract.id.as_str(),
-                contract.version.major(),
-                request,
-            )
-            .map_err(|error| Self::execution_error("service request", error));
-
-        instance.store.data_mut().finish_service_execution();
-        response
     }
 }
 

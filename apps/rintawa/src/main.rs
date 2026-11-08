@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use rintawa_host::{HOST_SCOPE, HostHome, HostRuntime, UserContentId};
+use rintawa_host::{HOST_SCOPE, HostHome, HostRuntime};
 use rintawa_sdk::{
     contracts::ComponentRef, runtime_permissions::RuntimePermission, types::RuntimeScopeId,
     world::WorldId,
@@ -103,25 +103,6 @@ enum Commands {
         #[arg(long, default_value = HOST_SCOPE)]
         scope: String,
     },
-    /// Import a validated RTW into the generic persistent user-content library.
-    ContentImport {
-        /// Local RTW content file.
-        path: PathBuf,
-    },
-    /// List persistent generic user-content entries.
-    ContentList,
-    /// Replace one logical user-content item with a validated RTW revision.
-    ContentReplace {
-        /// Stable logical user-content identity.
-        id: UserContentId,
-        /// Replacement local RTW content file.
-        path: PathBuf,
-    },
-    /// Remove one logical user-content item from the library index.
-    ContentRemove {
-        /// Stable logical user-content identity.
-        id: UserContentId,
-    },
     /// Create an empty persistent authoritative world.
     WorldCreate,
     /// List persistent worlds in the local Rintawa home.
@@ -174,10 +155,6 @@ fn main() -> Result<()> {
             origin,
             scope,
         } => revoke_http_origin(&home, instance, component, origin, scope),
-        Commands::ContentImport { path } => content_import(&home, path),
-        Commands::ContentList => content_list(&home),
-        Commands::ContentReplace { id, path } => content_replace(&home, id, path),
-        Commands::ContentRemove { id } => content_remove(&home, id),
         Commands::WorldCreate => world_create(&home),
         Commands::WorldList => world_list(&home),
         Commands::WorldInfo { id } => world_info(&home, id),
@@ -331,61 +308,6 @@ fn revoke_http_origin(
     Ok(())
 }
 
-fn content_import(home: &HostHome, path: PathBuf) -> Result<()> {
-    let mut runtime = HostRuntime::start(home)?;
-    let operation = (|| {
-        let entry = runtime.import_user_content_rtw(home, path)?;
-        print_user_content_entry(&entry);
-        Ok(())
-    })();
-    finish_runtime_operation(runtime, operation)
-}
-
-fn content_list(home: &HostHome) -> Result<()> {
-    let entries = home.list_user_content()?;
-    if entries.is_empty() {
-        println!("No user content imported.");
-        return Ok(());
-    }
-    for entry in entries {
-        println!("{} {} {}", entry.id, entry.content, entry.revision);
-    }
-    Ok(())
-}
-
-fn content_replace(home: &HostHome, id: UserContentId, path: PathBuf) -> Result<()> {
-    let mut runtime = HostRuntime::start(home)?;
-    let operation = (|| {
-        let entry = runtime.replace_user_content_rtw(home, id, path)?;
-        print_user_content_entry(&entry);
-        Ok(())
-    })();
-    finish_runtime_operation(runtime, operation)
-}
-
-fn content_remove(home: &HostHome, id: UserContentId) -> Result<()> {
-    let entry = home.remove_user_content(id)?;
-    print_user_content_entry(&entry);
-    Ok(())
-}
-
-fn print_user_content_entry(entry: &rintawa_host::UserContentEntry) {
-    println!("id = {}", entry.id);
-    println!("content = {}", entry.content);
-    println!("revision = {}", entry.revision);
-}
-
-fn finish_runtime_operation(runtime: HostRuntime, operation: Result<()>) -> Result<()> {
-    let shutdown = runtime.shutdown().map_err(anyhow::Error::from);
-    match (operation, shutdown) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(operation_error), Err(shutdown_error)) => {
-            Err(operation_error.context(format!("runtime shutdown also failed: {shutdown_error}")))
-        }
-    }
-}
-
 fn world_create(home: &HostHome) -> Result<()> {
     let world = home.create_world()?;
     println!("world = {}", world.id);
@@ -407,9 +329,15 @@ fn world_list(home: &HostHome) -> Result<()> {
 
 fn world_info(home: &HostHome, world_id: WorldId) -> Result<()> {
     let world = home.load_world_state(world_id)?;
-    let metadata = home.load_world_catalog_metadata(world_id)?;
+    let title = world
+        .manifest()
+        .as_value()
+        .get("metadata")
+        .and_then(|metadata| metadata.get("title"))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("world manifest has no valid title"))?;
     println!("world = {}", world.id());
-    println!("title = {}", metadata.title());
+    println!("title = {title}");
     println!("properties = {}", world.properties().len());
     Ok(())
 }
@@ -482,6 +410,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_should_reject_retired_content_commands() {
+        for args in [
+            vec!["rintawa", "content-import", "content.rtw"],
+            vec!["rintawa", "content-list"],
+            vec!["rintawa", "content-remove", "legacy-id"],
+            vec!["rintawa", "content-replace", "legacy-id", "content.rtw"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
     fn test_should_parse_runtime_permission_commands() {
         let grant = Cli::try_parse_from([
             "rintawa",
@@ -499,13 +439,6 @@ mod tests {
                 permission: RuntimePermission::BackgroundTask,
                 scope,
             } if instance == "example.runtime" && component == "runtime" && scope == HOST_SCOPE
-        ));
-
-        let content_import = Cli::try_parse_from(["rintawa", "content-import", "/tmp/content.rtw"])
-            .expect("content-import command should parse");
-        assert!(matches!(
-            content_import.command,
-            Commands::ContentImport { path } if path == std::path::Path::new("/tmp/content.rtw")
         ));
 
         let world_default = Cli::try_parse_from(["rintawa", "world-default", "example.runtime"])

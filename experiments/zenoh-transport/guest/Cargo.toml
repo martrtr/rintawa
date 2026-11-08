@@ -1,0 +1,13 @@
+[package]
+name = "rintawa-zenoh-guest"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.57.1"

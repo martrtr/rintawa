@@ -5,9 +5,8 @@ use wasmtime::{StoreLimits, StoreLimitsBuilder};
 /// Host-owned resource limits for one WASM component instance.
 ///
 /// Lifecycle and event callbacks receive a fresh `fuel_per_callback` allowance.
-/// Cooperative runtime tasks, service callbacks, and interactive Portable UI actions
-/// receive dedicated larger allowances because they may legitimately process bounded
-/// payloads while still remaining finite.
+/// Cooperative runtime tasks and service callbacks receive dedicated larger
+/// allowances while still remaining finite.
 ///
 /// Memory and table limits are enforced by Wasmtime for the lifetime of the
 /// component store. These defaults are a conservative local-host baseline, not a
@@ -32,8 +31,6 @@ pub struct WasmExecutionBudget {
     pub fuel_per_runtime_task: u64,
     /// Fuel made available before a bounded service request callback.
     pub fuel_per_service_request: u64,
-    /// Fuel made available before an interactive Portable UI action.
-    pub fuel_per_ui_action: u64,
     /// Maximum byte length of an inbound event topic or payload.
     pub max_host_message_bytes: usize,
     /// Maximum byte length of one bounded service request or response.
@@ -44,16 +41,8 @@ pub struct WasmExecutionBudget {
     pub max_artifact_import_bytes: usize,
     /// Maximum raw asset bytes accepted by one generic asset import call.
     pub max_asset_import_bytes: usize,
-    /// Maximum immutable asset bytes returned to one authenticated UI Layer read.
-    pub max_presented_asset_bytes: usize,
-    /// Maximum deferred user-content writes accepted during one guest callback.
-    pub max_user_content_writes_per_execution: usize,
     /// Maximum world-session mutations accepted during one guest callback.
     pub max_world_session_mutations_per_execution: usize,
-    /// Maximum authoritative world commands accepted during one guest callback.
-    pub max_world_command_submissions_per_execution: usize,
-    /// Maximum policy-filtered World Projection reads accepted during one guest callback.
-    pub max_world_projection_reads_per_execution: usize,
     /// Maximum cooperative background tasks owned by one WASM component.
     pub max_background_tasks: usize,
     /// Smallest periodic task interval accepted from a guest.
@@ -94,17 +83,12 @@ impl Default for WasmExecutionBudget {
             fuel_per_callback: 10_000_000,
             fuel_per_runtime_task: 250_000_000,
             fuel_per_service_request: 500_000_000,
-            fuel_per_ui_action: 50_000_000,
             max_host_message_bytes: 1024 * 1024,
             max_service_message_bytes: 8 * 1024 * 1024,
             max_artifact_read_bytes: 8 * 1024 * 1024,
             max_artifact_import_bytes: 32 * 1024 * 1024,
             max_asset_import_bytes: 32 * 1024 * 1024,
-            max_presented_asset_bytes: 32 * 1024 * 1024,
-            max_user_content_writes_per_execution: 4,
             max_world_session_mutations_per_execution: 8,
-            max_world_command_submissions_per_execution: 8,
-            max_world_projection_reads_per_execution: 8,
             max_background_tasks: 8,
             min_background_task_interval_ms: 10,
             max_network_handles: 64,

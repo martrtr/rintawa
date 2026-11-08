@@ -15,17 +15,11 @@ use rintawa_sdk::{
     runtime_effects::RuntimeEffect,
     runtime_permissions::RuntimePermission,
     secrets::SecretPathPattern,
-    services::ServiceCallResult,
     traits::Component,
     types::{
         ComponentId, ContributionId, ExtensionId, ExtensionInstanceId, RuntimeEffectId,
         RuntimeScopeId,
     },
-    ui::{UiActionEvent, UiError, UiLayerDescriptor, WorldPresentationDescriptor},
-    world::WorldId,
-};
-use rintawa_ui_runtime::{
-    QueuedWorldFocusRequest, UiLayerPresentationState, UiPresentationSurface, UiRuntime,
 };
 use tracing::warn;
 
@@ -44,19 +38,17 @@ use crate::{
     execution_targets::{ExecutionTargetDependency, ExecutionTargetRegistry},
     host_access::{
         ArtifactStoreAccess, AssetStoreAccess, CompositionAccess, HostAccessServices,
-        PreferenceAccess, RuntimeContextAccess, RuntimePolicyAccess, UserContentAccess,
-        UserContentWriteAccess, UserResourceAccess, WorldCommandAccess, WorldProjectionAccess,
+        PreferenceAccess, RuntimeContextAccess, RuntimePolicyAccess, UserResourceAccess,
         WorldSessionAccess,
     },
-    runtime::{AsyncObserverRegistry, WasmRuntimeEngine},
+    runtime::WasmRuntimeEngine,
     runtime_effects::RuntimeEffectRegistry,
     runtime_permissions::RuntimePermissionManager,
     secrets::SecretManager,
-    services::{
-        BoundServiceCaller, ComponentHandle, PlatformServiceCaller, ServiceInstanceRegistration,
-        ServiceRuntime,
-    },
+    transport::{Transport, TransportError},
 };
+
+type ComponentHandle = Arc<Mutex<Box<dyn Component>>>;
 
 /// Represents the active lifecycle state of an extension in the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,18 +151,6 @@ impl ManagedComponent {
             .map_err(|_| ExtensionError::Message(String::from("component lock was poisoned")))?;
         component.handle_event(context, topic, payload)
     }
-
-    fn handle_ui_action(
-        &self,
-        context: &mut dyn ComponentContext,
-        event: &UiActionEvent,
-    ) -> ExtensionResult<()> {
-        let mut component = self
-            .handle
-            .lock()
-            .map_err(|_| ExtensionError::Message(String::from("component lock was poisoned")))?;
-        component.handle_ui_action(context, event)
-    }
 }
 
 /// A contribution registered by a specific component within an extension.
@@ -186,9 +166,7 @@ pub struct ExtensionEngine {
     runtime_effects: RuntimeEffectRegistry,
     runtime_permissions: RuntimePermissionManager,
     secrets: SecretManager,
-    services: ServiceRuntime,
-    async_observers: Arc<AsyncObserverRegistry>,
-    ui: UiRuntime,
+    transport: Transport,
     preferred_contract_providers: HashMap<RuntimeScopeId, HashMap<ContractKey, ComponentRef>>,
     platform_contract_definitions:
         HashMap<RuntimeScopeId, HashMap<ContractKey, ContractDefinition>>,
@@ -207,33 +185,6 @@ fn default_instance_id(extension_id: &ExtensionId) -> ExtensionInstanceId {
     ExtensionInstanceId::new(extension_id.as_str())
 }
 
-fn rollback_started_components(
-    extension: &mut ManagedExtension,
-    runtime_effects: &mut RuntimeEffectRegistry,
-    secrets: &SecretManager,
-    services: &ServiceRuntime,
-    ui: &UiRuntime,
-) -> Vec<ComponentStopFailure> {
-    let mut failures = Vec::new();
-    for component in extension.components.iter().rev() {
-        let identity = ComponentIdentity::new(
-            extension.manifest.id.clone(),
-            extension.instance_id.clone(),
-            extension.scope_id.clone(),
-            component.id().clone(),
-        );
-        let mut context =
-            EngineComponentContext::new(identity, runtime_effects, secrets, services, ui, false);
-        if let Err(error) = component.stop(&mut context) {
-            failures.push(ComponentStopFailure {
-                component_id: component.id().to_string(),
-                reason: error.to_string(),
-            });
-        }
-    }
-    failures
-}
-
 fn compare_component_refs(left: &ComponentRef, right: &ComponentRef) -> std::cmp::Ordering {
     left.instance_id
         .as_str()
@@ -241,42 +192,16 @@ fn compare_component_refs(left: &ComponentRef, right: &ComponentRef) -> std::cmp
         .then_with(|| left.component_id.as_str().cmp(right.component_id.as_str()))
 }
 
-fn is_transient_queued_ui_rejection(error: &EngineError) -> bool {
-    matches!(
-        error,
-        EngineError::Ui(
-            UiError::LayerNotOwner
-                | UiError::ScopeNotVisible
-                | UiError::InstanceNotRegistered(_)
-                | UiError::OwnerInactive
-                | UiError::SurfaceNotRegistered(_)
-                | UiError::SurfaceNotMounted(_)
-                | UiError::RevisionMismatch { .. }
-                | UiError::NodeNotFound(_)
-                | UiError::ActionNotBound { .. }
-                | UiError::ActionDisabled { .. }
-                | UiError::InvalidActionPayload { .. }
-        )
-    )
-}
-
-fn should_contain_queued_ui_error(error: &EngineError) -> bool {
-    matches!(error, EngineError::UiActionFailed { .. }) || is_transient_queued_ui_rejection(error)
-}
-
 impl Default for ExtensionEngine {
     fn default() -> Self {
         let secrets = SecretManager::default();
-        let services = ServiceRuntime::new(secrets.clone());
         Self {
             extensions: HashMap::new(),
             active_contributions: HashSet::new(),
             runtime_effects: RuntimeEffectRegistry::default(),
             runtime_permissions: RuntimePermissionManager::default(),
             secrets,
-            services,
-            async_observers: Arc::new(AsyncObserverRegistry::default()),
-            ui: UiRuntime::new(),
+            transport: Transport::default(),
             preferred_contract_providers: HashMap::new(),
             platform_contract_definitions: HashMap::new(),
             execution_targets: ExecutionTargetRegistry::default(),
@@ -329,60 +254,18 @@ impl ExtensionEngine {
     pub fn attach_user_resource_access(&mut self, access: Arc<dyn UserResourceAccess>) {
         self.host_access = self.host_access.clone().with_user_resource_access(access);
     }
-
-    /// Attaches generic read-only user-content library access.
-    ///
-    /// Embedded hosts that do not call this method remain fail-closed with an
-    /// unavailable capability. Guest access is still permission-gated per component.
-    pub fn attach_user_content_access(&mut self, access: Arc<dyn UserContentAccess>) {
-        self.host_access = self.host_access.clone().with_user_content_access(access);
-    }
-
-    /// Attaches generic deferred user-content library mutations.
-    ///
-    /// Embedded hosts that do not call this method remain fail-closed. Guest access
-    /// is still permission-gated and owner-scoped per exact component principal.
-    pub fn attach_user_content_write_access(&mut self, access: Arc<dyn UserContentWriteAccess>) {
-        self.host_access = self
-            .host_access
-            .clone()
-            .with_user_content_write_access(access);
-    }
-
-    /// Attaches generic authenticated world-command submission.
-    ///
-    /// Embedded hosts that do not call this method remain fail-closed. Guest access
-    /// is still permission-gated per exact component principal.
-    pub fn attach_world_command_access(&mut self, access: Arc<dyn WorldCommandAccess>) {
-        self.host_access = self.host_access.clone().with_world_command_access(access);
-    }
-
-    /// Attaches generic deferred policy-filtered World Projection reads.
-    ///
-    /// Embedded hosts that do not call this method remain fail-closed. Guest access
-    /// remains permission-gated and owner-scoped per exact component principal.
-    pub fn attach_world_projection_access(&mut self, access: Arc<dyn WorldProjectionAccess>) {
-        self.host_access = self
-            .host_access
-            .clone()
-            .with_world_projection_access(access);
-    }
-
     /// Creates an engine using a host-configured secret manager.
     ///
     /// Rintawa should supply its production credential-store manager here.
     /// The engine's internal tests use an in-memory vault separately.
     pub fn with_secret_manager(secrets: SecretManager) -> Self {
-        let services = ServiceRuntime::new(secrets.clone());
         Self {
             extensions: HashMap::new(),
             active_contributions: HashSet::new(),
             runtime_effects: RuntimeEffectRegistry::default(),
             runtime_permissions: RuntimePermissionManager::default(),
             secrets,
-            services,
-            async_observers: Arc::new(AsyncObserverRegistry::default()),
-            ui: UiRuntime::new(),
+            transport: Transport::default(),
             preferred_contract_providers: HashMap::new(),
             platform_contract_definitions: HashMap::new(),
             execution_targets: ExecutionTargetRegistry::default(),
@@ -496,13 +379,144 @@ impl ExtensionEngine {
     pub fn wasm_runtime_engine(&self) -> EngineResult<WasmRuntimeEngine> {
         WasmRuntimeEngine::with_host_services(
             self.secrets.clone(),
-            self.services.clone(),
-            self.ui.clone(),
+            self.transport.clone(),
             self.execution_targets.clone(),
             self.runtime_permissions.clone(),
             self.host_access.clone(),
-            self.async_observers.clone(),
         )
+    }
+
+    /// Restricts one scoped Zenoh point to the selected exact component.
+    ///
+    /// The Host persists this policy in the composition; it is not guest-writable.
+    /// Configure before starting the scope's extensions. Missing or stopped
+    /// providers never fall back to another implementation.
+    ///
+    /// # Errors
+    /// Rejects invalid points, conflicting active registrations and exhausted limits.
+    pub fn set_authoritative_transport_provider_in_scope(
+        &self,
+        scope: &RuntimeScopeId,
+        point: &str,
+        provider: &ComponentRef,
+    ) -> Result<(), TransportError> {
+        self.transport.select_authoritative(scope, point, provider)
+    }
+
+    /// Clears Host-selected transport providers when a composition is removed.
+    pub fn clear_authoritative_transport_providers_in_scope(&self, scope: &RuntimeScopeId) {
+        self.transport.clear_authoritative_in_scope(scope);
+    }
+
+    /// Declares one ephemeral fan-out extension point for an active component.
+    ///
+    /// The callback runs in trusted native Host code, not in a sandbox. An
+    /// untrusted WASM component will use an authenticated WIT import instead.
+    /// The key is derived from the component's registered runtime scope.
+    ///
+    /// # Errors
+    ///
+    /// Rejects inactive/foreign component refs, invalid names, duplicate
+    /// declarations, and Zenoh failures.
+    pub fn declare_transport_contribution<F>(
+        &self,
+        owner: &ComponentRef,
+        point: &str,
+        callback: F,
+    ) -> Result<(), TransportError>
+    where
+        F: Fn(zenoh::query::Query) + Send + Sync + 'static,
+    {
+        let scope = self.transport_scope(owner)?;
+        self.transport.declare(owner, &scope, point, callback)
+    }
+
+    /// Collects all live contributions under one point within the caller's scope.
+    ///
+    /// Responses are bounded by count, total bytes and a fixed deadline.
+    /// The transport never interprets their content or applies World mutations.
+    ///
+    /// # Errors
+    ///
+    /// Rejects inactive/foreign component refs, invalid names, oversized
+    /// requests or replies, and transport failures.
+    pub fn query_transport_contributions(
+        &self,
+        caller: &ComponentRef,
+        point: &str,
+        payload: &[u8],
+    ) -> Result<Vec<Vec<u8>>, TransportError> {
+        let scope = self.transport_scope(caller)?;
+        self.transport.query(&scope, point, payload)
+    }
+
+    /// Publishes a non-durable notification within the caller's World scope.
+    ///
+    /// # Errors
+    /// Rejects inactive callers, invalid names, oversized payloads or Zenoh failures.
+    pub fn publish_transport_notification(
+        &self,
+        caller: &ComponentRef,
+        point: &str,
+        payload: &[u8],
+    ) -> Result<(), TransportError> {
+        let scope = self.transport_scope(caller)?;
+        self.transport.publish(caller, &scope, point, payload)
+    }
+
+    /// Subscribes to notifications with a bounded buffer; no durable delivery.
+    ///
+    /// # Errors
+    /// Rejects inactive callers, invalid names, exhausted limits or Zenoh failures.
+    pub fn subscribe_transport_notifications(
+        &self,
+        caller: &ComponentRef,
+        point: &str,
+    ) -> Result<u64, TransportError> {
+        let scope = self.transport_scope(caller)?;
+        self.transport.subscribe(caller, &scope, point)
+    }
+
+    /// Takes the available messages without waiting; old events may have been lost.
+    ///
+    /// # Errors
+    /// Rejects inactive callers, foreign handles or Zenoh failures.
+    pub fn poll_transport_notifications(
+        &self,
+        caller: &ComponentRef,
+        handle: u64,
+    ) -> Result<Vec<Vec<u8>>, TransportError> {
+        self.transport_scope(caller)?;
+        self.transport.poll(caller, handle)
+    }
+
+    /// Removes a caller-owned notification subscription.
+    ///
+    /// # Errors
+    /// Rejects inactive callers, foreign handles or Zenoh failures.
+    pub fn unsubscribe_transport_notifications(
+        &self,
+        caller: &ComponentRef,
+        handle: u64,
+    ) -> Result<(), TransportError> {
+        self.transport_scope(caller)?;
+        self.transport.unsubscribe(caller, handle)
+    }
+
+    fn transport_scope(&self, owner: &ComponentRef) -> Result<RuntimeScopeId, TransportError> {
+        let extension = self
+            .extensions
+            .get(&owner.instance_id)
+            .ok_or(TransportError::Inactive)?;
+        if extension.state != ExtensionState::Active
+            || !extension
+                .components
+                .iter()
+                .any(|component| component.id() == &owner.component_id)
+        {
+            return Err(TransportError::Inactive);
+        }
+        Ok(extension.scope_id.clone())
     }
 
     /// Parses and validates an extension manifest from a TOML string.
@@ -531,7 +545,7 @@ impl ExtensionEngine {
             for owned in &extension.contract_definitions {
                 definitions.insert(
                     owned.definition.contract.clone(),
-                    (owned.definition.resolution, owned.definition.protocol),
+                    owned.definition.resolution,
                 );
             }
         }
@@ -549,19 +563,16 @@ impl ExtensionEngine {
                 });
             }
             if let Some(existing) = definitions.get(&definition.contract) {
-                let incoming = (definition.resolution, definition.protocol);
+                let incoming = definition.resolution;
                 if *existing != incoming {
                     return Err(EngineError::ContractDefinitionConflict {
                         contract: definition.contract.to_string(),
-                        existing: format!("{}/{}", existing.1, existing.0),
-                        incoming: format!("{}/{}", incoming.1, incoming.0),
+                        existing: existing.to_string(),
+                        incoming: incoming.to_string(),
                     });
                 }
             } else {
-                definitions.insert(
-                    definition.contract.clone(),
-                    (definition.resolution, definition.protocol),
-                );
+                definitions.insert(definition.contract.clone(), definition.resolution);
             }
         }
         Ok(())
@@ -591,34 +602,11 @@ impl ExtensionEngine {
         )
     }
 
-    /// Defines one platform-owned unary service contract inside an exact runtime scope.
-    ///
-    /// Extensions may provide or consume the contract but cannot redefine its
-    /// protocol or resolution policy.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same reservation/conflict errors as
-    /// [`Self::define_platform_binding_contract_in_scope`].
-    pub fn define_platform_service_contract_in_scope(
-        &mut self,
-        scope_id: RuntimeScopeId,
-        contract: ContractKey,
-        resolution: ContractResolutionPolicy,
-    ) -> EngineResult<()> {
-        self.define_platform_contract_in_scope(
-            scope_id,
-            ContractDefinition::service(contract, resolution),
-        )
-    }
-
     /// Removes every platform-owned contract reservation in one exact runtime scope.
     ///
     /// Scope supervisors call this only after their extension instances and
-    /// host-owned workers are stopped. The service router is cleared together with
-    /// the composition index so stale platform roles cannot survive reactivation.
+    /// host-owned workers are stopped.
     pub fn clear_platform_contract_definitions_in_scope(&mut self, scope_id: &RuntimeScopeId) {
-        self.services.clear_platform_contracts_in_scope(scope_id);
         self.platform_contract_definitions.remove(scope_id);
     }
 
@@ -650,19 +638,12 @@ impl ExtensionEngine {
             if existing != &definition {
                 return Err(EngineError::ContractDefinitionConflict {
                     contract: contract.to_string(),
-                    existing: format!("{}/{}", existing.protocol, existing.resolution),
-                    incoming: format!("{}/{}", definition.protocol, definition.resolution),
+                    existing: existing.resolution.to_string(),
+                    incoming: definition.resolution.to_string(),
                 });
             }
-            self.services
-                .define_platform_contract(scope_id, definition)
-                .map_err(|()| EngineError::ServiceRuntimeUnavailable)?;
             return Ok(());
         }
-
-        self.services
-            .define_platform_contract(scope_id.clone(), definition.clone())
-            .map_err(|()| EngineError::ServiceRuntimeUnavailable)?;
         self.platform_contract_definitions
             .entry(scope_id)
             .or_default()
@@ -741,9 +722,6 @@ impl ExtensionEngine {
         let mut contract_definitions = Vec::new();
         let mut contract_providers = Vec::new();
         let mut contract_consumers = Vec::new();
-        let mut ui_surfaces = Vec::new();
-        let mut ui_layers = Vec::new();
-        let mut world_presentations = Vec::new();
 
         for comp in &mut components {
             let first_contribution = registered_descriptors.len();
@@ -753,9 +731,6 @@ impl ExtensionEngine {
                 contract_definitions: &mut contract_definitions,
                 contract_providers: &mut contract_providers,
                 contract_consumers: &mut contract_consumers,
-                ui_surfaces: &mut ui_surfaces,
-                ui_layers: &mut ui_layers,
-                world_presentations: &mut world_presentations,
             };
             let identity = ComponentIdentity::new(
                 manifest.id.clone(),
@@ -797,38 +772,6 @@ impl ExtensionEngine {
                 }
             })
             .collect();
-
-        self.services
-            .register_instance(ServiceInstanceRegistration {
-                instance_id: instance_id.clone(),
-                extension_id: manifest.id.clone(),
-                scope_id: scope_id.clone(),
-                definitions: contract_definitions.clone(),
-                providers: contract_providers.clone(),
-                consumers: contract_consumers.clone(),
-                components: components
-                    .iter()
-                    .map(|component| (component.id.clone(), component.handle.clone()))
-                    .collect(),
-            })
-            .map_err(|()| EngineError::ServiceRuntimeUnavailable)?;
-
-        if let Err(error) = self.ui.register_instance(
-            instance_id.clone(),
-            scope_id.clone(),
-            ui_surfaces.clone(),
-            ui_layers.clone(),
-        ) {
-            self.services.unregister_instance(&instance_id);
-            return Err(error.into());
-        }
-        for presentation in world_presentations {
-            if let Err(error) = self.ui.register_world_presentation(presentation) {
-                self.ui.unregister_instance(&instance_id);
-                self.services.unregister_instance(&instance_id);
-                return Err(error.into());
-            }
-        }
 
         for contrib in &extension_contributions {
             self.active_contributions
@@ -1154,14 +1097,8 @@ impl ExtensionEngine {
                 scope_id.clone(),
                 comp.id().clone(),
             );
-            let mut ctx = EngineComponentContext::new(
-                identity,
-                runtime_effects,
-                &self.secrets,
-                &self.services,
-                &self.ui,
-                true,
-            );
+            let mut ctx =
+                EngineComponentContext::new(identity, runtime_effects, &self.secrets, true);
 
             if let Err(err) = comp.start(&mut ctx) {
                 let failed_component_id = comp.id().as_str().to_string();
@@ -1174,14 +1111,8 @@ impl ExtensionEngine {
                     scope_id.clone(),
                     comp.id().clone(),
                 );
-                let mut failed_stop_context = EngineComponentContext::new(
-                    identity,
-                    runtime_effects,
-                    &self.secrets,
-                    &self.services,
-                    &self.ui,
-                    false,
-                );
+                let mut failed_stop_context =
+                    EngineComponentContext::new(identity, runtime_effects, &self.secrets, false);
                 if let Err(stop_error) = comp.stop(&mut failed_stop_context) {
                     rollback_failures.push(ComponentStopFailure {
                         component_id: failed_component_id.clone(),
@@ -1201,8 +1132,6 @@ impl ExtensionEngine {
                         identity,
                         runtime_effects,
                         &self.secrets,
-                        &self.services,
-                        &self.ui,
                         false,
                     );
                     if let Err(stop_error) = comp_to_stop.stop(&mut stop_ctx) {
@@ -1216,8 +1145,7 @@ impl ExtensionEngine {
                 runtime_effects.revoke_instance(&concrete_instance_id);
                 self.execution_targets
                     .revoke_instance(&concrete_instance_id);
-                self.ui.set_instance_active(&concrete_instance_id, false)?;
-                self.services.deactivate_instance(&concrete_instance_id);
+                self.transport.revoke_instance(&concrete_instance_id);
 
                 if ext.state == ExtensionState::Stopped {
                     for contrib in &ext.contributions {
@@ -1241,48 +1169,6 @@ impl ExtensionEngine {
                     rollback_failures,
                 });
             }
-        }
-
-        let finalization_result: EngineResult<()> = (|| {
-            self.ui.set_instance_active(&concrete_instance_id, true)?;
-            self.services
-                .activate_instance(&concrete_instance_id)
-                .map_err(|()| EngineError::ServiceRuntimeUnavailable)?;
-            Ok(())
-        })();
-        if let Err(finalization_error) = finalization_result {
-            self.services.deactivate_instance(&concrete_instance_id);
-            let mut rollback_failures = rollback_started_components(
-                ext,
-                runtime_effects,
-                &self.secrets,
-                &self.services,
-                &self.ui,
-            );
-            if let Err(error) = self.ui.set_instance_active(&concrete_instance_id, false) {
-                rollback_failures.push(ComponentStopFailure {
-                    component_id: String::from("engine-ui"),
-                    reason: error.to_string(),
-                });
-            }
-            runtime_effects.revoke_instance(&concrete_instance_id);
-            self.execution_targets
-                .revoke_instance(&concrete_instance_id);
-            if ext.state == ExtensionState::Stopped {
-                for contrib in &ext.contributions {
-                    self.active_contributions
-                        .remove(&(scope_id.clone(), contrib.descriptor.id.clone()));
-                }
-            }
-            if rollback_failures.is_empty() {
-                return Err(finalization_error);
-            }
-            return Err(EngineError::StartupRollbackFailed {
-                extension_id: logical_id.to_string(),
-                component_id: String::from("engine"),
-                start_reason: finalization_error.to_string(),
-                rollback_failures,
-            });
         }
 
         ext.state = ExtensionState::Active;
@@ -1389,8 +1275,7 @@ impl ExtensionEngine {
         let scope_id = ext.scope_id.clone();
         let concrete_instance_id = ext.instance_id.clone();
 
-        self.ui.set_instance_active(&concrete_instance_id, false)?;
-        self.services.deactivate_instance(&concrete_instance_id);
+        self.transport.revoke_instance(&concrete_instance_id);
 
         let mut stop_failures = Vec::new();
         for comp in ext.components.iter_mut().rev() {
@@ -1401,14 +1286,8 @@ impl ExtensionEngine {
                 scope_id.clone(),
                 comp.id().clone(),
             );
-            let mut ctx = EngineComponentContext::new(
-                identity,
-                runtime_effects,
-                &self.secrets,
-                &self.services,
-                &self.ui,
-                false,
-            );
+            let mut ctx =
+                EngineComponentContext::new(identity, runtime_effects, &self.secrets, false);
             if let Err(err) = comp.stop(&mut ctx) {
                 stop_failures.push(ComponentStopFailure {
                     component_id,
@@ -1498,8 +1377,7 @@ impl ExtensionEngine {
                         component.id.clone(),
                     ));
             }
-            self.services.unregister_instance(instance_id);
-            self.ui.unregister_instance(instance_id);
+            self.transport.revoke_instance(instance_id);
             self.execution_targets.revoke_instance(instance_id);
         }
         Ok(())
@@ -1535,8 +1413,6 @@ impl ExtensionEngine {
             .entry(scope_id.clone())
             .or_default()
             .insert(contract.clone(), provider.clone());
-        self.services
-            .set_preferred_provider(scope_id, contract, provider);
     }
 
     /// Selects a currently registered preferred provider inside one exact runtime scope.
@@ -1582,7 +1458,6 @@ impl ExtensionEngine {
                 self.preferred_contract_providers.remove(scope_id);
             }
         }
-        self.services.clear_preferred_provider(scope_id, contract);
     }
 
     /// Removes every preferred-provider selection in one exact runtime scope.
@@ -1593,14 +1468,7 @@ impl ExtensionEngine {
         &mut self,
         scope_id: &RuntimeScopeId,
     ) {
-        let contracts = self
-            .preferred_contract_providers
-            .remove(scope_id)
-            .map(|providers| providers.into_keys().collect::<Vec<_>>())
-            .unwrap_or_default();
-        for contract in contracts {
-            self.services.clear_preferred_provider(scope_id, &contract);
-        }
+        self.preferred_contract_providers.remove(scope_id);
     }
 
     /// Executes one cooperative runtime pump across every active component.
@@ -1660,8 +1528,6 @@ impl ExtensionEngine {
                     identity,
                     &mut self.runtime_effects,
                     &self.secrets,
-                    &self.services,
-                    &self.ui,
                     true,
                 );
                 match handle.lock() {
@@ -1687,17 +1553,6 @@ impl ExtensionEngine {
                         "extension runtime callback failed; quarantining extension instance"
                     );
                     self.quarantine_extension_instance(&instance_id)?;
-                }
-            }
-        }
-
-        for queued in self.ui.drain_queued_actions()? {
-            if let Err(error) = self.dispatch_ui_action(&queued.layer_owner, queued.event) {
-                if matches!(error, EngineError::UiActionFailed { .. }) {
-                    warn!(error = %error, "Portable UI action failed; runtime pump continues");
-                }
-                if !should_contain_queued_ui_error(&error) {
-                    return Err(error);
                 }
             }
         }
@@ -1744,28 +1599,6 @@ impl ExtensionEngine {
         self.dispatch_runtime_subscribers(scope_id, topic, payload, subscribers, "event")
     }
 
-    /// Dispatches one ephemeral runtime signal to exact-topic signal subscribers.
-    ///
-    /// Signal subscriptions are intentionally disjoint from durable-event
-    /// subscriptions even when their topic strings are identical.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError::InvalidRuntimeSignalTopic`] for an empty topic or
-    /// a host-level lifecycle error while quarantining a failed subscriber.
-    pub fn dispatch_runtime_signal_in_scope(
-        &mut self,
-        scope_id: &RuntimeScopeId,
-        topic: &str,
-        payload: &[u8],
-    ) -> EngineResult<usize> {
-        if topic.trim().is_empty() {
-            return Err(EngineError::InvalidRuntimeSignalTopic);
-        }
-        let subscribers = self.runtime_effects.signal_subscribers(topic);
-        self.dispatch_runtime_subscribers(scope_id, topic, payload, subscribers, "signal")
-    }
-
     fn dispatch_runtime_subscribers(
         &mut self,
         scope_id: &RuntimeScopeId,
@@ -1804,8 +1637,6 @@ impl ExtensionEngine {
                     identity,
                     &mut self.runtime_effects,
                     &self.secrets,
-                    &self.services,
-                    &self.ui,
                     true,
                 );
                 let managed = ManagedComponent {
@@ -1832,319 +1663,6 @@ impl ExtensionEngine {
             }
         }
         Ok(delivered)
-    }
-
-    /// Returns the owner-scoped World presentation descriptor registered by a component.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError::Ui`] when the component registered no descriptor or UI
-    /// runtime state is unavailable.
-    pub fn registered_world_presentation_descriptor(
-        &self,
-        owner: &ComponentRef,
-    ) -> EngineResult<WorldPresentationDescriptor> {
-        Ok(self.ui.registered_world_presentation_descriptor(owner)?)
-    }
-
-    /// Imports one active World scope into an exact UI Layer presentation session.
-    ///
-    /// This changes presentation visibility only. It never starts or stops the World
-    /// runtime or mutates authoritative World state.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError::Ui`] when `layer_owner` is not an active UI Layer or
-    /// the focused World contains a mounted surface unsupported by that layer.
-    pub fn set_focused_world_for_ui_layer(
-        &self,
-        layer_owner: &ComponentRef,
-        world_id: WorldId,
-        scope_id: RuntimeScopeId,
-        descriptor: WorldPresentationDescriptor,
-    ) -> EngineResult<()> {
-        self.ui
-            .set_focused_world_scope(layer_owner, world_id, scope_id, descriptor)?;
-        Ok(())
-    }
-
-    /// Queues a deferred World-focus request for one exact UI Layer session.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError::Ui`] when `layer_owner` is not an active layer or the
-    /// bounded deferred focus queue cannot accept another layer request.
-    pub fn request_world_focus_for_ui_layer(
-        &self,
-        layer_owner: &ComponentRef,
-        world_id: WorldId,
-    ) -> EngineResult<()> {
-        self.ui.queue_world_focus_request(layer_owner, world_id)?;
-        Ok(())
-    }
-
-    /// Drains deferred UI Layer World-focus requests for Host orchestration.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError::Ui`] when shared UI state is unavailable.
-    pub fn drain_world_focus_requests(&self) -> EngineResult<Vec<QueuedWorldFocusRequest>> {
-        Ok(self.ui.drain_world_focus_requests()?)
-    }
-
-    /// Records one bounded failure for a completed deferred focus request.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError::Ui`] when the requesting UI Layer session no longer exists.
-    pub fn record_world_focus_failure(
-        &self,
-        layer_owner: &ComponentRef,
-        world_id: WorldId,
-        diagnostic: &str,
-    ) -> EngineResult<()> {
-        self.ui
-            .record_world_focus_failure(layer_owner, world_id, diagnostic)?;
-        Ok(())
-    }
-
-    /// Returns renderer-facing focus state for one exact UI Layer session.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError::Ui`] when `layer_owner` is not an active UI Layer.
-    pub fn ui_layer_presentation_state(
-        &self,
-        layer_owner: &ComponentRef,
-    ) -> EngineResult<UiLayerPresentationState> {
-        Ok(self.ui.presentation_state_for_layer(layer_owner)?)
-    }
-
-    /// Clears the focused World imported into one UI Layer presentation session.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError::Ui`] when `layer_owner` is not the active UI Layer.
-    pub fn clear_focused_world_for_ui_layer(&self, layer_owner: &ComponentRef) -> EngineResult<()> {
-        self.ui.clear_focused_world_scope(layer_owner)?;
-        Ok(())
-    }
-
-    /// Returns the World currently focused by one UI Layer presentation session.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError::Ui`] when `layer_owner` is not the active UI Layer.
-    pub fn focused_world_for_ui_layer(
-        &self,
-        layer_owner: &ComponentRef,
-    ) -> EngineResult<Option<WorldId>> {
-        Ok(self.ui.focused_world_for_layer(layer_owner)?)
-    }
-
-    /// Clears one deactivated World scope from every UI Layer presentation session.
-    ///
-    /// Cleanup is fail-safe and recovers poisoned UI state so a stopped World cannot
-    /// remain referenced as the foreground presentation context.
-    pub fn clear_focused_world_scope_for_all_ui_layers(&self, scope_id: &RuntimeScopeId) {
-        self.ui.clear_focused_world_scope_for_all_layers(scope_id);
-    }
-
-    /// Attaches the statically registered descriptor for the selected UI Layer provider.
-    ///
-    /// # Errors
-    ///
-    /// Returns a portable UI error when the component did not register a layer
-    /// descriptor, is inactive, conflicts with another attached layer, or cannot
-    /// render the currently mounted surfaces in its scope.
-    pub fn attach_registered_ui_layer(&self, owner: ComponentRef) -> EngineResult<()> {
-        self.ui.attach_registered_layer(owner)?;
-        Ok(())
-    }
-
-    /// Attaches the selected portable UI Layer for an active extension component.
-    ///
-    /// # Errors
-    ///
-    /// Returns a portable UI error when the owner is inactive, another layer is
-    /// attached, the protocol is incompatible, or mounted surfaces require unsupported capabilities.
-    pub fn attach_ui_layer(
-        &self,
-        owner: ComponentRef,
-        descriptor: UiLayerDescriptor,
-    ) -> EngineResult<()> {
-        self.ui.attach_layer(owner, descriptor)?;
-        Ok(())
-    }
-
-    /// Detaches the selected portable UI Layer without deleting feature snapshots.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError::Ui`] when another component owns the active layer.
-    pub fn detach_ui_layer(&self, owner: &ComponentRef) -> EngineResult<()> {
-        self.ui.detach_layer(owner)?;
-        Ok(())
-    }
-
-    /// Returns a host snapshot of every active portable UI surface across scopes.
-    pub fn portable_ui_surfaces(&self) -> Vec<UiPresentationSurface> {
-        self.ui.presentation_surfaces()
-    }
-
-    /// Returns portable surfaces visible to one active UI Layer.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError::Ui`] when the caller is not the active layer in
-    /// its runtime scope.
-    pub fn portable_ui_surfaces_for_layer(
-        &self,
-        layer_owner: &ComponentRef,
-    ) -> EngineResult<Vec<UiPresentationSurface>> {
-        Ok(self.ui.presentation_surfaces_for_layer(layer_owner)?)
-    }
-
-    /// Validates and dispatches one semantic input event from the active UI Layer.
-    ///
-    /// # Errors
-    ///
-    /// Returns a portable UI validation error for spoofed, cross-scope, or stale
-    /// input, [`EngineError::ExtensionInstanceNotFound`] if its runtime owner
-    /// disappeared, or [`EngineError::UiActionFailed`] when the owner component
-    /// rejects the action.
-    pub fn dispatch_ui_action(
-        &mut self,
-        layer_owner: &ComponentRef,
-        event: UiActionEvent,
-    ) -> EngineResult<()> {
-        let dispatch = self.ui.route_action(layer_owner, event)?;
-        let (logical_id, scope_id, component_handle) = {
-            let extension = self
-                .extensions
-                .get(&dispatch.owner.instance_id)
-                .ok_or_else(|| {
-                    EngineError::ExtensionInstanceNotFound(dispatch.owner.instance_id.to_string())
-                })?;
-            if extension.state != ExtensionState::Active {
-                return Err(EngineError::UiActionFailed {
-                    extension_id: extension.manifest.id.to_string(),
-                    component_id: dispatch.owner.component_id.to_string(),
-                    action_id: dispatch.event.action_id.to_string(),
-                    reason: String::from("surface owner extension instance is not active"),
-                });
-            }
-            let component = extension
-                .components
-                .iter()
-                .find(|component| component.id() == &dispatch.owner.component_id)
-                .ok_or_else(|| EngineError::UiActionFailed {
-                    extension_id: extension.manifest.id.to_string(),
-                    component_id: dispatch.owner.component_id.to_string(),
-                    action_id: dispatch.event.action_id.to_string(),
-                    reason: String::from("surface owner component is not loaded"),
-                })?;
-            (
-                extension.manifest.id.clone(),
-                extension.scope_id.clone(),
-                component.handle.clone(),
-            )
-        };
-
-        let owner = dispatch.owner.clone();
-        let action_id = dispatch.event.action_id.to_string();
-        let action_result = {
-            let identity = ComponentIdentity::new(
-                logical_id.clone(),
-                owner.instance_id.clone(),
-                scope_id,
-                owner.component_id.clone(),
-            );
-            let mut context = EngineComponentContext::new(
-                identity,
-                &mut self.runtime_effects,
-                &self.secrets,
-                &self.services,
-                &self.ui,
-                true,
-            );
-            let managed = ManagedComponent {
-                id: owner.component_id.clone(),
-                handle: component_handle,
-            };
-            managed.handle_ui_action(&mut context, &dispatch.event)
-        };
-
-        match action_result {
-            Ok(()) => Ok(()),
-            Err(ExtensionError::ComponentRuntimeInvalidated { reason, .. }) => {
-                warn!(
-                    extension_id = %logical_id,
-                    instance_id = %owner.instance_id,
-                    component_id = %owner.component_id,
-                    action_id = %action_id,
-                    reason = %reason,
-                    "Portable UI action invalidated its component runtime; quarantining extension instance"
-                );
-                self.quarantine_extension_instance(&owner.instance_id)?;
-                Err(EngineError::UiActionFailed {
-                    extension_id: logical_id.to_string(),
-                    component_id: owner.component_id.to_string(),
-                    action_id,
-                    reason,
-                })
-            }
-            Err(other) => Err(EngineError::UiActionFailed {
-                extension_id: logical_id.to_string(),
-                component_id: owner.component_id.to_string(),
-                action_id,
-                reason: other.to_string(),
-            }),
-        }
-    }
-
-    /// Returns a cloneable service caller bound to one component principal.
-    ///
-    /// Constructing the handle grants no rights. Calls still require the bound
-    /// component to be an active declared consumer and resolve through normal
-    /// scope/grant/provider policy.
-    pub fn bound_service_caller(&self, consumer: ComponentRef) -> BoundServiceCaller {
-        BoundServiceCaller::new(self.services.clone(), consumer)
-    }
-
-    /// Returns a cloneable host caller for platform-owned services in one scope.
-    ///
-    /// The handle cannot invoke extension-defined contracts and does not impersonate
-    /// an extension component principal.
-    pub fn platform_service_caller(&self, scope_id: RuntimeScopeId) -> PlatformServiceCaller {
-        PlatformServiceCaller::new(self.services.clone(), scope_id)
-    }
-
-    /// Returns a host caller restricted to one provider extension in one scope.
-    ///
-    /// This is useful when a platform-owned service contract represents authority
-    /// delegated to the owner of another versioned resource, such as a world schema.
-    pub fn platform_service_caller_for_extension(
-        &self,
-        scope_id: RuntimeScopeId,
-        provider_extension_id: ExtensionId,
-    ) -> PlatformServiceCaller {
-        PlatformServiceCaller::for_extension(self.services.clone(), scope_id, provider_extension_id)
-    }
-
-    /// Calls a unary service on behalf of an active consumer component.
-    ///
-    /// # Errors
-    ///
-    /// Returns a transport-level service error when the consumer has no usable
-    /// single-provider binding or provider execution fails.
-    pub fn call_service(
-        &self,
-        consumer: &ComponentRef,
-        contract: &ContractKey,
-        request: &[u8],
-    ) -> ServiceCallResult<Vec<u8>> {
-        self.services.call(consumer, contract, request)
     }
 
     /// Builds a deterministic provider-before-consumer plan for registered instances.
@@ -2458,6 +1976,3 @@ impl ExtensionEngine {
         self.extensions.get(instance_id).map(|ext| ext.state)
     }
 }
-
-#[cfg(test)]
-mod queued_ui_tests;

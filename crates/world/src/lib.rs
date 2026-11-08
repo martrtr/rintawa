@@ -19,12 +19,12 @@ mod session;
 mod state;
 mod transaction;
 
-pub use command::{CausationRef, WorldCommand};
+pub use command::WorldCommand;
 pub use error::{WorldError, WorldResult};
 pub use runtime_schema::{
     RuntimeSchemaDefinition, RuntimeSchemaRegistration, SchemaKind, SchemaRegistry,
 };
 pub use schema::{DefinitionRegistration, PropertyDefinition, PropertyRegistry};
-pub use session::{WORLD_FORMAT_VERSION, WorldManifest, WorldSessionState};
+pub use session::{WorldManifest, WorldSessionState};
 pub use state::{ITEM_TYPE_OBJECT, ITEM_TYPE_RELATION, ItemKind, ItemRecord, PropertyRecord};
-pub use transaction::{RuntimeSignal, StateChange, WorldTransaction};
+pub use transaction::{StateChange, WorldTransaction};

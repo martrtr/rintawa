@@ -38,12 +38,6 @@ interface registration {
         multiple,
     }
 
-    /// Host interaction protocol exposed by a contract.
-    enum contract-protocol {
-        binding,
-        service,
-    }
-
     /// An explicit failure while declaring static metadata.
     variant error {
         registration-not-active,
@@ -56,7 +50,6 @@ interface registration {
         name: string,
         version: u32,
         resolution: resolution-policy,
-        protocol: contract-protocol,
     ) -> result<_, error>;
 
     /// Declares this component as a provider of one versioned contract.
@@ -92,9 +85,6 @@ interface world-registration {
     enum schema-kind {
         property,
         command,
-        event,
-        effect,
-        projection,
     }
 
     /// Failure while declaring immutable world metadata.
@@ -137,11 +127,6 @@ interface runtime-effects {
     /// Removes a subscription previously returned by `subscribe-event`.
     unsubscribe-event: func(handle: handle) -> result<_, error>;
 
-    /// Adds an owner-scoped ephemeral runtime-signal subscription.
-    subscribe-signal: func(topic: string) -> result<handle, error>;
-
-    /// Removes a signal subscription previously returned by `subscribe-signal`.
-    unsubscribe-signal: func(handle: handle) -> result<_, error>;
 }
 
 /// Read-only identity of the component callback currently executing in the Host.
@@ -232,72 +217,6 @@ interface network {
 
     /// Closes one listener or stream owned by the current component.
     close: func(handle: handle) -> result<_, error>;
-}
-
-/// Ephemeral component-owned progress and byte events for long-lived operations.
-///
-/// This is transport, not a WorldEvent or durable effect. One execution principal
-/// owns every handle; cross-component service handoff requires separate policy.
-interface async-operations {
-    record progress-update {
-        sequence: u64,
-        percent: u8,
-    }
-
-    record data-chunk {
-        sequence: u64,
-        bytes: list<u8>,
-    }
-
-    /// Progress and data are provisional until an explicit terminal state.
-    variant event {
-        pending,
-        progress(progress-update),
-        data(data-chunk),
-        completed(list<u8>),
-        failed(string),
-        cancelled,
-    }
-
-    variant error {
-        access-not-active,
-        unknown-handle,
-        invalid-state,
-        invalid-progress,
-        message-too-large,
-        queue-full,
-        limit-exceeded,
-        unavailable,
-    }
-
-    /// Creates one ephemeral operation with an unguessable activation-local ID.
-    create: func() -> result<string, error>;
-    /// Pushes a monotonic progress percentage in 0..=100.
-    push-progress: func(handle: string, percent: u8) -> result<_, error>;
-    /// Pushes one bounded ordered byte chunk; never silently drops a full queue.
-    push-data: func(handle: string, data: list<u8>) -> result<_, error>;
-    /// Declares successful completion after queued progress/data are drained.
-    complete: func(handle: string, output: list<u8>) -> result<_, error>;
-    /// Declares terminal failure with a bounded diagnostic.
-    fail: func(handle: string, reason: string) -> result<_, error>;
-    /// Atomically cancels this owner's operation, discarding provisional events.
-    cancel: func(handle: string) -> result<_, error>;
-    /// Reads at most one ordered event without blocking.
-    poll: func(handle: string) -> result<event, error>;
-    /// Transfers read-only consumption of this stream to the authenticated
-    /// immediate caller of a routed service callback, in the same scope.
-    /// Only one reader can be delegated. No guest-selected principal is accepted.
-    share-with-caller: func(handle: string) -> result<string, error>;
-
-    /// Consumes one ordered event through a caller-bound read-only lease.
-    /// The original owner retains cancellation and finalization authority.
-    poll-observer: func(token: string) -> result<event, error>;
-
-    /// Relinquishes the caller-bound lease without cancelling the operation.
-    close-observer: func(token: string) -> result<_, error>;
-
-    /// Releases the exact handle before its automatic short terminal expiry.
-    close: func(handle: string) -> result<_, error>;
 }
 
 /// Owner-scoped bounded asynchronous HTTP requests without implicit redirects.
@@ -504,68 +423,6 @@ interface user-resources {
     release-resource: func(reference: resource-ref) -> result<_, error>;
 }
 
-/// Generic persistent user-content library reads.
-interface user-content {
-    /// One logical library item pointing at an immutable RTW revision.
-    record entry {
-        id: string,
-        content: string,
-        revision: string,
-    }
-
-    /// One item plus its bounded root content descriptor.
-    record document {
-        metadata: entry,
-        descriptor: list<u8>,
-    }
-
-    /// Failure while reading or requesting generic user-content mutations.
-    variant error {
-        access-not-active,
-        permission-denied,
-        invalid-id,
-        invalid-content,
-        not-found,
-        queue-full,
-        limit-exceeded,
-        message-too-large,
-        rejected,
-        unavailable,
-    }
-
-    /// Host-generated identity for one accepted deferred write request.
-    record accepted-write {
-        operation-id: string,
-    }
-
-    /// Current state of one owner-scoped deferred write request.
-    variant write-state {
-        pending,
-        succeeded(entry),
-        failed(string),
-    }
-
-    /// Lists logical items, optionally restricted to one exact versioned content type.
-    /// Requires `user-content-read`.
-    list-items: func(content: option<string>) -> result<list<entry>, error>;
-
-    /// Reads one bounded root descriptor by logical library identity.
-    /// Requires `user-content-read`.
-    read: func(id: string) -> result<document, error>;
-
-    /// Queues validation/publication of one complete RTW content revision.
-    /// Requires `user-content-write`; execution happens after the guest callback unwinds.
-    request-import: func(rtw: list<u8>) -> result<accepted-write, error>;
-
-    /// Queues replacement of one logical item with a complete RTW revision.
-    /// Requires `user-content-write`; content type cannot change.
-    request-replace: func(id: string, rtw: list<u8>) -> result<accepted-write, error>;
-
-    /// Reads owner-scoped status for one accepted write request.
-    /// Requires `user-content-write`.
-    write-status: func(operation-id: string) -> result<write-state, error>;
-}
-
 /// Generic persistent-world catalog and deferred runtime lifecycle control.
 interface world-sessions {
     use asset-store.{asset-ref};
@@ -610,99 +467,6 @@ interface world-sessions {
     /// The request is applied after the current guest callback unwinds, during a
     /// later host runtime pump; `pending-active` exposes the accepted desired state.
     set-active: func(world-id: string, active: bool) -> result<_, error>;
-}
-
-/// Deferred submission of commands to authoritative worlds.
-interface world-commands {
-    /// One bounded command request. Principal, CommandId, and correlation are host-owned.
-    ///
-    /// There is no actor selection and no optimistic position: the authenticated
-    /// host principal acts directly, and authoritative atomicity comes from the
-    /// single-writer queue rather than from a persisted revision.
-    record request {
-        world-id: string,
-        schema: string,
-        payload-json: list<u8>,
-    }
-
-    /// Stable identities allocated before the deferred request enters the host queue.
-    record accepted {
-        command-id: string,
-        correlation-id: string,
-    }
-
-    /// Failure while validating or accepting a deferred world command.
-    variant error {
-        access-not-active,
-        permission-denied,
-        invalid-world-id,
-        invalid-schema,
-        invalid-payload,
-        not-found,
-        world-not-active,
-        queue-full,
-        limit-exceeded,
-        message-too-large,
-        rejected,
-        unavailable,
-    }
-
-    /// Queues one command for authoritative execution after the current guest callback unwinds.
-    /// Requires `world-command-submit`. The guest never supplies an authenticated PrincipalId.
-    submit: func(request: request) -> result<accepted, error>;
-}
-
-/// Deferred policy-filtered reads from active authoritative Worlds.
-interface world-projections {
-    /// One bounded projection request. Principal is always Host-owned.
-    record request {
-        world-id: string,
-        schema: string,
-        input-json: list<u8>,
-    }
-
-    /// Host-generated identity for one accepted owner-scoped projection operation.
-    record accepted {
-        operation-id: string,
-    }
-
-    /// One immutable schema-validated projection view.
-    record view {
-        world-id: string,
-        schema: string,
-        value-json: list<u8>,
-    }
-
-    /// Current state of one owner-scoped deferred projection operation.
-    variant read-state {
-        pending,
-        succeeded(view),
-        failed(string),
-    }
-
-    /// Failure while validating or inspecting a projection read.
-    variant error {
-        access-not-active,
-        permission-denied,
-        invalid-world-id,
-        invalid-schema,
-        invalid-input,
-        not-found,
-        world-not-active,
-        queue-full,
-        limit-exceeded,
-        message-too-large,
-        rejected,
-        unavailable,
-    }
-
-    /// Queues one Principal-filtered Projection evaluation after the callback unwinds.
-    /// Requires `world-projection-read`.
-    request-read: func(request: request) -> result<accepted, error>;
-
-    /// Reads owner-scoped status for one accepted Projection evaluation.
-    /// Requires `world-projection-read`.
-    read-status: func(operation-id: string) -> result<read-state, error>;
 }
 
 /// Owner-scoped non-authoritative persistent preferences.
@@ -970,158 +734,34 @@ interface secrets {
 }
 
 
-/// Generic service transport available while guest code is executing.
-interface services {
-    /// Transport-level routing failure.
-    variant error {
-        unavailable,
-        not-consumer,
-        not-service-contract,
-        unsupported-resolution,
-        cyclic-call,
-        provider-busy,
-        provider-failed,
-        request-too-large,
-        response-too-large,
-    }
-
-    /// Opaque caller-bound selection of one provider for a `multiple` service contract.
-    type provider-handle = u64;
-
-    /// Calls the provider selected for a versioned `single` service contract.
-    call: func(
-        contract: string,
-        version: u32,
-        payload: list<u8>,
-    ) -> result<list<u8>, error>;
-
-    /// Lists eligible providers for a versioned `multiple` service contract.
-    list-providers: func(
-        contract: string,
-        version: u32,
-    ) -> result<list<provider-handle>, error>;
-
-    /// Calls one provider previously returned by `list-providers`.
-    call-provider: func(
-        provider: provider-handle,
-        payload: list<u8>,
-    ) -> result<list<u8>, error>;
-}
-
-/// Portable UI operations available to a component during registration or execution.
-interface portable-ui {
-    /// Renderer-neutral placement hint for a surface.
-    enum placement-hint {
-        primary,
-        secondary,
-        sidebar,
-        settings,
-        dialog,
-        status,
-        overlay,
-    }
-
-    /// Portable UI boundary failure.
-    variant error {
-        unavailable,
-        registration-not-active,
-        duplicate-surface,
-        duplicate-layer,
-        duplicate-world-presentation,
-        invalid-payload,
-        message-too-large,
-        unsupported-capability(string),
-        rejected,
-    }
-
-    /// Renderer-neutral shell activity metadata associated with one or more surfaces.
-    record activity {
-        id: string,
-        label: string,
-        icon-slot: option<string>,
-    }
-
-    /// Registers one static portable UI surface during guest `register`.
-    register-surface: func(
-        id: string,
-        placement: placement-hint,
-        semantic-contract: option<string>,
-        semantic-version: option<u32>,
-        activity: option<activity>,
-        traits: list<string>,
-        required-capabilities: list<string>,
-    ) -> result<_, error>;
-
-    /// Registers this component's renderer capabilities during guest `register`.
-    ///
-    /// Selection remains host-owned composition policy. Registering a descriptor
-    /// does not make this component the active UI Layer.
-    register-layer: func(
-        protocol-major: u32,
-        capabilities: list<string>,
-    ) -> result<_, error>;
-
-    /// Registers the initial portable surface for this component when selected as a
-    /// World presentation provider. Optional semantic intent is a versioned contract key;
-    /// both intent fields must be present together or absent together.
-    register-world-presentation: func(
-        entry-surface-id: string,
-        intent-contract: option<string>,
-        intent-version: option<u32>,
-    ) -> result<_, error>;
-
-    /// Mounts a serialized `UiSurfaceSnapshot` during active guest execution.
-    mount-surface: func(snapshot-json: list<u8>) -> result<_, error>;
-
-    /// Applies a serialized `UiPatchBatch` during active guest execution.
-    patch-surface: func(batch-json: list<u8>) -> result<_, error>;
-
-    /// Unmounts one owned surface during active guest execution.
-    unmount-surface: func(surface-id: string) -> result<_, error>;
-}
-
-/// Renderer-facing operations available to the selected active UI Layer.
-interface ui-layer {
-    /// Failure while reading presentation state or submitting semantic input.
+/// Host-scoped ephemeral Zenoh queries. Names and payloads belong to features.
+interface transport {
     variant error {
         access-not-active,
-        not-active-layer,
-        invalid-payload,
-        message-too-large,
-        queue-full,
+        invalid-name,
+        duplicate,
+        limit-exceeded,
         unavailable,
-        rejected,
+        unknown-subscription,
+        not-selected,
     }
+    /// Stages a queryable during guest.start, activated only after success.
+    declare: func(point: string) -> result<_, error>;
+    /// Collects bounded replies from queryables in the same World scope.
+    query: func(point: string, payload: list<u8>) -> result<list<list<u8>>, error>;
+    /// Sends a transient notification; not permitted during guest.start.
+    publish: func(point: string, payload: list<u8>) -> result<_, error>;
+    /// Creates a host-owned bounded Zenoh subscription.
+    subscribe: func(point: string) -> result<u64, error>;
+    /// Nonblocking receive; lagging consumers may lose oldest messages.
+    poll: func(handle: u64) -> result<list<list<u8>>, error>;
+    /// Removes a subscription early; stop automatically revokes remaining ones.
+    unsubscribe: func(handle: u64) -> result<_, error>;
+}
 
-    /// Constant-size layer-local change token for visible presentation changes.
-    presentation-generation: func() -> result<u64, error>;
-
-    /// Returns the current visible presentation as serialized JSON.
-    presentation-surfaces: func() -> result<list<u8>, error>;
-
-    /// Exact verified bytes for one immutable asset already referenced by the visible presentation.
-    record presented-asset {
-        media-type: string,
-        bytes: list<u8>,
-    }
-
-    /// Reads an asset only when this exact active UI Layer can currently see an asset-image node
-    /// carrying the requested digest. This never exposes host filesystem or CAS paths.
-    read-presented-asset: func(digest: string) -> result<presented-asset, error>;
-
-    /// Returns renderer-session World focus state as serialized JSON.
-    presentation-state: func() -> result<list<u8>, error>;
-
-    /// Queues one World as the desired focus of this exact UI Layer session.
-    /// The Host resolves lifecycle/composition only after the current callback unwinds.
-    request-world-focus: func(world-id: string) -> result<_, error>;
-
-    /// Clears the focused-World scope of this exact UI Layer session.
-    /// World lifecycle state is not changed.
-    clear-world-focus: func() -> result<_, error>;
-
-    /// Queues one serialized `UiActionEvent` for Engine validation and dispatch.
-    dispatch-action: func(action-json: list<u8>) -> result<_, error>;
+/// Optional WASM provider callback, invoked with host-attested identity.
+interface transport-handler {
+    on-query: func(point: string, payload: list<u8>) -> list<u8>;
 }
 
 /// Optional callback surface for components that schedule background tasks.
@@ -1178,16 +818,6 @@ interface target-provider {
         payload: list<u8>,
     ) -> result<_, error>;
 
-    /// Handles one validated portable UI action for the dependent component.
-    handle-ui-action: func(handle: component-handle, action-json: list<u8>) -> result<_, error>;
-
-    /// Handles one service request for a contract provided by the dependent component.
-    handle-service: func(
-        handle: component-handle,
-        contract: string,
-        version: u32,
-        payload: list<u8>,
-    ) -> result<list<u8>, error>;
 }
 
 /// Guest lifecycle and event handlers implemented by the WASM plugin.
@@ -1207,18 +837,6 @@ interface guest {
     /// Dispatches a subscribed event payload to the plugin.
     on-event: func(topic: string, payload: list<u8>);
 
-    /// Handles one validated semantic action for a surface owned by this component.
-    handle-ui-action: func(action-json: list<u8>);
-
-    /// Handles one unary request for a contract provided by this component.
-    ///
-    /// Domain-level errors are encoded by the versioned contract itself. A
-    /// trap or host execution failure is reported to the caller as provider-failed.
-    handle-service: func(
-        contract: string,
-        version: u32,
-        payload: list<u8>,
-    ) -> list<u8>;
 }
 
 /// The plugin world contract combining host imports and guest exports.
@@ -1232,14 +850,10 @@ world plugin {
     import network;
     import http-fetch;
     import http-request;
-    import async-operations;
     import artifact-store;
     import asset-store;
     import user-resources;
-    import user-content;
     import world-sessions;
-    import world-commands;
-    import world-projections;
     import preferences;
     import composition;
     import scoped-composition;
@@ -1247,10 +861,19 @@ world plugin {
     import scoped-runtime-policy;
     import execution-targets;
     import secrets;
-    import services;
-    import portable-ui;
-    import ui-layer;
+    import transport;
     export guest;
+}
+
+/// Authoring world for components providing transport responses.
+world plugin-transport {
+    include plugin;
+    export transport-handler;
+}
+
+/// Optional typed view for queryable callbacks on an ordinary plugin.
+world transport-handler-plugin {
+    export transport-handler;
 }
 
 /// Optional typed view of the same instance for runtime-provider callbacks.
@@ -1275,14 +898,10 @@ world task-runtime-plugin {
     import network;
     import http-fetch;
     import http-request;
-    import async-operations;
     import artifact-store;
     import asset-store;
     import user-resources;
-    import user-content;
     import world-sessions;
-    import world-commands;
-    import world-projections;
     import preferences;
     import composition;
     import scoped-composition;
@@ -1290,9 +909,7 @@ world task-runtime-plugin {
     import scoped-runtime-policy;
     import execution-targets;
     import secrets;
-    import services;
-    import portable-ui;
-    import ui-layer;
+    import transport;
     export guest;
     export task-handler;
 }
@@ -1308,14 +925,10 @@ world runtime-provider-plugin {
     import network;
     import http-fetch;
     import http-request;
-    import async-operations;
     import artifact-store;
     import asset-store;
     import user-resources;
-    import user-content;
     import world-sessions;
-    import world-commands;
-    import world-projections;
     import preferences;
     import composition;
     import scoped-composition;
@@ -1323,9 +936,7 @@ world runtime-provider-plugin {
     import scoped-runtime-policy;
     import execution-targets;
     import secrets;
-    import services;
-    import portable-ui;
-    import ui-layer;
+    import transport;
     export guest;
     export target-provider;
 }
@@ -1341,14 +952,10 @@ world runtime-provider-task-plugin {
     import network;
     import http-fetch;
     import http-request;
-    import async-operations;
     import artifact-store;
     import asset-store;
     import user-resources;
-    import user-content;
     import world-sessions;
-    import world-commands;
-    import world-projections;
     import preferences;
     import composition;
     import scoped-composition;
@@ -1356,9 +963,7 @@ world runtime-provider-task-plugin {
     import scoped-runtime-policy;
     import execution-targets;
     import secrets;
-    import services;
-    import portable-ui;
-    import ui-layer;
+    import transport;
     export guest;
     export target-provider;
     export task-handler;

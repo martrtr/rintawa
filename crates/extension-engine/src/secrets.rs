@@ -187,10 +187,6 @@ impl SecretManager {
         Ok(())
     }
 
-    pub(crate) fn policy_revision(&self) -> u64 {
-        self.policy_revision.load(Ordering::Relaxed)
-    }
-
     /// Returns whether one component currently holds a grant covering `pattern`.
     pub(crate) fn has_read_grant(&self, owner: &ComponentRef, pattern: &SecretPathPattern) -> bool {
         let principal = owner.clone();

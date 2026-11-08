@@ -4,11 +4,9 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use rintawa_sdk::{
     context::{ComponentContext, RegistrationContext},
-    contracts::ContractKey,
     errors::{ExtensionError, ExtensionResult},
     traits::Component,
     types::ComponentId,
-    ui::UiActionEvent,
 };
 use tracing::warn;
 use wasmtime::component::Resource;
@@ -359,104 +357,6 @@ impl WasmTargetProviderEndpoint {
         }
     }
 
-    fn handle_ui_action(
-        &self,
-        handle: u64,
-        ctx: &mut dyn ComponentContext,
-        payload: &[u8],
-    ) -> ExtensionResult<()> {
-        if payload.len() > self.budget.max_host_message_bytes {
-            return Err(ExtensionError::HostMessageTooLarge {
-                operation: "target UI action",
-                actual_bytes: payload.len(),
-                maximum_bytes: self.budget.max_host_message_bytes,
-            });
-        }
-        let owner = rintawa_sdk::contracts::ComponentRef::new(
-            ctx.extension_instance_id().clone(),
-            ctx.component_id().clone(),
-        );
-        let mut runtime = self.runtime_for_callback()?;
-        let instance = Self::live_instance_for_callback(&mut runtime)?;
-        WasmComponent::set_ui_action_fuel(&mut instance.store, &self.budget, "target UI action")?;
-        instance
-            .store
-            .data_mut()
-            .begin_delegated_guest_execution(owner);
-        let result = match instance.target_provider.as_ref() {
-            Some(provider) => provider
-                .rintawa_engine_target_provider()
-                .call_handle_ui_action(&mut instance.store, handle, payload)
-                .map_err(|error| WasmComponent::execution_error("target UI action", error)),
-            None => Err(ExtensionError::Message(String::from(
-                "target-provider export view is unavailable",
-            ))),
-        };
-        match result {
-            Ok(Ok(())) => match instance.store.data_mut().finish_guest_execution(ctx) {
-                Ok(()) => Ok(()),
-                Err(error) => Err(instance.store.data_mut().abort_guest_execution(ctx, error)),
-            },
-            Ok(Err(error)) => {
-                let error = map_wit_target_host_error("UI action", error);
-                Err(instance.store.data_mut().abort_guest_execution(ctx, error))
-            }
-            Err(error) => Err(instance.store.data_mut().abort_guest_execution(ctx, error)),
-        }
-    }
-
-    fn handle_service(
-        &self,
-        handle: u64,
-        ctx: &mut dyn ComponentContext,
-        contract: &ContractKey,
-        request: &[u8],
-    ) -> ExtensionResult<Vec<u8>> {
-        if request.len() > self.budget.max_service_message_bytes {
-            return Err(ExtensionError::HostMessageTooLarge {
-                operation: "target service request",
-                actual_bytes: request.len(),
-                maximum_bytes: self.budget.max_service_message_bytes,
-            });
-        }
-        let owner = rintawa_sdk::contracts::ComponentRef::new(
-            ctx.extension_instance_id().clone(),
-            ctx.component_id().clone(),
-        );
-        let mut runtime = self.runtime_for_callback()?;
-        let instance = Self::live_instance_for_callback(&mut runtime)?;
-        WasmComponent::set_callback_fuel(&mut instance.store, &self.budget, "target service")?;
-        instance
-            .store
-            .data_mut()
-            .begin_delegated_service_execution(owner);
-        let result = match instance.target_provider.as_ref() {
-            Some(provider) => provider
-                .rintawa_engine_target_provider()
-                .call_handle_service(
-                    &mut instance.store,
-                    handle,
-                    contract.id.as_str(),
-                    contract.version.major(),
-                    request,
-                )
-                .map_err(|error| WasmComponent::execution_error("target service", error)),
-            None => Err(ExtensionError::Message(String::from(
-                "target-provider export view is unavailable",
-            ))),
-        };
-        instance.store.data_mut().finish_service_execution();
-        let response = result?.map_err(|error| map_wit_target_host_error("service", error))?;
-        if response.len() > self.budget.max_service_message_bytes {
-            return Err(ExtensionError::HostMessageTooLarge {
-                operation: "target service response",
-                actual_bytes: response.len(),
-                maximum_bytes: self.budget.max_service_message_bytes,
-            });
-        }
-        Ok(response)
-    }
-
     fn drop_component(&self, handle: u64) -> ExtensionResult<()> {
         let mut runtime = self.runtime_for_callback()?;
         let instance = Self::live_instance_for_callback(&mut runtime)?;
@@ -520,31 +420,6 @@ impl Component for WasmExecutionTargetProxy {
         payload: &[u8],
     ) -> ExtensionResult<()> {
         self.provider.handle_event(self.handle, ctx, topic, payload)
-    }
-
-    fn handle_ui_action(
-        &mut self,
-        ctx: &mut dyn ComponentContext,
-        event: &UiActionEvent,
-    ) -> ExtensionResult<()> {
-        let payload = serde_json::to_vec(event).map_err(|error| {
-            ExtensionError::Message(format!("could not encode target UI action: {error}"))
-        })?;
-        self.provider.handle_ui_action(self.handle, ctx, &payload)
-    }
-
-    fn service_message_limit(&self) -> Option<usize> {
-        Some(self.provider.budget.max_service_message_bytes)
-    }
-
-    fn handle_service(
-        &mut self,
-        ctx: &mut dyn ComponentContext,
-        contract: &ContractKey,
-        request: &[u8],
-    ) -> ExtensionResult<Vec<u8>> {
-        self.provider
-            .handle_service(self.handle, ctx, contract, request)
     }
 }
 

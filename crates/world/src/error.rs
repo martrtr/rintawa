@@ -28,6 +28,15 @@ pub enum WorldError {
         reason: String,
     },
 
+    /// A System attempted to mutate a property outside its active owner bindings.
+    #[error("System cannot {operation} property {key}: no active owner binding")]
+    PropertyAccessDenied {
+        /// Exact property key refused by the command runtime.
+        key: SchemaKey,
+        /// Operation that was rejected before COMMIT.
+        operation: &'static str,
+    },
+
     /// A requested versioned property definition is absent from the world.
     #[error("property definition {key} is not registered")]
     DefinitionNotRegistered {
