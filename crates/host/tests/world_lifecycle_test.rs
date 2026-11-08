@@ -1,7 +1,12 @@
 //! Integration tests for Host-managed world lifecycle behavior.
 
 use rintawa_host::{HostError, HostHome, WORLD_CATALOG_METADATA_FILE};
-use rintawa_sdk::world::WorldId;
+use rintawa_sdk::{
+    types::ExtensionId,
+    world::{SchemaKey, WorldId},
+};
+use rintawa_storage::SqliteWorldStorage;
+use rintawa_world::PropertyDefinition;
 
 #[test]
 fn test_should_create_list_and_restore_world_across_host_restart() -> anyhow::Result<()> {
@@ -10,7 +15,6 @@ fn test_should_create_list_and_restore_world_across_host_restart() -> anyhow::Re
 
     let home = HostHome::open(&home_path)?;
     let created = home.create_world()?;
-    assert_eq!(created.commit_position, 0);
     assert_eq!(created.title, "New World");
     assert!(created.cover.is_none());
 
@@ -21,9 +25,53 @@ fn test_should_create_list_and_restore_world_across_host_restart() -> anyhow::Re
     let reopened = HostHome::open(&home_path)?;
     let state = reopened.load_world_state(created.id)?;
     assert_eq!(state.id(), created.id);
-    assert_eq!(state.commit_position(), 0);
-    assert!(state.schemas().is_empty());
+    assert!(state.properties().is_empty());
+    assert_eq!(state.manifest().as_value(), &serde_json::json!({}));
     assert_eq!(reopened.list_worlds()?, vec![created]);
+    Ok(())
+}
+
+#[test]
+fn test_should_reopen_world_with_its_persisted_property_vocabulary() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let home_path = root.path().join("home");
+    let home = HostHome::open(&home_path)?;
+    let created = home.create_world()?;
+    let database = home
+        .root()
+        .join("worlds")
+        .join(created.id.to_string())
+        .join("world.sqlite");
+    let key: SchemaKey = "example.identity@1".parse()?;
+    let definition = PropertyDefinition::new(
+        key.clone(),
+        ExtensionId::new("example.owner"),
+        serde_json::json!({ "type": "object" }),
+    );
+    {
+        let storage = SqliteWorldStorage::open(&database)?;
+        storage.register_definition(&definition)?;
+    }
+
+    let state = home.load_world_state(created.id)?;
+    // `property_registry` stores name, version and schema only; the owning package
+    // is Host composition metadata and is not persisted with the world.
+    assert_eq!(
+        state.properties().get(&key).map(PropertyDefinition::schema),
+        Some(&serde_json::json!({ "type": "object" }))
+    );
+    drop(home);
+
+    let reopened = HostHome::open(&home_path)?;
+    let restored = reopened.load_world_state(created.id)?;
+    assert_eq!(restored.properties().len(), 1);
+    assert_eq!(
+        restored
+            .properties()
+            .get(&key)
+            .map(PropertyDefinition::schema),
+        Some(&serde_json::json!({ "type": "object" }))
+    );
     Ok(())
 }
 

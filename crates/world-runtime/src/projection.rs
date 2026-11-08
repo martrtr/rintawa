@@ -1,39 +1,37 @@
-//! Policy-filtered world projections produced by extension-owned services.
+//! Service-backed policy-filtered World Projections.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashSet},
+    sync::Arc,
+};
 
 use rintawa_sdk::{
     contracts::ContractKey,
-    services::{ServiceCallError, ServiceCallResult},
-    types::ExtensionId,
-    world::{PrincipalId, SchemaKey, WorldId},
-    world_system::{
-        WorldSystemEntityRecord, WorldSystemFacetRecord, WorldSystemFacetTarget,
-        WorldSystemRelationRecord,
+    services::ServiceCallResult,
+    world::{PrincipalId, SchemaId, SchemaKey, WorldId},
+    world_projection::{
+        WorldProjectionReadRequest, WorldProjectionReadResult, WorldProjectionServiceRequest,
+        WorldProjectionServiceResponse, WorldProjectionView, world_projection_service_contract_key,
     },
-};
-use rintawa_world::{
-    EntityRecord, FacetRecord, FacetTarget, RelationRecord, SchemaKind, SchemaRegistry, WorldError,
 };
 use thiserror::Error;
 
-use crate::{WorldReadError, WorldSnapshot};
+use crate::WorldSnapshot;
+use crate::service::{encode_item, encode_property};
 
 pub use rintawa_sdk::world_projection::{
     MAX_WORLD_PROJECTION_DIAGNOSTIC_BYTES, MAX_WORLD_PROJECTION_INPUT_BYTES,
-    WORLD_PROJECTION_SERVICE_PROTOCOL_VERSION, WorldProjectionReadRequest,
-    WorldProjectionReadResult, WorldProjectionServiceRequest, WorldProjectionServiceResponse,
-    WorldProjectionView, world_projection_service_contract_key,
+    WORLD_PROJECTION_SERVICE_PROTOCOL_VERSION,
 };
 
-/// Maximum continuation rounds permitted for one projection evaluation.
+/// Maximum read/continuation rounds permitted for one projection evaluation.
 pub const MAX_WORLD_PROJECTION_SERVICE_ROUNDS: usize = 8;
-/// Maximum distinct authoritative reads permitted for one projection evaluation.
+/// Maximum distinct snapshot reads permitted for one projection evaluation.
 pub const MAX_WORLD_PROJECTION_SERVICE_READS: usize = 256;
 
-/// Transport used by one service-backed projection implementation.
+/// Transport used by a service-backed projection provider.
 pub trait WorldProjectionServiceClient: Send + Sync + 'static {
-    /// Calls one exact platform projection service contract.
+    /// Calls one exact platform service contract.
     fn call(&self, contract: &ContractKey, request: &[u8]) -> ServiceCallResult<Vec<u8>>;
 }
 
@@ -46,363 +44,195 @@ where
     }
 }
 
-/// Failure while resolving one policy-filtered world projection.
+/// Errors returned while building one policy-filtered projection.
 #[derive(Debug, Error)]
 pub enum WorldProjectionError {
-    /// The projection binding was used with a snapshot from another World.
-    #[error("projection service binding belongs to another world")]
-    CrossWorldBinding,
-    /// The projection schema was not registered in the pinned world snapshot.
-    #[error("projection schema {0} is not registered")]
-    SchemaUnavailable(SchemaKey),
-    /// The bound projection schema does not have Projection semantics.
-    #[error("schema {0} is not a projection schema")]
-    SchemaKindMismatch(SchemaKey),
-    /// Durable schema ownership no longer matches the owner-pinned service binding.
-    #[error("projection schema {0} is owned by another extension")]
-    SchemaOwnerMismatch(SchemaKey),
-    /// Caller input exceeded the host-side projection bound.
-    #[error("projection input is {actual_bytes} bytes; maximum is {maximum_bytes}")]
-    InputTooLarge {
-        /// Serialized input size observed by the host.
-        actual_bytes: usize,
-        /// Maximum accepted serialized input size.
-        maximum_bytes: usize,
-    },
-    /// Persistent snapshot state could not be read.
+    /// Snapshot state required by the provider could not be read.
     #[error(transparent)]
-    Read(#[from] WorldReadError),
-    /// Generic service routing or provider execution failed.
-    #[error("projection service transport failed: {0}")]
-    Transport(#[from] ServiceCallError),
-    /// Host request serialization unexpectedly failed.
-    #[error("failed to encode projection service request")]
-    RequestEncode(#[source] serde_json::Error),
-    /// Provider returned bytes that are not a valid projection response.
-    #[error("invalid projection service response")]
-    ResponseDecode(#[source] serde_json::Error),
-    /// Provider requested no reads in a continuation round.
-    #[error("projection service requested an empty read round")]
-    EmptyReadRound,
-    /// Provider requested the same pinned read more than once.
-    #[error("projection service repeated a resolved snapshot read")]
-    RepeatedRead,
-    /// Provider exceeded the total read budget for one projection.
-    #[error("projection service exceeded the snapshot read limit")]
-    ReadLimitExceeded,
-    /// Provider exhausted the continuation-round budget without completing.
-    #[error("projection service exceeded the evaluation round limit")]
-    RoundLimitExceeded,
-    /// Provider returned a diagnostic above the protocol bound.
-    #[error("projection service returned an oversized diagnostic")]
-    DiagnosticTooLarge,
-    /// Projection policy deliberately rejected the caller.
+    Read(#[from] crate::WorldReadError),
+
+    /// Projection policy deliberately denies the request.
     #[error("projection rejected: {0}")]
     Rejected(String),
-    /// Projection provider failed to produce a view.
+
+    /// The provider could not build a projection.
     #[error("projection failed: {0}")]
     Failed(String),
-    /// Provider output failed its registered Projection schema.
-    #[error("projection output failed schema validation")]
-    InvalidOutput(#[source] WorldError),
 }
 
-/// Result type used by policy-filtered projection evaluation.
+/// Result type used by projection evaluation.
 pub type WorldProjectionResult<T> = Result<T, WorldProjectionError>;
 
-/// Extension-owned projection evaluator bound to one exact world/schema/owner tuple.
+/// Projection provider bound to one world and one exact projection schema.
 pub struct ServiceWorldProjection {
     world_id: WorldId,
     projection_schema: SchemaKey,
-    projection_owner: ExtensionId,
     contract: ContractKey,
+    owned_properties: Arc<BTreeSet<SchemaId>>,
     client: Arc<dyn WorldProjectionServiceClient>,
 }
 
 impl ServiceWorldProjection {
-    /// Creates one owner-pinned projection evaluator.
+    /// Creates a projection provider that may read only the listed property names.
     pub fn new<C>(
         world_id: WorldId,
         projection_schema: SchemaKey,
-        projection_owner: ExtensionId,
+        owned_properties: impl IntoIterator<Item = SchemaId>,
         client: C,
     ) -> Self
     where
         C: WorldProjectionServiceClient,
     {
+        Self::from_shared(
+            world_id,
+            projection_schema,
+            owned_properties,
+            Arc::new(client),
+        )
+    }
+
+    /// Creates a projection provider from one shared transport client.
+    pub fn from_shared(
+        world_id: WorldId,
+        projection_schema: SchemaKey,
+        owned_properties: impl IntoIterator<Item = SchemaId>,
+        client: Arc<dyn WorldProjectionServiceClient>,
+    ) -> Self {
         let contract = world_projection_service_contract_key(&projection_schema);
         Self {
             world_id,
             projection_schema,
-            projection_owner,
             contract,
-            client: Arc::new(client),
+            owned_properties: Arc::new(owned_properties.into_iter().collect()),
+            client,
         }
     }
 
-    /// Returns the exact world owned by this projection binding.
-    pub const fn world_id(&self) -> WorldId {
-        self.world_id
-    }
-
-    /// Returns the exact registered Projection schema.
-    pub const fn projection_schema(&self) -> &SchemaKey {
-        &self.projection_schema
-    }
-
-    /// Returns the immutable extension owner used for raw-read filtering.
-    pub const fn projection_owner(&self) -> &ExtensionId {
-        &self.projection_owner
-    }
-
-    /// Returns the platform service contract that supplies this projection.
+    /// Returns the platform contract that must be provided in the world scope.
     pub const fn service_contract(&self) -> &ContractKey {
         &self.contract
     }
 
-    /// Builds one Principal-specific view from a fixed authoritative snapshot.
+    /// Builds one projection for a fixed Principal at the snapshot of the caller.
     ///
     /// # Errors
     ///
-    /// Returns a typed binding, storage, transport, protocol, policy, or output
-    /// validation failure. Raw reads are never exposed directly to the caller.
+    /// Returns a read, rejection or provider failure.
     pub fn project(
         &self,
         snapshot: &WorldSnapshot,
         principal: PrincipalId,
         input: serde_json::Value,
     ) -> WorldProjectionResult<WorldProjectionView> {
-        if snapshot.world_id() != self.world_id {
-            return Err(WorldProjectionError::CrossWorldBinding);
-        }
-
-        let definition = snapshot
-            .load_schema_definition(&self.projection_schema)?
-            .ok_or_else(|| {
-                WorldProjectionError::SchemaUnavailable(self.projection_schema.clone())
-            })?;
-        if definition.kind() != SchemaKind::Projection {
-            return Err(WorldProjectionError::SchemaKindMismatch(
-                self.projection_schema.clone(),
-            ));
-        }
-        if definition.owner() != &self.projection_owner {
-            return Err(WorldProjectionError::SchemaOwnerMismatch(
-                self.projection_schema.clone(),
-            ));
-        }
-
-        let input_bytes = serde_json::to_vec(&input)
-            .map_err(WorldProjectionError::RequestEncode)?
+        let input_size = serde_json::to_vec(&input)
+            .map_err(|_| WorldProjectionError::Failed(String::from("invalid input")))?
             .len();
-        if input_bytes > MAX_WORLD_PROJECTION_INPUT_BYTES {
-            return Err(WorldProjectionError::InputTooLarge {
-                actual_bytes: input_bytes,
-                maximum_bytes: MAX_WORLD_PROJECTION_INPUT_BYTES,
-            });
+        if input_size > MAX_WORLD_PROJECTION_INPUT_BYTES {
+            return Err(WorldProjectionError::Rejected(String::from(
+                "projection input is too large",
+            )));
         }
 
-        let mut output_registry = SchemaRegistry::new();
-        output_registry
-            .register(definition)
-            .map_err(WorldProjectionError::InvalidOutput)?;
         let mut reads = Vec::new();
-        let mut seen_reads = HashSet::new();
+        let mut seen = HashSet::new();
 
         for _ in 0..MAX_WORLD_PROJECTION_SERVICE_ROUNDS {
-            let envelope = WorldProjectionServiceRequest {
-                world_id: snapshot.world_id(),
-                snapshot_position: snapshot.position(),
+            let request = WorldProjectionServiceRequest {
+                world_id: self.world_id,
                 projection_schema: self.projection_schema.clone(),
                 principal,
                 input: input.clone(),
                 reads: reads.clone(),
             };
-            let request =
-                serde_json::to_vec(&envelope).map_err(WorldProjectionError::RequestEncode)?;
-            let response = self.client.call(&self.contract, &request)?;
-            let response: WorldProjectionServiceResponse =
-                serde_json::from_slice(&response).map_err(WorldProjectionError::ResponseDecode)?;
+            let encoded = serde_json::to_vec(&request)
+                .map_err(|_| WorldProjectionError::Failed(String::from("encode failed")))?;
+            let response = self
+                .client
+                .call(&self.contract, &encoded)
+                .map_err(|error| {
+                    WorldProjectionError::Failed(format!("projection transport failed: {error}"))
+                })?;
+            let response: WorldProjectionServiceResponse = serde_json::from_slice(&response)
+                .map_err(|_| {
+                    WorldProjectionError::Failed(String::from("invalid projection response"))
+                })?;
 
             match response {
                 WorldProjectionServiceResponse::Complete { value } => {
-                    output_registry
-                        .validate_payload(&self.projection_schema, SchemaKind::Projection, &value)
-                        .map_err(WorldProjectionError::InvalidOutput)?;
                     return Ok(WorldProjectionView::new(
-                        snapshot.world_id(),
-                        snapshot.position(),
+                        self.world_id,
                         self.projection_schema.clone(),
                         principal,
                         value,
                     ));
                 }
                 WorldProjectionServiceResponse::Rejected { reason } => {
-                    return Err(WorldProjectionError::Rejected(validate_diagnostic(reason)?));
+                    return Err(WorldProjectionError::Rejected(bounded(reason)?));
                 }
                 WorldProjectionServiceResponse::Failed { reason } => {
-                    return Err(WorldProjectionError::Failed(validate_diagnostic(reason)?));
+                    return Err(WorldProjectionError::Failed(bounded(reason)?));
                 }
                 WorldProjectionServiceResponse::Read { requests } => {
                     if requests.is_empty() {
-                        return Err(WorldProjectionError::EmptyReadRound);
+                        return Err(WorldProjectionError::Failed(String::from(
+                            "projection requested an empty read round",
+                        )));
                     }
                     if reads.len().saturating_add(requests.len())
                         > MAX_WORLD_PROJECTION_SERVICE_READS
                     {
-                        return Err(WorldProjectionError::ReadLimitExceeded);
+                        return Err(WorldProjectionError::Failed(String::from(
+                            "projection exceeded the snapshot read limit",
+                        )));
                     }
                     for request in requests {
-                        if !seen_reads.insert(request.clone()) {
-                            return Err(WorldProjectionError::RepeatedRead);
+                        if !seen.insert(request.clone()) {
+                            return Err(WorldProjectionError::Failed(String::from(
+                                "projection repeated a resolved snapshot read",
+                            )));
                         }
-                        reads.push(resolve_read(
-                            snapshot,
-                            principal,
-                            &self.projection_owner,
-                            request,
-                        )?);
+                        reads.push(self.resolve_read(snapshot, request)?);
                     }
                 }
             }
         }
 
-        Err(WorldProjectionError::RoundLimitExceeded)
+        Err(WorldProjectionError::Failed(String::from(
+            "projection exceeded the evaluation round limit",
+        )))
     }
-}
 
-fn resolve_read(
-    snapshot: &WorldSnapshot,
-    principal: PrincipalId,
-    projection_owner: &ExtensionId,
-    request: WorldProjectionReadRequest,
-) -> WorldProjectionResult<WorldProjectionReadResult> {
-    match request {
-        WorldProjectionReadRequest::Entity { entity_id } => {
-            let value = match snapshot.load_entity(entity_id)? {
-                Some(entity)
-                    if schema_owned_by(
-                        snapshot,
-                        entity.schema(),
-                        projection_owner,
-                        SchemaKind::Entity,
-                    )? =>
-                {
-                    Some(encode_entity(entity))
-                }
-                _ => None,
-            };
-            Ok(WorldProjectionReadResult::Entity { entity_id, value })
-        }
-        WorldProjectionReadRequest::Relation { relation_id } => {
-            let value = match snapshot.load_relation(relation_id)? {
-                Some(relation)
-                    if schema_owned_by(
-                        snapshot,
-                        relation.schema(),
-                        projection_owner,
-                        SchemaKind::Relation,
-                    )? =>
-                {
-                    Some(encode_relation(relation))
-                }
-                _ => None,
-            };
-            Ok(WorldProjectionReadResult::Relation { relation_id, value })
-        }
-        WorldProjectionReadRequest::Facet { target, schema } => {
-            let internal_target = decode_facet_target(target);
-            let value = if schema_owned_by(snapshot, &schema, projection_owner, SchemaKind::Facet)?
-            {
-                snapshot
-                    .load_facet(internal_target, &schema)?
-                    .map(encode_facet)
-            } else {
-                None
-            };
-            Ok(WorldProjectionReadResult::Facet {
-                target,
-                schema,
-                value,
-            })
-        }
-        WorldProjectionReadRequest::CanControl {
-            actor_entity,
-            command_schema,
-        } => {
-            let allowed = if schema_owned_by(
-                snapshot,
-                &command_schema,
-                projection_owner,
-                SchemaKind::Command,
-            )? {
-                snapshot.principal_can_control(principal, actor_entity, &command_schema)?
-            } else {
-                false
-            };
-            Ok(WorldProjectionReadResult::CanControl {
-                actor_entity,
-                command_schema,
-                allowed,
-            })
+    fn resolve_read(
+        &self,
+        snapshot: &WorldSnapshot,
+        request: WorldProjectionReadRequest,
+    ) -> WorldProjectionResult<WorldProjectionReadResult> {
+        match request {
+            WorldProjectionReadRequest::Item { item_id } => Ok(WorldProjectionReadResult::Item {
+                item_id,
+                value: snapshot.load_item(item_id)?.map(encode_item),
+            }),
+            WorldProjectionReadRequest::Property { item_id, key } => {
+                let value = if self.owned_properties.contains(key.id()) {
+                    snapshot.load_property(item_id, &key)?.map(encode_property)
+                } else {
+                    None
+                };
+                Ok(WorldProjectionReadResult::Property {
+                    item_id,
+                    key,
+                    value,
+                })
+            }
         }
     }
 }
 
-fn encode_entity(entity: EntityRecord) -> WorldSystemEntityRecord {
-    WorldSystemEntityRecord {
-        id: entity.id(),
-        schema: entity.schema().clone(),
-    }
-}
-
-fn encode_relation(relation: RelationRecord) -> WorldSystemRelationRecord {
-    WorldSystemRelationRecord {
-        id: relation.id(),
-        schema: relation.schema().clone(),
-        from: relation.from(),
-        to: relation.to(),
-    }
-}
-
-fn encode_facet(facet: FacetRecord) -> WorldSystemFacetRecord {
-    WorldSystemFacetRecord {
-        target: encode_facet_target(facet.target()),
-        schema: facet.schema().clone(),
-        payload: facet.payload().clone(),
-    }
-}
-
-fn encode_facet_target(target: FacetTarget) -> WorldSystemFacetTarget {
-    match target {
-        FacetTarget::World => WorldSystemFacetTarget::World,
-        FacetTarget::Entity(entity) => WorldSystemFacetTarget::Entity(entity),
-        FacetTarget::Relation(relation) => WorldSystemFacetTarget::Relation(relation),
-    }
-}
-
-fn decode_facet_target(target: WorldSystemFacetTarget) -> FacetTarget {
-    match target {
-        WorldSystemFacetTarget::World => FacetTarget::World,
-        WorldSystemFacetTarget::Entity(entity) => FacetTarget::Entity(entity),
-        WorldSystemFacetTarget::Relation(relation) => FacetTarget::Relation(relation),
-    }
-}
-
-fn schema_owned_by(
-    snapshot: &WorldSnapshot,
-    schema: &SchemaKey,
-    owner: &ExtensionId,
-    kind: SchemaKind,
-) -> Result<bool, WorldReadError> {
-    Ok(snapshot
-        .load_schema_definition(schema)?
-        .is_some_and(|definition| definition.kind() == kind && definition.owner() == owner))
-}
-
-fn validate_diagnostic(reason: String) -> WorldProjectionResult<String> {
+fn bounded(reason: String) -> WorldProjectionResult<String> {
     if reason.len() > MAX_WORLD_PROJECTION_DIAGNOSTIC_BYTES {
-        return Err(WorldProjectionError::DiagnosticTooLarge);
+        return Err(WorldProjectionError::Failed(String::from(
+            "projection returned an oversized diagnostic",
+        )));
     }
     Ok(reason)
 }

@@ -1,27 +1,30 @@
 //! Authoritative, feature-neutral world model primitives.
 //!
-//! This crate owns generic world state semantics. Feature packages define
-//! concrete entity, relation, command, event, and facet schemas through the SDK.
+//! This crate owns the generic world state model: items (objects and relations),
+//! versioned properties, one world manifest, and one in-memory atomic change set.
+//! There is no durable command ledger, commit position, event log, consumer
+//! cursor, effect outbox or control grant.
+//!
+//! Feature packages define concrete property definitions and command schemas
+//! through the SDK; nothing here assigns player, NPC or ownership semantics.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, rustdoc::broken_intra_doc_links)]
 
-mod authority;
 mod command;
 mod error;
+mod runtime_schema;
 mod schema;
 mod session;
 mod state;
 mod transaction;
 
-pub use authority::{ActorRef, ControlGrant, ControlScope};
 pub use command::{CausationRef, WorldCommand};
 pub use error::{WorldError, WorldResult};
-pub use schema::{SchemaDefinition, SchemaKind, SchemaRegistration, SchemaRegistry};
-pub use session::{WORLD_FORMAT_VERSION, WorldSessionState};
-pub use state::{EntityRecord, FacetRecord, FacetTarget, RelationRecord, WorldMutation};
-pub use transaction::{
-    CommandAdmission, CommandProvenance, CommitDisposition, CommitReceipt, EffectJobDraft,
-    StoredEffectJob, StoredWorldEvent, StoredWorldMutation, WORLD_MUTATION_FORMAT_VERSION,
-    WorldEventDraft, WorldTransaction,
+pub use runtime_schema::{
+    RuntimeSchemaDefinition, RuntimeSchemaRegistration, SchemaKind, SchemaRegistry,
 };
+pub use schema::{DefinitionRegistration, PropertyDefinition, PropertyRegistry};
+pub use session::{WORLD_FORMAT_VERSION, WorldManifest, WorldSessionState};
+pub use state::{ITEM_TYPE_OBJECT, ITEM_TYPE_RELATION, ItemKind, ItemRecord, PropertyRecord};
+pub use transaction::{RuntimeSignal, StateChange, WorldTransaction};

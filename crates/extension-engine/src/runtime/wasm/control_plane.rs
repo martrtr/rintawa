@@ -8,9 +8,8 @@ use crate::{
     host_access::{
         CompositionActivation, HostAccessError, RuntimePolicyComponent, UserContentDocument,
         UserContentSummary, UserContentWriteStatus, UserResourceRef, WorldCommandAccessError,
-        WorldCommandActor as HostWorldCommandActor, WorldCommandRequest,
-        WorldProjectionAccessError, WorldProjectionReadStatus, WorldProjectionRequest,
-        WorldSessionAssetRef, WorldSessionSummary,
+        WorldCommandRequest, WorldProjectionAccessError, WorldProjectionReadStatus,
+        WorldProjectionRequest, WorldSessionAssetRef, WorldSessionSummary,
     },
     runtime::wasm::{
         ArtifactStoreError, ArtifactStoreHost, AssetStoreError, AssetStoreHost, CompositionError,
@@ -21,10 +20,9 @@ use crate::{
         WitAssetRef, WitCompositionActivation, WitImportedArtifact, WitRuntimeArtifactPolicy,
         WitRuntimeHttpOriginGrant, WitRuntimePolicyComponent, WitRuntimePolicyRequest,
         WitUserContentDocument, WitUserContentEntry, WitUserContentWriteState, WitUserResourceRef,
-        WitWorldCommandActor, WitWorldCommandRequest, WitWorldProjectionReadState,
-        WitWorldProjectionRequest, WitWorldProjectionView, WitWorldSummary, WorldCommandError,
-        WorldCommandsHost, WorldProjectionError, WorldProjectionsHost, WorldSessionError,
-        WorldSessionsHost,
+        WitWorldCommandRequest, WitWorldProjectionReadState, WitWorldProjectionRequest,
+        WitWorldProjectionView, WitWorldSummary, WorldCommandError, WorldCommandsHost,
+        WorldProjectionError, WorldProjectionsHost, WorldSessionError, WorldSessionsHost,
     },
 };
 
@@ -589,32 +587,21 @@ impl WorldCommandsHost for WasmHostState {
     ) -> Result<WitAcceptedWorldCommand, WorldCommandError> {
         self.require_world_command_submit()?;
         self.consume_world_command_submission_budget()?;
-        let actor_bytes = match &request.actor {
-            WitWorldCommandActor::Principal => 0,
-            WitWorldCommandActor::Entity(entity_id) => entity_id.len(),
-        };
         let message_bytes = request
             .world_id
             .len()
             .saturating_add(request.schema.len())
-            .saturating_add(actor_bytes)
             .saturating_add(request.payload_json.len());
         if message_bytes > self.max_host_message_bytes {
             return Err(WorldCommandError::MessageTooLarge);
         }
 
-        let actor = match request.actor {
-            WitWorldCommandActor::Principal => HostWorldCommandActor::Principal,
-            WitWorldCommandActor::Entity(entity_id) => HostWorldCommandActor::Entity(entity_id),
-        };
         let accepted = self
             .host_access
             .world_commands
             .submit_world_command(WorldCommandRequest {
                 world_id: request.world_id,
                 schema: request.schema,
-                actor,
-                expected_position: request.expected_position,
                 payload_json: request.payload_json,
                 verified_ui_action: self.verified_ui_action_active,
             })
@@ -685,7 +672,6 @@ impl WorldProjectionsHost for WasmHostState {
                 Ok(WitWorldProjectionReadState::Succeeded(
                     WitWorldProjectionView {
                         world_id: view.world_id,
-                        snapshot_position: view.snapshot_position,
                         schema: view.schema,
                         value_json: view.value_json,
                     },
@@ -1498,7 +1484,6 @@ fn to_wit_world_summary(world: WorldSessionSummary) -> WitWorldSummary {
             size: reference.size,
             media_type: reference.media_type,
         }),
-        commit_position: world.commit_position,
         active: world.active,
         pending_active: world.pending_active,
         last_error: world.last_error,
@@ -1544,7 +1529,6 @@ fn map_world_command_access_error(error: WorldCommandAccessError) -> WorldComman
     match error {
         WorldCommandAccessError::InvalidWorldId => WorldCommandError::InvalidWorldId,
         WorldCommandAccessError::InvalidSchema => WorldCommandError::InvalidSchema,
-        WorldCommandAccessError::InvalidActor => WorldCommandError::InvalidActor,
         WorldCommandAccessError::InvalidPayload => WorldCommandError::InvalidPayload,
         WorldCommandAccessError::NotFound => WorldCommandError::NotFound,
         WorldCommandAccessError::WorldNotActive => WorldCommandError::WorldNotActive,

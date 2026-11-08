@@ -1,22 +1,20 @@
 //! Submitted command envelope and causal metadata.
+//!
+//! A command is an in-memory request. It is not persisted, has no stored receipt
+//! and no optimistic position: concurrency is controlled by the single-writer
+//! queue, and atomicity by one SQLite transaction per accepted change.
 
-use rintawa_sdk::world::{
-    CommandId, CorrelationId, EffectJobId, PrincipalId, SchemaKey, UnixTimeMillis, WorldEventId,
-};
+use rintawa_sdk::world::{CommandId, CorrelationId, PrincipalId, SchemaKey, UnixTimeMillis};
 use serde::{Deserialize, Serialize};
 
-use crate::{ActorRef, SchemaKind, SchemaRegistry, WorldResult};
+use crate::{SchemaRegistry, WorldResult};
 
-/// Durable reference to the operation that directly caused another command/event.
+/// Direct cause of one command, when it was issued by another command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "kind", content = "id")]
 pub enum CausationRef {
     /// Another submitted command.
     Command(CommandId),
-    /// A previously committed world event.
-    Event(WorldEventId),
-    /// A durable external effect result.
-    Effect(EffectJobId),
 }
 
 /// Immutable input envelope submitted to one authoritative world.
@@ -25,8 +23,6 @@ pub struct WorldCommand {
     id: CommandId,
     schema: SchemaKey,
     principal: PrincipalId,
-    actor: ActorRef,
-    expected_position: Option<u64>,
     causation: Option<CausationRef>,
     correlation_id: CorrelationId,
     effective_at: Option<UnixTimeMillis>,
@@ -35,18 +31,11 @@ pub struct WorldCommand {
 
 impl WorldCommand {
     /// Creates a new command and correlation identity.
-    pub fn new(
-        schema: SchemaKey,
-        principal: PrincipalId,
-        actor: ActorRef,
-        payload: serde_json::Value,
-    ) -> Self {
+    pub fn new(schema: SchemaKey, principal: PrincipalId, payload: serde_json::Value) -> Self {
         Self {
             id: CommandId::new(),
             schema,
             principal,
-            actor,
-            expected_position: None,
             causation: None,
             correlation_id: CorrelationId::new(),
             effective_at: None,
@@ -54,32 +43,23 @@ impl WorldCommand {
         }
     }
 
-    /// Creates a command with externally preserved durable identities.
+    /// Creates a command with externally preserved identities.
     pub fn with_ids(
         id: CommandId,
         correlation_id: CorrelationId,
         schema: SchemaKey,
         principal: PrincipalId,
-        actor: ActorRef,
         payload: serde_json::Value,
     ) -> Self {
         Self {
             id,
             schema,
             principal,
-            actor,
-            expected_position: None,
             causation: None,
             correlation_id,
             effective_at: None,
             payload,
         }
-    }
-
-    /// Requires the world to still be at the supplied snapshot position.
-    pub const fn expecting_position(mut self, position: u64) -> Self {
-        self.expected_position = Some(position);
-        self
     }
 
     /// Attaches direct causal provenance.
@@ -94,7 +74,7 @@ impl WorldCommand {
         self
     }
 
-    /// Returns the stable command idempotency identity.
+    /// Returns the command identity used for logs and correlation.
     pub const fn id(&self) -> CommandId {
         self.id
     }
@@ -107,16 +87,6 @@ impl WorldCommand {
     /// Returns the authenticated outside principal.
     pub const fn principal(&self) -> PrincipalId {
         self.principal
-    }
-
-    /// Returns the role on whose behalf the command executes.
-    pub const fn actor(&self) -> ActorRef {
-        self.actor
-    }
-
-    /// Returns the optional optimistic-concurrency snapshot position.
-    pub const fn expected_position(&self) -> Option<u64> {
-        self.expected_position
     }
 
     /// Returns direct causal provenance, if any.
@@ -139,12 +109,15 @@ impl WorldCommand {
         &self.payload
     }
 
-    /// Validates this command payload against the registered command schema.
+    /// Validates this command payload against the registered runtime command schema.
+    ///
+    /// Command schemas are extension runtime API descriptions; they are never
+    /// stored in the property vocabulary.
     ///
     /// # Errors
     ///
-    /// Returns a missing/wrong-kind schema or payload validation error.
+    /// Returns a missing definition or payload validation error.
     pub fn validate_schema(&self, schemas: &SchemaRegistry) -> WorldResult<()> {
-        schemas.validate_payload(self.schema(), SchemaKind::Command, self.payload())
+        schemas.validate_payload(&self.schema, crate::SchemaKind::Command, &self.payload)
     }
 }

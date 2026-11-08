@@ -41,8 +41,6 @@ pub struct WorldSessionSummary {
     pub description: Option<String>,
     /// Optional immutable cover asset reference.
     pub cover: Option<WorldSessionAssetRef>,
-    /// Last committed authoritative world position.
-    pub commit_position: u64,
     /// Whether the world currently owns a running authoritative runtime.
     pub active: bool,
     /// Requested active state awaiting the next host runtime pump, when any.
@@ -286,15 +284,6 @@ pub trait WorldSessionAccess: Send + Sync {
     fn set_active(&self, world_id: &str, active: bool) -> HostAccessResult<()>;
 }
 
-/// Actor selected for one host-authenticated authoritative world command.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorldCommandActor {
-    /// The host-authenticated outside principal acts directly.
-    Principal,
-    /// The authenticated principal acts through one world entity subject to ControlGrant policy.
-    Entity(String),
-}
-
 /// One bounded command request accepted from an ordinary extension component.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorldCommandRequest {
@@ -302,10 +291,6 @@ pub struct WorldCommandRequest {
     pub world_id: String,
     /// Exact versioned command schema.
     pub schema: String,
-    /// Role on whose behalf the authenticated principal requests the command.
-    pub actor: WorldCommandActor,
-    /// Optional optimistic-concurrency world position.
-    pub expected_position: Option<u64>,
     /// Extension-owned JSON command payload bytes.
     pub payload_json: Vec<u8>,
     /// Trusted invocation provenance set ONLY by the WASM host callback dispatcher.
@@ -332,8 +317,6 @@ pub enum WorldCommandAccessError {
     InvalidWorldId,
     /// Versioned command schema is malformed.
     InvalidSchema,
-    /// Entity actor identity is malformed.
-    InvalidActor,
     /// Command payload is not valid JSON.
     InvalidPayload,
     /// Target persistent world does not exist.
@@ -386,8 +369,6 @@ pub struct AcceptedWorldProjectionRead {
 pub struct WorldProjectionReadView {
     /// Authoritative World represented by the view.
     pub world_id: String,
-    /// Exact pinned World position used to construct the view.
-    pub snapshot_position: u64,
     /// Exact versioned Projection schema.
     pub schema: String,
     /// Schema-validated feature-owned JSON view bytes.

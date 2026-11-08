@@ -1,4 +1,9 @@
 //! Integration tests for extension-provided World System services.
+//!
+//! An ordinary extension System lives behind one platform service contract. The
+//! runtime encodes the immutable command envelope, resolves bounded read rounds
+//! from the same pinned snapshot, decodes an item/property proposal and still
+//! enforces the authoritative property vocabulary before COMMIT.
 
 mod common;
 
@@ -8,233 +13,318 @@ use std::sync::{
 };
 
 use anyhow::Result;
-use rintawa_sdk::{
-    services::ServiceCallError,
-    world::{EntityId, PrincipalId},
-    world_system::{WorldSystemEventProposal, WorldSystemTransaction},
+use rintawa_sdk::contracts::ContractKey;
+use rintawa_sdk::services::{ServiceCallError, ServiceCallResult};
+use rintawa_sdk::world::{CommandId, CorrelationId, ItemId, PrincipalId, UnixTimeMillis, WorldId};
+use rintawa_sdk::world_system::{
+    WorldSystemCausation, WorldSystemCommand, WorldSystemMutation, WorldSystemSignalProposal,
+    WorldSystemTransaction,
 };
-use rintawa_world::{EntityRecord, WorldMutation, WorldTransaction};
+use rintawa_storage::SqliteWorldStorage;
+use rintawa_world::{StateChange, WorldTransaction};
 use rintawa_world_runtime::{
-    MAX_WORLD_SYSTEM_SERVICE_ROUNDS, ServiceWorldSystem, SystemError, WorldRuntimeBuilder,
+    MAX_WORLD_SYSTEM_SERVICE_ROUNDS, ServiceWorldSystem, SystemError, WorldRuntime,
     WorldRuntimeError, WorldSystemReadRequest, WorldSystemReadResult, WorldSystemServiceRequest,
     WorldSystemServiceResponse, world_system_service_contract_key,
 };
 
-use common::{command, create_storage};
+use common::{command, create_storage, key, runtime_builder};
+
+/// One over the private 8 KiB runtime diagnostic ceiling.
+const OVERSIZED_DIAGNOSTIC_LEN: usize = 8 * 1024 + 1;
+
+fn fixed_client(
+    response: WorldSystemServiceResponse,
+) -> impl Fn(&ContractKey, &[u8]) -> ServiceCallResult<Vec<u8>> + Send + Sync + 'static {
+    move |_: &ContractKey, _: &[u8]| {
+        Ok(serde_json::to_vec(&response).expect("System response must encode"))
+    }
+}
+
+fn expect_service_failure(
+    runtime: &WorldRuntime,
+    schemas: &common::TestSchemas,
+    principal: PrincipalId,
+    item: ItemId,
+    fragment: &str,
+) -> Result<()> {
+    let ticket = runtime.submit(command(
+        &schemas.command,
+        principal,
+        serde_json::json!({ "item": item.to_string() }),
+    ))?;
+    let error = ticket.wait().expect_err("service System must fail closed");
+    match error {
+        WorldRuntimeError::SystemFailed { schema, source } => {
+            assert_eq!(schema, schemas.command);
+            match source {
+                SystemError::Failed(reason) => {
+                    assert!(reason.contains(fragment));
+                }
+                other => panic!("unexpected System error: {other:?}"),
+            }
+        }
+        other => panic!("unexpected runtime error: {other:?}"),
+    }
+    Ok(())
+}
 
 #[test]
-fn test_service_system_reads_pinned_snapshot_and_commits_transaction() -> Result<()> {
+fn test_should_round_trip_reads_and_commit_proposal() -> Result<()> {
     let (_root, storage, schemas) = create_storage()?;
     let world_id = storage.world_id();
     let principal = PrincipalId::new();
-    let entity_id = EntityId::new();
+    let item = ItemId::new();
 
-    let setup = command(
-        &schemas.command,
-        principal,
-        serde_json::json!({ "kind": "setup" }),
-    );
-    let mut setup_transaction = WorldTransaction::new();
-    setup_transaction.push_mutation(WorldMutation::CreateEntity {
-        entity: EntityRecord::new(entity_id, schemas.entity.clone()),
+    let mut seed = WorldTransaction::new();
+    seed.push_change(StateChange::CreateObject { id: item });
+    seed.push_change(StateChange::SetProperty {
+        item,
+        key: schemas.identity.clone(),
+        data: serde_json::json!({ "name": "Alice" }),
     });
-    storage.commit(&setup, &setup_transaction, 0)?;
+    storage.apply(&seed)?;
 
     let expected_contract = world_system_service_contract_key(&schemas.command);
-    let event_schema = schemas.event.clone();
-    let entity_schema = schemas.entity.clone();
+    let expected_payload = serde_json::json!({ "item": item.to_string() });
+    let submitted = command(&schemas.command, principal, expected_payload.clone());
+    let command_id = submitted.id();
+    let command_schema = schemas.command.clone();
+    let identity = schemas.identity.clone();
+    let mood = schemas.mood.clone();
+    let signal = schemas.signal.clone();
     let calls = Arc::new(AtomicUsize::new(0));
     let observed_calls = Arc::clone(&calls);
 
-    let client = move |contract: &_, bytes: &[u8]| {
+    let client = move |contract: &ContractKey, request: &[u8]| -> ServiceCallResult<Vec<u8>> {
         assert_eq!(contract, &expected_contract);
         let request: WorldSystemServiceRequest =
-            serde_json::from_slice(bytes).expect("service request must decode");
+            serde_json::from_slice(request).expect("System request must decode");
         assert_eq!(request.world_id(), world_id);
-        assert_eq!(request.snapshot_position(), 1);
+        assert_eq!(request.command().id, command_id);
+        assert_eq!(request.command().schema, command_schema);
+        assert_eq!(request.command().principal, principal);
+        assert_eq!(request.command().payload, expected_payload);
 
         let response = match observed_calls.fetch_add(1, Ordering::SeqCst) {
             0 => {
                 assert!(request.reads().is_empty());
                 WorldSystemServiceResponse::Read {
-                    requests: vec![WorldSystemReadRequest::Entity { entity_id }],
+                    requests: vec![
+                        WorldSystemReadRequest::Item { item_id: item },
+                        WorldSystemReadRequest::Property {
+                            item_id: item,
+                            key: identity.clone(),
+                        },
+                    ],
                 }
             }
             1 => {
-                assert_eq!(request.reads().len(), 1);
+                assert_eq!(request.reads().len(), 2);
                 match &request.reads()[0] {
-                    WorldSystemReadResult::Entity {
-                        entity_id: observed_id,
-                        value: Some(entity),
+                    WorldSystemReadResult::Item {
+                        item_id,
+                        value: Some(record),
                     } => {
-                        assert_eq!(*observed_id, entity_id);
-                        assert_eq!(entity.id(), entity_id);
-                        assert_eq!(entity.schema(), &entity_schema);
+                        assert_eq!(*item_id, item);
+                        assert!(!record.is_relation());
                     }
-                    other => panic!("unexpected read result: {other:?}"),
+                    other => panic!("unexpected item read result: {other:?}"),
+                }
+                match &request.reads()[1] {
+                    WorldSystemReadResult::Property {
+                        value: Some(record),
+                        ..
+                    } => {
+                        assert_eq!(record.data()["name"], "Alice");
+                    }
+                    other => panic!("unexpected property read result: {other:?}"),
                 }
 
                 let mut transaction = WorldSystemTransaction::new();
-                transaction.push_event(WorldSystemEventProposal {
-                    schema: event_schema.clone(),
-                    payload: serde_json::json!({ "kind": "service-system" }),
+                transaction.push_mutation(WorldSystemMutation::SetProperty {
+                    item_id: item,
+                    key: mood.clone(),
+                    data: serde_json::json!({ "level": 4 }),
+                });
+                transaction.push_signal(WorldSystemSignalProposal {
+                    schema: signal.clone(),
+                    payload: serde_json::json!({ "level": 4 }),
                 });
                 WorldSystemServiceResponse::Transaction { transaction }
             }
-            other => panic!("unexpected service call {other}"),
+            other => panic!("unexpected System service call {other}"),
         };
-        Ok(serde_json::to_vec(&response).expect("service response must encode"))
+        Ok(serde_json::to_vec(&response).expect("System response must encode"))
     };
+    let system = ServiceWorldSystem::new(world_id, schemas.command.clone(), client);
 
-    let mut builder = WorldRuntimeBuilder::new(storage);
-    builder.register_system(ServiceWorldSystem::new(
-        world_id,
-        schemas.command.clone(),
-        client,
-    ))?;
+    let mut builder = runtime_builder(storage, &[&schemas.command])?;
+    builder.register_system(system)?;
     let runtime = builder.start()?;
-    let receipt = runtime
-        .submit(command(
-            &schemas.command,
-            principal,
-            serde_json::json!({ "kind": "execute" }),
-        ))?
-        .wait()?;
 
-    assert_eq!(receipt.position(), 2);
+    let outcome = runtime.submit(submitted)?.wait()?;
+    assert_eq!(outcome.command_id(), command_id);
+    assert_eq!(outcome.signals().len(), 1);
+    assert_eq!(outcome.signals()[0].schema(), &schemas.signal);
+    assert_eq!(outcome.signals()[0].payload()["level"], 4);
+
+    let snapshot = runtime.snapshot()?;
+    let mood_record = snapshot
+        .load_property(item, &schemas.mood)?
+        .expect("mood committed");
+    assert_eq!(mood_record.data()["level"], 4);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     runtime.shutdown()?;
     Ok(())
 }
 
 #[test]
-fn test_service_system_rejects_cross_world_binding_before_service_call() -> Result<()> {
+fn test_should_round_trip_system_service_transport() -> Result<()> {
+    let item = ItemId::new();
+    let world_id = WorldId::new();
+    let command_id = CommandId::new();
+    let correlation_id = CorrelationId::new();
+    let principal = PrincipalId::new();
+    let causation = CommandId::new();
+    let schema = key("runtime-test.command@1");
+    let property = key("runtime-test.identity@1");
+
+    let request = WorldSystemServiceRequest {
+        world_id,
+        command: WorldSystemCommand {
+            id: command_id,
+            schema: schema.clone(),
+            principal,
+            causation: Some(WorldSystemCausation::Command(causation)),
+            correlation_id,
+            effective_at: Some(UnixTimeMillis::new(1_700_000_000_000)),
+            payload: serde_json::json!({ "item": item.to_string() }),
+        },
+        reads: Vec::new(),
+    };
+    let encoded = serde_json::to_vec(&request)?;
+    let decoded: WorldSystemServiceRequest = serde_json::from_slice(&encoded)?;
+    assert_eq!(decoded, request);
+
+    let mut transaction = WorldSystemTransaction::new();
+    transaction.push_mutation(WorldSystemMutation::SetProperty {
+        item_id: item,
+        key: property,
+        data: serde_json::json!({ "name": "Alice" }),
+    });
+    transaction.push_signal(WorldSystemSignalProposal {
+        schema,
+        payload: serde_json::json!({ "created": true }),
+    });
+    let response = WorldSystemServiceResponse::Transaction { transaction };
+    let encoded = serde_json::to_vec(&response)?;
+    let decoded: WorldSystemServiceResponse = serde_json::from_slice(&encoded)?;
+    assert_eq!(decoded, response);
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_cross_world_binding_before_service_call() -> Result<()> {
     let (root, storage, schemas) = create_storage()?;
     let path = root.path().join("world.sqlite");
     let principal = PrincipalId::new();
+    let item = ItemId::new();
     let calls = Arc::new(AtomicUsize::new(0));
     let observed_calls = Arc::clone(&calls);
 
-    let client = move |_: &_, _: &[u8]| {
+    let client = move |_: &ContractKey, _: &[u8]| -> ServiceCallResult<Vec<u8>> {
         observed_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(serde_json::to_vec(&WorldSystemServiceResponse::Failed {
+        let response = WorldSystemServiceResponse::Failed {
             reason: String::from("must not be reached"),
-        })
-        .expect("service response must encode"))
+        };
+        Ok(serde_json::to_vec(&response).expect("System response must encode"))
     };
+    let system = ServiceWorldSystem::new(WorldId::new(), schemas.command.clone(), client);
 
-    let mut builder = WorldRuntimeBuilder::new(storage);
-    builder.register_system(ServiceWorldSystem::new(
-        rintawa_sdk::world::WorldId::new(),
-        schemas.command.clone(),
-        client,
-    ))?;
+    let mut builder = runtime_builder(storage, &[&schemas.command])?;
+    builder.register_system(system)?;
     let runtime = builder.start()?;
-    let error = runtime
-        .submit(command(
-            &schemas.command,
-            principal,
-            serde_json::json!({ "kind": "wrong-world" }),
-        ))?
-        .wait()
-        .expect_err("cross-world service binding must fail closed");
 
-    assert!(matches!(
-        error,
-        WorldRuntimeError::SystemFailed {
-            source: SystemError::Failed(reason),
-            ..
-        } if reason.contains("another world")
-    ));
+    let ticket = runtime.submit(command(
+        &schemas.command,
+        principal,
+        serde_json::json!({ "item": item.to_string() }),
+    ))?;
+    let error = ticket.wait().expect_err("cross-world binding must fail");
+    match error {
+        WorldRuntimeError::SystemFailed { schema, source } => {
+            assert_eq!(schema, schemas.command);
+            match source {
+                SystemError::Failed(reason) => {
+                    assert!(reason.contains("another world"));
+                }
+                other => panic!("unexpected System error: {other:?}"),
+            }
+        }
+        other => panic!("unexpected runtime error: {other:?}"),
+    }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     runtime.shutdown()?;
 
-    let storage = rintawa_storage::SqliteWorldStorage::open(path)?;
-    assert_eq!(storage.load_session()?.commit_position(), 0);
+    let storage = SqliteWorldStorage::open(path)?;
+    assert!(storage.load_item(item)?.is_none());
     Ok(())
 }
 
 #[test]
-fn test_service_system_rejects_repeated_snapshot_read() -> Result<()> {
+fn test_should_reject_repeated_snapshot_read() -> Result<()> {
     let (_root, storage, schemas) = create_storage()?;
     let world_id = storage.world_id();
     let principal = PrincipalId::new();
-    let entity_id = EntityId::new();
+    let item = ItemId::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed_calls = Arc::clone(&calls);
 
-    let client = move |_: &_, _: &[u8]| {
+    let client = move |_: &ContractKey, _: &[u8]| -> ServiceCallResult<Vec<u8>> {
+        observed_calls.fetch_add(1, Ordering::SeqCst);
         let response = WorldSystemServiceResponse::Read {
-            requests: vec![WorldSystemReadRequest::Entity { entity_id }],
+            requests: vec![WorldSystemReadRequest::Item { item_id: item }],
         };
-        Ok(serde_json::to_vec(&response).expect("service response must encode"))
+        Ok(serde_json::to_vec(&response).expect("System response must encode"))
     };
+    let system = ServiceWorldSystem::new(world_id, schemas.command.clone(), client);
 
-    let mut builder = WorldRuntimeBuilder::new(storage);
-    builder.register_system(ServiceWorldSystem::new(
-        world_id,
-        schemas.command.clone(),
-        client,
-    ))?;
+    let mut builder = runtime_builder(storage, &[&schemas.command])?;
+    builder.register_system(system)?;
     let runtime = builder.start()?;
-    let error = runtime
-        .submit(command(
-            &schemas.command,
-            principal,
-            serde_json::json!({ "kind": "repeat-read" }),
-        ))?
-        .wait()
-        .expect_err("repeated read must fail closed");
-    assert!(matches!(
-        error,
-        WorldRuntimeError::SystemFailed {
-            source: SystemError::Failed(reason),
-            ..
-        } if reason.contains("repeated")
-    ));
+
+    expect_service_failure(&runtime, &schemas, principal, item, "repeated")?;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     runtime.shutdown()?;
     Ok(())
 }
 
 #[test]
-fn test_service_system_bounds_read_rounds() -> Result<()> {
+fn test_should_bound_system_service_read_rounds() -> Result<()> {
     let (_root, storage, schemas) = create_storage()?;
     let world_id = storage.world_id();
     let principal = PrincipalId::new();
+    let item = ItemId::new();
     let calls = Arc::new(AtomicUsize::new(0));
     let observed_calls = Arc::clone(&calls);
 
-    let client = move |_: &_, _: &[u8]| {
+    let client = move |_: &ContractKey, _: &[u8]| -> ServiceCallResult<Vec<u8>> {
         observed_calls.fetch_add(1, Ordering::SeqCst);
         let response = WorldSystemServiceResponse::Read {
-            requests: vec![WorldSystemReadRequest::Entity {
-                entity_id: EntityId::new(),
+            requests: vec![WorldSystemReadRequest::Item {
+                item_id: ItemId::new(),
             }],
         };
-        Ok(serde_json::to_vec(&response).expect("service response must encode"))
+        Ok(serde_json::to_vec(&response).expect("System response must encode"))
     };
+    let system = ServiceWorldSystem::new(world_id, schemas.command.clone(), client);
 
-    let mut builder = WorldRuntimeBuilder::new(storage);
-    builder.register_system(ServiceWorldSystem::new(
-        world_id,
-        schemas.command.clone(),
-        client,
-    ))?;
+    let mut builder = runtime_builder(storage, &[&schemas.command])?;
+    builder.register_system(system)?;
     let runtime = builder.start()?;
-    let error = runtime
-        .submit(command(
-            &schemas.command,
-            principal,
-            serde_json::json!({ "kind": "round-limit" }),
-        ))?
-        .wait()
-        .expect_err("unbounded continuation must fail closed");
 
-    assert!(matches!(
-        error,
-        WorldRuntimeError::SystemFailed {
-            source: SystemError::Failed(reason),
-            ..
-        } if reason.contains("round limit")
-    ));
+    expect_service_failure(&runtime, &schemas, principal, item, "round limit")?;
     assert_eq!(
         calls.load(Ordering::SeqCst),
         MAX_WORLD_SYSTEM_SERVICE_ROUNDS
@@ -244,117 +334,104 @@ fn test_service_system_bounds_read_rounds() -> Result<()> {
 }
 
 #[test]
-fn test_service_system_transport_rejects_authority_mutation_variant() -> Result<()> {
-    let (root, storage, schemas) = create_storage()?;
+fn test_should_reject_empty_read_round() -> Result<()> {
+    let (_root, storage, schemas) = create_storage()?;
     let world_id = storage.world_id();
-    let path = root.path().join("world.sqlite");
     let principal = PrincipalId::new();
+    let item = ItemId::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed_calls = Arc::clone(&calls);
 
-    let client = move |_: &_, _: &[u8]| {
-        Ok(serde_json::to_vec(&serde_json::json!({
-            "kind": "transaction",
-            "transaction": {
-                "mutations": [{ "operation": "grant-control" }],
-                "events": [],
-                "effects": []
-            }
-        }))
-        .expect("malformed test response must encode"))
+    let client = move |_: &ContractKey, _: &[u8]| -> ServiceCallResult<Vec<u8>> {
+        observed_calls.fetch_add(1, Ordering::SeqCst);
+        let response = WorldSystemServiceResponse::Read { requests: vec![] };
+        Ok(serde_json::to_vec(&response).expect("System response must encode"))
     };
+    let system = ServiceWorldSystem::new(world_id, schemas.command.clone(), client);
 
-    let mut builder = WorldRuntimeBuilder::new(storage);
-    builder.register_system(ServiceWorldSystem::new(
-        world_id,
-        schemas.authority_command.clone(),
-        client,
-    ))?;
+    let mut builder = runtime_builder(storage, &[&schemas.command])?;
+    builder.register_system(system)?;
     let runtime = builder.start()?;
-    let error = runtime
-        .submit(command(
-            &schemas.authority_command,
-            principal,
-            serde_json::json!({ "kind": "grant" }),
-        ))?
-        .wait()
-        .expect_err("ordinary System transport must not represent authority mutations");
 
-    assert!(matches!(
-        error,
-        WorldRuntimeError::SystemFailed {
-            source: SystemError::Failed(reason),
-            ..
-        } if reason.contains("invalid System service response")
-    ));
+    expect_service_failure(&runtime, &schemas, principal, item, "empty read round")?;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     runtime.shutdown()?;
-
-    let storage = rintawa_storage::SqliteWorldStorage::open(path)?;
-    assert_eq!(storage.load_session()?.commit_position(), 0);
     Ok(())
 }
 
 #[test]
-fn test_service_system_preserves_domain_and_transport_failures() -> Result<()> {
+fn test_should_reject_oversized_diagnostic() -> Result<()> {
     let (_root, storage, schemas) = create_storage()?;
     let world_id = storage.world_id();
     let principal = PrincipalId::new();
+    let item = ItemId::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed_calls = Arc::clone(&calls);
 
-    let rejecting = |_: &_, _: &[u8]| {
-        Ok(serde_json::to_vec(&WorldSystemServiceResponse::Rejected {
-            reason: String::from("domain rejection"),
-        })
-        .expect("service response must encode"))
+    let client = move |_: &ContractKey, _: &[u8]| -> ServiceCallResult<Vec<u8>> {
+        observed_calls.fetch_add(1, Ordering::SeqCst);
+        let response = WorldSystemServiceResponse::Failed {
+            reason: "x".repeat(OVERSIZED_DIAGNOSTIC_LEN),
+        };
+        Ok(serde_json::to_vec(&response).expect("System response must encode"))
     };
-    let mut builder = WorldRuntimeBuilder::new(storage);
-    builder.register_system(ServiceWorldSystem::new(
-        world_id,
-        schemas.command.clone(),
-        rejecting,
-    ))?;
+    let system = ServiceWorldSystem::new(world_id, schemas.command.clone(), client);
+
+    let mut builder = runtime_builder(storage, &[&schemas.command])?;
+    builder.register_system(system)?;
     let runtime = builder.start()?;
-    let error = runtime
-        .submit(command(
-            &schemas.command,
-            principal,
-            serde_json::json!({ "kind": "reject" }),
-        ))?
-        .wait()
-        .expect_err("domain rejection must propagate");
-    assert!(matches!(
-        error,
-        WorldRuntimeError::SystemFailed {
-            source: SystemError::Rejected(reason),
-            ..
-        } if reason == "domain rejection"
-    ));
+
+    expect_service_failure(&runtime, &schemas, principal, item, "oversized")?;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    runtime.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn test_should_preserve_domain_and_transport_failures() -> Result<()> {
+    let (_root, storage, schemas) = create_storage()?;
+    let world_id = storage.world_id();
+    let principal = PrincipalId::new();
+    let item = ItemId::new();
+    let client = fixed_client(WorldSystemServiceResponse::Rejected {
+        reason: String::from("domain rejection"),
+    });
+    let system = ServiceWorldSystem::new(world_id, schemas.command.clone(), client);
+
+    let mut builder = runtime_builder(storage, &[&schemas.command])?;
+    builder.register_system(system)?;
+    let runtime = builder.start()?;
+
+    let ticket = runtime.submit(command(
+        &schemas.command,
+        principal,
+        serde_json::json!({ "item": item.to_string() }),
+    ))?;
+    let error = ticket.wait().expect_err("domain rejection must propagate");
+    match error {
+        WorldRuntimeError::SystemFailed { schema, source } => {
+            assert_eq!(schema, schemas.command);
+            match source {
+                SystemError::Rejected(reason) => assert_eq!(reason, "domain rejection"),
+                other => panic!("unexpected System error: {other:?}"),
+            }
+        }
+        other => panic!("unexpected runtime error: {other:?}"),
+    }
     runtime.shutdown()?;
 
     let (_root, storage, schemas) = create_storage()?;
-    let unavailable_world_id = storage.world_id();
-    let unavailable = |_: &_, _: &[u8]| -> Result<Vec<u8>, ServiceCallError> {
+    let world_id = storage.world_id();
+    let unavailable = |_: &ContractKey, _: &[u8]| -> ServiceCallResult<Vec<u8>> {
         Err(ServiceCallError::Unavailable)
     };
-    let mut builder = WorldRuntimeBuilder::new(storage);
-    builder.register_system(ServiceWorldSystem::new(
-        unavailable_world_id,
-        schemas.command.clone(),
-        unavailable,
-    ))?;
+    let system = ServiceWorldSystem::new(world_id, schemas.command.clone(), unavailable);
+
+    let mut builder = runtime_builder(storage, &[&schemas.command])?;
+    builder.register_system(system)?;
     let runtime = builder.start()?;
-    let error = runtime
-        .submit(command(
-            &schemas.command,
-            principal,
-            serde_json::json!({ "kind": "unavailable" }),
-        ))?
-        .wait()
-        .expect_err("transport failure must propagate");
-    assert!(matches!(
-        error,
-        WorldRuntimeError::SystemFailed {
-            source: SystemError::Failed(reason),
-            ..
-        } if reason.contains("service unavailable")
-    ));
+
+    expect_service_failure(&runtime, &schemas, principal, item, "unavailable")?;
     runtime.shutdown()?;
     Ok(())
 }

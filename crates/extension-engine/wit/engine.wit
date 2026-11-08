@@ -85,11 +85,12 @@ interface registration {
 
 /// World-schema declarations available only from guest `register`.
 interface world-registration {
-    /// Semantic category of one immutable world schema.
+    /// Semantic category of one immutable world runtime schema.
+    ///
+    /// Property definitions are declared separately through the property
+    /// vocabulary: they are persisted world state, not runtime API schemas.
     enum schema-kind {
-        entity,
-        relation,
-        facet,
+        property,
         command,
         event,
         effect,
@@ -575,7 +576,6 @@ interface world-sessions {
         title: string,
         description: option<string>,
         cover: option<asset-ref>,
-        commit-position: u64,
         active: bool,
         pending-active: option<bool>,
         last-error: option<string>,
@@ -614,20 +614,14 @@ interface world-sessions {
 
 /// Deferred submission of commands to authoritative worlds.
 interface world-commands {
-    /// Role on whose behalf the host-authenticated principal requests the command.
-    variant actor {
-        /// The authenticated principal acts directly.
-        principal,
-        /// The authenticated principal acts through one world entity.
-        entity(string),
-    }
-
     /// One bounded command request. Principal, CommandId, and correlation are host-owned.
+    ///
+    /// There is no actor selection and no optimistic position: the authenticated
+    /// host principal acts directly, and authoritative atomicity comes from the
+    /// single-writer queue rather than from a persisted revision.
     record request {
         world-id: string,
         schema: string,
-        actor: actor,
-        expected-position: option<u64>,
         payload-json: list<u8>,
     }
 
@@ -643,7 +637,6 @@ interface world-commands {
         permission-denied,
         invalid-world-id,
         invalid-schema,
-        invalid-actor,
         invalid-payload,
         not-found,
         world-not-active,
@@ -676,7 +669,6 @@ interface world-projections {
     /// One immutable schema-validated projection view.
     record view {
         world-id: string,
-        snapshot-position: u64,
         schema: string,
         value-json: list<u8>,
     }

@@ -389,7 +389,7 @@ fn finish_runtime_operation(runtime: HostRuntime, operation: Result<()>) -> Resu
 fn world_create(home: &HostHome) -> Result<()> {
     let world = home.create_world()?;
     println!("world = {}", world.id);
-    println!("commit_position = {}", world.commit_position);
+    println!("title = {}", world.title);
     Ok(())
 }
 
@@ -400,16 +400,17 @@ fn world_list(home: &HostHome) -> Result<()> {
         return Ok(());
     }
     for world in worlds {
-        println!("{} {}", world.id, world.commit_position);
+        println!("{} {}", world.id, world.title);
     }
     Ok(())
 }
 
 fn world_info(home: &HostHome, world_id: WorldId) -> Result<()> {
     let world = home.load_world_state(world_id)?;
+    let metadata = home.load_world_catalog_metadata(world_id)?;
     println!("world = {}", world.id());
-    println!("commit_position = {}", world.commit_position());
-    println!("schemas = {}", world.schemas().len());
+    println!("title = {}", metadata.title());
+    println!("properties = {}", world.properties().len());
     Ok(())
 }
 

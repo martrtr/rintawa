@@ -8,15 +8,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     contracts::{ContractKey, ContractVersion},
-    world::{EntityId, PrincipalId, RelationId, SchemaKey, WorldId},
-    world_system::{
-        WorldSystemEntityRecord, WorldSystemFacetRecord, WorldSystemFacetTarget,
-        WorldSystemRelationRecord,
-    },
+    world::{ItemId, PrincipalId, SchemaKey, WorldId},
+    world_system::{WorldSystemItemRecord, WorldSystemPropertyRecord},
 };
 
 /// Major version of the platform-owned World Projection service protocol.
-pub const WORLD_PROJECTION_SERVICE_PROTOCOL_VERSION: ContractVersion = ContractVersion::new(1);
+pub const WORLD_PROJECTION_SERVICE_PROTOCOL_VERSION: ContractVersion = ContractVersion::new(2);
 /// Maximum serialized feature input accepted before invoking a projection provider.
 pub const MAX_WORLD_PROJECTION_INPUT_BYTES: usize = 64 * 1024;
 /// Maximum provider diagnostic size accepted by the projection protocol.
@@ -38,29 +35,18 @@ pub fn world_projection_service_contract_key(projection_schema: &SchemaKey) -> C
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "kind")]
 pub enum WorldProjectionReadRequest {
-    /// Loads one entity only when its exact schema is owned by the projection extension.
-    Entity {
-        /// Entity to read.
-        entity_id: EntityId,
+    /// Loads one item.
+    Item {
+        /// Item to read.
+        item_id: ItemId,
     },
-    /// Loads one relation only when its exact schema is owned by the projection extension.
-    Relation {
-        /// Relation to read.
-        relation_id: RelationId,
-    },
-    /// Loads one facet only when its exact schema is owned by the projection extension.
-    Facet {
-        /// Target carrying the facet.
-        target: WorldSystemFacetTarget,
-        /// Exact versioned facet schema.
-        schema: SchemaKey,
-    },
-    /// Checks whether the fixed projection Principal controls one entity for one command.
-    CanControl {
-        /// Entity actor whose current grant should be checked.
-        actor_entity: EntityId,
-        /// Exact command schema whose grant scope is required.
-        command_schema: SchemaKey,
+    /// Loads one property only when its exact versioned name is owned by the
+    /// projection extension.
+    Property {
+        /// Item that owns the property.
+        item_id: ItemId,
+        /// Exact versioned property name.
+        key: SchemaKey,
     },
 }
 
@@ -68,37 +54,21 @@ pub enum WorldProjectionReadRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "kind")]
 pub enum WorldProjectionReadResult {
-    /// Result of an owner-filtered entity read.
-    Entity {
-        /// Requested entity identity.
-        entity_id: EntityId,
-        /// Entity value, or `None` when absent or owned by another extension.
-        value: Option<WorldSystemEntityRecord>,
+    /// Result of an owner-filtered item read.
+    Item {
+        /// Requested item identity.
+        item_id: ItemId,
+        /// Item value, or `None` when absent.
+        value: Option<WorldSystemItemRecord>,
     },
-    /// Result of an owner-filtered relation read.
-    Relation {
-        /// Requested relation identity.
-        relation_id: RelationId,
-        /// Relation value, or `None` when absent or owned by another extension.
-        value: Option<WorldSystemRelationRecord>,
-    },
-    /// Result of an owner-filtered facet read.
-    Facet {
-        /// Requested state target.
-        target: WorldSystemFacetTarget,
-        /// Requested exact facet schema.
-        schema: SchemaKey,
-        /// Facet value, or `None` when absent or owned by another extension.
-        value: Option<WorldSystemFacetRecord>,
-    },
-    /// Result of an authoritative ControlGrant check for the fixed Principal.
-    CanControl {
-        /// Entity actor checked by the Host.
-        actor_entity: EntityId,
-        /// Exact command schema checked by the Host.
-        command_schema: SchemaKey,
-        /// Whether a non-expired matching ControlGrant exists at the pinned position.
-        allowed: bool,
+    /// Result of an owner-filtered property read.
+    Property {
+        /// Requested owning item.
+        item_id: ItemId,
+        /// Requested exact property name.
+        key: SchemaKey,
+        /// Property value, or `None` when absent or owned by another extension.
+        value: Option<WorldSystemPropertyRecord>,
     },
 }
 
@@ -107,8 +77,6 @@ pub enum WorldProjectionReadResult {
 pub struct WorldProjectionServiceRequest {
     /// Authoritative World being projected.
     pub world_id: WorldId,
-    /// Exact pinned position used for every read in this evaluation.
-    pub snapshot_position: u64,
     /// Exact projection schema requested by the caller.
     pub projection_schema: SchemaKey,
     /// Authenticated audience Principal fixed by the Host.
@@ -123,11 +91,6 @@ impl WorldProjectionServiceRequest {
     /// Returns the authoritative World being projected.
     pub const fn world_id(&self) -> WorldId {
         self.world_id
-    }
-
-    /// Returns the exact pinned position used for every read in this evaluation.
-    pub const fn snapshot_position(&self) -> u64 {
-        self.snapshot_position
     }
 
     /// Returns the exact projection schema requested by the caller.
@@ -177,11 +140,10 @@ pub enum WorldProjectionServiceResponse {
     },
 }
 
-/// One immutable policy-filtered view produced at an authoritative World position.
+/// One immutable policy-filtered view produced by an extension projection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorldProjectionView {
     world_id: WorldId,
-    snapshot_position: u64,
     schema: SchemaKey,
     principal: PrincipalId,
     value: serde_json::Value,
@@ -191,14 +153,12 @@ impl WorldProjectionView {
     /// Creates one already-authorized projection view.
     pub fn new(
         world_id: WorldId,
-        snapshot_position: u64,
         schema: SchemaKey,
         principal: PrincipalId,
         value: serde_json::Value,
     ) -> Self {
         Self {
             world_id,
-            snapshot_position,
             schema,
             principal,
             value,
@@ -208,11 +168,6 @@ impl WorldProjectionView {
     /// Returns the authoritative World represented by this view.
     pub const fn world_id(&self) -> WorldId {
         self.world_id
-    }
-
-    /// Returns the exact World position used to build this view.
-    pub const fn snapshot_position(&self) -> u64 {
-        self.snapshot_position
     }
 
     /// Returns the exact versioned projection schema.
@@ -234,10 +189,7 @@ impl WorldProjectionView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        world::{SchemaId, SchemaVersion},
-        world_system::WorldSystemFacetTarget,
-    };
+    use crate::world::{SchemaId, SchemaVersion};
 
     fn schema(id: &str) -> SchemaKey {
         SchemaKey::new(
@@ -249,9 +201,9 @@ mod tests {
     #[test]
     fn test_should_round_trip_projection_service_transport() -> anyhow::Result<()> {
         let request = WorldProjectionServiceResponse::Read {
-            requests: vec![WorldProjectionReadRequest::Facet {
-                target: WorldSystemFacetTarget::World,
-                schema: schema("example.timeline"),
+            requests: vec![WorldProjectionReadRequest::Property {
+                item_id: ItemId::new(),
+                key: schema("example.timeline"),
             }],
         };
         let encoded = serde_json::to_vec(&request)?;

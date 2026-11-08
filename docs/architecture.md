@@ -12,7 +12,7 @@ Core owns:
 - package activation and scoped composition;
 - extension execution and service routing;
 - authoritative World state, transactions and persistence;
-- generic permissions, runtime capabilities and durable effects;
+- generic permissions and bounded runtime capabilities;
 - renderer-neutral Portable UI and presentation routing.
 
 Core does not own Chat, Characters, Narrator, AI, inventory, quests or a specific
@@ -111,9 +111,9 @@ component and per WASM instance, and automatically expire after a bounded idle o
 terminal retention interval. Cancellation immediately discards provisional chunks.
 Terminal results are small; larger payloads must use separately bounded transports.
 
-These operations are **ephemeral** progress transport, not durable WorldEvents or
-World effect jobs. The owner may publish and observe directly, or hand off
-**one read-only consumer** through an already authorized, routed service callback.
+These operations are **ephemeral** progress transport, never durable World state. The
+owner may publish and observe directly, or hand off **one read-only consumer** through an
+already authorized, routed service callback.
 The Host supplies the immediate authenticated service caller; the producer cannot
 select a reader from guest payloads. An opaque observer token is bound to this
 exact principal within the same scope. Delegation transfers consumption of the
@@ -126,52 +126,72 @@ per WASM loader, so distinct provider/consumer components from separate loader
 factories in the same Engine can resolve leases correctly. A real two-component
 WASM service fixture exercises this boundary, restart, cancellation and failure.
 
-A durable World effect/job identity remains separate. Owner-pinned World
-effect handlers can now return a bounded deferred continuation and a Host-scheduled
-poll interval. The Host retains this opaque cursor only in the active World's
-memory for the same unexpired SQLite-fenced attempt. Before resumption and
-result application it checks the persisted claim, rejecting cancelled, expired
-or reclaimed attempts. World deactivation or Host restart discards the cursor:
-the same durable EffectJobId becomes eligible for a new attempt only after its
-lease expires. Completion still uses the job-derived deterministic CommandId
-and normal authoritative World command validation. A Host-only EffectCommitGuard
-is carried through the single-writer queue. The SQLite BEGIN IMMEDIATE commit
-validates the exact still-running attempt and unexpired lease, commits the
-World result, and marks the job completed in one transaction. Cancellation and
-reclaim serialize under the same writer lock: cancellation during System
-evaluation cannot create canonical state. Monotonic elapsed time is accounted
-for while a follow-up waits and evaluates. Identical already-committed commands
-remain idempotent, including recovery from older interrupted completions.
-Provisional data is never committed as World state.
-
-The direct bridge from a World effect to a separately delegated async-operation
-observer token, and the feature-owned inference adapter/reconciliation policy,
-remain to be implemented. Core does not interpret progress bytes as model tokens.
+The World model has **no durable effect/job identity**. A committed command may attach
+best-effort runtime signals; no job outbox, retry table or effect lease exists. Any
+external work a feature wants to perform is started by the extension after it observes a
+signal or result, and is never part of the authoritative commit.
 
 ## World authority
 
-A World is the authoritative unit of simulation and persistence.
+A World is the authoritative unit of simulation and persistence. One SQLite database
+holds exactly one World and exactly four domain tables: `world`, `items`,
+`property_registry` and `properties`. There is no fifth table for commands, events,
+effects, jobs, cursors or grants.
+
+The state model is deliberately small:
+
+- every object and every relation is an item with its own UUIDv7 identity, stored as a
+  BLOB(16) primary key; a relation item points at two object items;
+- all feature data is a property value attached to an item by an exact versioned name;
+- the property vocabulary is immutable per `(name, version)` and compiles one JSON
+  Schema validator per definition;
+- property names are flat identifiers such as `character.identity`, never an
+  inheritance path; `player`, `npc` and similar are ordinary extension properties with
+  no Core ownership semantics.
 
 Commands enter a bounded single-writer runtime. A registered System evaluates a command
-against a pinned snapshot and proposes a `WorldTransaction`. The Host validates
-authority and commits state, events and durable effect jobs atomically to SQLite.
+against a pinned SQLite WAL snapshot and proposes one `WorldTransaction` containing an
+ordered change set and optional signals. The runtime validates the change set against
+the persisted property vocabulary and applies it as one `BEGIN IMMEDIATE` transaction, so
+items and properties of one command become visible atomically or not at all. The reply
+is produced only after COMMIT.
 
 ```text
 command
-  -> System
+  -> bounded single-writer queue
+  -> System (pinned snapshot)
   -> WorldTransaction
-  -> atomic commit
-       state
-       mutation log
-       WorldEvents
-       durable effect/outbox jobs
+       changes: create/delete item, set/remove property
+       signals: best-effort, not persisted
+  -> vocabulary validation
+  -> one SQLite transaction (COMMIT)
+  -> outcome + best-effort signal dispatch
 ```
 
-`Principal`, `Actor` and durable `ControlGrant` records define who may act for an
-entity. Extensions do not receive raw database handles.
+There is no durable command ledger: a repeated command is evaluated and committed again,
+and no receipt, disposition or commit position is returned. The single-writer queue is
+the only ordering mechanism, and it is in-memory; a Host restart loses queued work.
 
-Read-side feature views use owner-pinned Projection services. Renderer code receives
-validated projections, not World storage access.
+Read-side feature views use owner-pinned Projection services. A projection provider may
+read only the property names it owns; reads of any other name resolve to `None` even when
+the World stores a value. Renderer code receives validated projections, not World storage
+access.
+
+### Deliberately reduced World guarantees
+
+The four-table model trades durability features for a small, auditable core. It
+explicitly does **not** provide:
+
+- a durable command ledger, receipts, dispositions, commit positions or optimistic
+  concurrency tokens;
+- an event log, event replay or consumer cursors;
+- durable jobs, an outbox, effect leases or effect completion records;
+- actor records or control grants: authority is Host composition policy, not World
+  state;
+- more than one World per database, or any cross-World state.
+
+Post-COMMIT runtime signals are best-effort in-process notifications. They are never
+persisted or replayed, and a crash between COMMIT and dispatch loses them by design.
 
 ## Content and files
 
@@ -244,5 +264,5 @@ creator choices; creator providers return capability/results, not foreign UI tre
 - Scope boundaries are explicit; there is no implicit cross-scope provider fallback.
 - World focus is presentation state, not lifecycle state.
 - Extensions do not receive raw filesystem paths, SQLite handles or DOM access.
-- Nondeterministic external work runs after commit through durable effects/jobs; canonical
-  World state changes through authoritative commands and transactions.
+- Canonical World state changes only through authoritative commands and atomic change
+  sets; post-COMMIT signals and external work are best-effort and never canonical.

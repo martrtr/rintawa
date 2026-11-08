@@ -171,8 +171,8 @@ use bindings::rintawa::engine::{
         Error as UserResourceError, Host as UserResourcesHost, ResourceRef as WitUserResourceRef,
     },
     world_commands::{
-        Accepted as WitAcceptedWorldCommand, Actor as WitWorldCommandActor,
-        Error as WorldCommandError, Host as WorldCommandsHost, Request as WitWorldCommandRequest,
+        Accepted as WitAcceptedWorldCommand, Error as WorldCommandError, Host as WorldCommandsHost,
+        Request as WitWorldCommandRequest,
     },
     world_projections::{
         Accepted as WitAcceptedWorldProjectionRead, Error as WorldProjectionError,
@@ -1530,9 +1530,7 @@ impl WorldRegistrationHost for WasmHostState {
             .parse::<SchemaKey>()
             .map_err(|_| WorldRegistrationError::InvalidWorldSchema)?;
         let kind = match kind {
-            WitSchemaKind::Entity => SchemaKind::Entity,
-            WitSchemaKind::Relation => SchemaKind::Relation,
-            WitSchemaKind::Facet => SchemaKind::Facet,
+            WitSchemaKind::Property => SchemaKind::Property,
             WitSchemaKind::Command => SchemaKind::Command,
             WitSchemaKind::Event => SchemaKind::Event,
             WitSchemaKind::Effect => SchemaKind::Effect,

@@ -4,17 +4,17 @@ use std::{
     collections::BTreeMap,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc,
+        Arc, Mutex,
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
 };
 
 use rintawa_sdk::world::{CommandId, SchemaKey, WorldId};
-use rintawa_storage::{EffectCommitGuard, SqliteWorldStorage};
+use rintawa_storage::SqliteWorldStorage;
 use rintawa_world::{
-    CommandAdmission, CommitReceipt, SchemaKind, StoredWorldEvent, WorldCommand, WorldMutation,
-    WorldTransaction,
+    DefinitionRegistration, PropertyDefinition, RuntimeSchemaDefinition, RuntimeSignal, SchemaKind,
+    SchemaRegistry, WorldCommand, WorldSessionState, WorldTransaction,
 };
 
 use crate::{WorldRuntimeError, WorldRuntimeResult, WorldSnapshot, WorldSystem};
@@ -53,42 +53,9 @@ impl Default for WorldRuntimePolicy {
     }
 }
 
-/// Host-owned privileges granted to one registered World System.
-///
-/// These privileges are not package self-declarations. A future extension bridge
-/// must derive them from host policy before registering a System.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct WorldSystemPrivileges {
-    can_mutate_authority: bool,
-}
-
-impl WorldSystemPrivileges {
-    /// Creates ordinary unprivileged System policy.
-    pub const fn ordinary() -> Self {
-        Self {
-            can_mutate_authority: false,
-        }
-    }
-
-    /// Creates policy for a trusted authority-management System.
-    ///
-    /// Only host policy should grant this privilege.
-    pub const fn authority_manager() -> Self {
-        Self {
-            can_mutate_authority: true,
-        }
-    }
-
-    /// Returns whether the System may create or revoke Core ControlGrants.
-    pub const fn can_mutate_authority(self) -> bool {
-        self.can_mutate_authority
-    }
-}
-
 #[derive(Clone)]
 struct RegisteredSystem {
     system: Arc<dyn WorldSystem>,
-    privileges: WorldSystemPrivileges,
 }
 
 /// Builder that binds one storage boundary to its command Systems.
@@ -96,6 +63,7 @@ pub struct WorldRuntimeBuilder {
     storage: SqliteWorldStorage,
     policy: WorldRuntimePolicy,
     systems: BTreeMap<SchemaKey, RegisteredSystem>,
+    schemas: SchemaRegistry,
 }
 
 impl WorldRuntimeBuilder {
@@ -105,12 +73,29 @@ impl WorldRuntimeBuilder {
             storage,
             policy: WorldRuntimePolicy::default(),
             systems: BTreeMap::new(),
+            schemas: SchemaRegistry::new(),
         }
     }
 
     /// Replaces host-owned runtime resource policy.
     pub fn set_policy(&mut self, policy: WorldRuntimePolicy) {
         self.policy = policy;
+    }
+
+    /// Registers one transient extension runtime-API schema.
+    ///
+    /// Command and projection schemas come from exact installed packages; they are
+    /// never persisted in the world property vocabulary.
+    ///
+    /// # Errors
+    ///
+    /// Returns a definition conflict or an invalid JSON Schema error.
+    pub fn register_runtime_schema(
+        &mut self,
+        definition: RuntimeSchemaDefinition,
+    ) -> WorldRuntimeResult<()> {
+        self.schemas.register(definition)?;
+        Ok(())
     }
 
     /// Registers one System for one exact command schema.
@@ -122,29 +107,10 @@ impl WorldRuntimeBuilder {
     where
         S: WorldSystem,
     {
-        self.register_system_with_privileges(system, WorldSystemPrivileges::ordinary())
+        self.register_shared_system(Arc::new(system))
     }
 
-    /// Registers one System with explicit host-owned privileges.
-    ///
-    /// Privileges must come from host policy, never directly from a package
-    /// declaration. Ordinary extension Systems should use register_system().
-    ///
-    /// # Errors
-    ///
-    /// Returns DuplicateSystem when another System already owns the schema.
-    pub fn register_system_with_privileges<S>(
-        &mut self,
-        system: S,
-        privileges: WorldSystemPrivileges,
-    ) -> WorldRuntimeResult<()>
-    where
-        S: WorldSystem,
-    {
-        self.register_shared_system_with_privileges(Arc::new(system), privileges)
-    }
-
-    /// Registers one shared ordinary System implementation.
+    /// Registers one shared System implementation.
     ///
     /// # Errors
     ///
@@ -153,25 +119,11 @@ impl WorldRuntimeBuilder {
         &mut self,
         system: Arc<dyn WorldSystem>,
     ) -> WorldRuntimeResult<()> {
-        self.register_shared_system_with_privileges(system, WorldSystemPrivileges::ordinary())
-    }
-
-    /// Registers one shared System with explicit host-owned privileges.
-    ///
-    /// # Errors
-    ///
-    /// Returns DuplicateSystem when another System already owns the schema.
-    pub fn register_shared_system_with_privileges(
-        &mut self,
-        system: Arc<dyn WorldSystem>,
-        privileges: WorldSystemPrivileges,
-    ) -> WorldRuntimeResult<()> {
         let schema = system.command_schema().clone();
         if self.systems.contains_key(&schema) {
             return Err(WorldRuntimeError::DuplicateSystem(schema));
         }
-        self.systems
-            .insert(schema, RegisteredSystem { system, privileges });
+        self.systems.insert(schema, RegisteredSystem { system });
         Ok(())
     }
 
@@ -179,32 +131,33 @@ impl WorldRuntimeBuilder {
     ///
     /// # Errors
     ///
-    /// Returns invalid policy, schema validation, storage, or thread-spawn errors.
+    /// Returns invalid policy, missing command schema, storage, or thread-spawn errors.
     pub fn start(self) -> WorldRuntimeResult<WorldRuntime> {
         validate_policy(self.policy)?;
 
         let session = self.storage.load_session()?;
         for schema in self.systems.keys() {
-            session
-                .schemas()
-                .require_kind(schema, SchemaKind::Command)?;
+            self.schemas.require_kind(schema, SchemaKind::Command)?;
         }
 
         let world_id = self.storage.world_id();
         let storage = Arc::new(self.storage);
         let systems = Arc::new(self.systems);
+        let session = Arc::new(Mutex::new(session));
         let (sender, receiver) = mpsc::sync_channel(self.policy.command_queue_capacity());
 
         let worker_storage = Arc::clone(&storage);
         let worker_systems = Arc::clone(&systems);
+        let worker_session = Arc::clone(&session);
         let worker = thread::Builder::new()
             .name(format!("rintawa-world-{world_id}"))
-            .spawn(move || worker_loop(worker_storage, worker_systems, receiver))
+            .spawn(move || worker_loop(worker_storage, worker_systems, worker_session, receiver))
             .map_err(WorldRuntimeError::WorkerSpawn)?;
 
         Ok(WorldRuntime {
             world_id,
             storage,
+            session,
             sender: Some(sender),
             worker: Some(worker),
         })
@@ -215,6 +168,7 @@ impl WorldRuntimeBuilder {
 pub struct WorldRuntime {
     world_id: WorldId,
     storage: Arc<SqliteWorldStorage>,
+    session: Arc<Mutex<WorldSessionState>>,
     sender: Option<SyncSender<CommandJob>>,
     worker: Option<JoinHandle<()>>,
 }
@@ -225,13 +179,33 @@ impl WorldRuntime {
         self.world_id
     }
 
-    /// Captures the current read-side world position.
+    /// Captures a pinned read-side snapshot of current state.
     ///
     /// # Errors
     ///
-    /// Returns a storage error when world metadata cannot be restored.
+    /// Returns a storage error when the snapshot cannot be opened.
     pub fn snapshot(&self) -> WorldRuntimeResult<WorldSnapshot> {
         Ok(WorldSnapshot::new(self.storage.snapshot()?))
+    }
+
+    /// Persists property definitions from exact installed packages.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict/validation error or a storage error.
+    pub fn register_property_definitions(
+        &self,
+        definitions: &[PropertyDefinition],
+    ) -> WorldRuntimeResult<Vec<DefinitionRegistration>> {
+        let registrations = self.storage.register_definitions(definitions)?;
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| WorldRuntimeError::RuntimePoisoned)?;
+        for definition in definitions {
+            session.register_property(definition.clone())?;
+        }
+        Ok(registrations)
     }
 
     /// Enqueues one command without waiting for System execution or commit.
@@ -241,48 +215,6 @@ impl WorldRuntime {
     /// Returns QueueFull when bounded capacity is exhausted, or RuntimeStopped
     /// after shutdown/worker disconnect.
     pub fn submit(&self, command: WorldCommand) -> WorldRuntimeResult<WorldCommandTicket> {
-        self.submit_with_guard(command, CommandAdmission::Unknown, None)
-    }
-
-    /// Submits an ingress command carrying a Host-authenticated admission class.
-    ///
-    /// Only the trusted Host/transport admission boundary may call this method.
-    /// WIT requests and extension-declared preferences do not supply this tag;
-    /// it never bypasses World Principal/Actor/ControlGrant authorization.
-    ///
-    /// # Errors
-    ///
-    /// Returns queue-full or stopped-runtime errors.
-    pub fn submit_attested(
-        &self,
-        command: WorldCommand,
-        admission: CommandAdmission,
-    ) -> WorldRuntimeResult<WorldCommandTicket> {
-        self.submit_with_guard(command, admission, None)
-    }
-
-    /// Enqueues an effect-produced command carrying its durable SQLite fencing
-    /// claim into the same authoritative commit as World mutations and events.
-    ///
-    /// The guard is Host-owned; untrusted extension payloads do not supply it.
-    ///
-    /// # Errors
-    ///
-    /// Returns QueueFull or RuntimeStopped when this World cannot accept work.
-    pub fn submit_effect_follow_up(
-        &self,
-        command: WorldCommand,
-        guard: EffectCommitGuard,
-    ) -> WorldRuntimeResult<WorldCommandTicket> {
-        self.submit_with_guard(command, CommandAdmission::Automated, Some(guard))
-    }
-
-    fn submit_with_guard(
-        &self,
-        command: WorldCommand,
-        admission: CommandAdmission,
-        effect_guard: Option<EffectCommitGuard>,
-    ) -> WorldRuntimeResult<WorldCommandTicket> {
         let sender = self
             .sender
             .as_ref()
@@ -291,8 +223,6 @@ impl WorldRuntime {
         let (response_sender, response_receiver) = mpsc::channel();
         let job = CommandJob {
             command,
-            admission,
-            effect_guard,
             response: response_sender,
         };
 
@@ -330,34 +260,32 @@ impl Drop for WorldRuntime {
     }
 }
 
-/// Completed command result together with durable events from its commit.
+/// Result of one committed command.
+///
+/// The change set is already durable when this value exists. Attached signals are
+/// best-effort runtime notifications drained after COMMIT; they are never replayed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorldCommandOutcome {
-    receipt: CommitReceipt,
-    committed_events: Vec<StoredWorldEvent>,
+    command_id: CommandId,
+    signals: Vec<RuntimeSignal>,
 }
 
 impl WorldCommandOutcome {
-    fn new(receipt: CommitReceipt, committed_events: Vec<StoredWorldEvent>) -> Self {
+    fn new(command_id: CommandId, signals: Vec<RuntimeSignal>) -> Self {
         Self {
-            receipt,
-            committed_events,
+            command_id,
+            signals,
         }
     }
 
-    /// Returns the durable command receipt.
-    pub const fn receipt(&self) -> &CommitReceipt {
-        &self.receipt
+    /// Returns the command identity that produced this outcome.
+    pub const fn command_id(&self) -> CommandId {
+        self.command_id
     }
 
-    /// Returns durable event envelopes created by this command's commit.
-    pub fn committed_events(&self) -> &[StoredWorldEvent] {
-        &self.committed_events
-    }
-
-    /// Consumes the outcome and returns its durable receipt.
-    pub fn into_receipt(self) -> CommitReceipt {
-        self.receipt
+    /// Returns post-COMMIT best-effort signals produced by the command.
+    pub fn signals(&self) -> &[RuntimeSignal] {
+        &self.signals
     }
 }
 
@@ -379,21 +307,7 @@ impl WorldCommandTicket {
     ///
     /// Returns the command/runtime error, or WorkerStopped if the worker ended
     /// before producing a result.
-    pub fn wait(self) -> WorldRuntimeResult<CommitReceipt> {
-        self.wait_outcome().map(WorldCommandOutcome::into_receipt)
-    }
-
-    /// Waits for the authoritative commit and returns its durable event envelopes.
-    ///
-    /// Idempotent replay returns the original receipt and original committed
-    /// events. Callers that bridge events into ephemeral runtimes should inspect
-    /// the receipt disposition before deciding whether to redeliver them.
-    ///
-    /// # Errors
-    ///
-    /// Returns the command/runtime error, or WorkerStopped if the worker ended
-    /// before producing a result.
-    pub fn wait_outcome(self) -> WorldRuntimeResult<WorldCommandOutcome> {
+    pub fn wait(self) -> WorldRuntimeResult<WorldCommandOutcome> {
         self.receiver
             .recv()
             .map_err(|_| WorldRuntimeError::WorkerStopped)?
@@ -402,8 +316,6 @@ impl WorldCommandTicket {
 
 struct CommandJob {
     command: WorldCommand,
-    admission: CommandAdmission,
-    effect_guard: Option<EffectCommitGuard>,
     response: mpsc::Sender<WorldRuntimeResult<WorldCommandOutcome>>,
 }
 
@@ -421,16 +333,11 @@ fn validate_policy(policy: WorldRuntimePolicy) -> WorldRuntimeResult<()> {
 fn worker_loop(
     storage: Arc<SqliteWorldStorage>,
     systems: Arc<BTreeMap<SchemaKey, RegisteredSystem>>,
+    session: Arc<Mutex<WorldSessionState>>,
     receiver: Receiver<CommandJob>,
 ) {
     while let Ok(job) = receiver.recv() {
-        let result = process_command(
-            &storage,
-            &systems,
-            job.command,
-            job.admission,
-            job.effect_guard,
-        );
+        let result = process_command(&storage, &systems, &session, job.command);
         let _ = job.response.send(result);
     }
 }
@@ -438,22 +345,14 @@ fn worker_loop(
 fn process_command(
     storage: &Arc<SqliteWorldStorage>,
     systems: &BTreeMap<SchemaKey, RegisteredSystem>,
+    session: &Mutex<WorldSessionState>,
     command: WorldCommand,
-    admission: CommandAdmission,
-    effect_guard: Option<EffectCommitGuard>,
 ) -> WorldRuntimeResult<WorldCommandOutcome> {
-    if let Some(receipt) = storage.committed_receipt_attested(&command, admission)? {
-        let events = storage.events_at_position(receipt.position())?;
-        return Ok(WorldCommandOutcome::new(receipt, events));
-    }
-
     let registered = systems
         .get(command.schema())
         .ok_or_else(|| WorldRuntimeError::SystemUnavailable(command.schema().clone()))?;
 
-    let snapshot = WorldSnapshot::new(storage.snapshot_for_command(&command)?);
-    let evaluated_position = snapshot.position();
-
+    let snapshot = WorldSnapshot::new(storage.snapshot()?);
     let output = catch_unwind(AssertUnwindSafe(|| {
         registered.system.evaluate(&snapshot, &command)
     }))
@@ -463,35 +362,27 @@ fn process_command(
         source,
     })?;
 
-    reject_privileged_authority_output(command.schema(), &output, registered.privileges)?;
+    validate_output(command.schema(), session, &output)?;
 
-    let receipt = match effect_guard {
-        Some(guard) => {
-            storage.commit_effect_follow_up(&command, &output, evaluated_position, &guard)?
-        }
-        None => storage.commit_attested(&command, &output, evaluated_position, admission)?,
-    };
-    let events = storage.events_at_position(receipt.position())?;
-    Ok(WorldCommandOutcome::new(receipt, events))
+    let command_id = command.id();
+    let signals = output.signals().to_vec();
+    storage.apply(&output)?;
+    Ok(WorldCommandOutcome::new(command_id, signals))
 }
 
-fn reject_privileged_authority_output(
+fn validate_output(
     schema: &SchemaKey,
+    session: &Mutex<WorldSessionState>,
     transaction: &WorldTransaction,
-    privileges: WorldSystemPrivileges,
 ) -> WorldRuntimeResult<()> {
-    if privileges.can_mutate_authority() {
-        return Ok(());
-    }
-
-    let has_authority_mutation = transaction.mutations().iter().any(|mutation| {
-        matches!(
-            mutation,
-            WorldMutation::GrantControl { .. } | WorldMutation::RevokeControl { .. }
-        )
-    });
-    if has_authority_mutation {
-        return Err(WorldRuntimeError::AuthorityMutationDenied(schema.clone()));
-    }
+    let session = session
+        .lock()
+        .map_err(|_| WorldRuntimeError::RuntimePoisoned)?;
+    transaction
+        .validate(session.properties())
+        .map_err(|source| WorldRuntimeError::InvalidTransaction {
+            schema: schema.clone(),
+            source,
+        })?;
     Ok(())
 }

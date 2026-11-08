@@ -1,22 +1,17 @@
 //! Errors returned by the authoritative world model.
 
-use rintawa_sdk::world::{
-    CommandId, ControlGrantId, EffectJobId, EntityId, PrincipalId, RelationId, SchemaKey,
-    WorldEventId,
-};
+use rintawa_sdk::world::{ItemId, SchemaKey};
 use thiserror::Error;
-
-use crate::{ActorRef, SchemaKind};
 
 /// Errors returned by feature-neutral world operations.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum WorldError {
-    /// The same schema key was registered with different semantics.
+    /// The same versioned property definition was registered with other semantics.
     #[error(
-        "schema {key} conflicts with the existing definition owned by {existing_owner}; incoming owner is {incoming_owner}"
+        "property definition {key} conflicts with the registered definition owned by {existing_owner}; incoming owner is {incoming_owner}"
     )]
-    SchemaConflict {
-        /// Versioned schema identity that conflicts.
+    DefinitionConflict {
+        /// Versioned property name whose definition conflicts.
         key: SchemaKey,
         /// Owner of the already registered definition.
         existing_owner: String,
@@ -24,34 +19,34 @@ pub enum WorldError {
         incoming_owner: String,
     },
 
-    /// A schema document cannot be compiled as local JSON Schema.
-    #[error("schema {key} is invalid: {reason}")]
-    InvalidSchemaDefinition {
-        /// Versioned schema identity whose definition is invalid.
+    /// A property definition cannot be compiled as local JSON Schema.
+    #[error("property definition {key} is invalid: {reason}")]
+    InvalidDefinition {
+        /// Versioned property name whose definition is invalid.
         key: SchemaKey,
         /// Sanitized validator error without user payload data.
         reason: String,
     },
 
-    /// A requested schema is absent from the world registry.
-    #[error("schema {key} is not registered")]
-    SchemaNotRegistered {
-        /// Missing versioned schema identity.
+    /// A requested versioned property definition is absent from the world.
+    #[error("property definition {key} is not registered")]
+    DefinitionNotRegistered {
+        /// Missing versioned property name.
         key: SchemaKey,
     },
 
-    /// A schema exists but belongs to another semantic category.
+    /// A runtime API schema exists but belongs to another semantic category.
     #[error("schema {key} has kind {actual}, expected {expected}")]
-    SchemaKindMismatch {
+    DefinitionKindMismatch {
         /// Versioned schema identity with the wrong category.
         key: SchemaKey,
         /// Required schema category.
-        expected: SchemaKind,
+        expected: crate::SchemaKind,
         /// Registered schema category.
-        actual: SchemaKind,
+        actual: crate::SchemaKind,
     },
 
-    /// A feature payload violates its registered JSON Schema.
+    /// A runtime API payload violates its registered JSON Schema.
     #[error("payload for schema {key} is invalid at {instance_path}: {reason}")]
     PayloadValidationFailed {
         /// Schema used to validate the payload.
@@ -62,103 +57,62 @@ pub enum WorldError {
         reason: String,
     },
 
-    /// An exact control grant scope contains no command schemas.
-    #[error("exact control grant scope must contain at least one command schema")]
-    EmptyControlScope,
-
-    /// A control grant identity already exists.
-    #[error("control grant {0} already exists")]
-    ControlGrantAlreadyExists(ControlGrantId),
-
-    /// A control grant identity does not exist.
-    #[error("control grant {0} does not exist")]
-    ControlGrantNotFound(ControlGrantId),
-
-    /// The authenticated principal cannot act as the requested actor for this command.
-    #[error("principal {principal} is not authorized as actor {actor:?} for command {command}")]
-    ActorUnauthorized {
-        /// Authenticated outside principal.
-        principal: PrincipalId,
-        /// Requested world actor.
-        actor: ActorRef,
-        /// Command schema being authorized.
-        command: SchemaKey,
+    /// A property value violates its registered JSON Schema.
+    #[error("property {key} is invalid at {instance_path}: {reason}")]
+    PropertyValidationFailed {
+        /// Property definition used to validate the value.
+        key: SchemaKey,
+        /// JSON Pointer locating the rejected value.
+        instance_path: String,
+        /// Masked validator message that does not expose the property value.
+        reason: String,
     },
 
-    /// A transaction contains no mutation, event, or durable effect.
+    /// The stored `items.type` value is neither an object nor a relation.
+    #[error("item type {0} is not a valid item kind")]
+    InvalidItemKind(i64),
+
+    /// A transaction contains no change at all.
     #[error("world transaction is empty")]
     EmptyTransaction,
 
-    /// The same event identity appears more than once in one transaction.
-    #[error("world transaction contains duplicate event id {0}")]
-    DuplicateEventId(WorldEventId),
+    /// The same item identity was created more than once in one transaction.
+    #[error("world transaction creates item {0} more than once")]
+    DuplicateItemCreation(ItemId),
 
-    /// The same effect-job identity appears more than once in one transaction.
-    #[error("world transaction contains duplicate effect job id {0}")]
-    DuplicateEffectJobId(EffectJobId),
-
-    /// A retried command identity was reused for different immutable command input.
-    #[error("command id {0} was already committed with different command content")]
-    CommandIdConflict(CommandId),
-
-    /// An event identity was already used by another committed command.
-    #[error("world event id {0} already exists")]
-    WorldEventAlreadyExists(WorldEventId),
-
-    /// An effect-job identity was already used by another committed command.
-    #[error("effect job id {0} already exists")]
-    EffectJobAlreadyExists(EffectJobId),
-
-    /// State changed after a System evaluated its transaction output.
-    #[error("world changed since System evaluation: evaluated {evaluated}, actual {actual}")]
-    WorldChangedSinceEvaluation {
-        /// Position of the snapshot read by the System.
-        evaluated: u64,
-        /// Current authoritative position at commit.
-        actual: u64,
-    },
-
-    /// Optimistic concurrency observed a newer or older world position.
-    #[error("world position changed: expected {expected}, actual {actual}")]
-    StaleWorldPosition {
-        /// Position expected by the transaction.
-        expected: u64,
-        /// Current authoritative position.
-        actual: u64,
-    },
-
-    /// The monotonic commit position cannot advance further.
-    #[error("world commit position overflow")]
-    CommitPositionOverflow,
-
-    /// An entity identity already exists in current state.
-    #[error("entity {0} already exists")]
-    EntityAlreadyExists(EntityId),
-
-    /// An entity identity does not exist in current state.
-    #[error("entity {0} does not exist")]
-    EntityNotFound(EntityId),
-
-    /// A relation identity already exists in current state.
-    #[error("relation {0} already exists")]
-    RelationAlreadyExists(RelationId),
-
-    /// A relation identity does not exist in current state.
-    #[error("relation {0} does not exist")]
-    RelationNotFound(RelationId),
-
-    /// A relation endpoint references an entity absent from current state.
-    #[error("relation {relation_id} references missing entity {entity_id}")]
-    RelationEndpointNotFound {
+    /// A relation endpoint is missing from current state.
+    #[error("relation {relation} references missing item {endpoint}")]
+    RelationEndpointMissing {
         /// Relation being created.
-        relation_id: RelationId,
-        /// Missing source or destination entity.
-        entity_id: EntityId,
+        relation: ItemId,
+        /// Missing subject or object endpoint.
+        endpoint: ItemId,
     },
 
-    /// A facet target references current state that does not exist.
-    #[error("facet target does not exist")]
-    FacetTargetNotFound,
+    /// A relation endpoint names another relation instead of an object-item.
+    #[error("relation {relation} references {endpoint}, which is not an object")]
+    RelationEndpointNotObject {
+        /// Relation being created.
+        relation: ItemId,
+        /// Endpoint that is a relation.
+        endpoint: ItemId,
+    },
+
+    /// A relation-item was found with a missing endpoint.
+    #[error("relation {0} has no endpoint")]
+    RelationEndpointAbsent(ItemId),
+
+    /// An item identity does not exist in current state.
+    #[error("item {0} does not exist")]
+    ItemNotFound(ItemId),
+
+    /// An item identity already exists in current state.
+    #[error("item {0} already exists")]
+    ItemAlreadyExists(ItemId),
+
+    /// A property name is already present in a property vocabulary.
+    #[error("property name {0} is empty")]
+    EmptyPropertyName(String),
 }
 
 /// Result type used by world-model operations.

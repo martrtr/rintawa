@@ -6,6 +6,10 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, rustdoc::broken_intra_doc_links)]
+// Host errors wrap storage, world-model and runtime errors, which are themselves
+// structured. Boxing them would change the public Host error surface for no gain
+// in a host process that fails fast on any of them.
+#![allow(clippy::result_large_err)]
 
 mod identity;
 mod profile;
@@ -44,14 +48,7 @@ pub use profile::{
     ActivationRecord, BaselineProfile, CompositionProfile, HttpLoopbackOriginGrant, PROFILE_SCHEMA,
     PreferredProviderSelection, RuntimePermissionGrant,
 };
-pub use runtime::event_replay::{
-    MAX_WORLD_EVENT_REPLAY_BATCH, TrustedWorldEventConsumer, WorldEventReplayDecision,
-    WorldEventReplaySourceGate,
-};
-pub use runtime::{
-    EFFECT_JOB_LEASE_MILLIS, EFFECT_RETRY_BASE_MILLIS, EFFECT_RETRY_MAX_MILLIS, HostRuntime,
-    MAX_EFFECT_JOBS_PER_PUMP, WorldCommandDispatchOutcome,
-};
+pub use runtime::{HostRuntime, WorldCommandDispatchOutcome};
 pub use runtime_signal::{
     DEFAULT_RUNTIME_SIGNAL_QUEUE_CAPACITY, MAX_RUNTIME_SIGNAL_MESSAGE_BYTES,
     MAX_RUNTIME_SIGNAL_TOPIC_BYTES,
@@ -265,12 +262,6 @@ impl std::error::Error for HostShutdownFailures {
 /// Errors returned by local host composition operations.
 #[derive(Debug, Error)]
 pub enum HostError {
-    /// The trusted Host event consumer policy violates its identity or resource bounds.
-    #[error("invalid Host WorldEvent replay policy")]
-    InvalidWorldEventReplayPolicy,
-    /// A routed command attempted to change trusted controller or source provenance.
-    #[error("Host WorldEvent replay command violates its controller or source binding")]
-    InvalidWorldEventReplayCommand,
     /// Trusted interactive session and World command Principal do not match.
     #[error("interactive World command Principal differs from authenticated session")]
     InteractiveWorldCommandPrincipalMismatch,
@@ -394,9 +385,6 @@ pub enum HostError {
         /// Filesystem cleanup failure.
         cleanup: String,
     },
-    /// A runtime event envelope could not be serialized for extension delivery.
-    #[error("failed to encode runtime event envelope: {0}")]
-    EventEnvelopeEncode(#[from] serde_json::Error),
     /// An extension declared malformed JSON for one immutable world schema.
     #[error("world schema `{schema}` contains invalid JSON: {source}")]
     InvalidWorldSchemaJson {
@@ -406,9 +394,6 @@ pub enum HostError {
         #[source]
         source: serde_json::Error,
     },
-    /// One delivery batch mixed events owned by different authoritative worlds.
-    #[error("world event delivery batch contains multiple WorldIds")]
-    MixedWorldEventBatch,
     /// An ephemeral runtime signal used an empty or oversized routing topic.
     #[error("runtime signal topic must be non-empty and within host bounds")]
     InvalidRuntimeSignalTopic,
@@ -753,8 +738,6 @@ pub struct WorldSummary {
     pub description: Option<String>,
     /// Optional immutable cover asset reference.
     pub cover: Option<rintawa_artifacts::AssetRef>,
-    /// Last committed local world position.
-    pub commit_position: u64,
 }
 
 /// One resolved entry point for an active World's presentation in a concrete UI session.
@@ -1833,6 +1816,5 @@ fn world_summary(state: &WorldSessionState, metadata: WorldCatalogMetadata) -> W
         title: metadata.title().to_string(),
         description: metadata.description().map(str::to_string),
         cover: metadata.cover().cloned(),
-        commit_position: state.commit_position(),
     }
 }

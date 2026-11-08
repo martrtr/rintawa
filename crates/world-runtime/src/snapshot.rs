@@ -1,15 +1,16 @@
 //! Read-only authoritative snapshot capability used by Systems and Host-side projections.
 
-use rintawa_sdk::world::{EntityId, PrincipalId, RelationId, SchemaKey, WorldId};
+use rintawa_sdk::world::{ItemId, SchemaKey, WorldId};
 use rintawa_storage::SqliteWorldSnapshot;
-use rintawa_world::{EntityRecord, FacetRecord, FacetTarget, RelationRecord, SchemaDefinition};
+use rintawa_world::{ItemRecord, PropertyRecord};
 
 use crate::WorldReadResult;
 
-/// Read-only view evaluated by one System at a fixed authoritative position.
+/// Read-only view evaluated by one System against one pinned SQLite WAL snapshot.
 ///
-/// All reads use one pinned SQLite WAL snapshot. The runtime also requires the
-/// authoritative position to remain unchanged before committing System output.
+/// The single-writer runtime guarantees that no other writer is active while a
+/// System evaluates, so the snapshot cannot drift between the reads a System
+/// performs and the commit of its output.
 #[derive(Debug)]
 pub struct WorldSnapshot {
     storage: SqliteWorldSnapshot,
@@ -25,60 +26,44 @@ impl WorldSnapshot {
         self.storage.world_id()
     }
 
-    /// Returns the exact position against which the System is evaluating.
-    pub const fn position(&self) -> u64 {
-        self.storage.position()
-    }
-
-    /// Loads one entity from the pinned snapshot.
+    /// Loads one item from the pinned snapshot.
     ///
     /// # Errors
     ///
     /// Returns a read error when persistent state cannot be decoded.
-    pub fn load_entity(&self, entity_id: EntityId) -> WorldReadResult<Option<EntityRecord>> {
-        Ok(self.storage.load_entity(entity_id)?)
+    pub fn load_item(&self, id: ItemId) -> WorldReadResult<Option<ItemRecord>> {
+        Ok(self.storage.load_item(id)?)
     }
 
-    /// Loads one relation from the pinned snapshot.
+    /// Loads one property value from the pinned snapshot.
     ///
     /// # Errors
     ///
-    /// Returns a read error when persistent state cannot be decoded.
-    pub fn load_relation(
+    /// Returns a read error when persistent state cannot be decoded, including a
+    /// value stored under a different property version.
+    pub fn load_property(
         &self,
-        relation_id: RelationId,
-    ) -> WorldReadResult<Option<RelationRecord>> {
-        Ok(self.storage.load_relation(relation_id)?)
-    }
-
-    /// Loads one facet from the pinned snapshot.
-    ///
-    /// # Errors
-    ///
-    /// Returns a read error when persistent state cannot be decoded.
-    pub fn load_facet(
-        &self,
-        target: FacetTarget,
-        schema: &SchemaKey,
-    ) -> WorldReadResult<Option<FacetRecord>> {
-        Ok(self.storage.load_facet(target, schema)?)
-    }
-
-    pub(crate) fn load_schema_definition(
-        &self,
+        item: ItemId,
         key: &SchemaKey,
-    ) -> WorldReadResult<Option<SchemaDefinition>> {
-        Ok(self.storage.load_schema(key)?)
+    ) -> WorldReadResult<Option<PropertyRecord>> {
+        Ok(self.storage.load_property(item, key)?)
     }
 
-    pub(crate) fn principal_can_control(
-        &self,
-        principal: PrincipalId,
-        actor_entity: EntityId,
-        command_schema: &SchemaKey,
-    ) -> WorldReadResult<bool> {
-        Ok(self
-            .storage
-            .principal_can_control(principal, actor_entity, command_schema)?)
+    /// Loads every current property of one item.
+    ///
+    /// # Errors
+    ///
+    /// Returns a read error when persistent state cannot be decoded.
+    pub fn properties_of(&self, item: ItemId) -> WorldReadResult<Vec<PropertyRecord>> {
+        Ok(self.storage.properties_of(item)?)
+    }
+
+    /// Loads every relation whose subject or object is the given item.
+    ///
+    /// # Errors
+    ///
+    /// Returns a read error when persistent state cannot be decoded.
+    pub fn relations_pointing_at(&self, item: ItemId) -> WorldReadResult<Vec<ItemRecord>> {
+        Ok(self.storage.relations_pointing_at(item)?)
     }
 }

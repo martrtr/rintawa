@@ -1,165 +1,170 @@
-//! Generic current-state records and mutations for authoritative worlds.
+//! Current-state records for items and properties.
+//!
+//! The persistent model has exactly one identity system: every object and every
+//! relation is an [`ItemRecord`] with its own UUIDv7 [`ItemId`]. Relations are
+//! items whose endpoints point at object-items, and all extension-defined data is
+//! a [`PropertyRecord`] attached to an item by an exact versioned property name.
 
-use rintawa_sdk::world::{ControlGrantId, EntityId, RelationId, SchemaKey};
-
-use crate::ControlGrant;
+use rintawa_sdk::world::{ItemId, SchemaKey};
 use serde::{Deserialize, Serialize};
 
-/// One typed entity in authoritative current state.
+use crate::{WorldError, WorldResult};
+
+/// Value of `items.type` for an object-item.
+pub const ITEM_TYPE_OBJECT: i64 = 1;
+/// Value of `items.type` for a relation-item.
+pub const ITEM_TYPE_RELATION: i64 = 2;
+
+/// Persistent kind of one item, stored as the integer `items.type` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ItemKind {
+    /// A plain item that can carry properties and be a relation endpoint.
+    Object,
+    /// A directed link between two object-items, with its own identity.
+    Relation,
+}
+
+impl ItemKind {
+    /// Returns the integer stored in `items.type`.
+    pub const fn code(self) -> i64 {
+        match self {
+            Self::Object => ITEM_TYPE_OBJECT,
+            Self::Relation => ITEM_TYPE_RELATION,
+        }
+    }
+
+    /// Decodes an `items.type` value.
+    ///
+    /// # Errors
+    ///
+    /// Returns WorldError::InvalidItemKind for any value other than 1 or 2.
+    pub fn from_code(code: i64) -> WorldResult<Self> {
+        match code {
+            ITEM_TYPE_OBJECT => Ok(Self::Object),
+            ITEM_TYPE_RELATION => Ok(Self::Relation),
+            other => Err(WorldError::InvalidItemKind(other)),
+        }
+    }
+}
+
+/// One item in authoritative current state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EntityRecord {
-    id: EntityId,
-    schema: SchemaKey,
+pub struct ItemRecord {
+    id: ItemId,
+    kind: ItemKind,
+    subject: Option<ItemId>,
+    object: Option<ItemId>,
 }
 
-impl EntityRecord {
-    /// Creates an entity record.
-    pub const fn new(id: EntityId, schema: SchemaKey) -> Self {
-        Self { id, schema }
-    }
-
-    /// Returns the stable entity identity.
-    pub const fn id(&self) -> EntityId {
-        self.id
-    }
-
-    /// Returns the versioned entity-type schema.
-    pub const fn schema(&self) -> &SchemaKey {
-        &self.schema
-    }
-}
-
-/// One typed directed relation between two entities.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RelationRecord {
-    id: RelationId,
-    schema: SchemaKey,
-    from: EntityId,
-    to: EntityId,
-}
-
-impl RelationRecord {
-    /// Creates a directed relation record.
-    pub const fn new(id: RelationId, schema: SchemaKey, from: EntityId, to: EntityId) -> Self {
+impl ItemRecord {
+    /// Creates an object-item with no endpoints.
+    pub const fn object(id: ItemId) -> Self {
         Self {
             id,
-            schema,
-            from,
-            to,
+            kind: ItemKind::Object,
+            subject: None,
+            object: None,
         }
     }
 
-    /// Returns the stable relation identity.
-    pub const fn id(&self) -> RelationId {
+    /// Creates a relation-item between two object-items.
+    ///
+    /// Endpoint existence and endpoint kind are enforced by the authoritative
+    /// store; this constructor only builds the record.
+    pub const fn relation(id: ItemId, subject: ItemId, object: ItemId) -> Self {
+        Self {
+            id,
+            kind: ItemKind::Relation,
+            subject: Some(subject),
+            object: Some(object),
+        }
+    }
+
+    /// Returns the stable item identity.
+    pub const fn id(&self) -> ItemId {
         self.id
     }
 
-    /// Returns the versioned relation-type schema.
-    pub const fn schema(&self) -> &SchemaKey {
-        &self.schema
+    /// Returns the persistent kind of this item.
+    pub const fn kind(&self) -> ItemKind {
+        self.kind
     }
 
-    /// Returns the source entity.
-    pub const fn from(&self) -> EntityId {
-        self.from
+    /// Returns the subject endpoint of a relation-item.
+    pub const fn subject(&self) -> Option<ItemId> {
+        self.subject
     }
 
-    /// Returns the destination entity.
-    pub const fn to(&self) -> EntityId {
-        self.to
+    /// Returns the object endpoint of a relation-item.
+    pub const fn object_target(&self) -> Option<ItemId> {
+        self.object
+    }
+
+    /// Returns whether this item is a relation.
+    pub const fn is_relation(&self) -> bool {
+        matches!(self.kind, ItemKind::Relation)
     }
 }
 
-/// Target that owns one extension-defined facet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", tag = "kind", content = "id")]
-pub enum FacetTarget {
-    /// The world session itself.
-    World,
-    /// One entity.
-    Entity(EntityId),
-    /// One relation.
-    Relation(RelationId),
-}
-
-/// One current facet value attached to a world-state target.
+/// One current property value attached to an item.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FacetRecord {
-    target: FacetTarget,
-    schema: SchemaKey,
-    payload: serde_json::Value,
+pub struct PropertyRecord {
+    item: ItemId,
+    key: SchemaKey,
+    data: serde_json::Value,
 }
 
-impl FacetRecord {
-    /// Creates a facet value.
-    pub fn new(target: FacetTarget, schema: SchemaKey, payload: serde_json::Value) -> Self {
-        Self {
-            target,
-            schema,
-            payload,
-        }
+impl PropertyRecord {
+    /// Creates a property value for one item.
+    pub fn new(item: ItemId, key: SchemaKey, data: serde_json::Value) -> Self {
+        Self { item, key, data }
     }
 
-    /// Returns the target that owns this facet.
-    pub const fn target(&self) -> FacetTarget {
-        self.target
+    /// Returns the item that owns this property.
+    pub const fn item(&self) -> ItemId {
+        self.item
     }
 
-    /// Returns the versioned facet schema.
-    pub const fn schema(&self) -> &SchemaKey {
-        &self.schema
+    /// Returns the exact versioned property name.
+    pub const fn key(&self) -> &SchemaKey {
+        &self.key
     }
 
-    /// Returns the validated facet payload.
-    pub const fn payload(&self) -> &serde_json::Value {
-        &self.payload
+    /// Returns the property value.
+    pub const fn data(&self) -> &serde_json::Value {
+        &self.data
     }
 }
 
-/// One generic current-state mutation within an atomic world transaction.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", tag = "operation")]
-pub enum WorldMutation {
-    /// Creates one typed entity.
-    CreateEntity {
-        /// Entity record to create.
-        entity: EntityRecord,
-    },
-    /// Deletes an entity and current relations/facets owned by it.
-    DeleteEntity {
-        /// Entity identity to delete.
-        entity_id: EntityId,
-    },
-    /// Creates one typed directed relation.
-    CreateRelation {
-        /// Relation record to create.
-        relation: RelationRecord,
-    },
-    /// Deletes one relation and its current facets.
-    DeleteRelation {
-        /// Relation identity to delete.
-        relation_id: RelationId,
-    },
-    /// Inserts or replaces one facet value.
-    SetFacet {
-        /// Facet value to persist.
-        facet: FacetRecord,
-    },
-    /// Removes one facet value when present.
-    RemoveFacet {
-        /// Target that owns the facet.
-        target: FacetTarget,
-        /// Versioned facet schema to remove.
-        schema: SchemaKey,
-    },
-    /// Creates one durable principal-to-entity control grant.
-    GrantControl {
-        /// Grant to persist.
-        grant: ControlGrant,
-    },
-    /// Revokes one durable control grant.
-    RevokeControl {
-        /// Grant identity to revoke.
-        grant_id: ControlGrantId,
-    },
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_round_trip_item_kind_codes() -> WorldResult<()> {
+        assert_eq!(ItemKind::from_code(1)?, ItemKind::Object);
+        assert_eq!(ItemKind::from_code(2)?, ItemKind::Relation);
+        assert_eq!(ItemKind::Object.code(), 1);
+        assert_eq!(ItemKind::Relation.code(), 2);
+        assert!(matches!(
+            ItemKind::from_code(3),
+            Err(WorldError::InvalidItemKind(3))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_keep_endpoints_only_on_relations() {
+        let item = ItemId::new();
+        let object = ItemRecord::object(item);
+        let relation = ItemRecord::relation(ItemId::new(), item, item);
+
+        assert!(!object.is_relation());
+        assert_eq!(object.subject(), None);
+        assert_eq!(object.object_target(), None);
+        assert!(relation.is_relation());
+        assert_eq!(relation.subject(), Some(item));
+        assert_eq!(relation.object_target(), Some(item));
+    }
 }
