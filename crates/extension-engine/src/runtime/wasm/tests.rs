@@ -1659,6 +1659,7 @@ fn test_should_fail_fast_when_target_provider_runtime_is_reentered() {
     let runtime = Arc::new(Mutex::new(WasmSharedRuntime {
         instance: None,
         failed_lifecycle_callback: None,
+        active: false,
     }));
     let endpoint = WasmTargetProviderEndpoint {
         runtime: runtime.clone(),

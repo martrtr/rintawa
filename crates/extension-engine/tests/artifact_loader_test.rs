@@ -27,6 +27,10 @@ struct TestHostedComponent {
 }
 
 impl Component for TestHostedComponent {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn id(&self) -> &ComponentId {
         &self.id
     }

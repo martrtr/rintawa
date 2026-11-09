@@ -9,12 +9,17 @@ use crate::{
     errors::{ExtensionError, ExtensionResult},
     types::ComponentId,
 };
+use std::any::Any;
 
 /// The trait that all components must implement.
 ///
 /// This trait defines the lifecycle methods that all components must provide.
 /// Components are the building blocks of Rintawa extensions.
 pub trait Component: Send {
+    /// Returns this component as a dynamically typed value for Host-owned
+    /// execution boundaries that are not part of the SDK lifecycle contract.
+    fn as_any(&self) -> &dyn Any;
+
     /// Returns the unique identifier of this component.
     fn id(&self) -> &ComponentId;
 

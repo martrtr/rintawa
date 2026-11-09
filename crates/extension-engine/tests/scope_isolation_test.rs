@@ -17,6 +17,10 @@ impl ScopedComponent {
 }
 
 impl Component for ScopedComponent {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn id(&self) -> &ComponentId {
         &self.id
     }

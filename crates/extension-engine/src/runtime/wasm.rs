@@ -7,7 +7,10 @@ use std::{
     fs::File,
     io::Read,
     path::Path,
-    sync::{Arc, Mutex, MutexGuard, TryLockError},
+    sync::{
+        Arc, Mutex, MutexGuard, TryLockError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -24,8 +27,10 @@ use rintawa_sdk::{
     secrets::{SecretAccessError, SecretPath, SecretPathPattern},
     traits::Component,
     types::{ComponentId, ExtensionId, ExtensionInstanceId, RuntimeEffectId, RuntimeScopeId},
-    world::{SchemaKey, SchemaKind},
+    world::{ItemId, SchemaKey, SchemaKind},
 };
+use rintawa_world::{WorldCommand, WorldTransaction};
+use rintawa_world_runtime::{SystemError, SystemResult, WorldReadError, WorldSnapshot};
 use tracing::{debug, error, info, trace, warn};
 use wasmtime::{
     Engine, Store, StoreLimits, Trap,
@@ -62,6 +67,7 @@ use crate::runtime::wasm::network::{
 const TARGET_PROVIDER_EXPORT_NAME: &str = "rintawa:engine/target-provider@0.0.1";
 const TASK_HANDLER_EXPORT_NAME: &str = "rintawa:engine/task-handler@0.0.1";
 const TRANSPORT_HANDLER_EXPORT_NAME: &str = "rintawa:engine/transport-handler@0.0.1";
+const WORLD_SYSTEM_EXPORT_NAME: &str = "rintawa:engine/world-system@0.0.1";
 
 // Generated WIT bindings expose protocol names verbatim and are not hand-documented.
 #[allow(missing_docs)]
@@ -107,6 +113,16 @@ mod task_bindings {
     wasmtime::component::bindgen!({
         path: "wit/engine.wit",
         world: "task-plugin",
+        async: false,
+    });
+}
+
+// World System export is optional for ordinary WASM plugins.
+#[allow(missing_docs)]
+mod world_system_bindings {
+    wasmtime::component::bindgen!({
+        path: "wit/engine.wit",
+        world: "world-system-plugin",
         async: false,
     });
 }
@@ -163,10 +179,13 @@ use bindings::rintawa::engine::{
     world_sessions::{
         Error as WorldSessionError, Host as WorldSessionsHost, Summary as WitWorldSummary,
     },
+    world_system_snapshot::{Error as WorldSystemSnapshotError, Host as WorldSystemSnapshotHost},
 };
 use target_provider_bindings::TargetProviderPlugin;
 use task_bindings::TaskPlugin;
 use transport_bindings::TransportHandlerPlugin;
+use world_system_bindings::WorldSystemPlugin;
+use world_system_bindings::exports::rintawa::engine::world_system::Error as WorldSystemGuestError;
 
 #[derive(Debug)]
 struct PendingAssetUpload {
@@ -242,6 +261,7 @@ pub struct WasmHostState {
     world_session_mutations_this_execution: usize,
     execution_target_registration_active: bool,
     pending_execution_targets: Vec<String>,
+    world_system_snapshot: Option<WorldSnapshot>,
     resource_limits: StoreLimits,
     resource_table: ResourceTable,
 }
@@ -412,6 +432,7 @@ impl WasmHostState {
             world_session_mutations_this_execution: 0,
             execution_target_registration_active: false,
             pending_execution_targets: Vec::new(),
+            world_system_snapshot: None,
             resource_limits: budget.store_limits(),
             resource_table: ResourceTable::new(),
         }
@@ -558,6 +579,27 @@ impl WasmHostState {
         self.execution_target_registration_active = false;
         self.pending_execution_targets.clear();
         self.pending_transport_points.clear();
+        self.world_system_snapshot = None;
+    }
+
+    fn begin_world_system_execution(&mut self, snapshot: WorldSnapshot) -> ExtensionResult<()> {
+        if self.world_system_snapshot.is_some() {
+            return Err(ExtensionError::Message(String::from(
+                "WASM World System execution is already active",
+            )));
+        }
+        self.world_system_snapshot = Some(snapshot);
+        Ok(())
+    }
+
+    fn finish_world_system_execution(&mut self) {
+        self.world_system_snapshot = None;
+    }
+
+    fn world_system_snapshot(&self) -> Result<&WorldSnapshot, WorldSystemSnapshotError> {
+        self.world_system_snapshot
+            .as_ref()
+            .ok_or(WorldSystemSnapshotError::AccessNotActive)
     }
 
     fn queue_world_schema(
@@ -1368,6 +1410,83 @@ impl WorldRegistrationHost for WasmHostState {
     }
 }
 
+impl WorldSystemSnapshotHost for WasmHostState {
+    fn load_item(&mut self, id: String) -> Result<Option<String>, WorldSystemSnapshotError> {
+        let id = id
+            .parse::<ItemId>()
+            .map_err(|_| WorldSystemSnapshotError::InvalidRequest)?;
+        let item = self
+            .world_system_snapshot()?
+            .load_item(id)
+            .map_err(map_world_system_read_error)?;
+        item.map(|item| self.encode_world_system_read(item))
+            .transpose()
+    }
+
+    fn load_property(
+        &mut self,
+        item: String,
+        key: String,
+    ) -> Result<Option<String>, WorldSystemSnapshotError> {
+        let item = item
+            .parse::<ItemId>()
+            .map_err(|_| WorldSystemSnapshotError::InvalidRequest)?;
+        let key = key
+            .parse::<SchemaKey>()
+            .map_err(|_| WorldSystemSnapshotError::InvalidRequest)?;
+        let property = self
+            .world_system_snapshot()?
+            .load_property(item, &key)
+            .map_err(map_world_system_read_error)?;
+        property
+            .map(|property| self.encode_world_system_read(property))
+            .transpose()
+    }
+
+    fn properties_of(&mut self, item: String) -> Result<Vec<String>, WorldSystemSnapshotError> {
+        let item = item
+            .parse::<ItemId>()
+            .map_err(|_| WorldSystemSnapshotError::InvalidRequest)?;
+        let mut total_bytes = 0_usize;
+        self.world_system_snapshot()?
+            .properties_of(item)
+            .map_err(map_world_system_read_error)?
+            .into_iter()
+            .map(|property| {
+                let encoded = self.encode_world_system_read(property)?;
+                total_bytes = total_bytes.saturating_add(encoded.len());
+                if total_bytes > self.max_host_message_bytes {
+                    return Err(WorldSystemSnapshotError::MessageTooLarge);
+                }
+                Ok(encoded)
+            })
+            .collect()
+    }
+}
+
+impl WasmHostState {
+    fn encode_world_system_read<T: serde::Serialize>(
+        &self,
+        value: T,
+    ) -> Result<String, WorldSystemSnapshotError> {
+        let encoded =
+            serde_json::to_string(&value).map_err(|_| WorldSystemSnapshotError::Unavailable)?;
+        if encoded.len() > self.max_host_message_bytes {
+            return Err(WorldSystemSnapshotError::MessageTooLarge);
+        }
+        Ok(encoded)
+    }
+}
+
+fn map_world_system_read_error(error: WorldReadError) -> WorldSystemSnapshotError {
+    match error {
+        WorldReadError::PropertyAccessDenied(_) => WorldSystemSnapshotError::AccessDenied,
+        WorldReadError::SnapshotUnavailable | WorldReadError::Storage(_) => {
+            WorldSystemSnapshotError::Unavailable
+        }
+    }
+}
+
 impl TransportHost for WasmHostState {
     fn declare(&mut self, point: String) -> Result<(), TransportApiError> {
         // A provider target executing for a dependent principal must not
@@ -1631,6 +1750,10 @@ impl WasmRuntimeEngine {
             .component_type()
             .get_export(&self.engine, TRANSPORT_HANDLER_EXPORT_NAME)
             .is_some();
+        let world_system_handler_available = component
+            .component_type()
+            .get_export(&self.engine, WORLD_SYSTEM_EXPORT_NAME)
+            .is_some();
         let mut linker = Linker::new(&self.engine);
 
         Plugin::add_to_linker(&mut linker, |state: &mut WasmHostState| state)?;
@@ -1644,11 +1767,14 @@ impl WasmRuntimeEngine {
             execution_targets: self.execution_targets.clone(),
             task_handler_available,
             transport_handler_available,
+            world_system_handler_available,
+            world_system_active: Arc::new(AtomicBool::new(false)),
             budget: self.budget.clone(),
             active: false,
             runtime: Arc::new(Mutex::new(WasmSharedRuntime {
                 instance: None,
                 failed_lifecycle_callback: None,
+                active: false,
             })),
         })
     }
@@ -1704,9 +1830,26 @@ pub struct WasmComponent {
     execution_targets: ExecutionTargetRegistry,
     task_handler_available: bool,
     transport_handler_available: bool,
+    world_system_handler_available: bool,
+    world_system_active: Arc<AtomicBool>,
     budget: WasmExecutionBudget,
     active: bool,
     runtime: Arc<Mutex<WasmSharedRuntime>>,
+}
+
+/// A live, host-mediated entry point for one active WASM World System.
+///
+/// The endpoint carries no World identity, principal, or mutation capability.
+/// The Host supplies its owner-scoped pinned snapshot for each evaluation.
+#[derive(Clone)]
+pub struct WasmWorldSystemEndpoint {
+    engine: Engine,
+    component: WasmtimeComponent,
+    linker: Arc<Linker<WasmHostState>>,
+    host_services: WasmHostServices,
+    budget: WasmExecutionBudget,
+    active: Arc<AtomicBool>,
+    runtime: Arc<Mutex<WasmSystemRuntime>>,
 }
 
 impl WasmComponent {
@@ -1715,6 +1858,21 @@ impl WasmComponent {
             .component_type()
             .get_export(&self.engine, TARGET_PROVIDER_EXPORT_NAME)
             .is_some()
+    }
+
+    /// Returns this component's authoritative World System entry point when it
+    /// exports the dedicated callback interface.
+    pub fn world_system_endpoint(&self) -> Option<WasmWorldSystemEndpoint> {
+        self.world_system_handler_available
+            .then(|| WasmWorldSystemEndpoint {
+                engine: self.engine.clone(),
+                component: self.component.clone(),
+                linker: self.linker.clone(),
+                host_services: self.host_services.clone(),
+                budget: self.budget.clone(),
+                active: self.world_system_active.clone(),
+                runtime: Arc::new(Mutex::new(WasmSystemRuntime { instance: None })),
+            })
     }
 
     fn ensure_active(&self, operation: &'static str) -> ExtensionResult<()> {
@@ -1811,9 +1969,113 @@ impl WasmComponent {
     }
 }
 
+impl WasmWorldSystemEndpoint {
+    /// Evaluates one Host-validated command against the supplied pinned snapshot.
+    ///
+    /// The guest can read only through the snapshot imports enabled for this
+    /// callback and can return only a deserializable WorldTransaction.
+    pub fn evaluate(
+        &self,
+        snapshot: WorldSnapshot,
+        command: &WorldCommand,
+    ) -> SystemResult<WorldTransaction> {
+        let command_json = serde_json::to_string(&serde_json::json!({
+            "id": command.id().to_string(),
+            "schema": command.schema().to_string(),
+            "payload": command.payload(),
+        }))
+        .map_err(|error| SystemError::Failed(format!("could not encode World command: {error}")))?;
+        if command_json.len() > self.budget.max_host_message_bytes {
+            return Err(SystemError::Failed(String::from(
+                "World command exceeds WASM message limit",
+            )));
+        }
+
+        if !self.active.load(Ordering::Acquire) {
+            return Err(SystemError::Failed(String::from(
+                "WASM World System is not active",
+            )));
+        }
+        let mut runtime = self.runtime.try_lock().map_err(|_| {
+            SystemError::Failed(String::from("WASM World System is busy or unavailable"))
+        })?;
+        if runtime.instance.is_none() {
+            let host_state = WasmHostState::with_host_services_and_budget(
+                ComponentId::new("world-system"),
+                self.host_services.clone(),
+                false,
+                &self.budget,
+            );
+            let mut store = Store::new(&self.engine, host_state);
+            store.limiter(|state| &mut state.resource_limits);
+            WasmComponent::set_callback_fuel(&mut store, &self.budget, "World System instantiate")
+                .map_err(|error| SystemError::Failed(error.to_string()))?;
+            let instance = self
+                .linker
+                .instantiate(&mut store, &self.component)
+                .map_err(|error| {
+                    SystemError::Failed(format!("WASM World System instantiate failed: {error}"))
+                })?;
+            let handler = WorldSystemPlugin::new(&mut store, &instance).map_err(|error| {
+                SystemError::Failed(format!("WASM World System export is unavailable: {error}"))
+            })?;
+            runtime.instance = Some(WasmSystemInstance { store, handler });
+        }
+        let instance = runtime.instance.as_mut().ok_or_else(|| {
+            SystemError::Failed(String::from("WASM World System instance is unavailable"))
+        })?;
+        WasmComponent::set_callback_fuel(&mut instance.store, &self.budget, "World System")
+            .map_err(|error| SystemError::Failed(error.to_string()))?;
+        instance
+            .store
+            .data_mut()
+            .begin_world_system_execution(snapshot)
+            .map_err(|error| SystemError::Failed(error.to_string()))?;
+
+        let response = instance
+            .handler
+            .rintawa_engine_world_system()
+            .call_evaluate(&mut instance.store, &command_json)
+            .map_err(|error| SystemError::Failed(format!("WASM World System failed: {error}")));
+        instance.store.data_mut().finish_world_system_execution();
+
+        let response = match response {
+            Ok(Ok(transaction_json)) => transaction_json,
+            Ok(Err(WorldSystemGuestError::Rejected(reason))) => {
+                return Err(SystemError::Rejected(reason));
+            }
+            Ok(Err(WorldSystemGuestError::Failed(reason))) => {
+                return Err(SystemError::Failed(reason));
+            }
+            Err(error) => {
+                runtime.instance = None;
+                return Err(error);
+            }
+        };
+        if response.len() > self.budget.max_host_message_bytes {
+            return Err(SystemError::Failed(String::from(
+                "WASM World System transaction exceeds message limit",
+            )));
+        }
+        serde_json::from_str(&response).map_err(|error| {
+            SystemError::Failed(format!("invalid WASM World transaction: {error}"))
+        })
+    }
+}
+
 struct WasmSharedRuntime {
     instance: Option<WasmInstance>,
     failed_lifecycle_callback: Option<&'static str>,
+    active: bool,
+}
+
+struct WasmSystemRuntime {
+    instance: Option<WasmSystemInstance>,
+}
+
+struct WasmSystemInstance {
+    store: Store<WasmHostState>,
+    handler: WorldSystemPlugin,
 }
 
 /// A live guest instance and its host state for one component lifecycle.
@@ -2008,6 +2270,10 @@ impl WasmComponent {
 }
 
 impl Component for WasmComponent {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn id(&self) -> &ComponentId {
         &self.id
     }
@@ -2134,6 +2400,8 @@ impl Component for WasmComponent {
 
         if pending_targets.is_empty() {
             self.active = true;
+            self.world_system_active.store(true, Ordering::Release);
+            self.runtime()?.active = true;
             return Ok(());
         }
 
@@ -2158,11 +2426,14 @@ impl Component for WasmComponent {
             }
         }
         self.active = true;
+        self.world_system_active.store(true, Ordering::Release);
+        self.runtime()?.active = true;
         Ok(())
     }
 
     fn stop(&mut self, _ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
         self.active = false;
+        self.world_system_active.store(false, Ordering::Release);
         let budget = self.budget.clone();
         let (mut runtime, lock_failure) = match self.runtime.try_lock() {
             Ok(runtime) => (runtime, None),
@@ -2178,6 +2449,7 @@ impl Component for WasmComponent {
                 ))),
             ),
         };
+        runtime.active = false;
         let stop_result = if let Some(instance) = runtime.instance.as_mut() {
             let result = if let Some(error) = lock_failure {
                 Err(error)

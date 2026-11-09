@@ -105,6 +105,35 @@ interface world-registration {
     ) -> result<_, error>;
 }
 
+/// Read-only calls available only while the Host is evaluating one World System.
+/// Every call is served from that command's already-pinned, owner-scoped snapshot.
+interface world-system-snapshot {
+    variant error {
+        access-not-active,
+        invalid-request,
+        access-denied,
+        unavailable,
+        message-too-large,
+    }
+
+    load-item: func(id: string) -> result<option<string>, error>;
+    load-property: func(item: string, key: string) -> result<option<string>, error>;
+    properties-of: func(item: string) -> result<list<string>, error>;
+}
+
+/// One authoritative World System implementation supplied by a WASM component.
+interface world-system {
+    variant error {
+        rejected(string),
+        failed(string),
+    }
+
+    /// Evaluates the Host-validated command JSON and returns JSON for one bounded
+    /// WorldTransaction. World identity, principal and property owner are never
+    /// supplied by the guest.
+    evaluate: func(command-json: string) -> result<string, error>;
+}
+
 /// Reversible effects available from guest `start` and `on-event`.
 interface runtime-effects {
     /// A guest-local handle for one host-owned runtime effect.
@@ -845,6 +874,7 @@ world plugin {
     import runtime-context;
     import registration;
     import world-registration;
+    import world-system-snapshot;
     import runtime-effects;
     import runtime-tasks;
     import network;
@@ -863,6 +893,12 @@ world plugin {
     import secrets;
     import transport;
     export guest;
+}
+
+/// Optional typed view for authoritative World System callbacks on a plugin.
+world world-system-plugin {
+    include plugin;
+    export world-system;
 }
 
 /// Authoring world for components providing transport responses.

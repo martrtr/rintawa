@@ -27,3 +27,5 @@ uuid = { workspace = true, features = ["v7"] }
 
 rintawa-artifacts = { path = "../artifacts" }
 rintawa-sdk = { path = "../sdk" }
+rintawa-world = { path = "../world" }
+rintawa-world-runtime = { path = "../world-runtime" }

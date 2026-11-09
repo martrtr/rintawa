@@ -48,7 +48,7 @@ pub use host_access::{
     WorldSessionAccess, WorldSessionAssetRef, WorldSessionSummary,
 };
 pub use loader::ExtensionLoader;
-pub use runtime::{WasmComponent, WasmExecutionBudget, WasmRuntimeEngine};
+pub use runtime::{WasmComponent, WasmExecutionBudget, WasmRuntimeEngine, WasmWorldSystemEndpoint};
 
 /// Validates an exact Host-approved loopback HTTP origin and returns its canonical spelling.
 ///
@@ -136,6 +136,10 @@ mod tests {
     }
 
     impl Component for LifecycleFailureRuntime {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn id(&self) -> &ComponentId {
             &self.id
         }
@@ -178,6 +182,10 @@ mod tests {
     }
 
     impl Component for SubscriptionRuntime {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn id(&self) -> &ComponentId {
             &self.id
         }
@@ -196,6 +204,10 @@ mod tests {
     }
 
     impl Component for SecretReaderRuntime {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn id(&self) -> &ComponentId {
             &self.id
         }
@@ -221,6 +233,10 @@ mod tests {
     }
 
     impl Component for DummyRuntime {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn id(&self) -> &ComponentId {
             &self.id
         }

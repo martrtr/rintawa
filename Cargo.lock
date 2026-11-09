@@ -3292,6 +3292,8 @@ dependencies = [
  "reqwest",
  "rintawa-artifacts",
  "rintawa-sdk",
+ "rintawa-world",
+ "rintawa-world-runtime",
  "serde",
  "serde_json",
  "tempfile",

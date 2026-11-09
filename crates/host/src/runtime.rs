@@ -15,7 +15,8 @@ use rintawa_extension_engine::{
     ImportedArtifact, ImportedAsset, PreferenceAccess, RtwExtensionLoadOutcome, RtwExtensionLoader,
     RuntimeArtifactPolicy, RuntimeContextAccess, RuntimeHttpOriginGrant, RuntimePolicyAccess,
     RuntimePolicyComponent, RuntimePolicyRequest, UnresolvedContractReason, UserResourceAccess,
-    UserResourceRef, WorldSessionAccess, WorldSessionAssetRef, WorldSessionSummary,
+    UserResourceRef, WasmWorldSystemEndpoint, WorldSessionAccess, WorldSessionAssetRef,
+    WorldSessionSummary,
 };
 use rintawa_sdk::{
     contracts::{
@@ -27,7 +28,10 @@ use rintawa_sdk::{
     world::{PrincipalId, SchemaKey, WorldId},
 };
 use rintawa_world::{PropertyDefinition, RuntimeSchemaDefinition, SchemaKind, WorldCommand};
-use rintawa_world_runtime::{WorldCommandOutcome, WorldRuntime, WorldRuntimeBuilder};
+use rintawa_world_runtime::{
+    SystemResult, WorldCommandOutcome, WorldRuntime, WorldRuntimeBuilder, WorldSnapshot,
+    WorldSystem,
+};
 
 use uuid::Uuid;
 
@@ -874,6 +878,30 @@ struct ActiveWorldRuntimeParts {
     runtime: WorldRuntime,
 }
 
+/// Host-bound adapter from an active WASM component to one authoritative command schema.
+///
+/// The extension cannot choose this schema, owner, World or principal. The runtime
+/// validates the command before this adapter runs and validates its transaction
+/// again before committing.
+struct WasmWorldSystem {
+    command_schema: SchemaKey,
+    endpoint: WasmWorldSystemEndpoint,
+}
+
+impl WorldSystem for WasmWorldSystem {
+    fn command_schema(&self) -> &SchemaKey {
+        &self.command_schema
+    }
+
+    fn evaluate(
+        &self,
+        snapshot: &WorldSnapshot,
+        command: &WorldCommand,
+    ) -> SystemResult<rintawa_world::WorldTransaction> {
+        self.endpoint.evaluate(snapshot.clone(), command)
+    }
+}
+
 struct ActiveWorld {
     runtime: WorldRuntime,
     registered_instances: Vec<ExtensionInstanceId>,
@@ -1213,9 +1241,8 @@ impl HostRuntime {
 /// Builds the single-writer command runtime for one world from installed artifacts.
 ///
 /// Property definitions come from the exact installed world artifacts and are
-/// persisted in the world vocabulary. Command, event and effect schemas are
-/// transient runtime API descriptions. Extension-provided command execution is
-/// intentionally unavailable until the mediated Zenoh boundary is proven.
+/// persisted in the world vocabulary. Command schemas are transient runtime API
+/// descriptions and each is bound to exactly one active WASM System callback.
 ///
 /// # Errors
 ///
@@ -1250,6 +1277,16 @@ fn prepare_world_runtime(
             schema.owner.clone(),
             schema.definition.clone(),
         ))?;
+    }
+    for schema in schemas
+        .iter()
+        .filter(|schema| schema.kind == SchemaKind::Command)
+    {
+        let endpoint = host.engine.world_system_endpoint(&schema.declarer)?;
+        builder.register_system(WasmWorldSystem {
+            command_schema: schema.key.clone(),
+            endpoint,
+        })?;
     }
     let runtime = builder.start()?;
     runtime.register_property_definitions(&property_definitions)?;
@@ -1741,9 +1778,9 @@ mod tests {
     };
     use rintawa_world::{
         PropertyDefinition, RuntimeSchemaDefinition, SchemaKind, StateChange, WorldCommand,
-        WorldTransaction,
+        WorldError, WorldTransaction,
     };
-    use rintawa_world_runtime::{WorldRuntimeBuilder, WorldSystem};
+    use rintawa_world_runtime::{WorldRuntimeBuilder, WorldRuntimeError, WorldSystem};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -1793,6 +1830,10 @@ mod tests {
     }
 
     impl Component for ContractComponent {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn id(&self) -> &ComponentId {
             &self.id
         }
@@ -1873,6 +1914,10 @@ mod tests {
     }
 
     impl Component for WorldSchemaComponent {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn id(&self) -> &ComponentId {
             &self.id
         }
@@ -1894,8 +1939,6 @@ mod tests {
         let owner = ExtensionId::new("rintawa.schema-owner");
         let instance = ExtensionInstanceId::new("schema-owner-instance");
         let property: SchemaKey = "rintawa.test.mood@1".parse()?;
-        let command: SchemaKey = "rintawa.test.command@1".parse()?;
-        let event: SchemaKey = "rintawa.test.event@1".parse()?;
         let mut engine = ExtensionEngine::new();
 
         engine.register_extension_instance(
@@ -1904,23 +1947,11 @@ mod tests {
             test_manifest(owner.as_str()),
             vec![Box::new(WorldSchemaComponent {
                 id: ComponentId::new("schemas"),
-                schemas: vec![
-                    WorldSchemaContribution::new(
-                        property.clone(),
-                        SchemaKind::Property,
-                        r#"{"type":"object"}"#,
-                    ),
-                    WorldSchemaContribution::new(
-                        command.clone(),
-                        SchemaKind::Command,
-                        r#"{"type":"object"}"#,
-                    ),
-                    WorldSchemaContribution::new(
-                        event.clone(),
-                        SchemaKind::Command,
-                        r#"{"type":"object"}"#,
-                    ),
-                ],
+                schemas: vec![WorldSchemaContribution::new(
+                    property.clone(),
+                    SchemaKind::Property,
+                    r#"{"type":"object"}"#,
+                )],
             })],
         )?;
 
@@ -1946,8 +1977,6 @@ mod tests {
             &serde_json::json!({ "type": "object" })
         );
         assert_eq!(session.properties().len(), 1);
-        assert_eq!(session.properties().get(&command), None);
-        assert_eq!(session.properties().get(&event), None);
 
         // Exact re-registration is idempotent across world restarts.
         let repeated = PropertyDefinition::new(
@@ -1964,6 +1993,130 @@ mod tests {
             1
         );
 
+        parts.runtime.shutdown()?;
+        host.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_execute_wasm_world_system_commit_rollback_and_owner_denial() -> anyhow::Result<()>
+    {
+        const WORLD_SYSTEM_FIXTURE: &[u8] =
+            include_bytes!("../../extension-engine/tests/fixtures/world-system/component.wasm");
+
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let world_id = home.create_world()?.id;
+        let scope = world_runtime_scope_id(world_id);
+        let item = ItemId::new();
+        let mut seed = WorldTransaction::new();
+        seed.push_change(StateChange::CreateObject { id: item });
+        home.open_world_storage(world_id)?.apply(&seed)?;
+
+        let owner_instance = ExtensionInstanceId::new("wasm-world-system");
+        let foreign_instance = ExtensionInstanceId::new("foreign-property-owner");
+        let mut engine = ExtensionEngine::new();
+        let wasm_component = engine
+            .wasm_runtime_engine()?
+            .load_component_from_bytes(ComponentId::new("wasm-system"), WORLD_SYSTEM_FIXTURE)?;
+        engine.register_extension_instance(
+            owner_instance.clone(),
+            scope.clone(),
+            test_manifest("fixture.world-system"),
+            vec![Box::new(wasm_component)],
+        )?;
+        engine.register_extension_instance(
+            foreign_instance.clone(),
+            scope,
+            test_manifest("fixture.foreign-owner"),
+            vec![Box::new(WorldSchemaComponent {
+                id: ComponentId::new("foreign-schemas"),
+                schemas: vec![WorldSchemaContribution::new(
+                    "fixture.foreign-property@1".parse()?,
+                    SchemaKind::Property,
+                    r#"{"type":"integer"}"#,
+                )],
+            })],
+        )?;
+        engine.start_extension_instance(&owner_instance)?;
+        engine.start_extension_instance(&foreign_instance)?;
+
+        let mut host = HostRuntime {
+            active_worlds: BTreeMap::new(),
+            engine,
+            started_instances: Vec::new(),
+            host_shell_provider: None,
+            host_access: None,
+        };
+        let parts = prepare_world_runtime(
+            &mut host,
+            &home,
+            world_id,
+            &[owner_instance.clone(), foreign_instance],
+        )?;
+        let commit: SchemaKey = "fixture.commit@1".parse()?;
+        let reject: SchemaKey = "fixture.reject@1".parse()?;
+        let foreign: SchemaKey = "fixture.foreign@1".parse()?;
+        let payload = serde_json::json!({ "item": item.to_string() });
+        parts
+            .runtime
+            .submit(WorldCommand::new(
+                commit,
+                PrincipalId::new(),
+                payload.clone(),
+            ))?
+            .wait()?;
+        assert_eq!(
+            parts
+                .runtime
+                .snapshot()?
+                .load_property(item, &"fixture.value@1".parse()?)?
+                .expect("WASM transaction must commit")
+                .data(),
+            &serde_json::json!(7)
+        );
+        assert!(
+            parts
+                .runtime
+                .submit(WorldCommand::new(
+                    reject,
+                    PrincipalId::new(),
+                    payload.clone()
+                ))?
+                .wait()
+                .is_err()
+        );
+        let foreign_error = parts
+            .runtime
+            .submit(WorldCommand::new(foreign, PrincipalId::new(), payload))?
+            .wait()
+            .expect_err("foreign property write must be denied");
+        assert!(matches!(
+            foreign_error,
+            WorldRuntimeError::InvalidTransaction {
+                source: WorldError::PropertyAccessDenied { .. },
+                ..
+            }
+        ));
+        assert!(
+            parts
+                .runtime
+                .snapshot()?
+                .load_property(item, &"fixture.foreign-property@1".parse()?)?
+                .is_none()
+        );
+        host.engine.stop_extension_instance(&owner_instance)?;
+        assert!(
+            parts
+                .runtime
+                .submit(WorldCommand::new(
+                    "fixture.commit@1".parse()?,
+                    PrincipalId::new(),
+                    serde_json::json!({ "item": item.to_string() }),
+                ))?
+                .wait()
+                .is_err()
+        );
         parts.runtime.shutdown()?;
         host.shutdown()?;
         Ok(())
@@ -2709,6 +2862,10 @@ mod tests {
     }
 
     impl Component for FailingStopComponent {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn id(&self) -> &ComponentId {
             &self.id
         }

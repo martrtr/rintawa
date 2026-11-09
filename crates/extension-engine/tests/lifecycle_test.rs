@@ -17,6 +17,10 @@ impl MockChatComponent {
 }
 
 impl Component for MockChatComponent {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn id(&self) -> &ComponentId {
         &self.id
     }

@@ -41,7 +41,7 @@ use crate::{
         PreferenceAccess, RuntimeContextAccess, RuntimePolicyAccess, UserResourceAccess,
         WorldSessionAccess,
     },
-    runtime::WasmRuntimeEngine,
+    runtime::{WasmRuntimeEngine, WasmWorldSystemEndpoint},
     runtime_effects::RuntimeEffectRegistry,
     runtime_permissions::RuntimePermissionManager,
     secrets::SecretManager,
@@ -311,6 +311,50 @@ impl ExtensionEngine {
     /// Returns the active component that owns a registered execution target.
     pub fn execution_target_owner(&self, target: &str) -> Option<ComponentRef> {
         self.execution_targets.owner(target)
+    }
+
+    /// Returns the active WASM callback endpoint for one exact component principal.
+    ///
+    /// World command ownership is still bound by the Host from registered schema
+    /// metadata; callers cannot select a component by guest-provided identity.
+    pub fn world_system_endpoint(
+        &self,
+        owner: &ComponentRef,
+    ) -> EngineResult<WasmWorldSystemEndpoint> {
+        let extension = self
+            .extensions
+            .get(&owner.instance_id)
+            .ok_or_else(|| EngineError::ExtensionInstanceNotFound(owner.instance_id.to_string()))?;
+        if extension.state != ExtensionState::Active {
+            return Err(EngineError::WorldSystemUnavailable {
+                instance_id: owner.instance_id.to_string(),
+                component_id: owner.component_id.to_string(),
+            });
+        }
+        let component = extension
+            .components
+            .iter()
+            .find(|component| component.id() == &owner.component_id)
+            .ok_or_else(|| EngineError::WorldSystemUnavailable {
+                instance_id: owner.instance_id.to_string(),
+                component_id: owner.component_id.to_string(),
+            })?;
+        let component =
+            component
+                .handle
+                .lock()
+                .map_err(|_| EngineError::WorldSystemUnavailable {
+                    instance_id: owner.instance_id.to_string(),
+                    component_id: owner.component_id.to_string(),
+                })?;
+        component
+            .as_any()
+            .downcast_ref::<crate::runtime::WasmComponent>()
+            .and_then(crate::runtime::WasmComponent::world_system_endpoint)
+            .ok_or_else(|| EngineError::WorldSystemUnavailable {
+                instance_id: owner.instance_id.to_string(),
+                component_id: owner.component_id.to_string(),
+            })
     }
 
     pub(crate) fn resolve_component_host(

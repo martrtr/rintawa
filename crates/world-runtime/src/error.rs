@@ -6,6 +6,9 @@ use thiserror::Error;
 /// Read-side errors visible to a world System.
 #[derive(Debug, Error)]
 pub enum WorldReadError {
+    /// The pinned snapshot became unavailable after an internal failure.
+    #[error("world snapshot is unavailable")]
+    SnapshotUnavailable,
     /// The calling System does not own this active property definition.
     #[error("System cannot read property {0}: no active owner binding")]
     PropertyAccessDenied(SchemaKey),

@@ -1,6 +1,9 @@
 //! Read-only authoritative snapshots for Host and owner-scoped command Systems.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use rintawa_sdk::{
     types::ExtensionId,
@@ -48,15 +51,16 @@ impl WorldReadBatch {
 /// The single-writer runtime guarantees that no other writer is active while a
 /// System evaluates, so the snapshot cannot drift between the reads a System
 /// performs and the commit of its output.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WorldSnapshot {
-    storage: SqliteWorldSnapshot,
+    storage: Arc<Mutex<SqliteWorldSnapshot>>,
+    world_id: WorldId,
     // None is reserved for trusted native Host reads; System reads always carry
     // an owner from the registered command schema, never the submitted Principal.
     access: Option<SystemPropertyAccess>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SystemPropertyAccess {
     owner: ExtensionId,
     // Immutable per-command view; a later Host registration cannot change the
@@ -65,9 +69,11 @@ struct SystemPropertyAccess {
 }
 
 impl WorldSnapshot {
-    pub(crate) const fn new(storage: SqliteWorldSnapshot) -> Self {
+    pub(crate) fn new(storage: SqliteWorldSnapshot) -> Self {
+        let world_id = storage.world_id();
         Self {
-            storage,
+            storage: Arc::new(Mutex::new(storage)),
+            world_id,
             access: None,
         }
     }
@@ -77,8 +83,10 @@ impl WorldSnapshot {
         owner: ExtensionId,
         active_owners: Arc<BTreeMap<SchemaKey, ExtensionId>>,
     ) -> Self {
+        let world_id = storage.world_id();
         Self {
-            storage,
+            storage: Arc::new(Mutex::new(storage)),
+            world_id,
             access: Some(SystemPropertyAccess {
                 owner,
                 active_owners,
@@ -94,7 +102,7 @@ impl WorldSnapshot {
 
     /// Returns the authoritative world identity.
     pub const fn world_id(&self) -> WorldId {
-        self.storage.world_id()
+        self.world_id
     }
 
     /// Loads one item from the pinned snapshot.
@@ -103,7 +111,7 @@ impl WorldSnapshot {
     ///
     /// Returns a read error when persistent state cannot be decoded.
     pub fn load_item(&self, id: ItemId) -> WorldReadResult<Option<ItemRecord>> {
-        Ok(self.storage.load_item(id)?)
+        Ok(self.storage()?.load_item(id)?)
     }
 
     /// Loads one property value from the pinned snapshot.
@@ -125,7 +133,7 @@ impl WorldSnapshot {
         if !self.permits_property(key) {
             return Err(WorldReadError::PropertyAccessDenied(key.clone()));
         }
-        Ok(self.storage.load_property(item, key)?)
+        Ok(self.storage()?.load_property(item, key)?)
     }
 
     /// Loads a bounded batch of items and selected exact property definitions.
@@ -148,7 +156,7 @@ impl WorldSnapshot {
                 return Err(WorldReadError::PropertyAccessDenied(key.clone()));
             }
         }
-        let (items, properties) = self.storage.read(items, properties)?;
+        let (items, properties) = self.storage()?.read(items, properties)?;
         Ok(WorldReadBatch::new(items, properties))
     }
 
@@ -161,7 +169,7 @@ impl WorldSnapshot {
     ///
     /// Returns a read error when persistent state cannot be decoded.
     pub fn properties_of(&self, item: ItemId) -> WorldReadResult<Vec<PropertyRecord>> {
-        let mut properties = self.storage.properties_of(item)?;
+        let mut properties = self.storage()?.properties_of(item)?;
         properties.retain(|property| self.permits_property(property.key()));
         Ok(properties)
     }
@@ -184,7 +192,7 @@ impl WorldSnapshot {
         if !self.permits_property(key) {
             return Err(WorldReadError::PropertyAccessDenied(key.clone()));
         }
-        Ok(self.storage.find_properties(key, after, limit)?)
+        Ok(self.storage()?.find_properties(key, after, limit)?)
     }
 
     /// Finds a bounded keyset page for one exact property definition.
@@ -218,7 +226,9 @@ impl WorldSnapshot {
         after: Option<ItemId>,
         limit: usize,
     ) -> WorldReadResult<Vec<ItemRecord>> {
-        Ok(self.storage.relations_touching_any(targets, after, limit)?)
+        Ok(self
+            .storage()?
+            .relations_touching_any(targets, after, limit)?)
     }
 
     /// Finds a bounded directional relation page adjacent to the supplied targets.
@@ -244,7 +254,7 @@ impl WorldSnapshot {
             return Err(WorldReadError::PropertyAccessDenied(property.clone()));
         }
         Ok(self
-            .storage
+            .storage()?
             .find_relations(targets, direction, property, after, limit)?)
     }
 
@@ -255,7 +265,7 @@ impl WorldSnapshot {
         &self,
         item: ItemId,
     ) -> WorldReadResult<Option<SchemaKey>> {
-        for key in self.storage.property_keys_deleted_with_item(item)? {
+        for key in self.storage()?.property_keys_deleted_with_item(item)? {
             if !self.permits_property(&key) {
                 return Ok(Some(key));
             }
@@ -269,6 +279,12 @@ impl WorldSnapshot {
     ///
     /// Returns a read error when persistent state cannot be decoded.
     pub fn relations_pointing_at(&self, item: ItemId) -> WorldReadResult<Vec<ItemRecord>> {
-        Ok(self.storage.relations_pointing_at(item)?)
+        Ok(self.storage()?.relations_pointing_at(item)?)
+    }
+
+    fn storage(&self) -> WorldReadResult<std::sync::MutexGuard<'_, SqliteWorldSnapshot>> {
+        self.storage
+            .lock()
+            .map_err(|_| WorldReadError::SnapshotUnavailable)
     }
 }

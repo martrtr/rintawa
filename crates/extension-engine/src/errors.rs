@@ -90,6 +90,17 @@ pub enum EngineError {
         component_id: String,
     },
 
+    /// A declared World command has no active WASM System callback.
+    #[error(
+        "component `{component_id}` in extension instance `{instance_id}` cannot execute a World System"
+    )]
+    WorldSystemUnavailable {
+        /// Runtime instance containing the declared component.
+        instance_id: String,
+        /// Component that declared the command schema.
+        component_id: String,
+    },
+
     /// One or more registered extension instances still depend on this runtime provider.
     #[error(
         "extension instance `{provider_instance_id}` cannot stop while execution-target dependents remain registered: {dependents:?}"
