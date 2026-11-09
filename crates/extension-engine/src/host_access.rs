@@ -6,6 +6,12 @@
 
 use std::sync::Arc;
 
+use rintawa_sdk::{
+    types::{ExtensionId, RuntimeScopeId},
+    world::{ItemId, SchemaKey},
+};
+use rintawa_world_runtime::WorldCommandTicket;
+
 /// One immutable raw asset imported into the local asset store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportedAsset {
@@ -118,6 +124,48 @@ pub trait RuntimeContextAccess: Send + Sync {
         &self,
         scope_id: &rintawa_sdk::types::RuntimeScopeId,
     ) -> HostAccessResult<Option<rintawa_sdk::world::WorldId>>;
+}
+
+/// Host-mediated access to one active authoritative World runtime.
+///
+/// Callers supply only their Host-attested extension identity and runtime scope;
+/// World identity and command principal are assigned by the Host implementation.
+pub trait WorldDataAccess: Send + Sync {
+    /// Loads one item from the current World snapshot.
+    fn load_item(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ExtensionId,
+        item: ItemId,
+    ) -> HostAccessResult<Option<String>>;
+
+    /// Loads one owner-authorized property from the current World snapshot.
+    fn load_property(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ExtensionId,
+        item: ItemId,
+        key: &SchemaKey,
+    ) -> HostAccessResult<Option<String>>;
+
+    /// Finds one bounded owner-authorized property page from a current snapshot.
+    fn find_properties(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ExtensionId,
+        key: &SchemaKey,
+        after: Option<ItemId>,
+        limit: usize,
+    ) -> HostAccessResult<Vec<String>>;
+
+    /// Enqueues an exact schema command without waiting for the commit.
+    fn submit(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ExtensionId,
+        schema: SchemaKey,
+        payload: serde_json::Value,
+    ) -> HostAccessResult<WorldCommandTicket>;
 }
 
 /// Generic immutable RTW artifact-store operations.
@@ -600,6 +648,49 @@ impl RuntimeContextAccess for UnavailableRuntimeContextAccess {
 }
 
 #[derive(Default)]
+struct UnavailableWorldDataAccess;
+
+impl WorldDataAccess for UnavailableWorldDataAccess {
+    fn load_item(
+        &self,
+        _: &RuntimeScopeId,
+        _: &ExtensionId,
+        _: ItemId,
+    ) -> HostAccessResult<Option<String>> {
+        Err(HostAccessError::Unavailable)
+    }
+    fn load_property(
+        &self,
+        _: &RuntimeScopeId,
+        _: &ExtensionId,
+        _: ItemId,
+        _: &SchemaKey,
+    ) -> HostAccessResult<Option<String>> {
+        Err(HostAccessError::Unavailable)
+    }
+
+    fn find_properties(
+        &self,
+        _: &RuntimeScopeId,
+        _: &ExtensionId,
+        _: &SchemaKey,
+        _: Option<ItemId>,
+        _: usize,
+    ) -> HostAccessResult<Vec<String>> {
+        Err(HostAccessError::Unavailable)
+    }
+    fn submit(
+        &self,
+        _: &RuntimeScopeId,
+        _: &ExtensionId,
+        _: SchemaKey,
+        _: serde_json::Value,
+    ) -> HostAccessResult<WorldCommandTicket> {
+        Err(HostAccessError::Unavailable)
+    }
+}
+
+#[derive(Default)]
 struct UnavailableCompositionAccess;
 
 impl CompositionAccess for UnavailableCompositionAccess {
@@ -631,6 +722,7 @@ impl CompositionAccess for UnavailableCompositionAccess {
 #[derive(Clone)]
 pub(crate) struct HostAccessServices {
     pub(crate) runtime_context: Arc<dyn RuntimeContextAccess>,
+    pub(crate) world_data: Arc<dyn WorldDataAccess>,
     pub(crate) artifact_store: Arc<dyn ArtifactStoreAccess>,
     pub(crate) asset_store: Arc<dyn AssetStoreAccess>,
     pub(crate) user_resources: Arc<dyn UserResourceAccess>,
@@ -651,6 +743,7 @@ impl HostAccessServices {
     ) -> Self {
         Self {
             runtime_context: Arc::new(UnavailableRuntimeContextAccess),
+            world_data: Arc::new(UnavailableWorldDataAccess),
             artifact_store,
             asset_store,
             user_resources: Arc::new(UnavailableUserResourceAccess),
@@ -669,6 +762,11 @@ impl HostAccessServices {
         self
     }
 
+    pub(crate) fn with_world_data_access(mut self, world_data: Arc<dyn WorldDataAccess>) -> Self {
+        self.world_data = world_data;
+        self
+    }
+
     pub(crate) fn with_user_resource_access(
         mut self,
         user_resources: Arc<dyn UserResourceAccess>,
@@ -679,6 +777,7 @@ impl HostAccessServices {
     pub(crate) fn unavailable() -> Self {
         Self {
             runtime_context: Arc::new(UnavailableRuntimeContextAccess),
+            world_data: Arc::new(UnavailableWorldDataAccess),
             artifact_store: Arc::new(UnavailableArtifactStoreAccess),
             asset_store: Arc::new(UnavailableAssetStoreAccess),
             user_resources: Arc::new(UnavailableUserResourceAccess),

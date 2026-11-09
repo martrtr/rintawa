@@ -45,7 +45,7 @@ pub use host_access::{
     HostAccessError, HostAccessResult, ImportedArtifact, ImportedAsset, PreferenceAccess,
     RuntimeArtifactPolicy, RuntimeContextAccess, RuntimeHttpOriginGrant, RuntimePolicyAccess,
     RuntimePolicyComponent, RuntimePolicyRequest, UserResourceAccess, UserResourceRef,
-    WorldSessionAccess, WorldSessionAssetRef, WorldSessionSummary,
+    WorldDataAccess, WorldSessionAccess, WorldSessionAssetRef, WorldSessionSummary,
 };
 pub use loader::ExtensionLoader;
 pub use runtime::{WasmComponent, WasmExecutionBudget, WasmRuntimeEngine, WasmWorldSystemEndpoint};

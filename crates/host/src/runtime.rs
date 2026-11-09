@@ -15,8 +15,8 @@ use rintawa_extension_engine::{
     ImportedArtifact, ImportedAsset, PreferenceAccess, RtwExtensionLoadOutcome, RtwExtensionLoader,
     RuntimeArtifactPolicy, RuntimeContextAccess, RuntimeHttpOriginGrant, RuntimePolicyAccess,
     RuntimePolicyComponent, RuntimePolicyRequest, UnresolvedContractReason, UserResourceAccess,
-    UserResourceRef, WasmWorldSystemEndpoint, WorldSessionAccess, WorldSessionAssetRef,
-    WorldSessionSummary,
+    UserResourceRef, WasmWorldSystemEndpoint, WorldDataAccess, WorldSessionAccess,
+    WorldSessionAssetRef, WorldSessionSummary,
 };
 use rintawa_sdk::{
     contracts::{
@@ -29,8 +29,8 @@ use rintawa_sdk::{
 };
 use rintawa_world::{PropertyDefinition, RuntimeSchemaDefinition, SchemaKind, WorldCommand};
 use rintawa_world_runtime::{
-    SystemResult, WorldCommandOutcome, WorldRuntime, WorldRuntimeBuilder, WorldSnapshot,
-    WorldSystem,
+    SystemResult, WorldCommandOutcome, WorldRuntime, WorldRuntimeBuilder, WorldRuntimeClient,
+    WorldSnapshot, WorldSystem,
 };
 
 use uuid::Uuid;
@@ -62,6 +62,46 @@ struct WorldSessionRuntimeState {
     active: HashSet<WorldId>,
     pending: BTreeMap<WorldId, bool>,
     last_errors: BTreeMap<WorldId, String>,
+}
+
+#[derive(Default)]
+struct WorldDataRuntimeState {
+    clients: BTreeMap<WorldId, WorldRuntimeClient>,
+}
+
+#[derive(Clone, Default)]
+struct WorldDataRuntimeControl {
+    state: Arc<Mutex<WorldDataRuntimeState>>,
+}
+
+impl WorldDataRuntimeControl {
+    fn activate(&self, world_id: WorldId, client: WorldRuntimeClient) -> HostResult<()> {
+        self.state
+            .lock()
+            .map_err(|_| HostError::WorldSessionControlUnavailable)?
+            .clients
+            .insert(world_id, client);
+        Ok(())
+    }
+
+    fn deactivate(&self, world_id: WorldId) {
+        if let Ok(mut state) = self.state.lock() {
+            state.clients.remove(&world_id);
+        }
+    }
+
+    fn client(&self, scope: &RuntimeScopeId) -> HostAccessResult<WorldRuntimeClient> {
+        let Some(world_id) = canonical_scope_world_id(scope) else {
+            return Err(HostAccessError::Unavailable);
+        };
+        self.state
+            .lock()
+            .map_err(|_| HostAccessError::Unavailable)?
+            .clients
+            .get(&world_id)
+            .cloned()
+            .ok_or(HostAccessError::Unavailable)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -303,6 +343,102 @@ impl RuntimeContextAccess for LocalHostAccess {
             return Ok(None);
         }
         Ok(Some(world_id))
+    }
+}
+
+fn canonical_scope_world_id(scope_id: &RuntimeScopeId) -> Option<WorldId> {
+    let value = scope_id.as_str().strip_prefix(crate::WORLD_SCOPE_PREFIX)?;
+    let world_id = value.parse::<WorldId>().ok()?;
+    (world_runtime_scope_id(world_id) == *scope_id).then_some(world_id)
+}
+
+impl WorldDataAccess for WorldDataRuntimeControl {
+    fn load_item(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ExtensionId,
+        item: rintawa_sdk::world::ItemId,
+    ) -> HostAccessResult<Option<String>> {
+        let value = self
+            .client(scope)?
+            .snapshot_for_extension(owner.clone())
+            .map_err(|_| HostAccessError::Unavailable)?
+            .load_item(item)
+            .map_err(|_| HostAccessError::Unavailable)?;
+        value
+            .map(|item| serde_json::to_string(&item).map_err(|_| HostAccessError::Unavailable))
+            .transpose()
+    }
+
+    fn load_property(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ExtensionId,
+        item: rintawa_sdk::world::ItemId,
+        key: &SchemaKey,
+    ) -> HostAccessResult<Option<String>> {
+        let value = self
+            .client(scope)?
+            .snapshot_for_extension(owner.clone())
+            .map_err(|_| HostAccessError::Unavailable)?
+            .load_property(item, key)
+            .map_err(|error| match error {
+                rintawa_world_runtime::WorldReadError::PropertyAccessDenied(_) => {
+                    HostAccessError::Rejected
+                }
+                _ => HostAccessError::Unavailable,
+            })?;
+        value
+            .map(|property| {
+                serde_json::to_string(&property).map_err(|_| HostAccessError::Unavailable)
+            })
+            .transpose()
+    }
+
+    fn find_properties(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ExtensionId,
+        key: &SchemaKey,
+        after: Option<rintawa_sdk::world::ItemId>,
+        limit: usize,
+    ) -> HostAccessResult<Vec<String>> {
+        if !(1..=256).contains(&limit) {
+            return Err(HostAccessError::Rejected);
+        }
+        self.client(scope)?
+            .snapshot_for_extension(owner.clone())
+            .map_err(|_| HostAccessError::Unavailable)?
+            .find_properties(key, after, limit)
+            .map_err(|error| match error {
+                rintawa_world_runtime::WorldReadError::PropertyAccessDenied(_) => {
+                    HostAccessError::Rejected
+                }
+                _ => HostAccessError::Unavailable,
+            })?
+            .into_iter()
+            .map(|property| {
+                serde_json::to_string(&property).map_err(|_| HostAccessError::Unavailable)
+            })
+            .collect()
+    }
+
+    fn submit(
+        &self,
+        scope: &RuntimeScopeId,
+        _owner: &ExtensionId,
+        schema: SchemaKey,
+        payload: serde_json::Value,
+    ) -> HostAccessResult<rintawa_world_runtime::WorldCommandTicket> {
+        self.client(scope)?
+            .submit(WorldCommand::new(schema, PrincipalId::new(), payload))
+            .map_err(|error| match error {
+                rintawa_world_runtime::WorldRuntimeError::QueueFull => HostAccessError::QueueFull,
+                rintawa_world_runtime::WorldRuntimeError::RuntimeStopped => {
+                    HostAccessError::Unavailable
+                }
+                _ => HostAccessError::Rejected,
+            })
     }
 }
 
@@ -917,6 +1053,7 @@ pub struct HostRuntime {
     started_instances: Vec<ExtensionInstanceId>,
     host_shell_provider: Option<ComponentRef>,
     host_access: Option<Arc<LocalHostAccess>>,
+    world_data: WorldDataRuntimeControl,
 }
 
 impl HostRuntime {
@@ -932,6 +1069,7 @@ impl HostRuntime {
         let profile = home.load_profile()?;
         let user_resources = UserResourceRuntimeControl::default();
         let world_sessions = WorldSessionRuntimeControl::default();
+        let world_data = WorldDataRuntimeControl::default();
         let access = Arc::new(LocalHostAccess::new(
             home.root(),
             user_resources,
@@ -955,6 +1093,7 @@ impl HostRuntime {
         let runtime_context_access: Arc<dyn RuntimeContextAccess> = access.clone();
         engine.attach_runtime_context_access(runtime_context_access);
         engine.attach_user_resource_access(user_resource_access);
+        engine.attach_world_data_access(Arc::new(world_data.clone()));
         let host_scope = RuntimeScopeId::new(HOST_SCOPE);
         let host_shell_contract = host_shell_contract_key();
         engine.define_platform_binding_contract_in_scope(
@@ -1007,6 +1146,7 @@ impl HostRuntime {
             started_instances: started,
             host_shell_provider,
             host_access: Some(access),
+            world_data,
         })
     }
 
@@ -1074,6 +1214,8 @@ impl HostRuntime {
             }
         };
 
+        self.world_data
+            .activate(world_id, runtime_parts.runtime.client())?;
         self.active_worlds.insert(
             world_id,
             ActiveWorld {
@@ -1105,6 +1247,7 @@ impl HostRuntime {
             .active_worlds
             .remove(&world_id)
             .ok_or(HostError::WorldNotActive(world_id))?;
+        self.world_data.deactivate(world_id);
         let (world_failures, cleanup_failures) =
             cleanup_active_world(&mut self.engine, world_id, active);
         if world_failures.is_empty() && cleanup_failures.is_empty() {
@@ -1220,6 +1363,9 @@ impl HostRuntime {
 
     /// Stops every active world, then unregisters baseline runtime instances.
     pub fn shutdown(mut self) -> HostResult<()> {
+        if let Ok(mut state) = self.world_data.state.lock() {
+            state.clients.clear();
+        }
         let (world_failures, mut cleanup_failures) =
             shutdown_worlds(&mut self.active_worlds, &mut self.engine);
         cleanup_failures.extend(cleanup_instances(
@@ -1961,6 +2107,7 @@ mod tests {
             started_instances: Vec::new(),
             host_shell_provider: None,
             host_access: None,
+            world_data: WorldDataRuntimeControl::default(),
         };
         let parts = prepare_world_runtime(&mut host, &home, world_id, &[instance])?;
 
@@ -2015,7 +2162,9 @@ mod tests {
 
         let owner_instance = ExtensionInstanceId::new("wasm-world-system");
         let foreign_instance = ExtensionInstanceId::new("foreign-property-owner");
+        let world_data = WorldDataRuntimeControl::default();
         let mut engine = ExtensionEngine::new();
+        engine.attach_world_data_access(Arc::new(world_data.clone()));
         let wasm_component = engine
             .wasm_runtime_engine()?
             .load_component_from_bytes(ComponentId::new("wasm-system"), WORLD_SYSTEM_FIXTURE)?;
@@ -2047,6 +2196,7 @@ mod tests {
             started_instances: Vec::new(),
             host_shell_provider: None,
             host_access: None,
+            world_data,
         };
         let parts = prepare_world_runtime(
             &mut host,
@@ -2054,6 +2204,15 @@ mod tests {
             world_id,
             &[owner_instance.clone(), foreign_instance],
         )?;
+        assert!(matches!(
+            host.world_data.load_item(
+                &RuntimeScopeId::new(HOST_SCOPE),
+                &ExtensionId::new("fixture.world-system"),
+                item,
+            ),
+            Err(HostAccessError::Unavailable)
+        ));
+        host.world_data.activate(world_id, parts.runtime.client())?;
         let commit: SchemaKey = "fixture.commit@1".parse()?;
         let reject: SchemaKey = "fixture.reject@1".parse()?;
         let foreign: SchemaKey = "fixture.foreign@1".parse()?;
@@ -2105,6 +2264,41 @@ mod tests {
                 .load_property(item, &"fixture.foreign-property@1".parse()?)?
                 .is_none()
         );
+
+        // This is the ordinary guest path: the active component submits its
+        // own authoritative command from an event callback and only later
+        // polls the nonblocking ticket before reading its committed property.
+        host.engine.dispatch_runtime_event_in_scope(
+            &world_runtime_scope_id(world_id),
+            "fixture.world-data",
+            b"invalid",
+        )?;
+        host.engine.dispatch_runtime_event_in_scope(
+            &world_runtime_scope_id(world_id),
+            "fixture.world-data",
+            format!("foreign:{item}").as_bytes(),
+        )?;
+        host.engine.dispatch_runtime_event_in_scope(
+            &world_runtime_scope_id(world_id),
+            "fixture.world-data",
+            format!("submit:{item}").as_bytes(),
+        )?;
+        for _ in 0..100 {
+            if parts
+                .runtime
+                .snapshot()?
+                .load_property(item, &"fixture.value@1".parse()?)?
+                .is_some()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        host.engine.dispatch_runtime_event_in_scope(
+            &world_runtime_scope_id(world_id),
+            "fixture.world-data",
+            format!("verify:{item}").as_bytes(),
+        )?;
         host.engine.stop_extension_instance(&owner_instance)?;
         assert!(
             parts
@@ -2160,6 +2354,7 @@ mod tests {
             started_instances: Vec::new(),
             host_shell_provider: None,
             host_access: None,
+            world_data: WorldDataRuntimeControl::default(),
         };
         assert!(matches!(
             prepare_world_runtime(&mut host, &home, world_id, &instances),
@@ -2218,6 +2413,7 @@ mod tests {
             started_instances: Vec::new(),
             host_shell_provider: None,
             host_access: None,
+            world_data: WorldDataRuntimeControl::default(),
         };
         assert!(matches!(
             prepare_world_runtime(&mut host, &home, world_id, &instances),
@@ -2270,6 +2466,7 @@ mod tests {
             started_instances: Vec::new(),
             host_shell_provider: None,
             host_access: None,
+            world_data: WorldDataRuntimeControl::default(),
         };
         assert!(matches!(
             prepare_world_runtime(&mut host, &home, world_id, &[instance]),

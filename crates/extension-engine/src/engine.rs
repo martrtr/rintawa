@@ -39,7 +39,7 @@ use crate::{
     host_access::{
         ArtifactStoreAccess, AssetStoreAccess, CompositionAccess, HostAccessServices,
         PreferenceAccess, RuntimeContextAccess, RuntimePolicyAccess, UserResourceAccess,
-        WorldSessionAccess,
+        WorldDataAccess, WorldSessionAccess,
     },
     runtime::{WasmRuntimeEngine, WasmWorldSystemEndpoint},
     runtime_effects::RuntimeEffectRegistry,
@@ -245,6 +245,11 @@ impl ExtensionEngine {
     /// Embedded hosts that do not call this method remain fail-closed.
     pub fn attach_runtime_context_access(&mut self, access: Arc<dyn RuntimeContextAccess>) {
         self.host_access = self.host_access.clone().with_runtime_context_access(access);
+    }
+
+    /// Attaches the Host-owned active World access boundary.
+    pub fn attach_world_data_access(&mut self, access: Arc<dyn WorldDataAccess>) {
+        self.host_access = self.host_access.clone().with_world_data_access(access);
     }
 
     /// Attaches generic ephemeral user-resource ingress/read access.

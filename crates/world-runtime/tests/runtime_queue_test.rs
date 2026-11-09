@@ -181,3 +181,38 @@ fn test_should_reject_invalid_queue_capacity() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn test_should_revoke_cloned_client_before_worker_join() -> Result<()> {
+    let (_root, storage, schemas) = create_storage()?;
+    let principal = PrincipalId::new();
+    let system = RecordingSystem::new(schemas.command.clone());
+    let mut builder = runtime_builder(storage, &[&schemas.command])?;
+    builder.register_system(system)?;
+    let runtime = builder.start()?;
+    let client = runtime.client();
+
+    // Leaving a completed-or-pending ticket unconsumed must not retain a sender
+    // clone and prevent shutdown from joining the authoritative worker.
+    let unused_ticket = client.submit(command(
+        &schemas.command,
+        principal,
+        serde_json::json!({ "sequence": 1, "item": ItemId::new().to_string() }),
+    ))?;
+    runtime.shutdown()?;
+
+    assert!(matches!(
+        client.snapshot_for_extension(rintawa_sdk::types::ExtensionId::new(common::EXTENSION)),
+        Err(WorldRuntimeError::RuntimeStopped)
+    ));
+    assert!(matches!(
+        client.submit(command(
+            &schemas.command,
+            PrincipalId::new(),
+            serde_json::json!({ "sequence": 2, "item": ItemId::new().to_string() }),
+        )),
+        Err(WorldRuntimeError::RuntimeStopped)
+    ));
+    drop(unused_ticket);
+    Ok(())
+}

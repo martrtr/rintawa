@@ -41,7 +41,7 @@ use zenoh::Wait;
 use crate::{
     errors::{EngineError, EngineResult},
     execution_targets::ExecutionTargetRegistry,
-    host_access::HostAccessServices,
+    host_access::{HostAccessError, HostAccessServices},
     runtime_permissions::RuntimePermissionManager,
     secrets::SecretManager,
     transport::{MAX_PAYLOAD_BYTES, Transport, TransportError, validate_transport_point},
@@ -173,6 +173,7 @@ use bindings::rintawa::engine::{
     user_resources::{
         Error as UserResourceError, Host as UserResourcesHost, ResourceRef as WitUserResourceRef,
     },
+    world_data::{Error as WorldDataError, Host as WorldDataHost, TicketStatus as WitTicketStatus},
     world_registration::{
         Error as WorldRegistrationError, Host as WorldRegistrationHost, SchemaKind as WitSchemaKind,
     },
@@ -262,6 +263,9 @@ pub struct WasmHostState {
     execution_target_registration_active: bool,
     pending_execution_targets: Vec<String>,
     world_system_snapshot: Option<WorldSnapshot>,
+    world_data_access_active: bool,
+    next_world_data_ticket: u64,
+    world_data_tickets: HashMap<u64, rintawa_world_runtime::WorldCommandTicket>,
     resource_limits: StoreLimits,
     resource_table: ResourceTable,
 }
@@ -433,6 +437,9 @@ impl WasmHostState {
             execution_target_registration_active: false,
             pending_execution_targets: Vec::new(),
             world_system_snapshot: None,
+            world_data_access_active: false,
+            next_world_data_ticket: 0,
+            world_data_tickets: HashMap::new(),
             resource_limits: budget.store_limits(),
             resource_table: ResourceTable::new(),
         }
@@ -580,6 +587,8 @@ impl WasmHostState {
         self.pending_execution_targets.clear();
         self.pending_transport_points.clear();
         self.world_system_snapshot = None;
+        self.world_data_access_active = false;
+        self.world_data_tickets.clear();
     }
 
     fn begin_world_system_execution(&mut self, snapshot: WorldSnapshot) -> ExtensionResult<()> {
@@ -802,6 +811,7 @@ impl WasmHostState {
         self.task_access_active = true;
         self.network_access_active = true;
         self.host_access_active = true;
+        self.world_data_access_active = true;
         self.http_request_access_active = true;
         self.world_session_mutations_this_execution = 0;
         self.secret_access_active = true;
@@ -817,6 +827,7 @@ impl WasmHostState {
         self.task_access_active = true;
         self.network_access_active = true;
         self.host_access_active = true;
+        self.world_data_access_active = true;
         self.http_request_access_active = true;
         self.world_session_mutations_this_execution = 0;
         self.secret_access_active = true;
@@ -835,6 +846,7 @@ impl WasmHostState {
         self.task_access_active = true;
         self.network_access_active = true;
         self.host_access_active = true;
+        self.world_data_access_active = true;
         self.http_request_access_active = true;
         self.world_session_mutations_this_execution = 0;
         self.secret_access_active = true;
@@ -869,6 +881,7 @@ impl WasmHostState {
         self.discard_guest_execution();
         self.execution_owner = self.registered_owner();
         self.transport_access_active = true;
+        self.world_data_access_active = true;
         self.transport_queries_this_execution = 0;
         self.transport_publications_this_execution = 0;
     }
@@ -883,6 +896,7 @@ impl WasmHostState {
         self.task_access_active = false;
         self.network_access_active = false;
         self.host_access_active = false;
+        self.world_data_access_active = false;
         self.http_request_access_active = false;
         self.secret_access_active = false;
         self.transport_access_active = false;
@@ -1484,6 +1498,164 @@ fn map_world_system_read_error(error: WorldReadError) -> WorldSystemSnapshotErro
         WorldReadError::SnapshotUnavailable | WorldReadError::Storage(_) => {
             WorldSystemSnapshotError::Unavailable
         }
+    }
+}
+
+impl WorldDataHost for WasmHostState {
+    fn load_item(&mut self, id: String) -> Result<Option<String>, WorldDataError> {
+        let (scope, owner) = self.world_data_identity()?;
+        self.check_world_data_bytes(id.len())?;
+        let item = id
+            .parse::<ItemId>()
+            .map_err(|_| WorldDataError::InvalidRequest)?;
+        let value = self
+            .host_access
+            .world_data
+            .load_item(scope, owner, item)
+            .map_err(map_world_data_error)?;
+        self.check_world_data_result(value.as_deref())?;
+        Ok(value)
+    }
+
+    fn load_property(
+        &mut self,
+        item: String,
+        key: String,
+    ) -> Result<Option<String>, WorldDataError> {
+        let (scope, owner) = self.world_data_identity()?;
+        self.check_world_data_bytes(item.len().saturating_add(key.len()))?;
+        let item = item
+            .parse::<ItemId>()
+            .map_err(|_| WorldDataError::InvalidRequest)?;
+        let key = key
+            .parse::<SchemaKey>()
+            .map_err(|_| WorldDataError::InvalidRequest)?;
+        let value = self
+            .host_access
+            .world_data
+            .load_property(scope, owner, item, &key)
+            .map_err(map_world_data_error)?;
+        self.check_world_data_result(value.as_deref())?;
+        Ok(value)
+    }
+
+    fn find_properties(
+        &mut self,
+        key: String,
+        after: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<String>, WorldDataError> {
+        let (scope, owner) = self.world_data_identity()?;
+        self.check_world_data_bytes(
+            key.len()
+                .saturating_add(after.as_ref().map_or(0, String::len)),
+        )?;
+        let key = key
+            .parse::<SchemaKey>()
+            .map_err(|_| WorldDataError::InvalidRequest)?;
+        let after = after
+            .map(|value| {
+                value
+                    .parse::<ItemId>()
+                    .map_err(|_| WorldDataError::InvalidRequest)
+            })
+            .transpose()?;
+        let values = self
+            .host_access
+            .world_data
+            .find_properties(scope, owner, &key, after, limit as usize)
+            .map_err(map_world_data_error)?;
+        self.check_world_data_results(&values)?;
+        Ok(values)
+    }
+
+    fn submit(&mut self, schema: String, payload_json: String) -> Result<u64, WorldDataError> {
+        let (scope, owner) = self.world_data_identity()?;
+        self.check_world_data_bytes(payload_json.len().saturating_add(schema.len()))?;
+        if self.world_data_tickets.len() >= 16 {
+            return Err(WorldDataError::QueueFull);
+        }
+        let schema = schema
+            .parse::<SchemaKey>()
+            .map_err(|_| WorldDataError::InvalidRequest)?;
+        let payload =
+            serde_json::from_str(&payload_json).map_err(|_| WorldDataError::InvalidRequest)?;
+        let handle = self.next_world_data_ticket;
+        let next_handle = handle.checked_add(1).ok_or(WorldDataError::Unavailable)?;
+        let ticket = self
+            .host_access
+            .world_data
+            .submit(scope, owner, schema, payload)
+            .map_err(map_world_data_error)?;
+        self.next_world_data_ticket = next_handle;
+        self.world_data_tickets.insert(handle, ticket);
+        Ok(handle)
+    }
+
+    fn poll(&mut self, ticket: u64) -> Result<WitTicketStatus, WorldDataError> {
+        self.world_data_identity()?;
+        let result = self
+            .world_data_tickets
+            .get(&ticket)
+            .ok_or(WorldDataError::InvalidRequest)?
+            .try_wait();
+        match result {
+            Ok(None) => Ok(WitTicketStatus::Pending),
+            Ok(Some(_)) => {
+                self.world_data_tickets.remove(&ticket);
+                Ok(WitTicketStatus::Committed)
+            }
+            Err(error) => {
+                self.world_data_tickets.remove(&ticket);
+                Ok(WitTicketStatus::Failed(error.to_string()))
+            }
+        }
+    }
+}
+
+impl WasmHostState {
+    fn world_data_identity(&self) -> Result<(&RuntimeScopeId, &ExtensionId), WorldDataError> {
+        if !self.world_data_access_active || self.world_system_snapshot.is_some() {
+            return Err(WorldDataError::AccessNotActive);
+        }
+        let scope = self
+            .scope_id
+            .as_ref()
+            .ok_or(WorldDataError::AccessNotActive)?;
+        let owner = self
+            .extension_id
+            .as_ref()
+            .ok_or(WorldDataError::AccessNotActive)?;
+        Ok((scope, owner))
+    }
+
+    fn check_world_data_bytes(&self, bytes: usize) -> Result<(), WorldDataError> {
+        if bytes > self.max_host_message_bytes {
+            return Err(WorldDataError::MessageTooLarge);
+        }
+        Ok(())
+    }
+
+    fn check_world_data_result(&self, value: Option<&str>) -> Result<(), WorldDataError> {
+        self.check_world_data_bytes(value.map_or(0, str::len))
+    }
+
+    fn check_world_data_results(&self, values: &[String]) -> Result<(), WorldDataError> {
+        values.iter().try_fold(0_usize, |total, value| {
+            let total = total.saturating_add(value.len());
+            self.check_world_data_bytes(total)?;
+            Ok(total)
+        })?;
+        Ok(())
+    }
+}
+
+fn map_world_data_error(error: HostAccessError) -> WorldDataError {
+    match error {
+        HostAccessError::QueueFull => WorldDataError::QueueFull,
+        HostAccessError::Rejected => WorldDataError::AccessDenied,
+        HostAccessError::Unavailable => WorldDataError::Unavailable,
+        _ => WorldDataError::InvalidRequest,
     }
 }
 

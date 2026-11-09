@@ -177,7 +177,7 @@ impl WorldRuntimeBuilder {
             storage,
             session,
             property_owners,
-            sender: Some(sender),
+            sender: Arc::new(Mutex::new(Some(sender))),
             worker: Some(worker),
         })
     }
@@ -189,14 +189,36 @@ pub struct WorldRuntime {
     storage: Arc<SqliteWorldStorage>,
     session: Arc<Mutex<WorldSessionState>>,
     property_owners: Arc<Mutex<Arc<BTreeMap<SchemaKey, ExtensionId>>>>,
-    sender: Option<SyncSender<CommandJob>>,
+    sender: Arc<Mutex<Option<SyncSender<CommandJob>>>>,
     worker: Option<JoinHandle<()>>,
+}
+
+/// Cloneable, lifecycle-revocable access to one active World runtime.
+///
+/// This handle shares the runtime's bounded single-writer queue and snapshots;
+/// it never opens SQLite directly or creates another writer.
+#[derive(Clone)]
+pub struct WorldRuntimeClient {
+    world_id: WorldId,
+    storage: Arc<SqliteWorldStorage>,
+    property_owners: Arc<Mutex<Arc<BTreeMap<SchemaKey, ExtensionId>>>>,
+    sender: Arc<Mutex<Option<SyncSender<CommandJob>>>>,
 }
 
 impl WorldRuntime {
     /// Returns the authoritative world identity.
     pub const fn world_id(&self) -> WorldId {
         self.world_id
+    }
+
+    /// Returns a revocable client sharing this runtime's authoritative queue.
+    pub fn client(&self) -> WorldRuntimeClient {
+        WorldRuntimeClient {
+            world_id: self.world_id,
+            storage: self.storage.clone(),
+            property_owners: self.property_owners.clone(),
+            sender: self.sender.clone(),
+        }
     }
 
     /// Captures a trusted native Host snapshot of current state.
@@ -269,7 +291,9 @@ impl WorldRuntime {
     pub fn submit(&self, command: WorldCommand) -> WorldRuntimeResult<WorldCommandTicket> {
         let sender = self
             .sender
-            .as_ref()
+            .lock()
+            .map_err(|_| WorldRuntimeError::RuntimePoisoned)?
+            .clone()
             .ok_or(WorldRuntimeError::RuntimeStopped)?;
         let command_id = command.id();
         let (response_sender, response_receiver) = mpsc::channel();
@@ -298,11 +322,66 @@ impl WorldRuntime {
     }
 
     fn stop_worker(&mut self) -> WorldRuntimeResult<()> {
-        self.sender.take();
+        self.sender
+            .lock()
+            .map_err(|_| WorldRuntimeError::RuntimePoisoned)?
+            .take();
         let Some(worker) = self.worker.take() else {
             return Ok(());
         };
         worker.join().map_err(|_| WorldRuntimeError::WorkerPanicked)
+    }
+}
+
+impl WorldRuntimeClient {
+    /// Returns the bound World identity.
+    pub const fn world_id(&self) -> WorldId {
+        self.world_id
+    }
+
+    /// Enqueues one command without waiting for its commit.
+    pub fn submit(&self, command: WorldCommand) -> WorldRuntimeResult<WorldCommandTicket> {
+        let sender = self
+            .sender
+            .lock()
+            .map_err(|_| WorldRuntimeError::RuntimePoisoned)?
+            .clone()
+            .ok_or(WorldRuntimeError::RuntimeStopped)?;
+        let command_id = command.id();
+        let (response_sender, response_receiver) = mpsc::channel();
+        match sender.try_send(CommandJob {
+            command,
+            response: response_sender,
+        }) {
+            Ok(()) => Ok(WorldCommandTicket {
+                command_id,
+                receiver: response_receiver,
+            }),
+            Err(TrySendError::Full(_)) => Err(WorldRuntimeError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => Err(WorldRuntimeError::RuntimeStopped),
+        }
+    }
+
+    /// Captures an owner-scoped snapshot for a verified extension identity.
+    pub fn snapshot_for_extension(&self, owner: ExtensionId) -> WorldRuntimeResult<WorldSnapshot> {
+        if self
+            .sender
+            .lock()
+            .map_err(|_| WorldRuntimeError::RuntimePoisoned)?
+            .is_none()
+        {
+            return Err(WorldRuntimeError::RuntimeStopped);
+        }
+        let bindings = self
+            .property_owners
+            .lock()
+            .map_err(|_| WorldRuntimeError::RuntimePoisoned)?
+            .clone();
+        Ok(WorldSnapshot::for_system(
+            self.storage.snapshot()?,
+            owner,
+            bindings,
+        ))
     }
 }
 
@@ -353,6 +432,15 @@ impl WorldCommandTicket {
         self.receiver
             .recv()
             .map_err(|_| WorldRuntimeError::WorkerStopped)?
+    }
+
+    /// Returns a completed result without blocking, or `None` while queued.
+    pub fn try_wait(&self) -> WorldRuntimeResult<Option<WorldCommandOutcome>> {
+        match self.receiver.try_recv() {
+            Ok(result) => result.map(Some),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => Err(WorldRuntimeError::WorkerStopped),
+        }
     }
 }
 

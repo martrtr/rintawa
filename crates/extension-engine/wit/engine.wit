@@ -134,6 +134,32 @@ interface world-system {
     evaluate: func(command-json: string) -> result<string, error>;
 }
 
+/// Ordinary World reads and asynchronous command submission for a world-scoped guest.
+interface world-data {
+    type ticket = u64;
+
+    variant error {
+        access-not-active,
+        invalid-request,
+        access-denied,
+        queue-full,
+        unavailable,
+        message-too-large,
+    }
+
+    variant ticket-status {
+        pending,
+        committed,
+        failed(string),
+    }
+
+    load-item: func(id: string) -> result<option<string>, error>;
+    load-property: func(item: string, key: string) -> result<option<string>, error>;
+    find-properties: func(key: string, after: option<string>, limit: u32) -> result<list<string>, error>;
+    submit: func(schema: string, payload-json: string) -> result<ticket, error>;
+    poll: func(ticket: ticket) -> result<ticket-status, error>;
+}
+
 /// Reversible effects available from guest `start` and `on-event`.
 interface runtime-effects {
     /// A guest-local handle for one host-owned runtime effect.
@@ -875,6 +901,7 @@ world plugin {
     import registration;
     import world-registration;
     import world-system-snapshot;
+    import world-data;
     import runtime-effects;
     import runtime-tasks;
     import network;
