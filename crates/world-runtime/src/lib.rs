@@ -20,5 +20,5 @@ pub use runtime::{
     DEFAULT_COMMAND_QUEUE_CAPACITY, MAX_COMMAND_QUEUE_CAPACITY, WorldCommandOutcome,
     WorldCommandTicket, WorldRuntime, WorldRuntimeBuilder, WorldRuntimePolicy,
 };
-pub use snapshot::WorldSnapshot;
+pub use snapshot::{WorldReadBatch, WorldSnapshot};
 pub use system::WorldSystem;

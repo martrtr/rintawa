@@ -1,7 +1,7 @@
 //! Consistent read-only SQLite snapshot for one authoritative world.
 
 use rintawa_sdk::world::{ItemId, SchemaKey, WorldId};
-use rintawa_world::{ItemRecord, PropertyRecord};
+use rintawa_world::{ItemRecord, PropertyRecord, RelationDirection};
 use rusqlite::Connection;
 
 use crate::StorageResult;
@@ -64,6 +64,25 @@ impl SqliteWorldSnapshot {
         query::list_properties(&self.connection, item)
     }
 
+    /// Loads an item batch and selected properties through the same pinned snapshot.
+    ///
+    /// Both the item batch and property-key list are bounded by storage policy.
+    /// Missing items or absent properties are omitted from the returned vectors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a batch limit is exceeded or persisted state is invalid.
+    pub fn read(
+        &self,
+        items: &[ItemId],
+        properties: &[SchemaKey],
+    ) -> StorageResult<(Vec<ItemRecord>, Vec<PropertyRecord>)> {
+        Ok((
+            query::load_items(&self.connection, items)?,
+            query::load_properties_for_items(&self.connection, items, properties)?,
+        ))
+    }
+
     /// Finds a bounded page of values for one exact property definition.
     ///
     /// Results are ordered by item UUID; pass the last returned item as the next
@@ -97,6 +116,25 @@ impl SqliteWorldSnapshot {
         limit: usize,
     ) -> StorageResult<Vec<ItemRecord>> {
         query::relations_touching_any(&self.connection, targets, after, limit)
+    }
+
+    /// Finds a bounded directional relation page from the pinned snapshot.
+    ///
+    /// When `property` is supplied, only relation-items carrying that exact
+    /// property name and version are returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid batch/page limits or a storage error.
+    pub fn find_relations(
+        &self,
+        targets: &[ItemId],
+        direction: RelationDirection,
+        property: Option<&SchemaKey>,
+        after: Option<ItemId>,
+        limit: usize,
+    ) -> StorageResult<Vec<ItemRecord>> {
+        query::find_relations(&self.connection, targets, direction, property, after, limit)
     }
 
     /// Returns keys on the item and its incident relations that SQLite would

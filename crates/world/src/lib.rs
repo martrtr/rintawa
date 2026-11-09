@@ -26,5 +26,7 @@ pub use runtime_schema::{
 };
 pub use schema::{DefinitionRegistration, PropertyDefinition, PropertyRegistry};
 pub use session::{WorldManifest, WorldSessionState};
-pub use state::{ITEM_TYPE_OBJECT, ITEM_TYPE_RELATION, ItemKind, ItemRecord, PropertyRecord};
+pub use state::{
+    ITEM_TYPE_OBJECT, ITEM_TYPE_RELATION, ItemKind, ItemRecord, PropertyRecord, RelationDirection,
+};
 pub use transaction::{StateChange, WorldTransaction};

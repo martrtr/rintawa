@@ -1,7 +1,9 @@
 //! Item, relation and property reads over the four-table model.
 
 use rintawa_sdk::world::{ItemId, SchemaKey, WorldId};
-use rintawa_world::{ItemKind, ItemRecord, PropertyDefinition, PropertyRecord, PropertyRegistry};
+use rintawa_world::{
+    ItemKind, ItemRecord, PropertyDefinition, PropertyRecord, PropertyRegistry, RelationDirection,
+};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 
 use crate::{StorageError, StorageResult};
@@ -12,6 +14,8 @@ use crate::sqlite::codec::{decode_property_key, item_id_from_blob, world_id_from
 pub(crate) const MAX_QUERY_PAGE_SIZE: usize = 256;
 /// Maximum number of supplied item IDs accepted by one relation read.
 pub(crate) const MAX_QUERY_BATCH_SIZE: usize = 64;
+/// Maximum number of exact property keys accepted by one batched read.
+pub(crate) const MAX_READ_PROPERTY_KEYS: usize = 64;
 /// Maximum JSON payload bytes returned by one property search page.
 pub(crate) const MAX_PROPERTY_QUERY_BYTES: usize = 8 * 1024 * 1024;
 
@@ -133,6 +137,118 @@ pub(super) fn list_properties(
     Ok(properties)
 }
 
+/// Reads an item batch in one SQL statement.
+pub(super) fn load_items(
+    connection: &Connection,
+    items: &[ItemId],
+) -> StorageResult<Vec<ItemRecord>> {
+    validate_batch_size(items.len())?;
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = vec!["?"; items.len()].join(", ");
+    let sql = format!(
+        "SELECT id, type, subject, object FROM items WHERE id IN ({placeholders}) ORDER BY id"
+    );
+    let values = items
+        .iter()
+        .map(|item| Value::Blob(item.into_bytes().to_vec()));
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(values), |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<Vec<u8>>>(2)?,
+            row.get::<_, Option<Vec<u8>>>(3)?,
+        ))
+    })?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        let (id, kind, subject, object) = row?;
+        let id = item_id_from_blob(id, "item")?;
+        result.push(match (ItemKind::from_code(kind)?, subject, object) {
+            (ItemKind::Object, _, _) => ItemRecord::object(id),
+            (ItemKind::Relation, Some(subject), Some(object)) => ItemRecord::relation(
+                id,
+                item_id_from_blob(subject, "subject")?,
+                item_id_from_blob(object, "object")?,
+            ),
+            (ItemKind::Relation, _, _) => {
+                return Err(StorageError::World(
+                    rintawa_world::WorldError::RelationEndpointAbsent(id),
+                ));
+            }
+        });
+    }
+    Ok(result)
+}
+
+/// Reads selected property keys for an item batch in one SQL statement.
+pub(super) fn load_properties_for_items(
+    connection: &Connection,
+    items: &[ItemId],
+    keys: &[SchemaKey],
+) -> StorageResult<Vec<PropertyRecord>> {
+    validate_batch_size(items.len())?;
+    if keys.len() > MAX_READ_PROPERTY_KEYS {
+        return Err(StorageError::InvalidPropertyReadKeyCount {
+            requested: keys.len(),
+            maximum: MAX_READ_PROPERTY_KEYS,
+        });
+    }
+    if items.is_empty() || keys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let item_placeholders = vec!["?"; items.len()].join(", ");
+    let key_predicates = vec!["(name = ? AND version = ?)"; keys.len()].join(" OR ");
+    let sql = format!(
+        "SELECT item, name, version, data FROM properties
+         WHERE item IN ({item_placeholders}) AND ({key_predicates})
+         ORDER BY item, name"
+    );
+    let mut values = Vec::with_capacity(items.len() + keys.len() * 2);
+    values.extend(
+        items
+            .iter()
+            .map(|item| Value::Blob(item.into_bytes().to_vec())),
+    );
+    for key in keys {
+        values.push(Value::Text(key.id().as_str().to_string()));
+        values.push(Value::Integer(i64::from(key.version().get())));
+    }
+
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(values), |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut result = Vec::new();
+    let mut total_bytes = 0_usize;
+    for row in rows {
+        let (item, name, version, data) = row?;
+        total_bytes = total_bytes.saturating_add(data.len());
+        if total_bytes > MAX_PROPERTY_QUERY_BYTES {
+            return Err(StorageError::QueryPageTooLarge {
+                bytes: total_bytes,
+                maximum: MAX_PROPERTY_QUERY_BYTES,
+            });
+        }
+        result.push(PropertyRecord::new(
+            item_id_from_blob(item, "property item")?,
+            decode_property_key(name, version)?,
+            serde_json::from_str(&data)?,
+        ));
+    }
+    Ok(result)
+}
+
 /// Reads a bounded keyset page using the (name, version, item) index.
 ///
 /// A cursor is an exclusive item ID; the implicit initial cursor is the empty
@@ -191,12 +307,7 @@ pub(super) fn relations_touching_any(
     limit: usize,
 ) -> StorageResult<Vec<ItemRecord>> {
     let limit = validate_page_size(limit)?;
-    if targets.len() > MAX_QUERY_BATCH_SIZE {
-        return Err(StorageError::InvalidQueryBatchSize {
-            requested: targets.len(),
-            maximum: MAX_QUERY_BATCH_SIZE,
-        });
-    }
+    validate_batch_size(targets.len())?;
     if targets.is_empty() {
         return Ok(Vec::new());
     }
@@ -238,6 +349,92 @@ pub(super) fn relations_touching_any(
         ));
     }
     Ok(relations)
+}
+
+/// Finds a bounded page of directed relations with an optional exact property key.
+pub(super) fn find_relations(
+    connection: &Connection,
+    targets: &[ItemId],
+    direction: RelationDirection,
+    property: Option<&SchemaKey>,
+    after: Option<ItemId>,
+    limit: usize,
+) -> StorageResult<Vec<ItemRecord>> {
+    let limit = validate_page_size(limit)?;
+    validate_batch_size(targets.len())?;
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = vec!["?"; targets.len()].join(", ");
+    let endpoint_predicate = match direction {
+        RelationDirection::Outgoing => format!("subject IN ({placeholders})"),
+        RelationDirection::Incoming => format!("object IN ({placeholders})"),
+        RelationDirection::Either => {
+            format!("subject IN ({placeholders}) OR object IN ({placeholders})")
+        }
+    };
+    let property_predicate = property.map_or(String::new(), |_| {
+        String::from(
+            " AND EXISTS (SELECT 1 FROM properties
+              WHERE properties.item = items.id AND properties.name = ? AND properties.version = ?)",
+        )
+    });
+    let sql = format!(
+        "SELECT id, subject, object FROM items
+         WHERE type = 2 AND ({endpoint_predicate}){property_predicate}
+         AND id > COALESCE(?, X'') ORDER BY id LIMIT ?"
+    );
+    let target_copies = match direction {
+        RelationDirection::Either => 2,
+        RelationDirection::Outgoing | RelationDirection::Incoming => 1,
+    };
+    let mut values = Vec::with_capacity(targets.len() * target_copies + 4);
+    for _ in 0..target_copies {
+        values.extend(
+            targets
+                .iter()
+                .map(|target| Value::Blob(target.into_bytes().to_vec())),
+        );
+    }
+    if let Some(property) = property {
+        values.push(Value::Text(property.id().as_str().to_string()));
+        values.push(Value::Integer(i64::from(property.version().get())));
+    }
+    values.push(match after {
+        Some(cursor) => Value::Blob(cursor.into_bytes().to_vec()),
+        None => Value::Null,
+    });
+    values.push(Value::Integer(limit));
+
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(values), |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    })?;
+    let mut relations = Vec::new();
+    for row in rows {
+        let (id, subject, object) = row?;
+        relations.push(ItemRecord::relation(
+            item_id_from_blob(id, "relation id")?,
+            item_id_from_blob(subject, "relation subject")?,
+            item_id_from_blob(object, "relation object")?,
+        ));
+    }
+    Ok(relations)
+}
+
+fn validate_batch_size(size: usize) -> StorageResult<()> {
+    if size > MAX_QUERY_BATCH_SIZE {
+        return Err(StorageError::InvalidQueryBatchSize {
+            requested: size,
+            maximum: MAX_QUERY_BATCH_SIZE,
+        });
+    }
+    Ok(())
 }
 
 /// Returns distinct property keys removed by SQLite cascading an item deletion.

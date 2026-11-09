@@ -7,9 +7,41 @@ use rintawa_sdk::{
     world::{ItemId, SchemaKey, WorldId},
 };
 use rintawa_storage::SqliteWorldSnapshot;
-use rintawa_world::{ItemRecord, PropertyRecord};
+use rintawa_world::{ItemRecord, PropertyRecord, RelationDirection};
 
 use crate::{WorldReadError, WorldReadResult};
+
+/// Results of one bounded batched World read.
+///
+/// Missing requested items and properties are omitted. Both vectors are read
+/// through one pinned snapshot, so their contents describe one coherent World
+/// state even when another command commits while the caller is processing them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorldReadBatch {
+    items: Vec<ItemRecord>,
+    properties: Vec<PropertyRecord>,
+}
+
+impl WorldReadBatch {
+    fn new(items: Vec<ItemRecord>, properties: Vec<PropertyRecord>) -> Self {
+        Self { items, properties }
+    }
+
+    /// Returns the existing requested items in stable ID order.
+    pub fn items(&self) -> &[ItemRecord] {
+        &self.items
+    }
+
+    /// Returns visible selected properties in stable item/key order.
+    pub fn properties(&self) -> &[PropertyRecord] {
+        &self.properties
+    }
+
+    /// Consumes this batch and returns its item and property records.
+    pub fn into_parts(self) -> (Vec<ItemRecord>, Vec<PropertyRecord>) {
+        (self.items, self.properties)
+    }
+}
 
 /// Read-only view evaluated by one System against one pinned SQLite WAL snapshot.
 ///
@@ -96,6 +128,30 @@ impl WorldSnapshot {
         Ok(self.storage.load_property(item, key)?)
     }
 
+    /// Loads a bounded batch of items and selected exact property definitions.
+    ///
+    /// Each requested property key is authorization-checked before SQLite is
+    /// touched. A System therefore cannot use missing data as an oracle for a
+    /// property owned by another extension. Trusted native Host snapshots remain
+    /// unrestricted and are not suitable for an extension-facing boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns PropertyAccessDenied, an invalid batch limit, or a storage error.
+    pub fn read(
+        &self,
+        items: &[ItemId],
+        properties: &[SchemaKey],
+    ) -> WorldReadResult<WorldReadBatch> {
+        for key in properties {
+            if !self.permits_property(key) {
+                return Err(WorldReadError::PropertyAccessDenied(key.clone()));
+            }
+        }
+        let (items, properties) = self.storage.read(items, properties)?;
+        Ok(WorldReadBatch::new(items, properties))
+    }
+
     /// Loads the properties visible to the active System owner.
     ///
     /// Trusted native Host snapshots can inspect all properties. For Systems,
@@ -131,6 +187,24 @@ impl WorldSnapshot {
         Ok(self.storage.find_properties(key, after, limit)?)
     }
 
+    /// Finds a bounded keyset page for one exact property definition.
+    ///
+    /// The returned cursor is the last item ID in the page. Reusing this
+    /// snapshot preserves a pinned historical view; acquiring a new snapshot
+    /// intentionally sees later committed data.
+    ///
+    /// # Errors
+    ///
+    /// Returns PropertyAccessDenied or a storage/page-size error.
+    pub fn find_by_property(
+        &self,
+        key: &SchemaKey,
+        after: Option<ItemId>,
+        limit: usize,
+    ) -> WorldReadResult<Vec<PropertyRecord>> {
+        self.find_properties(key, after, limit)
+    }
+
     /// Reads a bounded page of relations adjacent to any supplied item.
     ///
     /// Graph structure is shared state; property values remain owner-scoped.
@@ -145,6 +219,33 @@ impl WorldSnapshot {
         limit: usize,
     ) -> WorldReadResult<Vec<ItemRecord>> {
         Ok(self.storage.relations_touching_any(targets, after, limit)?)
+    }
+
+    /// Finds a bounded directional relation page adjacent to the supplied targets.
+    ///
+    /// Relation topology is shared World state. If `property` is supplied, it
+    /// is an exact relation property filter and must be readable by the caller;
+    /// this avoids exposing foreign property presence through filtering.
+    ///
+    /// # Errors
+    ///
+    /// Returns PropertyAccessDenied, invalid batch/page limits, or a storage error.
+    pub fn find_relations(
+        &self,
+        targets: &[ItemId],
+        direction: RelationDirection,
+        property: Option<&SchemaKey>,
+        after: Option<ItemId>,
+        limit: usize,
+    ) -> WorldReadResult<Vec<ItemRecord>> {
+        if let Some(property) = property
+            && !self.permits_property(property)
+        {
+            return Err(WorldReadError::PropertyAccessDenied(property.clone()));
+        }
+        Ok(self
+            .storage
+            .find_relations(targets, direction, property, after, limit)?)
     }
 
     // Deleting an object cascades to its relation-items and their properties.

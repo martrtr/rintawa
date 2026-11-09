@@ -5,7 +5,8 @@ use rintawa_sdk::{
     world::{ItemId, SchemaKey, WorldId},
 };
 use rintawa_world::{
-    DefinitionRegistration, ItemKind, PropertyDefinition, StateChange, WorldTransaction,
+    DefinitionRegistration, ItemKind, PropertyDefinition, RelationDirection, StateChange,
+    WorldTransaction,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -364,6 +365,71 @@ fn test_should_pin_snapshot_reads() -> anyhow::Result<()> {
 
     assert!(snapshot.load_item(item)?.is_some());
     assert!(storage.load_item(item)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn test_should_read_batched_items_and_properties_and_page_directional_relations()
+-> anyhow::Result<()> {
+    let (_directory, storage) = temp_world();
+    let key = schema("character.identity@1");
+    storage.register_definition(&object_schema())?;
+    let alice = ItemId::new();
+    let forest = ItemId::new();
+    let cave = ItemId::new();
+    let outgoing = ItemId::new();
+    let incoming = ItemId::new();
+    let untagged = ItemId::new();
+
+    let mut transaction = WorldTransaction::new();
+    for id in [alice, forest, cave] {
+        transaction.push_change(StateChange::CreateObject { id });
+    }
+    transaction.push_change(StateChange::CreateRelation {
+        id: outgoing,
+        subject: alice,
+        object: forest,
+    });
+    transaction.push_change(StateChange::CreateRelation {
+        id: incoming,
+        subject: cave,
+        object: alice,
+    });
+    transaction.push_change(StateChange::CreateRelation {
+        id: untagged,
+        subject: alice,
+        object: cave,
+    });
+    transaction.push_change(StateChange::SetProperty {
+        item: alice,
+        key: key.clone(),
+        data: serde_json::json!({ "name": "Alice" }),
+    });
+    transaction.push_change(StateChange::SetProperty {
+        item: outgoing,
+        key: key.clone(),
+        data: serde_json::json!({ "name": "road" }),
+    });
+    storage.apply(&transaction)?;
+
+    let snapshot = storage.snapshot()?;
+    let (items, properties) =
+        snapshot.read(&[alice, forest, ItemId::new()], std::slice::from_ref(&key))?;
+    assert_eq!(items.len(), 2);
+    assert_eq!(properties.len(), 1);
+    assert_eq!(properties[0].item(), alice);
+    assert_eq!(properties[0].data()["name"], "Alice");
+
+    assert_eq!(
+        snapshot.find_relations(&[alice], RelationDirection::Outgoing, Some(&key), None, 8)?,
+        vec![snapshot.load_item(outgoing)?.expect("tagged relation")]
+    );
+    assert_eq!(
+        snapshot.find_relations(&[alice], RelationDirection::Incoming, None, None, 8)?,
+        vec![snapshot.load_item(incoming)?.expect("incoming relation")]
+    );
+    let either = snapshot.find_relations(&[alice], RelationDirection::Either, None, None, 8)?;
+    assert_eq!(either.len(), 3);
     Ok(())
 }
 

@@ -99,6 +99,15 @@ pub enum StorageError {
         maximum: usize,
     },
 
+    /// A batched property read requested too many distinct exact keys.
+    #[error("world property read requested {requested} keys; maximum is {maximum}")]
+    InvalidPropertyReadKeyCount {
+        /// Number of requested property keys.
+        requested: usize,
+        /// Largest supported number of property keys.
+        maximum: usize,
+    },
+
     /// The storage mutex became poisoned after an internal panic.
     #[error("world storage connection is unavailable")]
     ConnectionUnavailable,

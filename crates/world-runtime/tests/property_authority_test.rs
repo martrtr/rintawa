@@ -16,7 +16,9 @@ use rintawa_sdk::{
     world::{ItemId, PrincipalId, SchemaKey},
 };
 use rintawa_storage::SqliteWorldStorage;
-use rintawa_world::{PropertyDefinition, StateChange, WorldError, WorldTransaction};
+use rintawa_world::{
+    PropertyDefinition, RelationDirection, StateChange, WorldError, WorldTransaction,
+};
 use rintawa_world_runtime::{
     SystemError, SystemResult, WorldReadError, WorldRuntime, WorldRuntimeError, WorldSnapshot,
     WorldSystem,
@@ -535,10 +537,36 @@ impl WorldSystem for IndexedReadSystem {
             snapshot.find_properties(&self.forbidden_property, None, 20),
             Err(WorldReadError::PropertyAccessDenied(key)) if key == self.forbidden_property
         ));
+        let batch = snapshot.read(&[self.root], std::slice::from_ref(&self.allowed_property))?;
+        assert_eq!(batch.items().len(), 1);
+        assert_eq!(batch.properties().len(), 1);
+        assert!(matches!(
+            snapshot.read(&[self.root], std::slice::from_ref(&self.forbidden_property)),
+            Err(WorldReadError::PropertyAccessDenied(key)) if key == self.forbidden_property
+        ));
         // Structural relations are accessible without exposing their properties.
         let relations = snapshot.relations_touching_any(&[self.root], None, 10)?;
         assert_eq!(relations.len(), 1);
         assert_eq!(relations[0].id(), self.expected_relation);
+        let filtered = snapshot.find_relations(
+            &[self.root],
+            RelationDirection::Outgoing,
+            Some(&self.allowed_property),
+            None,
+            10,
+        )?;
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id(), self.expected_relation);
+        assert!(matches!(
+            snapshot.find_relations(
+                &[self.root],
+                RelationDirection::Outgoing,
+                Some(&self.forbidden_property),
+                None,
+                10,
+            ),
+            Err(WorldReadError::PropertyAccessDenied(key)) if key == self.forbidden_property
+        ));
 
         let mut transaction = WorldTransaction::new();
         transaction.push_change(StateChange::CreateObject { id: self.creates });
@@ -574,6 +602,11 @@ fn test_should_keep_indexed_search_scoped_to_command_system_owner() -> Result<()
         key: foreign.key().clone(),
         data: serde_json::json!({ "secret": "not readable" }),
     });
+    initial.push_change(StateChange::SetProperty {
+        item: link,
+        key: schemas.identity.clone(),
+        data: serde_json::json!({ "name": "visible relation" }),
+    });
     storage.apply(&initial)?;
     let observed = Arc::new(Mutex::new(Vec::new()));
     let mut builder = runtime_builder(storage, &[&schemas.command])?;
@@ -605,7 +638,10 @@ fn test_should_keep_indexed_search_scoped_to_command_system_owner() -> Result<()
             serde_json::json!({}),
         ))?
         .wait()?;
-    assert_eq!(*observed.lock().expect("search observer lock"), vec![root]);
+    assert_eq!(
+        *observed.lock().expect("search observer lock"),
+        vec![root, link]
+    );
     assert!(runtime.snapshot()?.load_item(created)?.is_some());
     runtime.shutdown()?;
     Ok(())

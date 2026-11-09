@@ -25,6 +25,23 @@ pub enum ItemKind {
     Relation,
 }
 
+/// Direction used when finding relation-items adjacent to object-items.
+///
+/// `Outgoing` matches relations whose subject is one of the supplied targets,
+/// `Incoming` matches relations whose object is a target, and `Either` matches
+/// either endpoint. Relations remain directed even when an `Either` query is
+/// used; the returned [`ItemRecord`] always includes both endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RelationDirection {
+    /// Match only relations directed away from a target.
+    Outgoing,
+    /// Match only relations directed toward a target.
+    Incoming,
+    /// Match relations in either direction.
+    Either,
+}
+
 impl ItemKind {
     /// Returns the integer stored in `items.type`.
     pub const fn code(self) -> i64 {
