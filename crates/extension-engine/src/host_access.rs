@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use rintawa_sdk::{
+    contracts::ComponentRef,
     types::{ExtensionId, RuntimeScopeId},
     world::{ItemId, SchemaKey},
 };
@@ -158,11 +159,11 @@ pub trait WorldDataAccess: Send + Sync {
         limit: usize,
     ) -> HostAccessResult<Vec<String>>;
 
-    /// Enqueues an exact schema command without waiting for the commit.
+    /// Enqueues a command owned by the exact attested component without waiting for the commit.
     fn submit(
         &self,
         scope: &RuntimeScopeId,
-        owner: &ExtensionId,
+        owner: &ComponentRef,
         schema: SchemaKey,
         payload: serde_json::Value,
     ) -> HostAccessResult<WorldCommandTicket>;
@@ -682,7 +683,7 @@ impl WorldDataAccess for UnavailableWorldDataAccess {
     fn submit(
         &self,
         _: &RuntimeScopeId,
-        _: &ExtensionId,
+        _: &ComponentRef,
         _: SchemaKey,
         _: serde_json::Value,
     ) -> HostAccessResult<WorldCommandTicket> {

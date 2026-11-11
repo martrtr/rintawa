@@ -20,13 +20,7 @@ use uuid::Uuid;
 use crate::{HostError, HostResult};
 
 /// Current host composition profile schema.
-pub const PROFILE_SCHEMA: u32 = 7;
-const LEGACY_PROFILE_SCHEMA_V1: u32 = 1;
-const LEGACY_PROFILE_SCHEMA_V2: u32 = 2;
-const LEGACY_PROFILE_SCHEMA_V3: u32 = 3;
-const LEGACY_PROFILE_SCHEMA_V4: u32 = 4;
-const LEGACY_PROFILE_SCHEMA_V5: u32 = 5;
-const LEGACY_PROFILE_SCHEMA_V6: u32 = 6;
+pub const PROFILE_SCHEMA: u32 = 8;
 
 const MAX_HTTP_ORIGINS_PER_COMPONENT: usize = 32;
 const MAX_AUTHORITATIVE_PROVIDERS_PER_PROFILE: usize = 64;
@@ -56,11 +50,6 @@ pub struct ActivationRecord {
     pub scope_id: RuntimeScopeId,
     /// Whether the activation starts automatically in this profile.
     pub enabled: bool,
-    /// Legacy schema-5 marker migrated once into the independent default-World recipe.
-    ///
-    /// New writes keep this false; the field remains decodable for crash-safe migration.
-    #[serde(default)]
-    pub world_default: bool,
 }
 
 /// One explicit provider choice for a versioned contract in one runtime scope.
@@ -264,9 +253,6 @@ pub struct CompositionProfile {
     pub preferences: Vec<PreferenceRecord>,
 }
 
-/// Backward-compatible public name for the pre-world composition profile.
-pub type BaselineProfile = CompositionProfile;
-
 impl Default for CompositionProfile {
     fn default() -> Self {
         Self {
@@ -287,18 +273,9 @@ impl CompositionProfile {
             return Ok(Self::default());
         }
         let source = std::fs::read_to_string(path)?;
-        let mut profile: Self = toml::from_str(&source)?;
-        match profile.schema {
-            PROFILE_SCHEMA => {}
-            LEGACY_PROFILE_SCHEMA_V1
-            | LEGACY_PROFILE_SCHEMA_V2
-            | LEGACY_PROFILE_SCHEMA_V3
-            | LEGACY_PROFILE_SCHEMA_V4
-            | LEGACY_PROFILE_SCHEMA_V5
-            | LEGACY_PROFILE_SCHEMA_V6 => {
-                profile.schema = PROFILE_SCHEMA;
-            }
-            unsupported => return Err(HostError::UnsupportedProfileSchema(unsupported)),
+        let profile: Self = toml::from_str(&source)?;
+        if profile.schema != PROFILE_SCHEMA {
+            return Err(HostError::UnsupportedProfileSchema(profile.schema));
         }
         profile.validate()?;
         Ok(profile)
@@ -701,7 +678,6 @@ impl CompositionProfile {
                     instance_id,
                     scope_id: scope_id.clone(),
                     enabled: activation.enabled,
-                    world_default: false,
                 }
             })
             .collect();
@@ -800,10 +776,8 @@ impl CompositionProfile {
             existing.subject == activation.subject && existing.scope_id == activation.scope_id
         }) {
             let enabled = override_enabled.unwrap_or(existing.enabled);
-            let world_default = existing.world_default;
             *existing = ActivationRecord {
                 enabled,
-                world_default,
                 ..activation
             };
             return enabled;

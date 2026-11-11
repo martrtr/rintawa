@@ -150,7 +150,7 @@ pub fn command(
     principal: PrincipalId,
     payload: serde_json::Value,
 ) -> WorldCommand {
-    WorldCommand::new(schema.clone(), principal, payload)
+    WorldCommand::interactive(schema.clone(), principal, payload)
 }
 
 /// Decodes one item identity from a command payload field.

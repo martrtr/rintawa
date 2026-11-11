@@ -1569,6 +1569,25 @@ fn test_should_require_delegated_principal_own_runtime_permissions() {
 }
 
 #[test]
+fn test_should_not_inherit_world_data_access_in_delegated_execution() {
+    let mut state = WasmHostState::new(ComponentId::new("provider-runtime"));
+    begin_test_registration(&mut state, ExtensionId::new("runtime.provider"));
+    state.finish_registration().unwrap();
+
+    state.begin_delegated_guest_execution(rintawa_sdk::contracts::ComponentRef::new(
+        "dependent-instance",
+        "hosted-component",
+    ));
+    assert!(matches!(
+        state.world_data_identity(),
+        Err(WorldDataError::AccessNotActive)
+    ));
+
+    state.begin_guest_execution();
+    assert!(state.world_data_identity().is_ok());
+}
+
+#[test]
 fn test_should_exchange_bounded_bytes_through_owner_scoped_loopback_handles() {
     let mut state = WasmHostState::new(ComponentId::new("runtime"));
     begin_test_registration(&mut state, ExtensionId::new("runtime.provider"));

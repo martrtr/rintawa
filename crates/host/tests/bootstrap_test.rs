@@ -639,23 +639,22 @@ fn test_should_reuse_cas_object_for_identical_bytes() -> anyhow::Result<()> {
 }
 
 #[test]
-fn test_should_read_legacy_profile_schemas_without_runtime_permissions() -> anyhow::Result<()> {
-    for schema in [1, 2, 3, 4] {
+fn test_should_reject_unsupported_profile_schemas_without_rewriting() -> anyhow::Result<()> {
+    for schema in 1..rintawa_host::PROFILE_SCHEMA {
         let root = tempfile::tempdir()?;
         let home_path = root.path().join(format!("home-{schema}"));
         let profile_dir = home_path.join("profiles");
+        let path = profile_dir.join(rintawa_host::BASELINE_PROFILE_FILE);
         fs::create_dir_all(&profile_dir)?;
-        fs::write(
-            profile_dir.join(rintawa_host::BASELINE_PROFILE_FILE),
-            format!("schema = {schema}\n"),
-        )?;
+        let source = format!("schema = {schema}\n");
+        fs::write(&path, &source)?;
 
         let home = HostHome::open(&home_path)?;
-        let profile = home.load_profile()?;
-        assert_eq!(profile.schema, rintawa_host::PROFILE_SCHEMA);
-        assert!(profile.activations.is_empty());
-        assert!(profile.preferred_providers.is_empty());
-        assert!(profile.runtime_permissions.is_empty());
+        assert!(matches!(
+            home.load_profile(),
+            Err(HostError::UnsupportedProfileSchema(actual)) if actual == schema
+        ));
+        assert_eq!(fs::read_to_string(path)?, source);
     }
     Ok(())
 }
@@ -798,7 +797,7 @@ fn test_should_persist_runtime_permission_and_apply_it_during_bootstrap() -> any
             .join("profiles")
             .join(rintawa_host::BASELINE_PROFILE_FILE),
     )?;
-    assert!(profile_source.contains("schema = 7"));
+    assert!(profile_source.contains("schema = 8"));
     assert!(profile_source.contains("[[runtime_permissions]]"));
     assert!(profile_source.contains("permission = \"background-task\""));
 
@@ -886,7 +885,7 @@ fn test_should_reject_duplicate_runtime_permission_records() -> anyhow::Result<(
     fs::create_dir_all(&profile_dir)?;
     fs::write(
         profile_dir.join(rintawa_host::BASELINE_PROFILE_FILE),
-        r#"schema = 3
+        r#"schema = 8
 
 [[runtime_permissions]]
 scope-id = "host"
@@ -1188,7 +1187,7 @@ fn test_should_persist_exact_http_origin_and_restore_it_on_bootstrap() -> anyhow
             .join("profiles")
             .join(rintawa_host::BASELINE_PROFILE_FILE),
     )?;
-    assert!(source.contains("schema = 7"));
+    assert!(source.contains("schema = 8"));
     assert!(source.contains("[[http_loopback_origins]]"));
     assert!(source.contains("origin = \"http://127.0.0.1:11434\""));
 
@@ -1438,32 +1437,6 @@ fn test_should_reject_invalid_origin_without_mutating_persisted_policy() -> anyh
         ));
     }
     assert_eq!(home.load_profile()?, before);
-    Ok(())
-}
-
-#[test]
-fn test_should_migrate_schema_6_profile_without_inventing_origin_grants() -> anyhow::Result<()> {
-    let root = tempfile::tempdir()?;
-    let artifact = build_task_runtime(root.path(), true)?;
-    let home_path = root.path().join("home");
-    let home = HostHome::open(&home_path)?;
-    home.install_local_rtw(&artifact, None)?;
-    let path = home_path
-        .join("profiles")
-        .join(rintawa_host::BASELINE_PROFILE_FILE);
-    let original = fs::read_to_string(&path)?;
-    assert!(original.contains("schema = 7"));
-    fs::write(&path, original.replace("schema = 7", "schema = 6"))?;
-    let old = HostHome::open(&home_path)?;
-    let profile = old.load_profile()?;
-    assert_eq!(profile.schema, rintawa_host::PROFILE_SCHEMA);
-    assert!(profile.http_loopback_origins.is_empty());
-    old.grant_runtime_permission(
-        RuntimeScopeId::new(HOST_SCOPE),
-        ComponentRef::new("bootstrap.task-runtime", "runtime"),
-        RuntimePermission::BackgroundTask,
-    )?;
-    assert!(fs::read_to_string(&path)?.contains("schema = 7"));
     Ok(())
 }
 

@@ -66,7 +66,12 @@ struct WorldSessionRuntimeState {
 
 #[derive(Default)]
 struct WorldDataRuntimeState {
-    clients: BTreeMap<WorldId, WorldRuntimeClient>,
+    worlds: BTreeMap<WorldId, ActiveWorldData>,
+}
+
+struct ActiveWorldData {
+    client: WorldRuntimeClient,
+    command_owners: BTreeMap<SchemaKey, ComponentRef>,
 }
 
 #[derive(Clone, Default)]
@@ -75,18 +80,29 @@ struct WorldDataRuntimeControl {
 }
 
 impl WorldDataRuntimeControl {
-    fn activate(&self, world_id: WorldId, client: WorldRuntimeClient) -> HostResult<()> {
+    fn activate(
+        &self,
+        world_id: WorldId,
+        client: WorldRuntimeClient,
+        command_owners: BTreeMap<SchemaKey, ComponentRef>,
+    ) -> HostResult<()> {
         self.state
             .lock()
             .map_err(|_| HostError::WorldSessionControlUnavailable)?
-            .clients
-            .insert(world_id, client);
+            .worlds
+            .insert(
+                world_id,
+                ActiveWorldData {
+                    client,
+                    command_owners,
+                },
+            );
         Ok(())
     }
 
     fn deactivate(&self, world_id: WorldId) {
         if let Ok(mut state) = self.state.lock() {
-            state.clients.remove(&world_id);
+            state.worlds.remove(&world_id);
         }
     }
 
@@ -97,10 +113,33 @@ impl WorldDataRuntimeControl {
         self.state
             .lock()
             .map_err(|_| HostAccessError::Unavailable)?
-            .clients
+            .worlds
             .get(&world_id)
-            .cloned()
+            .map(|world| world.client.clone())
             .ok_or(HostAccessError::Unavailable)
+    }
+
+    fn command_client(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ComponentRef,
+        schema: &SchemaKey,
+    ) -> HostAccessResult<WorldRuntimeClient> {
+        let Some(world_id) = canonical_scope_world_id(scope) else {
+            return Err(HostAccessError::Unavailable);
+        };
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| HostAccessError::Unavailable)?;
+        let world = state
+            .worlds
+            .get(&world_id)
+            .ok_or(HostAccessError::Unavailable)?;
+        if world.command_owners.get(schema) != Some(owner) {
+            return Err(HostAccessError::Rejected);
+        }
+        Ok(world.client.clone())
     }
 }
 
@@ -426,12 +465,12 @@ impl WorldDataAccess for WorldDataRuntimeControl {
     fn submit(
         &self,
         scope: &RuntimeScopeId,
-        _owner: &ExtensionId,
+        owner: &ComponentRef,
         schema: SchemaKey,
         payload: serde_json::Value,
     ) -> HostAccessResult<rintawa_world_runtime::WorldCommandTicket> {
-        self.client(scope)?
-            .submit(WorldCommand::new(schema, PrincipalId::new(), payload))
+        self.command_client(scope, owner, &schema)?
+            .submit(WorldCommand::system(schema, payload))
             .map_err(|error| match error {
                 rintawa_world_runtime::WorldRuntimeError::QueueFull => HostAccessError::QueueFull,
                 rintawa_world_runtime::WorldRuntimeError::RuntimeStopped => {
@@ -1012,6 +1051,7 @@ fn map_host_access_error(error: HostError) -> HostAccessError {
 
 struct ActiveWorldRuntimeParts {
     runtime: WorldRuntime,
+    command_owners: BTreeMap<SchemaKey, ComponentRef>,
 }
 
 /// Host-bound adapter from an active WASM component to one authoritative command schema.
@@ -1214,8 +1254,11 @@ impl HostRuntime {
             }
         };
 
-        self.world_data
-            .activate(world_id, runtime_parts.runtime.client())?;
+        self.world_data.activate(
+            world_id,
+            runtime_parts.runtime.client(),
+            runtime_parts.command_owners.clone(),
+        )?;
         self.active_worlds.insert(
             world_id,
             ActiveWorld {
@@ -1294,7 +1337,7 @@ impl HostRuntime {
         authenticated_principal: PrincipalId,
         command: WorldCommand,
     ) -> HostResult<WorldCommandOutcome> {
-        if command.principal() != authenticated_principal {
+        if command.interactive_principal() != Some(authenticated_principal) {
             return Err(HostError::InteractiveWorldCommandPrincipalMismatch);
         }
         self.submit_world_command(world_id, command)
@@ -1364,7 +1407,7 @@ impl HostRuntime {
     /// Stops every active world, then unregisters baseline runtime instances.
     pub fn shutdown(mut self) -> HostResult<()> {
         if let Ok(mut state) = self.world_data.state.lock() {
-            state.clients.clear();
+            state.worlds.clear();
         }
         let (world_failures, mut cleanup_failures) =
             shutdown_worlds(&mut self.active_worlds, &mut self.engine);
@@ -1413,6 +1456,11 @@ fn prepare_world_runtime(
         })
         .collect();
     let mut builder = WorldRuntimeBuilder::new(storage);
+    let command_owners = schemas
+        .iter()
+        .filter(|schema| schema.kind == SchemaKind::Command)
+        .map(|schema| (schema.key.clone(), schema.declarer.clone()))
+        .collect();
     for schema in schemas
         .iter()
         .filter(|schema| schema.kind != SchemaKind::Property)
@@ -1437,7 +1485,10 @@ fn prepare_world_runtime(
     let runtime = builder.start()?;
     runtime.register_property_definitions(&property_definitions)?;
 
-    Ok(ActiveWorldRuntimeParts { runtime })
+    Ok(ActiveWorldRuntimeParts {
+        runtime,
+        command_owners,
+    })
 }
 
 fn bounded_world_session_diagnostic(value: &str) -> String {
@@ -2212,18 +2263,27 @@ mod tests {
             ),
             Err(HostAccessError::Unavailable)
         ));
-        host.world_data.activate(world_id, parts.runtime.client())?;
+        host.world_data.activate(
+            world_id,
+            parts.runtime.client(),
+            parts.command_owners.clone(),
+        )?;
         let commit: SchemaKey = "fixture.commit@1".parse()?;
         let reject: SchemaKey = "fixture.reject@1".parse()?;
         let foreign: SchemaKey = "fixture.foreign@1".parse()?;
         let payload = serde_json::json!({ "item": item.to_string() });
+        assert!(matches!(
+            host.world_data.submit(
+                &world_runtime_scope_id(world_id),
+                &ComponentRef::new("foreign-property-owner", "foreign-schemas"),
+                commit.clone(),
+                payload.clone(),
+            ),
+            Err(HostAccessError::Rejected)
+        ));
         parts
             .runtime
-            .submit(WorldCommand::new(
-                commit,
-                PrincipalId::new(),
-                payload.clone(),
-            ))?
+            .submit(WorldCommand::system(commit, payload.clone()))?
             .wait()?;
         assert_eq!(
             parts
@@ -2237,17 +2297,13 @@ mod tests {
         assert!(
             parts
                 .runtime
-                .submit(WorldCommand::new(
-                    reject,
-                    PrincipalId::new(),
-                    payload.clone()
-                ))?
+                .submit(WorldCommand::system(reject, payload.clone()))?
                 .wait()
                 .is_err()
         );
         let foreign_error = parts
             .runtime
-            .submit(WorldCommand::new(foreign, PrincipalId::new(), payload))?
+            .submit(WorldCommand::system(foreign, payload))?
             .wait()
             .expect_err("foreign property write must be denied");
         assert!(matches!(
@@ -2303,9 +2359,8 @@ mod tests {
         assert!(
             parts
                 .runtime
-                .submit(WorldCommand::new(
+                .submit(WorldCommand::system(
                     "fixture.commit@1".parse()?,
-                    PrincipalId::new(),
                     serde_json::json!({ "item": item.to_string() }),
                 ))?
                 .wait()
@@ -2846,7 +2901,18 @@ mod tests {
             },
         );
         let principal = PrincipalId::new();
-        let good = WorldCommand::new(
+        assert!(matches!(
+            host.submit_interactive_world_command(
+                world.id,
+                principal,
+                WorldCommand::system(
+                    command_schema.clone(),
+                    serde_json::json!({"kind": "committed"}),
+                ),
+            ),
+            Err(HostError::InteractiveWorldCommandPrincipalMismatch)
+        ));
+        let good = WorldCommand::interactive(
             command_schema.clone(),
             principal,
             serde_json::json!({"kind": "committed"}),
@@ -2887,7 +2953,7 @@ mod tests {
         );
 
         let malformed =
-            WorldCommand::new(command_schema, principal, serde_json::json!({"kind": 99}));
+            WorldCommand::interactive(command_schema, principal, serde_json::json!({"kind": 99}));
         assert!(host.submit_world_command(world.id, malformed).is_err());
         assert_eq!(
             created
@@ -2941,7 +3007,6 @@ mod tests {
         let home = HostHome::open(root.path().join("home"))?;
         let created = home.create_world()?;
         let world_id = created.id;
-        let principal = PrincipalId::new();
         let command_schema: SchemaKey = "rintawa.test.supervised-command@1".parse()?;
 
         let mut host = HostRuntime::start(&home)?;
@@ -2957,11 +3022,8 @@ mod tests {
 
         host.deactivate_world(world_id)?;
         assert!(!host.is_world_active(world_id));
-        let command = WorldCommand::new(
-            command_schema,
-            principal,
-            serde_json::json!({ "kind": "after-stop" }),
-        );
+        let command =
+            WorldCommand::system(command_schema, serde_json::json!({ "kind": "after-stop" }));
         assert!(matches!(
             host.submit_world_command(world_id, command),
             Err(HostError::WorldNotActive(id)) if id == world_id

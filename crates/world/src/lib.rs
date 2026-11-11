@@ -19,7 +19,7 @@ mod session;
 mod state;
 mod transaction;
 
-pub use command::WorldCommand;
+pub use command::{WorldCommand, WorldCommandOrigin};
 pub use error::{WorldError, WorldResult};
 pub use runtime_schema::{
     RuntimeSchemaDefinition, RuntimeSchemaRegistration, SchemaKind, SchemaRegistry,

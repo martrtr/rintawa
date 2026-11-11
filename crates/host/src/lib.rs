@@ -41,8 +41,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub use profile::{
-    ActivationRecord, AuthoritativeProviderSelection, BaselineProfile, CompositionProfile,
-    HttpLoopbackOriginGrant, PROFILE_SCHEMA, PreferredProviderSelection, RuntimePermissionGrant,
+    ActivationRecord, AuthoritativeProviderSelection, CompositionProfile, HttpLoopbackOriginGrant,
+    PROFILE_SCHEMA, PreferredProviderSelection, RuntimePermissionGrant,
 };
 pub use runtime::HostRuntime;
 use world_metadata::WorldMetadata;
@@ -561,8 +561,8 @@ pub struct InstalledActivation {
     pub scope_id: RuntimeScopeId,
     /// Whether the selected composition activation should start automatically.
     pub enabled: bool,
-    /// Compatibility view indicating that this exact enabled baseline artifact is selected
-    /// in the independent default-World recipe. Always false outside the baseline view.
+    /// Whether this exact enabled baseline artifact is selected in the independent
+    /// default-World recipe. Always false outside the baseline view.
     pub world_default: bool,
 }
 
@@ -815,8 +815,8 @@ impl HostHome {
     }
 
     /// Loads the baseline pre-world composition.
-    pub fn load_profile(&self) -> HostResult<BaselineProfile> {
-        let profile = BaselineProfile::load(&self.profile_path)?;
+    pub fn load_profile(&self) -> HostResult<CompositionProfile> {
+        let profile = CompositionProfile::load(&self.profile_path)?;
         profile.validate_scope(&RuntimeScopeId::new(HOST_SCOPE))?;
         Ok(profile)
     }
@@ -1008,7 +1008,6 @@ impl HostHome {
                 instance_id: instance_id.clone(),
                 scope_id: scope_id.clone(),
                 enabled: true,
-                world_default: false,
             },
             enabled,
         );
@@ -1069,8 +1068,7 @@ impl HostHome {
         self.set_enabled_in_scope(&RuntimeScopeId::new(HOST_SCOPE), subject, enabled)
     }
 
-    /// Compatibility helper that adds or removes the current baseline artifact from the
-    /// independent default-World recipe.
+    /// Adds or removes the current baseline artifact from the independent default-World recipe.
     ///
     /// Existing Worlds and later baseline policy changes are never propagated implicitly.
     pub fn set_world_default(&self, subject: &str, world_default: bool) -> HostResult<()> {

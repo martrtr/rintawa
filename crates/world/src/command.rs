@@ -9,22 +9,46 @@ use serde::{Deserialize, Serialize};
 
 use crate::{SchemaRegistry, WorldResult};
 
+/// Origin attested by the Host for one submitted World command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorldCommandOrigin {
+    /// A Host-approved active System submitted this command.
+    System,
+    /// A trusted Host ingress authenticated this outside principal.
+    Interactive(PrincipalId),
+}
+
 /// Immutable input envelope submitted to one authoritative world.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorldCommand {
     id: CommandId,
     schema: SchemaKey,
-    principal: PrincipalId,
+    origin: WorldCommandOrigin,
     payload: serde_json::Value,
 }
 
 impl WorldCommand {
-    /// Creates a new command identity.
-    pub fn new(schema: SchemaKey, principal: PrincipalId, payload: serde_json::Value) -> Self {
+    /// Creates a command submitted by one Host-approved active System.
+    pub fn system(schema: SchemaKey, payload: serde_json::Value) -> Self {
         Self {
             id: CommandId::new(),
             schema,
-            principal,
+            origin: WorldCommandOrigin::System,
+            payload,
+        }
+    }
+
+    /// Creates a command from an authenticated outside principal.
+    pub fn interactive(
+        schema: SchemaKey,
+        principal: PrincipalId,
+        payload: serde_json::Value,
+    ) -> Self {
+        Self {
+            id: CommandId::new(),
+            schema,
+            origin: WorldCommandOrigin::Interactive(principal),
             payload,
         }
     }
@@ -39,9 +63,17 @@ impl WorldCommand {
         &self.schema
     }
 
-    /// Returns the authenticated outside principal.
-    pub const fn principal(&self) -> PrincipalId {
-        self.principal
+    /// Returns the Host-attested command origin.
+    pub const fn origin(&self) -> WorldCommandOrigin {
+        self.origin
+    }
+
+    /// Returns the authenticated outside principal for an interactive command.
+    pub const fn interactive_principal(&self) -> Option<PrincipalId> {
+        match self.origin {
+            WorldCommandOrigin::System => None,
+            WorldCommandOrigin::Interactive(principal) => Some(principal),
+        }
     }
 
     /// Returns the immutable command payload.
@@ -59,5 +91,26 @@ impl WorldCommand {
     /// Returns a missing definition or payload validation error.
     pub fn validate_schema(&self, schemas: &SchemaRegistry) -> WorldResult<()> {
         schemas.validate_payload(&self.schema, crate::SchemaKind::Command, &self.payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_keep_system_and_interactive_origins_distinct() {
+        let schema: SchemaKey = "test.command@1".parse().expect("test schema must be valid");
+        let system = WorldCommand::system(schema.clone(), serde_json::json!({}));
+        assert_eq!(system.origin(), WorldCommandOrigin::System);
+        assert_eq!(system.interactive_principal(), None);
+
+        let principal = PrincipalId::new();
+        let interactive = WorldCommand::interactive(schema, principal, serde_json::json!({}));
+        assert_eq!(
+            interactive.origin(),
+            WorldCommandOrigin::Interactive(principal)
+        );
+        assert_eq!(interactive.interactive_principal(), Some(principal));
     }
 }

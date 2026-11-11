@@ -827,7 +827,10 @@ impl WasmHostState {
         self.task_access_active = true;
         self.network_access_active = true;
         self.host_access_active = true;
-        self.world_data_access_active = true;
+        // This Store belongs to the target provider. A delegated component has
+        // no independently attested extension identity at this boundary, so it
+        // must not inherit the provider's World access.
+        self.world_data_access_active = false;
         self.http_request_access_active = true;
         self.world_session_mutations_this_execution = 0;
         self.secret_access_active = true;
@@ -846,7 +849,9 @@ impl WasmHostState {
         self.task_access_active = true;
         self.network_access_active = true;
         self.host_access_active = true;
-        self.world_data_access_active = true;
+        // See begin_delegated_guest_execution: World access is never inherited
+        // from the target provider by a delegated component.
+        self.world_data_access_active = false;
         self.http_request_access_active = true;
         self.world_session_mutations_this_execution = 0;
         self.secret_access_active = true;
@@ -1570,7 +1575,10 @@ impl WorldDataHost for WasmHostState {
     }
 
     fn submit(&mut self, schema: String, payload_json: String) -> Result<u64, WorldDataError> {
-        let (scope, owner) = self.world_data_identity()?;
+        let (scope, _) = self.world_data_identity()?;
+        let owner = self
+            .current_execution_owner()
+            .ok_or(WorldDataError::AccessNotActive)?;
         self.check_world_data_bytes(payload_json.len().saturating_add(schema.len()))?;
         if self.world_data_tickets.len() >= 16 {
             return Err(WorldDataError::QueueFull);
@@ -1615,7 +1623,10 @@ impl WorldDataHost for WasmHostState {
 
 impl WasmHostState {
     fn world_data_identity(&self) -> Result<(&RuntimeScopeId, &ExtensionId), WorldDataError> {
-        if !self.world_data_access_active || self.world_system_snapshot.is_some() {
+        if !self.world_data_access_active
+            || self.world_system_snapshot.is_some()
+            || self.current_execution_owner() != self.registered_owner().as_ref()
+        {
             return Err(WorldDataError::AccessNotActive);
         }
         let scope = self
