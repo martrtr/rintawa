@@ -32,11 +32,6 @@ impl Component for ScopedComponent {
         ))?;
         Ok(())
     }
-
-    fn start(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
-        ctx.register_runtime_effect(RuntimeEffect::event_subscription("example.event"))?;
-        Ok(())
-    }
 }
 
 fn manifest() -> ExtensionManifest {
@@ -92,8 +87,6 @@ fn test_should_isolate_same_extension_between_runtime_scopes() -> Result<()> {
             .is_some()
     );
 
-    assert_eq!(engine.active_runtime_effect_principals().len(), 2);
-
     engine.stop_extension_instance(&instance_a)?;
 
     assert_eq!(
@@ -114,9 +107,5 @@ fn test_should_isolate_same_extension_between_runtime_scopes() -> Result<()> {
             .active_contribution_owner_in_scope(&scope_b, &ContributionId::new("example.shared"))
             .is_some()
     );
-    let effects = engine.active_runtime_effect_principals();
-    assert_eq!(effects.len(), 1);
-    assert_eq!(effects[0].1.instance_id, instance_b);
-
     Ok(())
 }

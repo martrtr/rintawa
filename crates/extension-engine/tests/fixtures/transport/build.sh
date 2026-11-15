@@ -13,6 +13,14 @@ cat > "$workspace/Cargo.toml" <<'TOML'
 [workspace]
 members = ["provider", "consumer"]
 resolver = "2"
+
+[profile.dev]
+debug = 0
+strip = "symbols"
+opt-level = "z"
+panic = "abort"
+lto = true
+codegen-units = 1
 TOML
 for guest in provider consumer; do
   cat > "$workspace/$guest/Cargo.toml" <<TOML
@@ -53,7 +61,7 @@ TOML
 if [[ -f "$fixture_root/Cargo.lock" ]]; then
   cp "$fixture_root/Cargo.lock" "$workspace/Cargo.lock"
 else
-  (cd "$workspace" && cargo generate-lockfile --offline)
+  (cd "$workspace" && RUSTUP_TOOLCHAIN=stable cargo generate-lockfile --offline)
   cp "$workspace/Cargo.lock" "$fixture_root/Cargo.lock"
 fi
 if [[ -z "$(printenv CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_LINKER || true)" ]]; then
@@ -71,9 +79,9 @@ if [[ -n "$(printenv CARGO_TARGET_DIR || true)" ]]; then
   dev_cli="$(printenv CARGO_TARGET_DIR)/debug/rintawa-dev"
 fi
 if [[ ! -x "$dev_cli" ]]; then
-  (cd "$core_root" && cargo build --locked -p rintawa-dev)
+  (cd "$core_root" && RUSTUP_TOOLCHAIN=stable cargo build --locked -p rintawa-dev)
 fi
-"$dev_cli" check "$workspace"
+RUSTUP_TOOLCHAIN=stable "$dev_cli" check "$workspace"
 cp "$workspace/rtw/provider.wasm" "$fixture_root/provider.wasm"
 cp "$workspace/rtw/consumer.wasm" "$fixture_root/consumer.wasm"
 echo "Built WASM transport provider and consumer."

@@ -1,6 +1,6 @@
 # WASM target-provider fixture
 
-`component.wasm` is the release-size Component Model fixture used by
+`component.wasm` is the compact Component Model fixture used by
 `artifact_loader_test.rs` to exercise the generic execution-target WIT boundary.
 `guest.rs` is its auditable source.
 
@@ -14,3 +14,5 @@ The checked-in component must be regenerated whenever the provider WIT ABI
 changes. Although the generic authoring world exposes host-gated task/loopback
 imports, this fixture must not use those capabilities. It must not gain filesystem
 or CAS-path access, raw host resources, or any Web-specific API.
+
+Run `bash build.sh` to regenerate it.

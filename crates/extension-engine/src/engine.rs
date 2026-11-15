@@ -12,14 +12,10 @@ use rintawa_sdk::{
     contributions::{ContributionDescriptor, WorldSchemaContribution},
     errors::{ExtensionError, ExtensionResult},
     manifest::ExtensionManifest,
-    runtime_effects::RuntimeEffect,
     runtime_permissions::RuntimePermission,
     secrets::SecretPathPattern,
     traits::Component,
-    types::{
-        ComponentId, ContributionId, ExtensionId, ExtensionInstanceId, RuntimeEffectId,
-        RuntimeScopeId,
-    },
+    types::{ComponentId, ContributionId, ExtensionId, ExtensionInstanceId, RuntimeScopeId},
 };
 use tracing::warn;
 
@@ -42,7 +38,6 @@ use crate::{
         WorldDataAccess, WorldSessionAccess,
     },
     runtime::{WasmRuntimeEngine, WasmWorldSystemEndpoint},
-    runtime_effects::RuntimeEffectRegistry,
     runtime_permissions::RuntimePermissionManager,
     secrets::SecretManager,
     transport::{Transport, TransportError},
@@ -57,7 +52,7 @@ pub enum ExtensionState {
     Registered,
     /// Extension components are active.
     Active,
-    /// Host-owned contributions and runtime effects are deactivated.
+    /// Host-owned contributions are deactivated.
     ///
     /// A transition can still return [`EngineError::StopFailed`] when one or
     /// more component callbacks could not clean up their own external state.
@@ -138,19 +133,6 @@ impl ManagedComponent {
             .map_err(|_| ExtensionError::Message(String::from("component lock was poisoned")))?;
         component.stop(context)
     }
-
-    fn handle_event(
-        &self,
-        context: &mut dyn ComponentContext,
-        topic: &str,
-        payload: &[u8],
-    ) -> ExtensionResult<()> {
-        let mut component = self
-            .handle
-            .lock()
-            .map_err(|_| ExtensionError::Message(String::from("component lock was poisoned")))?;
-        component.handle_event(context, topic, payload)
-    }
 }
 
 /// A contribution registered by a specific component within an extension.
@@ -163,7 +145,6 @@ struct OwnedContribution {
 pub struct ExtensionEngine {
     extensions: HashMap<ExtensionInstanceId, ManagedExtension>,
     active_contributions: HashSet<(RuntimeScopeId, ContributionId)>,
-    runtime_effects: RuntimeEffectRegistry,
     runtime_permissions: RuntimePermissionManager,
     secrets: SecretManager,
     transport: Transport,
@@ -198,7 +179,6 @@ impl Default for ExtensionEngine {
         Self {
             extensions: HashMap::new(),
             active_contributions: HashSet::new(),
-            runtime_effects: RuntimeEffectRegistry::default(),
             runtime_permissions: RuntimePermissionManager::default(),
             secrets,
             transport: Transport::default(),
@@ -267,7 +247,6 @@ impl ExtensionEngine {
         Self {
             extensions: HashMap::new(),
             active_contributions: HashSet::new(),
-            runtime_effects: RuntimeEffectRegistry::default(),
             runtime_permissions: RuntimePermissionManager::default(),
             secrets,
             transport: Transport::default(),
@@ -1107,8 +1086,8 @@ impl ExtensionEngine {
 
         self.plan_extension_activation(std::slice::from_ref(instance_id))?;
 
-        let (extensions, runtime_effects) = (&mut self.extensions, &mut self.runtime_effects);
-        let ext = extensions
+        let ext = self
+            .extensions
             .get_mut(instance_id)
             .ok_or_else(|| EngineError::ExtensionInstanceNotFound(instance_id.to_string()))?;
 
@@ -1146,8 +1125,7 @@ impl ExtensionEngine {
                 scope_id.clone(),
                 comp.id().clone(),
             );
-            let mut ctx =
-                EngineComponentContext::new(identity, runtime_effects, &self.secrets, true);
+            let mut ctx = EngineComponentContext::new(identity, &self.secrets, true);
 
             if let Err(err) = comp.start(&mut ctx) {
                 let failed_component_id = comp.id().as_str().to_string();
@@ -1161,7 +1139,7 @@ impl ExtensionEngine {
                     comp.id().clone(),
                 );
                 let mut failed_stop_context =
-                    EngineComponentContext::new(identity, runtime_effects, &self.secrets, false);
+                    EngineComponentContext::new(identity, &self.secrets, false);
                 if let Err(stop_error) = comp.stop(&mut failed_stop_context) {
                     rollback_failures.push(ComponentStopFailure {
                         component_id: failed_component_id.clone(),
@@ -1177,12 +1155,7 @@ impl ExtensionEngine {
                         scope_id.clone(),
                         comp_to_stop.id().clone(),
                     );
-                    let mut stop_ctx = EngineComponentContext::new(
-                        identity,
-                        runtime_effects,
-                        &self.secrets,
-                        false,
-                    );
+                    let mut stop_ctx = EngineComponentContext::new(identity, &self.secrets, false);
                     if let Err(stop_error) = comp_to_stop.stop(&mut stop_ctx) {
                         rollback_failures.push(ComponentStopFailure {
                             component_id,
@@ -1191,7 +1164,6 @@ impl ExtensionEngine {
                     }
                 }
 
-                runtime_effects.revoke_instance(&concrete_instance_id);
                 self.execution_targets
                     .revoke_instance(&concrete_instance_id);
                 self.transport.revoke_instance(&concrete_instance_id);
@@ -1239,8 +1211,8 @@ impl ExtensionEngine {
 
     /// Stops one concrete extension runtime instance.
     ///
-    /// Host-owned services, UI presentation, contributions, and runtime effects
-    /// are revoked for this instance without affecting another instance of the
+    /// Host-owned services, UI presentation, and contributions are revoked for
+    /// this instance without affecting another instance of the
     /// same logical extension.
     ///
     /// # Errors
@@ -1315,8 +1287,8 @@ impl ExtensionEngine {
             self.ensure_execution_target_provider_not_in_use(instance_id)?;
         }
 
-        let (extensions, runtime_effects) = (&mut self.extensions, &mut self.runtime_effects);
-        let ext = extensions
+        let ext = self
+            .extensions
             .get_mut(instance_id)
             .ok_or_else(|| EngineError::ExtensionInstanceNotFound(instance_id.to_string()))?;
 
@@ -1335,8 +1307,7 @@ impl ExtensionEngine {
                 scope_id.clone(),
                 comp.id().clone(),
             );
-            let mut ctx =
-                EngineComponentContext::new(identity, runtime_effects, &self.secrets, false);
+            let mut ctx = EngineComponentContext::new(identity, &self.secrets, false);
             if let Err(err) = comp.stop(&mut ctx) {
                 stop_failures.push(ComponentStopFailure {
                     component_id,
@@ -1350,7 +1321,6 @@ impl ExtensionEngine {
                 .remove(&(scope_id.clone(), contrib.descriptor.id.clone()));
         }
 
-        runtime_effects.revoke_instance(&concrete_instance_id);
         self.execution_targets
             .revoke_instance(&concrete_instance_id);
         ext.state = ExtensionState::Stopped;
@@ -1573,12 +1543,7 @@ impl ExtensionEngine {
                     scope_id,
                     component_id.clone(),
                 );
-                let mut context = EngineComponentContext::new(
-                    identity,
-                    &mut self.runtime_effects,
-                    &self.secrets,
-                    true,
-                );
+                let mut context = EngineComponentContext::new(identity, &self.secrets, true);
                 match handle.lock() {
                     Ok(mut component) => component
                         .poll_runtime(&mut context)
@@ -1607,111 +1572,6 @@ impl ExtensionEngine {
         }
 
         Ok(next_wake)
-    }
-
-    /// Dispatches one runtime event in the legacy default runtime scope.
-    ///
-    /// Component callback failures are contained by quarantining the owning
-    /// extension instance. Other active subscribers continue to receive the
-    /// event in deterministic principal order.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an empty topic or when host-owned quarantine
-    /// infrastructure cannot complete safely.
-    pub fn dispatch_runtime_event(&mut self, topic: &str, payload: &[u8]) -> EngineResult<usize> {
-        self.dispatch_runtime_event_in_scope(&default_scope_id(), topic, payload)
-    }
-
-    /// Dispatches one runtime event to exact-topic event subscribers in one scope.
-    ///
-    /// The returned count contains successful component callbacks. Subscription
-    /// handles are owner-scoped runtime effects; stopped or quarantined owners
-    /// are skipped even when they appeared in the initial routing snapshot.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError::InvalidRuntimeEventTopic`] for an empty topic or
-    /// a host-level lifecycle error when quarantining a failed subscriber cannot
-    /// complete safely. Component callback errors themselves are logged and
-    /// contained so one extension cannot block delivery to unrelated subscribers.
-    pub fn dispatch_runtime_event_in_scope(
-        &mut self,
-        scope_id: &RuntimeScopeId,
-        topic: &str,
-        payload: &[u8],
-    ) -> EngineResult<usize> {
-        if topic.trim().is_empty() {
-            return Err(EngineError::InvalidRuntimeEventTopic);
-        }
-        let subscribers = self.runtime_effects.event_subscribers(topic);
-        self.dispatch_runtime_subscribers(scope_id, topic, payload, subscribers, "event")
-    }
-
-    fn dispatch_runtime_subscribers(
-        &mut self,
-        scope_id: &RuntimeScopeId,
-        topic: &str,
-        payload: &[u8],
-        subscribers: Vec<ComponentRef>,
-        stream: &'static str,
-    ) -> EngineResult<usize> {
-        let mut delivered = 0_usize;
-        for owner in subscribers {
-            let Some((logical_id, component_handle)) = self
-                .extensions
-                .get(&owner.instance_id)
-                .filter(|extension| {
-                    extension.state == ExtensionState::Active && &extension.scope_id == scope_id
-                })
-                .and_then(|extension| {
-                    extension
-                        .components
-                        .iter()
-                        .find(|component| component.id() == &owner.component_id)
-                        .map(|component| (extension.manifest.id.clone(), component.handle.clone()))
-                })
-            else {
-                continue;
-            };
-
-            let callback_result = {
-                let identity = ComponentIdentity::new(
-                    logical_id.clone(),
-                    owner.instance_id.clone(),
-                    scope_id.clone(),
-                    owner.component_id.clone(),
-                );
-                let mut context = EngineComponentContext::new(
-                    identity,
-                    &mut self.runtime_effects,
-                    &self.secrets,
-                    true,
-                );
-                let managed = ManagedComponent {
-                    id: owner.component_id.clone(),
-                    handle: component_handle,
-                };
-                managed.handle_event(&mut context, topic, payload)
-            };
-
-            match callback_result {
-                Ok(()) => delivered += 1,
-                Err(error) => {
-                    warn!(
-                        extension_id = %logical_id,
-                        instance_id = %owner.instance_id,
-                        component_id = %owner.component_id,
-                        topic = %topic,
-                        stream,
-                        reason = %error,
-                        "runtime callback failed; quarantining extension instance"
-                    );
-                    self.quarantine_extension_instance(&owner.instance_id)?;
-                }
-            }
-        }
-        Ok(delivered)
     }
 
     /// Builds a deterministic provider-before-consumer plan for registered instances.
@@ -1983,33 +1843,6 @@ impl ExtensionEngine {
                     .find(|contrib| contrib.descriptor.id == *contribution_id)
                     .map(|contrib| (&ext.manifest.id, &contrib.component_id))
             })
-    }
-
-    /// Returns all active runtime effects using legacy logical-extension ownership.
-    pub fn active_runtime_effects(
-        &self,
-    ) -> Vec<(&RuntimeEffectId, &ExtensionId, &ComponentId, &RuntimeEffect)> {
-        self.runtime_effects
-            .active_effects()
-            .into_iter()
-            .filter_map(|(effect_id, owner, effect)| {
-                self.extensions.get(&owner.instance_id).map(|extension| {
-                    (
-                        effect_id,
-                        &extension.manifest.id,
-                        &owner.component_id,
-                        effect,
-                    )
-                })
-            })
-            .collect()
-    }
-
-    /// Returns all active runtime effects with their exact runtime principal.
-    pub fn active_runtime_effect_principals(
-        &self,
-    ) -> Vec<(&RuntimeEffectId, &ComponentRef, &RuntimeEffect)> {
-        self.runtime_effects.active_effects()
     }
 
     /// Returns lifecycle state of the default instance of one logical extension.

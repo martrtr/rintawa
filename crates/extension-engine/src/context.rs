@@ -8,18 +8,13 @@ use rintawa_sdk::{
     contracts::{ContractConsumer, ContractDefinition, ContractProvider},
     contributions::{ContributionDescriptor, WorldSchemaContribution},
     errors::{ExtensionError, ExtensionResult},
-    runtime_effects::RuntimeEffect,
     secrets::{SecretPath, SecretValue},
-    types::{
-        ComponentId, ContributionId, ExtensionId, ExtensionInstanceId, RuntimeEffectId,
-        RuntimeScopeId,
-    },
+    types::{ComponentId, ContributionId, ExtensionId, ExtensionInstanceId, RuntimeScopeId},
 };
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     composition::{OwnedContractConsumer, OwnedContractDefinition, OwnedContractProvider},
-    runtime_effects::RuntimeEffectRegistry,
     secrets::SecretManager,
 };
 
@@ -239,7 +234,6 @@ impl<'a> RegistrationContext for EngineRegistrationContext<'a> {
 pub struct EngineComponentContext<'a> {
     identity: ComponentIdentity,
     logger: EngineLogger,
-    runtime_effects: &'a mut RuntimeEffectRegistry,
     secrets: &'a SecretManager,
     execution_active: bool,
 }
@@ -248,7 +242,6 @@ impl<'a> EngineComponentContext<'a> {
     /// Creates a new execution context.
     pub(crate) fn new(
         identity: ComponentIdentity,
-        runtime_effects: &'a mut RuntimeEffectRegistry,
         secrets: &'a SecretManager,
         execution_active: bool,
     ) -> Self {
@@ -256,7 +249,6 @@ impl<'a> EngineComponentContext<'a> {
         Self {
             identity,
             logger,
-            runtime_effects,
             secrets,
             execution_active,
         }
@@ -282,24 +274,6 @@ impl ComponentContext for EngineComponentContext<'_> {
 
     fn logger(&self) -> &dyn LoggerApi {
         &self.logger
-    }
-
-    fn register_runtime_effect(
-        &mut self,
-        effect: RuntimeEffect,
-    ) -> ExtensionResult<RuntimeEffectId> {
-        self.runtime_effects.register(self.identity.owner(), effect)
-    }
-
-    fn revoke_runtime_effect(&mut self, effect_id: &RuntimeEffectId) -> ExtensionResult<()> {
-        self.runtime_effects
-            .revoke(effect_id, &self.identity.owner())
-    }
-
-    fn revoke_all_runtime_effects(&mut self) -> ExtensionResult<()> {
-        self.runtime_effects
-            .revoke_component(&self.identity.owner());
-        Ok(())
     }
 
     fn read_secret(&self, path: &SecretPath) -> ExtensionResult<SecretValue> {

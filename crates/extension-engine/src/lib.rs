@@ -4,7 +4,7 @@
 //! - parsing manifests and managing component lifecycles (`register`, `start`, `stop`);
 //! - canonical loading of stored `rintawa.extension@1` RTW artifacts via [`RtwExtensionLoader`];
 //! - transitional directory discovery via [`ExtensionLoader`] and [`ExtensionsStateConfig`];
-//! - WASM runtime isolation and owner-scoped runtime effects.
+//! - WASM runtime isolation and owner-scoped Host capabilities.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, rustdoc::broken_intra_doc_links)]
@@ -24,7 +24,6 @@ mod secrets;
 mod state;
 mod transport;
 
-mod runtime_effects;
 mod runtime_permissions;
 
 pub use activation::{ActivationPlan, ActivationPlanError};
@@ -75,11 +74,6 @@ mod tests {
         id: ComponentId,
     }
 
-    struct SubscriptionRuntime {
-        id: ComponentId,
-        should_fail_after_registering: bool,
-    }
-
     struct SecretReaderRuntime {
         id: ComponentId,
         path: SecretPath,
@@ -126,15 +120,6 @@ mod tests {
         }
     }
 
-    impl SubscriptionRuntime {
-        fn new(id: &str, should_fail_after_registering: bool) -> Self {
-            Self {
-                id: ComponentId::new(id),
-                should_fail_after_registering,
-            }
-        }
-    }
-
     impl Component for LifecycleFailureRuntime {
         fn as_any(&self) -> &dyn std::any::Any {
             self
@@ -154,11 +139,7 @@ mod tests {
             Ok(())
         }
 
-        fn start(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
-            ctx.register_runtime_effect(RuntimeEffect::event_subscription(format!(
-                "test.{}",
-                self.id
-            )))?;
+        fn start(&mut self, _ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
             if self.fail_start {
                 return Err(ExtensionError::Message(String::from(
                     "simulated start failure",
@@ -167,38 +148,12 @@ mod tests {
             Ok(())
         }
 
-        fn stop(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
+        fn stop(&mut self, _ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
             if self.fail_stop {
-                ctx.register_runtime_effect(RuntimeEffect::event_subscription(format!(
-                    "stop.{}",
-                    self.id
-                )))?;
                 return Err(ExtensionError::Message(String::from(
                     "simulated stop failure",
                 )));
             }
-            Ok(())
-        }
-    }
-
-    impl Component for SubscriptionRuntime {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
-        fn id(&self) -> &ComponentId {
-            &self.id
-        }
-
-        fn start(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
-            ctx.register_runtime_effect(RuntimeEffect::event_subscription("dialogue.message"))?;
-
-            if self.should_fail_after_registering {
-                return Err(ExtensionError::Message(String::from(
-                    "simulated startup failure",
-                )));
-            }
-
             Ok(())
         }
     }
@@ -441,60 +396,6 @@ mod tests {
     }
 
     #[test]
-    fn test_should_scope_runtime_effects_and_cleanup_on_stop_and_failed_start() -> EngineResult<()>
-    {
-        let manifest_toml = r#"
-            id = "runtime-effects"
-            name = "Runtime Effects"
-            version = "0.0.1"
-            sdk = "^0.0"
-        "#;
-        let mut engine = ExtensionEngine::new();
-        let manifest = engine.parse_manifest(manifest_toml)?;
-
-        engine.register_extension(
-            manifest.clone(),
-            vec![Box::new(SubscriptionRuntime::new("subscriber", false))],
-        )?;
-        engine.start_extension(&manifest.id)?;
-
-        let effects = engine.active_runtime_effects();
-        assert_eq!(effects.len(), 1);
-        assert_eq!(effects[0].1, &manifest.id);
-        assert_eq!(effects[0].2.as_str(), "subscriber");
-        assert_eq!(
-            effects[0].3,
-            &RuntimeEffect::event_subscription("dialogue.message")
-        );
-
-        engine.stop_extension(&manifest.id)?;
-        assert!(engine.active_runtime_effects().is_empty());
-        engine.start_extension(&manifest.id)?;
-        assert_eq!(engine.active_runtime_effects().len(), 1);
-
-        let failed_manifest = engine.parse_manifest(
-            r#"
-                id = "failing-runtime-effects"
-                name = "Failing Runtime Effects"
-                version = "0.0.1"
-                sdk = "^0.0"
-            "#,
-        )?;
-        engine.register_extension(
-            failed_manifest.clone(),
-            vec![Box::new(SubscriptionRuntime::new(
-                "failing-subscriber",
-                true,
-            ))],
-        )?;
-
-        assert!(engine.start_extension(&failed_manifest.id).is_err());
-        assert_eq!(engine.active_runtime_effects().len(), 1);
-
-        Ok(())
-    }
-
-    #[test]
     fn test_should_return_stop_failures_after_host_cleanup() -> EngineResult<()> {
         let mut engine = ExtensionEngine::new();
         let manifest = engine.parse_manifest(
@@ -525,7 +426,6 @@ mod tests {
         )?;
         engine.start_extension(&manifest.id)?;
         assert_eq!(engine.active_contributions().len(), 2);
-        assert_eq!(engine.active_runtime_effects().len(), 2);
 
         let error = engine.stop_extension(&manifest.id).unwrap_err();
         match error {
@@ -556,7 +456,6 @@ mod tests {
             Some(ExtensionState::Stopped)
         );
         assert!(engine.active_contributions().is_empty());
-        assert!(engine.active_runtime_effects().is_empty());
 
         Ok(())
     }
@@ -593,7 +492,6 @@ mod tests {
             Some(ExtensionState::Stopped)
         );
         assert!(engine.active_contributions().is_empty());
-        assert!(engine.active_runtime_effects().is_empty());
 
         engine.unregister_extension(&manifest.id)?;
         assert_eq!(engine.extension_state(&manifest.id), None);
@@ -602,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn test_should_aggregate_startup_rollback_failures_and_revoke_effects() -> EngineResult<()> {
+    fn test_should_aggregate_startup_rollback_failures() -> EngineResult<()> {
         let mut engine = ExtensionEngine::new();
         let manifest = engine.parse_manifest(
             r#"
@@ -653,7 +551,6 @@ mod tests {
             engine.extension_state(&manifest.id),
             Some(ExtensionState::Registered)
         );
-        assert!(engine.active_runtime_effects().is_empty());
 
         Ok(())
     }

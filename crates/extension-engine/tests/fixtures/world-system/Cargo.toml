@@ -6,6 +6,14 @@ publish = false
 
 [workspace]
 
+[profile.dev]
+debug = 0
+strip = "symbols"
+opt-level = "z"
+panic = "abort"
+lto = true
+codegen-units = 1
+
 [lib]
 crate-type = ["cdylib"]
 

@@ -17,11 +17,6 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
 
     fn stop() {}
 
-    fn on_event(_topic: String, _payload: Vec<u8>) {}
-
-    fn handle_service(_contract: String, _version: u32, _payload: Vec<u8>) -> Vec<u8> {
-        Vec::new()
-    }
 }
 
 impl exports::rintawa::engine::target_provider::Guest for Fixture {
@@ -62,8 +57,6 @@ impl exports::rintawa::engine::target_provider::Guest for Fixture {
             return Err(exports::rintawa::engine::target_provider::Error::UnknownComponent);
         }
 
-        rintawa::engine::runtime_effects::subscribe_event("test.delegated-event@1")
-            .map_err(|_| exports::rintawa::engine::target_provider::Error::Unavailable)?;
         Ok(())
     }
 
@@ -83,34 +76,6 @@ impl exports::rintawa::engine::target_provider::Guest for Fixture {
         }
     }
 
-    fn handle_event(
-        handle: u64,
-        topic: String,
-        payload: Vec<u8>,
-    ) -> Result<(), exports::rintawa::engine::target_provider::Error> {
-        use exports::rintawa::engine::target_provider::Error;
-
-        if handle != 7 {
-            return Err(Error::UnknownComponent);
-        }
-        if topic != "test.delegated-event@1" || payload != b"delegated payload" {
-            return Err(Error::Rejected);
-        }
-        Ok(())
-    }
-
-    fn handle_service(
-        handle: u64,
-        _contract: String,
-        _version: u32,
-        payload: Vec<u8>,
-    ) -> Result<Vec<u8>, exports::rintawa::engine::target_provider::Error> {
-        if handle == 7 {
-            Ok(payload)
-        } else {
-            Err(exports::rintawa::engine::target_provider::Error::UnknownComponent)
-        }
-    }
 }
 
 export!(Fixture);

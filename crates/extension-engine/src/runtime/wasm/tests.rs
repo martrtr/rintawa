@@ -516,10 +516,6 @@ struct TestRuntimeContext {
     scope_id: RuntimeScopeId,
     component_id: ComponentId,
     logger: TestLogger,
-    effects: HashMap<RuntimeEffectId, RuntimeEffect>,
-    next_effect_sequence: u64,
-    registration_attempts: u64,
-    failing_registration_attempts: HashSet<u64>,
 }
 
 impl TestRuntimeContext {
@@ -530,15 +526,7 @@ impl TestRuntimeContext {
             scope_id: test_scope_id(),
             component_id: ComponentId::new("chat-runtime"),
             logger: TestLogger,
-            effects: HashMap::new(),
-            next_effect_sequence: 0,
-            registration_attempts: 0,
-            failing_registration_attempts: HashSet::new(),
         }
-    }
-
-    fn fail_registration_on(&mut self, attempt: u64) {
-        self.failing_registration_attempts.insert(attempt);
     }
 }
 
@@ -562,81 +550,19 @@ impl ComponentContext for TestRuntimeContext {
     fn logger(&self) -> &dyn LoggerApi {
         &self.logger
     }
-
-    fn register_runtime_effect(
-        &mut self,
-        effect: RuntimeEffect,
-    ) -> ExtensionResult<RuntimeEffectId> {
-        self.registration_attempts += 1;
-        if self
-            .failing_registration_attempts
-            .contains(&self.registration_attempts)
-        {
-            return Err(ExtensionError::Message(String::from(
-                "simulated effect registration failure",
-            )));
-        }
-        let effect_id = RuntimeEffectId::new(format!("effect-{}", self.next_effect_sequence));
-        self.next_effect_sequence += 1;
-        self.effects.insert(effect_id.clone(), effect);
-        Ok(effect_id)
-    }
-
-    fn revoke_runtime_effect(&mut self, effect_id: &RuntimeEffectId) -> ExtensionResult<()> {
-        self.effects.remove(effect_id);
-        Ok(())
-    }
-
-    fn revoke_all_runtime_effects(&mut self) -> ExtensionResult<()> {
-        self.effects.clear();
-        Ok(())
-    }
 }
 
 #[test]
-fn test_should_abort_failed_guest_execution_and_revoke_effects() {
+fn test_should_abort_failed_guest_execution_and_close_access() {
     let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
-    let mut context = TestRuntimeContext::new();
-    let effect_id = RuntimeEffectId::new("effect-active");
-    let effect = RuntimeEffect::event_subscription("dialogue.message");
-    context.effects.insert(effect_id.clone(), effect.clone());
-    state.effect_handles.insert(
-        String::from("guest-handle"),
-        ActiveWasmRuntimeEffect {
-            owner: rintawa_sdk::contracts::ComponentRef::new(
-                test_instance_id(),
-                ComponentId::new("chat-runtime"),
-            ),
-            effect_id,
-            effect,
-        },
-    );
     state.begin_guest_execution();
 
-    let error = state.abort_guest_execution(
-        &mut context,
-        ExtensionError::Message(String::from("simulated callback failure")),
-    );
+    let error = state.abort_guest_execution(ExtensionError::Message(String::from(
+        "simulated callback failure",
+    )));
 
     assert_eq!(error.to_string(), "simulated callback failure");
-    assert!(context.effects.is_empty());
-    assert!(state.effect_handles.is_empty());
-    assert!(!state.runtime_effects_active);
     assert!(!state.secret_access_active);
-}
-
-#[test]
-fn test_should_report_event_publication_as_unavailable() {
-    let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
-
-    assert!(matches!(
-        HostOperations::publish_event(
-            &mut state,
-            String::from("dialogue.message"),
-            b"payload".to_vec(),
-        ),
-        Err(PublishError::Unavailable)
-    ));
 }
 
 #[test]
@@ -757,38 +683,9 @@ fn test_should_stage_wasm_contract_registrations() {
 }
 
 #[test]
-fn test_should_install_and_revoke_wasm_runtime_effects_with_handles() {
-    let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
-    begin_test_registration(&mut state, ExtensionId::new("rintawa.chat"));
-    let _ = state
-        .finish_registration()
-        .expect("test registration should finish");
-    let mut context = TestRuntimeContext::new();
-
-    state.begin_guest_execution();
-    let event_handle =
-        RuntimeEffectsHost::subscribe_event(&mut state, String::from("dialogue.message")).unwrap();
-    state.finish_guest_execution(&mut context).unwrap();
-    assert_eq!(context.effects.len(), 1);
-    assert!(context.effects.values().any(|effect| matches!(
-        effect,
-        RuntimeEffect::EventSubscription { topic } if topic == "dialogue.message"
-    )));
-
-    state.begin_guest_execution();
-    RuntimeEffectsHost::unsubscribe_event(&mut state, event_handle).unwrap();
-    state.finish_guest_execution(&mut context).unwrap();
-    assert!(context.effects.is_empty());
-}
-
-#[test]
-fn test_should_reject_wasm_effect_or_registration_outside_its_lifecycle_scope() {
+fn test_should_reject_registration_outside_its_lifecycle_scope() {
     let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
 
-    assert!(matches!(
-        RuntimeEffectsHost::subscribe_event(&mut state, String::from("dialogue.message")),
-        Err(RuntimeEffectError::RuntimeNotActive)
-    ));
     assert!(matches!(
         RegistrationHost::register_capability(
             &mut state,
@@ -835,67 +732,10 @@ fn test_should_read_only_host_granted_wasm_secret_during_and_after_execution() {
         Err(SecretError::AccessDenied)
     ));
 
-    let mut context = TestRuntimeContext::new();
-    state.finish_guest_execution(&mut context).unwrap();
+    state.finish_guest_execution();
     assert!(matches!(
         SecretsHost::read(&mut state, String::from("ai.api_keys.openai")),
         Err(SecretError::AccessNotActive)
-    ));
-}
-
-#[test]
-fn test_should_roll_back_effects_when_a_callback_batch_fails() {
-    let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
-    begin_test_registration(&mut state, ExtensionId::new("rintawa.chat"));
-    let _ = state
-        .finish_registration()
-        .expect("test registration should finish");
-    let mut context = TestRuntimeContext::new();
-    context.fail_registration_on(2);
-
-    state.begin_guest_execution();
-    state
-        .subscribe_event(String::from("dialogue.first"))
-        .unwrap();
-    state
-        .subscribe_event(String::from("dialogue.second"))
-        .unwrap();
-
-    assert!(state.finish_guest_execution(&mut context).is_err());
-    assert!(context.effects.is_empty());
-}
-
-#[test]
-fn test_should_report_a_failed_rollback_without_retaining_a_stale_handle() {
-    let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
-    begin_test_registration(&mut state, ExtensionId::new("rintawa.chat"));
-    let _ = state
-        .finish_registration()
-        .expect("test registration should finish");
-    let mut context = TestRuntimeContext::new();
-
-    state.begin_guest_execution();
-    let active_handle = state
-        .subscribe_event(String::from("dialogue.active"))
-        .unwrap();
-    state.finish_guest_execution(&mut context).unwrap();
-
-    context.fail_registration_on(2);
-    context.fail_registration_on(3);
-    state.begin_guest_execution();
-    state.unsubscribe_event(active_handle.clone()).unwrap();
-    state.subscribe_event(String::from("dialogue.new")).unwrap();
-
-    assert!(matches!(
-        state.finish_guest_execution(&mut context),
-        Err(ExtensionError::RuntimeEffectRollbackFailed { .. })
-    ));
-    assert!(context.effects.is_empty());
-
-    state.begin_guest_execution();
-    assert!(matches!(
-        state.unsubscribe_event(active_handle),
-        Err(RuntimeEffectError::UnknownEffect)
     ));
 }
 
@@ -1802,46 +1642,6 @@ fn test_should_revoke_delegated_resources_when_provider_lock_is_poisoned() {
             .values()
             .all(|task| task.owner != owner)
     );
-}
-
-#[test]
-fn test_should_preserve_other_owner_effect_handles_after_delegated_abort() {
-    let mut state = WasmHostState::new(ComponentId::new("chat-runtime"));
-    let owner = rintawa_sdk::contracts::ComponentRef::new(
-        test_instance_id(),
-        ComponentId::new("chat-runtime"),
-    );
-    let other_owner = rintawa_sdk::contracts::ComponentRef::new(
-        test_instance_id(),
-        ComponentId::new("other-runtime"),
-    );
-    state.effect_handles.insert(
-        String::from("own"),
-        ActiveWasmRuntimeEffect {
-            owner: owner.clone(),
-            effect_id: RuntimeEffectId::new("own-effect"),
-            effect: RuntimeEffect::event_subscription("own.topic"),
-        },
-    );
-    state.effect_handles.insert(
-        String::from("other"),
-        ActiveWasmRuntimeEffect {
-            owner: other_owner,
-            effect_id: RuntimeEffectId::new("other-effect"),
-            effect: RuntimeEffect::event_subscription("other.topic"),
-        },
-    );
-    let mut context = TestRuntimeContext::new();
-    state.begin_delegated_guest_execution(owner);
-
-    let error = state.abort_guest_execution(
-        &mut context,
-        ExtensionError::Message(String::from("simulated delegated failure")),
-    );
-
-    assert_eq!(error.to_string(), "simulated delegated failure");
-    assert!(!state.effect_handles.contains_key("own"));
-    assert!(state.effect_handles.contains_key("other"));
 }
 
 #[cfg(test)]

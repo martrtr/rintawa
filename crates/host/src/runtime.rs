@@ -2321,40 +2321,6 @@ mod tests {
                 .is_none()
         );
 
-        // This is the ordinary guest path: the active component submits its
-        // own authoritative command from an event callback and only later
-        // polls the nonblocking ticket before reading its committed property.
-        host.engine.dispatch_runtime_event_in_scope(
-            &world_runtime_scope_id(world_id),
-            "fixture.world-data",
-            b"invalid",
-        )?;
-        host.engine.dispatch_runtime_event_in_scope(
-            &world_runtime_scope_id(world_id),
-            "fixture.world-data",
-            format!("foreign:{item}").as_bytes(),
-        )?;
-        host.engine.dispatch_runtime_event_in_scope(
-            &world_runtime_scope_id(world_id),
-            "fixture.world-data",
-            format!("submit:{item}").as_bytes(),
-        )?;
-        for _ in 0..100 {
-            if parts
-                .runtime
-                .snapshot()?
-                .load_property(item, &"fixture.value@1".parse()?)?
-                .is_some()
-            {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        host.engine.dispatch_runtime_event_in_scope(
-            &world_runtime_scope_id(world_id),
-            "fixture.world-data",
-            format!("verify:{item}").as_bytes(),
-        )?;
         host.engine.stop_extension_instance(&owner_instance)?;
         assert!(
             parts

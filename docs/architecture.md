@@ -54,8 +54,7 @@ Extensions expose versioned contracts through the Extension Engine.
 - Runtime permissions are explicit and owner-scoped.
 - Cross-scope operations require explicit Host capabilities.
 
-Execution targets, services, UI surfaces and runtime effects are revoked with their
-owning component lifecycle.
+Execution targets, services and UI surfaces are revoked with their owning component lifecycle.
 
 ## Outbound HTTP
 

@@ -22,11 +22,10 @@ use rintawa_sdk::{
     },
     contributions::{ContributionDescriptor, ContributionKind, WorldSchemaContribution},
     errors::{ExtensionError, ExtensionResult},
-    runtime_effects::RuntimeEffect,
     runtime_permissions::RuntimePermission,
     secrets::{SecretAccessError, SecretPath, SecretPathPattern},
     traits::Component,
-    types::{ComponentId, ExtensionId, ExtensionInstanceId, RuntimeEffectId, RuntimeScopeId},
+    types::{ComponentId, ExtensionId, ExtensionInstanceId, RuntimeScopeId},
     world::{ItemId, SchemaKey, SchemaKind},
 };
 use rintawa_world::{WorldCommand, WorldTransaction};
@@ -141,7 +140,7 @@ use bindings::rintawa::engine::{
         ArtifactError as TargetArtifactError, Host as ExecutionTargetsHost, HostArtifactSource,
         RegistrationError as TargetRegistrationError,
     },
-    host::{Host as HostOperations, LogLevel, PublishError},
+    host::{Host as HostOperations, LogLevel},
     http_fetch::{Error as HttpFetchError, Host as HttpFetchHost, Response as WitHttpResponse},
     http_request::{
         Error as HttpRequestError, Event as WitHttpEvent, Header as WitHttpHeader,
@@ -159,7 +158,6 @@ use bindings::rintawa::engine::{
     runtime_context::{
         Context as WitRuntimeContext, Error as RuntimeContextError, Host as RuntimeContextHost,
     },
-    runtime_effects::{Error as RuntimeEffectError, Host as RuntimeEffectsHost},
     runtime_policy::{
         ArtifactPolicy as WitRuntimeArtifactPolicy, ComponentPolicy as WitRuntimePolicyComponent,
         ComponentRequest as WitRuntimePolicyRequest, Error as RuntimePolicyError,
@@ -211,11 +209,6 @@ pub struct WasmHostState {
     scope_id: Option<RuntimeScopeId>,
     execution_owner: Option<rintawa_sdk::contracts::ComponentRef>,
     registration_scope: Option<WasmRegistrationScope>,
-    runtime_effects_active: bool,
-    next_effect_handle: u64,
-    effect_handles: HashMap<String, ActiveWasmRuntimeEffect>,
-    pending_effects: Vec<WasmRuntimeEffectOperation>,
-    pending_revocations: HashSet<String>,
     runtime_permissions: RuntimePermissionManager,
     task_access_active: bool,
     task_handler_available: bool,
@@ -293,27 +286,6 @@ struct WasmRegistrations {
     consumers: Vec<ContractConsumer>,
 }
 
-/// A guest request that is committed through the Engine-owned effect registry.
-enum WasmRuntimeEffectOperation {
-    Subscribe {
-        owner: rintawa_sdk::contracts::ComponentRef,
-        handle: String,
-        effect: RuntimeEffect,
-    },
-    Unsubscribe {
-        handle: String,
-        effect: ActiveWasmRuntimeEffect,
-    },
-}
-
-/// The Engine effect currently associated with one opaque guest handle.
-#[derive(Clone)]
-struct ActiveWasmRuntimeEffect {
-    owner: rintawa_sdk::contracts::ComponentRef,
-    effect_id: RuntimeEffectId,
-    effect: RuntimeEffect,
-}
-
 struct ActiveWasmTask {
     owner: rintawa_sdk::contracts::ComponentRef,
     interval: Duration,
@@ -385,11 +357,6 @@ impl WasmHostState {
             scope_id: None,
             execution_owner: None,
             registration_scope: None,
-            runtime_effects_active: false,
-            next_effect_handle: 0,
-            effect_handles: HashMap::new(),
-            pending_effects: Vec::new(),
-            pending_revocations: HashSet::new(),
             runtime_permissions,
             task_access_active: false,
             task_handler_available,
@@ -483,7 +450,6 @@ impl WasmHostState {
 
     fn begin_target_component_registration(&mut self) -> ExtensionResult<()> {
         self.execution_owner = None;
-        self.runtime_effects_active = false;
         self.task_access_active = false;
         self.network_access_active = false;
         self.host_access_active = false;
@@ -573,14 +539,11 @@ impl WasmHostState {
     fn discard_guest_execution(&mut self) {
         self.registration_scope = None;
         self.execution_owner = None;
-        self.runtime_effects_active = false;
         self.task_access_active = false;
         self.network_access_active = false;
         self.host_access_active = false;
         self.http_request_access_active = false;
         self.world_session_mutations_this_execution = 0;
-        self.pending_effects.clear();
-        self.pending_revocations.clear();
         self.secret_access_active = false;
         self.transport_access_active = false;
         self.execution_target_registration_active = false;
@@ -738,76 +701,9 @@ impl WasmHostState {
             .collect()
     }
 
-    fn subscribe_event(&mut self, topic: String) -> Result<String, RuntimeEffectError> {
-        self.subscribe_runtime_effect(RuntimeEffect::event_subscription(topic))
-    }
-
-    fn subscribe_runtime_effect(
-        &mut self,
-        effect: RuntimeEffect,
-    ) -> Result<String, RuntimeEffectError> {
-        if !self.runtime_effects_active {
-            return Err(RuntimeEffectError::RuntimeNotActive);
-        }
-        let RuntimeEffect::EventSubscription { topic } = &effect;
-        if topic.trim().is_empty() {
-            return Err(RuntimeEffectError::InvalidTopic);
-        }
-
-        let owner = self
-            .current_execution_owner()
-            .cloned()
-            .ok_or(RuntimeEffectError::RuntimeNotActive)?;
-        let handle = format!("effect-{}", self.next_effect_handle);
-        self.next_effect_handle = self
-            .next_effect_handle
-            .checked_add(1)
-            .ok_or(RuntimeEffectError::RuntimeNotActive)?;
-        self.pending_effects
-            .push(WasmRuntimeEffectOperation::Subscribe {
-                owner,
-                handle: handle.clone(),
-                effect,
-            });
-        Ok(handle)
-    }
-
-    fn unsubscribe_event(&mut self, handle: String) -> Result<(), RuntimeEffectError> {
-        self.unsubscribe_runtime_effect(handle)
-    }
-
-    fn unsubscribe_runtime_effect(&mut self, handle: String) -> Result<(), RuntimeEffectError> {
-        if !self.runtime_effects_active {
-            return Err(RuntimeEffectError::RuntimeNotActive);
-        }
-
-        if let Some(index) = self.pending_effects.iter().position(|operation| {
-            matches!(operation, WasmRuntimeEffectOperation::Subscribe { handle: pending, .. } if pending == &handle)
-        }) {
-            self.pending_effects.remove(index);
-            return Ok(());
-        }
-
-        if self.pending_revocations.contains(&handle) {
-            return Err(RuntimeEffectError::UnknownEffect);
-        }
-
-        let Some(effect) = self.effect_handles.get(&handle).cloned() else {
-            return Err(RuntimeEffectError::UnknownEffect);
-        };
-        if self.current_execution_owner() != Some(&effect.owner) {
-            return Err(RuntimeEffectError::UnknownEffect);
-        }
-        self.pending_revocations.insert(handle.clone());
-        self.pending_effects
-            .push(WasmRuntimeEffectOperation::Unsubscribe { handle, effect });
-        Ok(())
-    }
-
     /// Opens the normal guest execution scope for the provider component itself.
     fn begin_guest_execution(&mut self) {
         self.execution_owner = self.registered_owner();
-        self.runtime_effects_active = true;
         self.task_access_active = true;
         self.network_access_active = true;
         self.host_access_active = true;
@@ -823,7 +719,6 @@ impl WasmHostState {
 
     fn begin_delegated_guest_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
         self.execution_owner = Some(owner);
-        self.runtime_effects_active = true;
         self.task_access_active = true;
         self.network_access_active = true;
         self.host_access_active = true;
@@ -842,10 +737,6 @@ impl WasmHostState {
 
     fn begin_delegated_task_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
         self.execution_owner = Some(owner);
-        // Runtime effects require an Engine ComponentContext for the exact owner.
-        // The cooperative provider pump currently has only the provider context,
-        // so delegated task callbacks cannot create or revoke runtime effects.
-        self.runtime_effects_active = false;
         self.task_access_active = true;
         self.network_access_active = true;
         self.host_access_active = true;
@@ -880,8 +771,7 @@ impl WasmHostState {
         std::mem::take(&mut self.pending_transport_points)
     }
 
-    /// Query callbacks are not lifecycle callbacks and cannot commit
-    /// component effects or borrow privileged host entrypoints.
+    /// Query callbacks are not lifecycle callbacks and cannot borrow privileged host entrypoints.
     fn begin_transport_query_execution(&mut self) {
         self.discard_guest_execution();
         self.execution_owner = self.registered_owner();
@@ -895,9 +785,8 @@ impl WasmHostState {
         self.discard_guest_execution();
     }
 
-    /// Closes guest access before committing its queued runtime effects.
-    fn finish_guest_execution(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
-        self.runtime_effects_active = false;
+    /// Closes guest access after a guest lifecycle callback completes.
+    fn finish_guest_execution(&mut self) {
         self.task_access_active = false;
         self.network_access_active = false;
         self.host_access_active = false;
@@ -907,128 +796,16 @@ impl WasmHostState {
         self.transport_access_active = false;
         self.execution_target_registration_active = false;
 
-        let result = self.commit_runtime_effects(ctx);
         self.execution_owner = None;
-        result
     }
 
-    /// Commits reversible effects requested by the just-completed guest callback.
-    fn commit_runtime_effects(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
-        let mut registered_handles = Vec::new();
-        let mut revoked_effects = Vec::new();
-        for operation in std::mem::take(&mut self.pending_effects) {
-            let operation_result = match operation {
-                WasmRuntimeEffectOperation::Subscribe {
-                    owner,
-                    handle,
-                    effect,
-                } => ctx
-                    .register_runtime_effect(effect.clone())
-                    .map(|effect_id| {
-                        self.effect_handles.insert(
-                            handle.clone(),
-                            ActiveWasmRuntimeEffect {
-                                owner,
-                                effect_id,
-                                effect,
-                            },
-                        );
-                        registered_handles.push(handle);
-                    }),
-                WasmRuntimeEffectOperation::Unsubscribe { handle, effect } => {
-                    ctx.revoke_runtime_effect(&effect.effect_id).map(|()| {
-                        self.effect_handles.remove(&handle);
-                        self.pending_revocations.remove(&handle);
-                        revoked_effects.push((handle, effect));
-                    })
-                }
-            };
-
-            if let Err(error) = operation_result {
-                if let Err(rollback_error) =
-                    self.rollback_runtime_effects(ctx, registered_handles, revoked_effects)
-                {
-                    return Err(ExtensionError::RuntimeEffectRollbackFailed {
-                        operation: error.to_string(),
-                        rollback: rollback_error.to_string(),
-                    });
-                }
-                return Err(error);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn rollback_runtime_effects(
-        &mut self,
-        ctx: &mut dyn ComponentContext,
-        registered_handles: Vec<String>,
-        revoked_effects: Vec<(String, ActiveWasmRuntimeEffect)>,
-    ) -> ExtensionResult<()> {
-        let mut rollback_errors = Vec::new();
-
-        for handle in registered_handles.iter().rev() {
-            if let Some(effect) = self.effect_handles.remove(handle)
-                && let Err(error) = ctx.revoke_runtime_effect(&effect.effect_id)
-            {
-                self.effect_handles.insert(handle.clone(), effect);
-                rollback_errors.push(error.to_string());
-            }
-        }
-
-        for (handle, effect) in revoked_effects.into_iter().rev() {
-            match ctx.register_runtime_effect(effect.effect.clone()) {
-                Ok(effect_id) => {
-                    self.effect_handles.insert(
-                        handle.clone(),
-                        ActiveWasmRuntimeEffect {
-                            owner: effect.owner,
-                            effect_id,
-                            effect: effect.effect,
-                        },
-                    );
-                }
-                Err(error) => rollback_errors.push(error.to_string()),
-            }
-        }
-
-        self.pending_revocations.clear();
-
-        if rollback_errors.is_empty() {
-            Ok(())
-        } else {
-            Err(ExtensionError::Message(rollback_errors.join("; ")))
-        }
-    }
-
-    fn abort_guest_execution(
-        &mut self,
-        ctx: &mut dyn ComponentContext,
-        operation_error: ExtensionError,
-    ) -> ExtensionError {
-        let owner = rintawa_sdk::contracts::ComponentRef::new(
-            ctx.extension_instance_id().clone(),
-            ctx.component_id().clone(),
-        );
+    fn abort_guest_execution(&mut self, operation_error: ExtensionError) -> ExtensionError {
+        let owner = self.current_execution_owner().cloned();
         self.discard_guest_execution();
-        self.effect_handles
-            .retain(|_, effect| effect.owner != owner);
-        self.revoke_runtime_resources_for_owner(&owner);
-        if let Err(cleanup_error) = ctx.revoke_all_runtime_effects() {
-            return ExtensionError::RuntimeEffectCleanupFailed {
-                operation: operation_error.to_string(),
-                cleanup: cleanup_error.to_string(),
-            };
+        if let Some(owner) = owner {
+            self.revoke_runtime_resources_for_owner(&owner);
         }
         operation_error
-    }
-
-    fn forget_effect_handles_for_owner(&mut self, owner: &rintawa_sdk::contracts::ComponentRef) {
-        self.effect_handles
-            .retain(|_, effect| &effect.owner != owner);
-        self.pending_revocations
-            .retain(|handle| self.effect_handles.contains_key(handle));
     }
 
     fn runtime_permission_owner(
@@ -1225,10 +1002,6 @@ impl HostOperations for WasmHostState {
             LogLevel::Error => error!(target: "wasm_plugin", plugin = %id, "{message}"),
         }
     }
-
-    fn publish_event(&mut self, _topic: String, _payload: Vec<u8>) -> Result<(), PublishError> {
-        Err(PublishError::Unavailable)
-    }
 }
 
 impl RuntimeContextHost for WasmHostState {
@@ -1254,21 +1027,6 @@ impl RuntimeContextHost for WasmHostState {
             scope_id: scope_id.to_string(),
             world_id: world_id.map(|world_id| world_id.to_string()),
         })
-    }
-}
-
-impl RuntimeEffectsHost for WasmHostState {
-    fn subscribe_event(&mut self, topic: String) -> Result<String, RuntimeEffectError> {
-        debug!(
-            plugin = %self.component_id,
-            topic = %topic,
-            "WASM plugin subscribed to topic"
-        );
-        self.subscribe_event(topic)
-    }
-
-    fn unsubscribe_event(&mut self, handle: String) -> Result<(), RuntimeEffectError> {
-        self.unsubscribe_event(handle)
     }
 }
 
@@ -2058,16 +1816,6 @@ impl WasmComponent {
             })
     }
 
-    fn ensure_active(&self, operation: &'static str) -> ExtensionResult<()> {
-        if self.active {
-            Ok(())
-        } else {
-            Err(ExtensionError::Message(format!(
-                "WASM component is not active during {operation}"
-            )))
-        }
-    }
-
     fn respond_to_transport_query(
         runtime: &Arc<Mutex<WasmSharedRuntime>>,
         budget: &WasmExecutionBudget,
@@ -2394,62 +2142,6 @@ impl WasmComponent {
 
         ExtensionError::Message(format!("{operation} failed: {error}"))
     }
-
-    fn validate_inbound_message(
-        &self,
-        operation: &'static str,
-        message_bytes: usize,
-    ) -> ExtensionResult<()> {
-        if message_bytes > self.budget.max_host_message_bytes {
-            return Err(ExtensionError::HostMessageTooLarge {
-                operation,
-                actual_bytes: message_bytes,
-                maximum_bytes: self.budget.max_host_message_bytes,
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Triggers an incoming event dispatch into the WASM guest instance.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ExtensionError::Message`] if WASM instantiation or execution fails.
-    pub fn dispatch_event(
-        &mut self,
-        ctx: &mut dyn ComponentContext,
-        topic: &str,
-        payload: &[u8],
-    ) -> ExtensionResult<()> {
-        self.ensure_active("event dispatch")?;
-        self.validate_inbound_message("event topic", topic.len())?;
-        self.validate_inbound_message("event payload", payload.len())?;
-        let budget = self.budget.clone();
-        let mut runtime = self.runtime()?;
-        let instance = self.ensure_instance(&mut runtime)?;
-
-        instance.store.data().validate_execution_owner(ctx)?;
-        Self::set_callback_fuel(&mut instance.store, &budget, "event dispatch")?;
-
-        instance.store.data_mut().begin_guest_execution();
-
-        let dispatch_result = instance
-            .plugin
-            .rintawa_engine_guest()
-            .call_on_event(&mut instance.store, topic, payload)
-            .map_err(|err| Self::execution_error("event dispatch", err));
-
-        if let Err(error) = dispatch_result {
-            return Err(instance.store.data_mut().abort_guest_execution(ctx, error));
-        }
-
-        if let Err(error) = instance.store.data_mut().finish_guest_execution(ctx) {
-            return Err(instance.store.data_mut().abort_guest_execution(ctx, error));
-        }
-
-        Ok(())
-    }
 }
 
 impl Component for WasmComponent {
@@ -2514,10 +2206,8 @@ impl Component for WasmComponent {
                 instance.store.data_mut().discard_guest_execution();
                 guest_failed = true;
                 Err(error)
-            } else if let Err(error) = instance.store.data_mut().finish_guest_execution(ctx) {
-                instance.store.data_mut().discard_guest_execution();
-                Err(error)
             } else {
+                instance.store.data_mut().finish_guest_execution();
                 pending_targets = instance.store.data_mut().take_pending_execution_targets();
                 pending_transport_points =
                     instance.store.data_mut().take_pending_transport_points();
@@ -2647,7 +2337,6 @@ impl Component for WasmComponent {
             };
             let owner = instance.store.data().registered_owner();
             instance.store.data_mut().discard_guest_execution();
-            instance.store.data_mut().effect_handles.clear();
             if let Some(owner) = owner {
                 instance
                     .store
@@ -2668,15 +2357,6 @@ impl Component for WasmComponent {
         }
 
         Ok(())
-    }
-
-    fn handle_event(
-        &mut self,
-        ctx: &mut dyn ComponentContext,
-        topic: &str,
-        payload: &[u8],
-    ) -> ExtensionResult<()> {
-        self.dispatch_event(ctx, topic, payload)
     }
 
     fn poll_runtime(
@@ -2732,7 +2412,7 @@ impl Component for WasmComponent {
                     if let Err(error) = callback {
                         failure = Some(if is_root_owner {
                             guest_failed = true;
-                            instance.store.data_mut().abort_guest_execution(ctx, error)
+                            instance.store.data_mut().abort_guest_execution(error)
                         } else {
                             instance.store.data_mut().discard_guest_execution();
                             instance
@@ -2744,12 +2424,7 @@ impl Component for WasmComponent {
                         break;
                     }
                     if is_root_owner {
-                        if let Err(error) = instance.store.data_mut().finish_guest_execution(ctx) {
-                            guest_failed = true;
-                            failure =
-                                Some(instance.store.data_mut().abort_guest_execution(ctx, error));
-                            break;
-                        }
+                        instance.store.data_mut().finish_guest_execution();
                     } else {
                         instance.store.data_mut().finish_delegated_task_execution();
                     }

@@ -35,7 +35,6 @@ pub mod contracts;
 pub mod contributions;
 pub mod errors;
 pub mod manifest;
-pub mod runtime_effects;
 pub mod runtime_permissions;
 pub mod secrets;
 pub mod traits;

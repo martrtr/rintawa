@@ -15,9 +15,5 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
         assert_eq!(replies, vec![b"wasm:ping".to_vec(), b"wasm:ping".to_vec()]);
     }
     fn stop() {}
-    fn on_event(_topic: String, _payload: Vec<u8>) {}
-    fn handle_service(_contract: String, _version: u32, _payload: Vec<u8>) -> Vec<u8> {
-        Vec::new()
-    }
 }
 export!(Fixture);

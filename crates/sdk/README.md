@@ -105,9 +105,7 @@ replacement WIT Projection or generic extension query transport.
 
 The model is intentionally reduced: one World per database with four tables, no durable
 command ledger or receipts, no event log or replay, no jobs/outbox, and no actor control
-grants. The World runtime-signal bridge has been retired. Generic in-process
-Extension Engine event subscriptions remain separate and offer no World-change
-delivery or replay guarantees. Property names are flat identifiers, and
+grants. The World runtime-signal bridge has been retired. Property names are flat identifiers, and
 `player`/`npc` are ordinary extension properties with no Core ownership semantics.
 
 ## Lifecycle

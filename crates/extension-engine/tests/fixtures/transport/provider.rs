@@ -39,10 +39,6 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
         assert!(rintawa::engine::transport::publish("chat/updates/v1", b"stop").is_err());
         *SUBSCRIPTION.lock().expect("fixture subscription lock") = None;
     }
-    fn on_event(_topic: String, _payload: Vec<u8>) {}
-    fn handle_service(_contract: String, _version: u32, _payload: Vec<u8>) -> Vec<u8> {
-        Vec::new()
-    }
 }
 
 impl exports::rintawa::engine::transport_handler::Guest for Fixture {

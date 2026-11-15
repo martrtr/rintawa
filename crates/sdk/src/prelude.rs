@@ -29,7 +29,6 @@ pub use crate::manifest::{
     validate_component_target,
 };
 
-pub use crate::runtime_effects::RuntimeEffect;
 pub use crate::runtime_permissions::{RuntimePermission, RuntimePermissionParseError};
 
 pub use crate::secrets::{SecretAccessError, SecretPath, SecretPathPattern, SecretValue};
@@ -38,7 +37,7 @@ pub use crate::traits::Component;
 
 pub use crate::types::{
     ComponentId, ComponentTarget, ContractId, ContributionId, ExtensionId, ExtensionInstanceId,
-    RuntimeEffectId, RuntimeScopeId,
+    RuntimeScopeId,
 };
 
 pub use crate::world::{

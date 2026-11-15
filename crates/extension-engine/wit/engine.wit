@@ -14,20 +14,6 @@ interface host {
     /// Logs a message to the host's tracing system.
     log: func(level: log-level, message: string);
 
-    /// An explicit extension-originated event-publication failure.
-    variant publish-error {
-        /// Guest publication is unavailable under the current host policy.
-        unavailable,
-    }
-
-    /// Requests extension-originated runtime event publication.
-    ///
-    /// Host-to-subscriber Event Runtime delivery exists, but arbitrary guest
-    /// publication remains fail-closed until publisher/topic authorization and
-    /// guest-to-host quotas are part of the contract. The host therefore returns
-    /// `unavailable` instead of accepting an event it cannot authorize safely.
-    publish-event: func(topic: string, payload: list<u8>) -> result<_, publish-error>;
-
 }
 
 /// Static contribution declarations available only from guest `register`.
@@ -158,30 +144,6 @@ interface world-data {
     find-properties: func(key: string, after: option<string>, limit: u32) -> result<list<string>, error>;
     submit: func(schema: string, payload-json: string) -> result<ticket, error>;
     poll: func(ticket: ticket) -> result<ticket-status, error>;
-}
-
-/// Reversible effects available from guest `start` and `on-event`.
-interface runtime-effects {
-    /// A guest-local handle for one host-owned runtime effect.
-    type handle = string;
-
-    /// An explicit failure while managing a runtime effect.
-    variant error {
-        runtime-not-active,
-        invalid-topic,
-        unknown-effect,
-    }
-
-    /// Adds an owner-scoped subscription while the guest is running.
-    ///
-    /// The handle is later supplied to `unsubscribe-event`. It is valid only
-    /// for the current activation: the host revokes all remaining subscriptions
-    /// on stop or crash, and a later start requires a new subscription.
-    subscribe-event: func(topic: string) -> result<handle, error>;
-
-    /// Removes a subscription previously returned by `subscribe-event`.
-    unsubscribe-event: func(handle: handle) -> result<_, error>;
-
 }
 
 /// Read-only identity of the component callback currently executing in the Host.
@@ -866,16 +828,9 @@ interface target-provider {
     /// Permanently releases provider-local state after the proxy is unloaded.
     drop-component: func(handle: component-handle) -> result<_, error>;
 
-    /// Handles one subscribed runtime event for the dependent component.
-    handle-event: func(
-        handle: component-handle,
-        topic: string,
-        payload: list<u8>,
-    ) -> result<_, error>;
-
 }
 
-/// Guest lifecycle and event handlers implemented by the WASM plugin.
+/// Guest lifecycle callbacks implemented by the WASM plugin.
 interface guest {
     /// Initial plugin registration callback.
     register: func();
@@ -884,13 +839,8 @@ interface guest {
     start: func();
 
     /// Deactivates the plugin while preserving its guest instance for a later restart.
-    ///
-    /// The host revokes runtime effects after this callback. Full guest-state
-    /// disposal happens when the component is unloaded, not on `stop` alone.
+    /// Full guest-state disposal happens when the component is unloaded, not on `stop` alone.
     stop: func();
-
-    /// Dispatches a subscribed event payload to the plugin.
-    on-event: func(topic: string, payload: list<u8>);
 
 }
 
@@ -902,7 +852,6 @@ world plugin {
     import world-registration;
     import world-system-snapshot;
     import world-data;
-    import runtime-effects;
     import runtime-tasks;
     import network;
     import http-fetch;
@@ -956,7 +905,6 @@ world task-runtime-plugin {
     import runtime-context;
     import registration;
     import world-registration;
-    import runtime-effects;
     import runtime-tasks;
     import network;
     import http-fetch;
@@ -983,7 +931,6 @@ world runtime-provider-plugin {
     import runtime-context;
     import registration;
     import world-registration;
-    import runtime-effects;
     import runtime-tasks;
     import network;
     import http-fetch;
@@ -1010,7 +957,6 @@ world runtime-provider-task-plugin {
     import runtime-context;
     import registration;
     import world-registration;
-    import runtime-effects;
     import runtime-tasks;
     import network;
     import http-fetch;

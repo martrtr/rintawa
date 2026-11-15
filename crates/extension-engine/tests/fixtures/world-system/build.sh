@@ -26,5 +26,8 @@ name = "WASM World System fixture"
 version = "0.0.1"
 sdk = "^0.0"
 TOML
+if [[ ! -f "$workspace/Cargo.lock" ]]; then
+  (cd "$workspace" && RUSTUP_TOOLCHAIN=stable cargo generate-lockfile --offline)
+fi
 RUSTUP_TOOLCHAIN=stable "$core_root/target/debug/rintawa-dev" check "$workspace"
 cp "$workspace/rtw/component.wasm" "$fixture_root/component.wasm"

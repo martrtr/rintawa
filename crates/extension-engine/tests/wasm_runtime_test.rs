@@ -131,63 +131,7 @@ fn test_should_execute_granted_background_task_through_engine_runtime_pump() -> 
     std::thread::sleep(delay + Duration::from_millis(2));
     assert_eq!(engine.poll_runtime()?, None);
 
-    let effects = engine.active_runtime_effect_principals();
-    assert_eq!(effects.len(), 1);
-    assert_eq!(effects[0].1.component_id, component_id);
-
     engine.stop_extension(&extension_id)?;
-    assert!(engine.active_runtime_effect_principals().is_empty());
-    Ok(())
-}
-
-#[test]
-fn test_should_preserve_guest_state_across_component_lifecycle() -> EngineResult<()> {
-    let runtime = WasmRuntimeEngine::new()?;
-    let mut component = runtime.load_component_from_bytes(
-        ComponentId::new("stateful-component"),
-        STATEFUL_WASM_COMPONENT.as_bytes(),
-    )?;
-    let mut context = TestComponentContext::new();
-
-    component.register(&mut context)?;
-    component.start(&mut context)?;
-    component.dispatch_event(&mut context, "chat.message", b"first")?;
-    component.stop(&mut context)?;
-    component.start(&mut context)?;
-    component.dispatch_event(&mut context, "chat.message", b"second")?;
-
-    Ok(())
-}
-
-#[test]
-fn test_should_dispatch_events_only_while_component_is_active() -> EngineResult<()> {
-    let runtime = WasmRuntimeEngine::new()?;
-    let mut component = runtime.load_component_from_bytes(
-        ComponentId::new("stateful-component"),
-        STATEFUL_WASM_COMPONENT.as_bytes(),
-    )?;
-    let mut context = TestComponentContext::new();
-
-    component.register(&mut context)?;
-    assert!(matches!(
-        component.dispatch_event(&mut context, "chat.message", b"before-start"),
-        Err(ExtensionError::Message(message))
-            if message.contains("not active during event dispatch")
-    ));
-
-    component.start(&mut context)?;
-    component.dispatch_event(&mut context, "chat.message", b"active")?;
-    component.stop(&mut context)?;
-
-    assert!(matches!(
-        component.dispatch_event(&mut context, "chat.message", b"after-stop"),
-        Err(ExtensionError::Message(message))
-            if message.contains("not active during event dispatch")
-    ));
-
-    component.start(&mut context)?;
-    component.dispatch_event(&mut context, "chat.message", b"after-restart")?;
-
     Ok(())
 }
 
@@ -238,34 +182,6 @@ fn test_should_bound_file_reads_before_compiling_an_oversized_artifact() -> Engi
             maximum_bytes: 8,
             ..
         }
-    ));
-
-    Ok(())
-}
-
-#[test]
-fn test_should_reject_messages_above_the_host_budget() -> EngineResult<()> {
-    let budget = WasmExecutionBudget {
-        max_host_message_bytes: 3,
-        ..WasmExecutionBudget::default()
-    };
-    let runtime = WasmRuntimeEngine::with_execution_budget(budget)?;
-    let mut component = runtime.load_component_from_bytes(
-        ComponentId::new("stateful-component"),
-        STATEFUL_WASM_COMPONENT.as_bytes(),
-    )?;
-    let mut context = TestComponentContext::new();
-
-    component.register(&mut context)?;
-    component.start(&mut context)?;
-
-    assert!(matches!(
-        component.dispatch_event(&mut context, "chat", b"ok"),
-        Err(ExtensionError::HostMessageTooLarge {
-            operation: "event topic",
-            actual_bytes: 4,
-            maximum_bytes: 3,
-        })
     ));
 
     Ok(())
@@ -337,54 +253,6 @@ fn test_should_discard_wasm_instance_after_failed_stop() -> EngineResult<()> {
         Err(ExtensionError::Message(message))
             if message.contains("discarded after failed `stop` callback")
     ));
-
-    Ok(())
-}
-
-#[test]
-fn test_should_reset_fuel_for_each_callback_on_the_same_guest_instance() -> EngineResult<()> {
-    let budget = WasmExecutionBudget {
-        fuel_per_callback: 100_000,
-        ..WasmExecutionBudget::default()
-    };
-    let runtime = WasmRuntimeEngine::with_execution_budget(budget)?;
-    let fuel_consuming_component = STATEFUL_WASM_COMPONENT
-        .replace(
-            r#"(func (export "start")
-                (global.set $event-count
-                    (i32.add (global.get $event-count) (i32.const 1))))"#,
-            r#"(func (export "start")
-                (local $remaining i32)
-                (loop $work
-                    (local.set $remaining
-                        (i32.add (local.get $remaining) (i32.const 1)))
-                    (br_if $work
-                        (i32.lt_u (local.get $remaining) (i32.const 8000)))))"#,
-        )
-        .replace(
-            r#"(func (export "on-event") (param i32 i32 i32 i32)
-                (if (i32.eqz
-                    (i32.or
-                        (i32.eq (global.get $event-count) (i32.const 2))
-                        (i32.eq (global.get $event-count) (i32.const 3))))
-                    (then unreachable)))"#,
-            r#"(func (export "on-event") (param i32 i32 i32 i32)
-                (local $remaining i32)
-                (loop $work
-                    (local.set $remaining
-                        (i32.add (local.get $remaining) (i32.const 1)))
-                    (br_if $work
-                        (i32.lt_u (local.get $remaining) (i32.const 8000)))))"#,
-        );
-    let mut component = runtime.load_component_from_bytes(
-        ComponentId::new("stateful-component"),
-        fuel_consuming_component.as_bytes(),
-    )?;
-    let mut context = TestComponentContext::new();
-
-    component.register(&mut context)?;
-    component.start(&mut context)?;
-    component.dispatch_event(&mut context, "chat.message", b"message")?;
 
     Ok(())
 }

@@ -268,10 +268,6 @@ pub enum EngineError {
     #[error("extension instance `{0}` is already registered")]
     ExtensionInstanceAlreadyExists(String),
 
-    /// A host attempted to dispatch an invalid runtime event topic.
-    #[error("runtime event topic must not be empty")]
-    InvalidRuntimeEventTopic,
-
     /// A component failed during a lifecycle transition.
     #[error("component `{component_id}` in extension `{extension_id}` failed: {reason}")]
     LifecycleFailed {
