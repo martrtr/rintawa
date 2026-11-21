@@ -3374,6 +3374,7 @@ dependencies = [
  "rintawa-sdk",
  "rintawa-storage",
  "rintawa-world",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

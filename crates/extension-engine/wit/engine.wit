@@ -144,6 +144,8 @@ interface world-data {
     find-properties: func(key: string, after: option<string>, limit: u32) -> result<list<string>, error>;
     submit: func(schema: string, payload-json: string) -> result<ticket, error>;
     poll: func(ticket: ticket) -> result<ticket-status, error>;
+    /// Release the receiver without cancelling an admitted command.
+    close: func(ticket: ticket) -> result<_, error>;
 }
 
 /// Read-only identity of the component callback currently executing in the Host.

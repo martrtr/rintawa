@@ -14,7 +14,7 @@ correctness, minimal implementation or release readiness. New mechanisms still
 need the concrete requirement and acceptance checks specified here.
 
 P05/D1 and D6 are implemented and verified; see [implementation progress](core-mvp-contract.md#implementation-progress).
-P06/D4 is implemented. D2/D3/D5/D7 and the client implementation below remain pending. D8 remains proposed.
+P06/D4 and P07/D2 are implemented. D3/D5/D7 and the client implementation below remain pending. D8 remains proposed.
 
 Core baseline: `fb1072a2c9169af1b36ea9cdffed31c146ed0341`; rtwKit baseline:
 `77782727020f6066be4d4c205b077dd3f9555775`. Recheck relevant source before coding.
@@ -782,6 +782,6 @@ P05 implements D6 identity/context and its immediate transport/cleanup checks.
 Continue the broader lifecycle/budget checks through P09, D7 and exact guest reads
 with P08; realize the browser protocol in rtwKit P10. D8 requires explicit owner acceptance and is a separate transport
 slice after D6 and before P10; it does not block the already accepted D1 correction.
-P05 and P06 are complete; the next implementation slice is P07. Do not make Sol
+P05–P07 are implemented; the next implementation slice is P08. Do not make Sol
 choose among the rejected alternatives unless evidence shows this contract is
 inconsistent or impossible; report a narrow amendment instead.

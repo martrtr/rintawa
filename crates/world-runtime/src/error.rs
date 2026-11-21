@@ -125,3 +125,39 @@ pub enum WorldRuntimeError {
 
 /// Result type used by the world runtime.
 pub type WorldRuntimeResult<T> = Result<T, WorldRuntimeError>;
+
+impl WorldRuntimeError {
+    /// Whether a command completion error fails to establish that no COMMIT occurred.
+    /// Callers must report unavailable and must not automatically retry the command.
+    pub fn command_outcome_unknown(&self) -> bool {
+        match self {
+            Self::WorkerStopped | Self::WorkerPanicked => true,
+            Self::Storage(rintawa_storage::StorageError::Io(_)) => true,
+            Self::Storage(rintawa_storage::StorageError::Sqlite(error)) => {
+                !matches!(error, rusqlite::Error::SqliteFailure(error, _)
+                    if error.code == rusqlite::ErrorCode::ConstraintViolation)
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_should_distinguish_unknown_commit_from_constraint_rejection() {
+        let storage_error = |code| {
+            WorldRuntimeError::Storage(rintawa_storage::StorageError::Sqlite(
+                rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None),
+            ))
+        };
+        assert!(storage_error(rusqlite::ffi::SQLITE_IOERR).command_outcome_unknown());
+        assert!(!storage_error(rusqlite::ffi::SQLITE_CONSTRAINT).command_outcome_unknown());
+        assert!(WorldRuntimeError::WorkerStopped.command_outcome_unknown());
+        assert!(
+            !WorldRuntimeError::SystemPanicked("fixture.test@1".parse().unwrap())
+                .command_outcome_unknown()
+        );
+    }
+}

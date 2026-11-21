@@ -2173,3 +2173,26 @@ fn test_should_not_revoke_replacement_activation_on_old_store_quarantine() -> an
     );
     Ok(())
 }
+
+#[test]
+fn test_should_never_report_lost_command_outcomes_as_definite_failure() {
+    use rintawa_world_runtime::WorldRuntimeError;
+    for error in [
+        WorldRuntimeError::WorkerStopped,
+        WorldRuntimeError::WorkerPanicked,
+    ] {
+        assert!(matches!(
+            world_command_failure(error),
+            Err(WorldDataError::Unavailable)
+        ));
+    }
+    let error = WorldRuntimeError::World(rintawa_world::WorldError::InvalidDefinition {
+        key: "fixture.value@1".parse().unwrap(),
+        reason: "я".repeat(5000),
+    });
+    let Ok(WitTicketStatus::Failed(text)) = world_command_failure(error) else {
+        panic!("definite error expected");
+    };
+    assert!(text.len() <= MAX_COMMAND_FAILURE_BYTES);
+    assert!(text.is_char_boundary(text.len()));
+}

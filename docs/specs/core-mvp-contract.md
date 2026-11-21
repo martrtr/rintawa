@@ -35,7 +35,8 @@ Hosted callback declarations and World-data remain unavailable. D8 is not implem
 Evidence: [property authority regressions](../../crates/world-runtime/tests/property_authority_test.rs),
 [real WASM caller/selection tests](../../crates/extension-engine/tests/wasm_transport_test.rs),
 [hosted two-World/Store failure probe](../../crates/extension-engine/tests/artifact_loader_test.rs),
-and [domain authorization/atomicity tests](../../crates/host/src/runtime.rs).
+[domain authorization/atomicity tests](../../crates/host/src/runtime.rs), and
+[guest command completion tests](../../crates/host/src/runtime/command_ticket_tests.rs).
 Fixtures were rebuilt from Rust sources and current WIT. `bash scripts/check.sh`
 passed, including workspace tests, clippy, SDK WASM check, rustdoc and secret/style
 checks; loopback integration tests ran outside the restricted sandbox.
@@ -44,7 +45,11 @@ transactional metadata replacement on the active writer queue, complete per-prof
 mutation locking and validation against the current DDL definitions. Stopped clients
 do not retain writable ownership. Regression checks cover another process, file
 aliases, owner crash, active metadata, concurrent profile changes and altered DDL.
-P07 and later implementation slices remain pending; these checks are not product
+P07/D2 is implemented: command receivers survive ordinary callbacks, close releases
+quota without cancellation, and stop/trap/reload revoke old tickets. Real RTW/WASM
+acceptance covers pending/commit/rollback, queue and ticket limits, foreign handles,
+reopen and reply loss. Unknown completion is unavailable, never a definite failure.
+P08 and later implementation slices remain pending; these checks are not product
 or release acceptance.
 
 ## Goal and required scenarios
@@ -149,13 +154,24 @@ does not authenticate a human browser user.
 
 ## D2. One guest command completion model
 
-**Proposed lifecycle/API amendment.** Keep nonblocking `world-data.submit/poll`,
+**Accepted D2; implemented in P07.** Keep nonblocking `world-data.submit/poll`,
 repair ticket lifetime and add explicit release. Do not add a second synchronous
 public guest API in this proposal.
 
-Current `finish_transport_query_execution` calls `discard_guest_execution`, which
-clears `world_data_tickets`. A command can therefore continue after the next
-callback loses the handle needed to observe its outcome.
+At the implementation baseline, `finish_transport_query_execution` called
+`discard_guest_execution`, clearing `world_data_tickets` before a later callback
+could observe the command outcome.
+
+P07 keeps tickets with their exact execution context, allocates process-wide
+non-reused numeric handles, and releases receivers only on terminal poll, close,
+owner cleanup or Store drop. A terminal unavailable outcome consumes the handle
+because that receiver cannot recover its result. Worker-result loss and ambiguous
+storage failures map to unavailable; explicit pre-commit rejection and SQLite
+constraint failure map to failed. Failure text is limited to 2048 UTF-8 bytes.
+Tests use the real WASM transport consumer, a provider exporting both transport
+and World System, and a Host-side evaluation barrier. They cover pending across
+callbacks, commit/rejection/rollback, admission limits, close, stale/foreign handles,
+stop/trap/reload and reply loss without mutation replay.
 
 | Operation | Contract |
 | --- | --- |

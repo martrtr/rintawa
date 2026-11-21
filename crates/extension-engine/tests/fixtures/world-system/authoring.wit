@@ -1,0 +1,8 @@
+package rintawa:engine@0.0.2;
+
+/// Fixture composition of existing interfaces; no additional runtime contract.
+world command-ticket-fixture {
+    include plugin;
+    export world-system;
+    export transport-handler;
+}

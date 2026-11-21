@@ -113,6 +113,16 @@ command ledger or receipts, no event log or replay, no jobs/outbox, and no actor
 grants. The World runtime-signal bridge has been retired. Property names are flat identifiers, and
 `player`/`npc` are ordinary extension properties with no Core ownership semantics.
 
+## Guest command completion
+
+WASM `world-data.submit` returns a ticket after queue admission. Keep it and use
+`poll` on a later short callback: pending is not a COMMIT acknowledgement. Terminal
+committed/failed consumes the ticket. `close` releases receiver/quota without
+cancelling work. Up to 16 unconsumed tickets belong to one exact activation; stop,
+trap and reload invalidate them. Unavailable can mean the outcome is unknown;
+re-read known item IDs instead of automatically retrying a mutation. The Core
+stores no durable command receipt. Hosted World-data remains unavailable.
+
 ## Lifecycle
 
 The Extension Engine owns creation, ordering, rollback, and cleanup. A

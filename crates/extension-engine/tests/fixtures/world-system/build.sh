@@ -5,6 +5,7 @@ core_root="$(cd "$fixture_root/../../../../.." && pwd)"
 workspace="$core_root/target/world-system-fixture"
 mkdir -p "$workspace/src" "$workspace/wit" "$workspace/rtw"
 cp "$fixture_root/guest.rs" "$workspace/src/lib.rs"
+cp "$fixture_root/authoring.wit" "$workspace/wit/authoring.wit"
 cp "$core_root/crates/extension-engine/wit/engine.wit" "$workspace/wit/engine.wit"
 cp "$fixture_root/Cargo.toml" "$workspace/Cargo.toml"
 cat > "$workspace/rintawa-dev.toml" <<'TOML'

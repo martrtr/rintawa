@@ -42,6 +42,9 @@ use crate::{
     world_runtime_scope_id,
 };
 
+#[cfg(test)]
+mod command_ticket_tests;
+
 /// Maximum one-shot user resources retained by one HostRuntime.
 const MAX_USER_RESOURCES: usize = 32;
 /// Maximum bytes accepted for one ephemeral user resource.

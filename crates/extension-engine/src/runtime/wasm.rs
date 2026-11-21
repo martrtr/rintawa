@@ -9,7 +9,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex, MutexGuard, TryLockError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -63,6 +63,9 @@ use crate::runtime::wasm::target_provider::{WasmExecutionTargetHost, WasmTargetP
 use crate::runtime::wasm::network::{
     build_bounded_https_client, is_allowed_domain_destination_with_source, is_allowed_public_ip,
 };
+
+static NEXT_WORLD_DATA_TICKET: AtomicU64 = AtomicU64::new(1);
+const MAX_COMMAND_FAILURE_BYTES: usize = 2048;
 
 const TARGET_PROVIDER_EXPORT_NAME: &str = "rintawa:engine/target-provider@0.0.2";
 const TASK_HANDLER_EXPORT_NAME: &str = "rintawa:engine/task-handler@0.0.2";
@@ -205,6 +208,11 @@ struct PendingUserResourceUpload {
     bytes: Vec<u8>,
 }
 
+struct OwnedWorldDataTicket {
+    context: ExecutionContext,
+    ticket: rintawa_world_runtime::WorldCommandTicket,
+}
+
 /// Internal host state stored inside the Wasmtime Store context.
 pub struct WasmHostState {
     component_id: ComponentId,
@@ -263,8 +271,7 @@ pub struct WasmHostState {
     pending_execution_targets: Vec<String>,
     world_system_snapshot: Option<WorldSnapshot>,
     world_data_access_active: bool,
-    next_world_data_ticket: u64,
-    world_data_tickets: HashMap<u64, rintawa_world_runtime::WorldCommandTicket>,
+    world_data_tickets: HashMap<u64, OwnedWorldDataTicket>,
     resource_limits: StoreLimits,
     resource_table: ResourceTable,
 }
@@ -414,7 +421,6 @@ impl WasmHostState {
             pending_execution_targets: Vec::new(),
             world_system_snapshot: None,
             world_data_access_active: false,
-            next_world_data_ticket: 0,
             world_data_tickets: HashMap::new(),
             resource_limits: budget.store_limits(),
             resource_table: ResourceTable::new(),
@@ -569,7 +575,6 @@ impl WasmHostState {
         self.pending_transport_points.clear();
         self.world_system_snapshot = None;
         self.world_data_access_active = false;
-        self.world_data_tickets.clear();
     }
 
     fn begin_world_system_execution(&mut self, snapshot: WorldSnapshot) -> ExtensionResult<()> {
@@ -868,6 +873,8 @@ impl WasmHostState {
             .retain(|_, upload| upload.owner.component() != *owner);
         self.user_resource_uploads
             .retain(|_, upload| upload.owner.component() != *owner);
+        self.world_data_tickets
+            .retain(|_, ticket| ticket.context.principal.component() != *owner);
         self.active_tasks.retain(|_, task| &task.owner != owner);
         self.network_handles
             .retain(|_, resource| &resource.owner != owner);
@@ -1437,15 +1444,22 @@ impl WorldDataHost for WasmHostState {
             .map_err(|_| WorldDataError::InvalidRequest)?;
         let payload =
             serde_json::from_str(&payload_json).map_err(|_| WorldDataError::InvalidRequest)?;
-        let handle = self.next_world_data_ticket;
-        let next_handle = handle.checked_add(1).ok_or(WorldDataError::Unavailable)?;
+        let context = self
+            .execution_context
+            .clone()
+            .ok_or(WorldDataError::AccessNotActive)?;
+        let handle = NEXT_WORLD_DATA_TICKET
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| WorldDataError::Unavailable)?;
         let ticket = self
             .host_access
             .world_data
             .submit(scope, owner, schema, payload)
             .map_err(map_world_data_error)?;
-        self.next_world_data_ticket = next_handle;
-        self.world_data_tickets.insert(handle, ticket);
+        self.world_data_tickets
+            .insert(handle, OwnedWorldDataTicket { context, ticket });
         Ok(handle)
     }
 
@@ -1454,7 +1468,9 @@ impl WorldDataHost for WasmHostState {
         let result = self
             .world_data_tickets
             .get(&ticket)
+            .filter(|owned| self.execution_context.as_ref() == Some(&owned.context))
             .ok_or(WorldDataError::InvalidRequest)?
+            .ticket
             .try_wait();
         match result {
             Ok(None) => Ok(WitTicketStatus::Pending),
@@ -1464,9 +1480,21 @@ impl WorldDataHost for WasmHostState {
             }
             Err(error) => {
                 self.world_data_tickets.remove(&ticket);
-                Ok(WitTicketStatus::Failed(error.to_string()))
+                world_command_failure(error)
             }
         }
+    }
+    fn close(&mut self, ticket: u64) -> Result<(), WorldDataError> {
+        self.world_data_identity()?;
+        if !self
+            .world_data_tickets
+            .get(&ticket)
+            .is_some_and(|owned| self.execution_context.as_ref() == Some(&owned.context))
+        {
+            return Err(WorldDataError::InvalidRequest);
+        }
+        self.world_data_tickets.remove(&ticket);
+        Ok(())
     }
 }
 
@@ -1510,6 +1538,17 @@ impl WasmHostState {
         })?;
         Ok(())
     }
+}
+
+fn world_command_failure(
+    error: rintawa_world_runtime::WorldRuntimeError,
+) -> Result<WitTicketStatus, WorldDataError> {
+    if error.command_outcome_unknown() {
+        return Err(WorldDataError::Unavailable);
+    }
+    let mut diagnostic = error.to_string();
+    diagnostic.truncate(diagnostic.floor_char_boundary(MAX_COMMAND_FAILURE_BYTES));
+    Ok(WitTicketStatus::Failed(diagnostic))
 }
 
 fn map_world_data_error(error: HostAccessError) -> WorldDataError {
