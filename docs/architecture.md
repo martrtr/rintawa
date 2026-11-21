@@ -187,19 +187,20 @@ page through deduplicated relation-items, again in ID order. These are direct
 read primitives, not the retired Projection service or a new extension transport.
 The authorization gate is applied to indexed property searches before querying;
 relation structure does not grant access to foreign property values. Deletion
-checks now inspect distinct affected property keys through one joined SQLite
-query instead of performing one properties lookup per adjacent relation.
+checks inspect distinct affected property keys through one joined SQLite query
+inside the write transaction, including effects of earlier changes.
 
-Each running System gets a property-scoped snapshot: its trusted command-schema owner
-comes from Host-installed runtime declarations, never from the command Principal.
+Each running System gets a property-scoped snapshot: its exact instance owner
+comes from Host-installed command bindings, never from the command Principal.
 The Runtime accepts active property owner bindings only from Host-installed package
-definitions, revalidated against the durable JSON Schema. While those bindings
-are grouped by logical ExtensionId, Host rejects two different runtime instances
-of the same logical extension that both declare World schemas: otherwise the
-instances could inherit each other's property access even with distinct schema
-keys. World System calls are pinned more narrowly to the exact declaring
-instance/component, including when other same-ID components advertise the same
-service contract. This is an explicit MVP restriction, not per-item ownership.
+definitions, revalidated against the durable JSON Schema. Components in one exact
+instance share property authority; a sibling instance with the same logical
+ExtensionId has no such access. Different instances may declare disjoint property
+names, but every active version of one name must have the same instance owner.
+World command admission remains pinned to the exact declaring instance/component.
+SetProperty checks both its incoming key and the stored version it replaces.
+Authorization follows the entire ordered transaction inside SQLite; a denied
+replacement or cascade rolls back all preceding changes.
 An absent binding denies
 read and write even when that definition is stored in SQLite. A System can neither
 read another owner's property directly, enumerate its property values, set/remove

@@ -44,6 +44,22 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
 impl exports::rintawa::engine::transport_handler::Guest for Fixture {
     fn on_query(point: String, payload: Vec<u8>) -> Vec<u8> {
         assert_eq!(point, "chat/send-controls/v1");
+        if let Some(item) = payload.strip_prefix(b"world-property:") {
+            let item = std::str::from_utf8(item).expect("fixture item ID");
+            return match rintawa::engine::world_data::load_property(item, "fixture.private@1") {
+                Ok(Some(value)) => value.into_bytes(),
+                Ok(None) => b"missing".to_vec(),
+                Err(rintawa::engine::world_data::Error::AccessDenied) => b"denied".to_vec(),
+                Err(error) => format!("error:{error:?}").into_bytes(),
+            };
+        }
+        if payload == b"world-find" {
+            return match rintawa::engine::world_data::find_properties("fixture.private@1", None, 1) {
+                Ok(values) => format!("found:{}", values.len()).into_bytes(),
+                Err(rintawa::engine::world_data::Error::AccessDenied) => b"denied".to_vec(),
+                Err(error) => format!("error:{error:?}").into_bytes(),
+            };
+        }
         if payload == b"send-event" {
             rintawa::engine::transport::publish("chat/updates/v1", b"from-wasm")
                 .expect("publish inside active WASM handler");

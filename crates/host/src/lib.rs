@@ -348,18 +348,6 @@ pub enum HostError {
         #[source]
         source: serde_json::Error,
     },
-    /// Multiple runtime instances of one logical extension declared World schemas.
-    #[error(
-        "extension {extension_id} declares World schemas from multiple instances {first} and {second}"
-    )]
-    AmbiguousWorldExtensionInstance {
-        /// Logical extension owning more than one World schema instance.
-        extension_id: String,
-        /// First runtime instance.
-        first: String,
-        /// Second runtime instance.
-        second: String,
-    },
     /// Different registered components declared the same World schema identity.
     #[error("world schema {schema} has ambiguous declaring components {first} and {second}")]
     AmbiguousWorldSchemaDeclaration {

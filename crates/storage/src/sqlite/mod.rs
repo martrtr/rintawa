@@ -277,8 +277,25 @@ impl SqliteWorldStorage {
     ///
     /// Returns a world or storage error. No partial change is committed.
     pub fn apply(&self, transaction: &WorldTransaction) -> StorageResult<()> {
+        self.apply_with_property_access(transaction, |_| true)
+    }
+
+    /// Applies changes with property authorization against each ordered SQL effect.
+    ///
+    /// The Host supplies active bindings. Checks include the stored version
+    /// replaced by a set and every property affected by an item cascade, including
+    /// effects of earlier changes in this transaction. No owner is persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an access or storage error and rolls back the entire transaction.
+    pub fn apply_with_property_access(
+        &self,
+        transaction: &WorldTransaction,
+        permits: impl Fn(&SchemaKey) -> bool,
+    ) -> StorageResult<()> {
         let mut connection = self.writer()?;
-        apply::apply(&mut connection, transaction)
+        apply::apply(&mut connection, transaction, permits)
     }
 
     /// Loads one item.

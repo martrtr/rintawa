@@ -395,12 +395,12 @@ impl WorldDataAccess for WorldDataRuntimeControl {
     fn load_item(
         &self,
         scope: &RuntimeScopeId,
-        owner: &ExtensionId,
+        owner: &ExtensionInstanceId,
         item: rintawa_sdk::world::ItemId,
     ) -> HostAccessResult<Option<String>> {
         let value = self
             .client(scope)?
-            .snapshot_for_extension(owner.clone())
+            .snapshot_for_instance(owner.clone())
             .map_err(|_| HostAccessError::Unavailable)?
             .load_item(item)
             .map_err(|_| HostAccessError::Unavailable)?;
@@ -412,13 +412,13 @@ impl WorldDataAccess for WorldDataRuntimeControl {
     fn load_property(
         &self,
         scope: &RuntimeScopeId,
-        owner: &ExtensionId,
+        owner: &ExtensionInstanceId,
         item: rintawa_sdk::world::ItemId,
         key: &SchemaKey,
     ) -> HostAccessResult<Option<String>> {
         let value = self
             .client(scope)?
-            .snapshot_for_extension(owner.clone())
+            .snapshot_for_instance(owner.clone())
             .map_err(|_| HostAccessError::Unavailable)?
             .load_property(item, key)
             .map_err(|error| match error {
@@ -437,7 +437,7 @@ impl WorldDataAccess for WorldDataRuntimeControl {
     fn find_properties(
         &self,
         scope: &RuntimeScopeId,
-        owner: &ExtensionId,
+        owner: &ExtensionInstanceId,
         key: &SchemaKey,
         after: Option<rintawa_sdk::world::ItemId>,
         limit: usize,
@@ -446,7 +446,7 @@ impl WorldDataAccess for WorldDataRuntimeControl {
             return Err(HostAccessError::Rejected);
         }
         self.client(scope)?
-            .snapshot_for_extension(owner.clone())
+            .snapshot_for_instance(owner.clone())
             .map_err(|_| HostAccessError::Unavailable)?
             .find_properties(key, after, limit)
             .map_err(|error| match error {
@@ -1444,14 +1444,17 @@ fn prepare_world_runtime(
 ) -> HostResult<ActiveWorldRuntimeParts> {
     let storage = home.open_world_storage(world_id)?;
     let schemas = installed_world_schemas(&host.engine, instance_ids)?;
-    let property_definitions: Vec<PropertyDefinition> = schemas
+    let property_definitions: Vec<_> = schemas
         .iter()
         .filter(|schema| schema.kind == SchemaKind::Property)
         .map(|schema| {
-            PropertyDefinition::new(
-                schema.key.clone(),
-                schema.owner.clone(),
-                schema.definition.clone(),
+            (
+                schema.declarer.instance_id.clone(),
+                PropertyDefinition::new(
+                    schema.key.clone(),
+                    schema.owner.clone(),
+                    schema.definition.clone(),
+                ),
             )
         })
         .collect();
@@ -1465,12 +1468,15 @@ fn prepare_world_runtime(
         .iter()
         .filter(|schema| schema.kind != SchemaKind::Property)
     {
-        builder.register_runtime_schema(RuntimeSchemaDefinition::new(
-            schema.key.clone(),
-            schema.kind,
-            schema.owner.clone(),
-            schema.definition.clone(),
-        ))?;
+        builder.register_runtime_schema(
+            schema.declarer.instance_id.clone(),
+            RuntimeSchemaDefinition::new(
+                schema.key.clone(),
+                schema.kind,
+                schema.owner.clone(),
+                schema.definition.clone(),
+            ),
+        )?;
     }
     for schema in schemas
         .iter()
@@ -1727,12 +1733,10 @@ struct InstalledWorldSchema {
 
 /// Collects the world schemas declared by the exact installed world artifacts.
 ///
-/// Ownership comes from the installed artifact manifest and its exact registered
-/// component, never from a guest-supplied identity. Until property owner
-/// bindings include concrete instances, one logical extension may register
-/// World schemas from only one instance per World. Otherwise a same-ID instance
-/// could read/write its sibling's properties. Duplicate keys declared by
-/// different principals are also rejected before durable publication.
+/// Ownership comes from the installed artifact manifest and exact instance.
+/// Components in that instance share property authority; command admission
+/// requires the exact declaring component. All versions of a property name
+/// must share the same instance, checked before any durable publication.
 ///
 /// # Errors
 ///
@@ -1743,21 +1747,21 @@ fn installed_world_schemas(
     instance_ids: &[ExtensionInstanceId],
 ) -> HostResult<Vec<InstalledWorldSchema>> {
     let mut schemas = Vec::new();
-    let mut extension_instances = BTreeMap::<String, ExtensionInstanceId>::new();
+    let mut property_owners = BTreeMap::new();
     for instance_id in instance_ids {
         for registered in engine.registered_world_schemas(instance_id)? {
-            let extension_id = registered.extension_id();
-            if let Some(previous) =
-                extension_instances.insert(extension_id.to_string(), instance_id.clone())
+            let contribution = registered.contribution();
+            if contribution.kind() == SchemaKind::Property
+                && let Some(previous) =
+                    property_owners.insert(contribution.key().id().clone(), instance_id.clone())
                 && previous != *instance_id
             {
-                return Err(HostError::AmbiguousWorldExtensionInstance {
-                    extension_id: extension_id.to_string(),
+                return Err(HostError::AmbiguousWorldSchemaDeclaration {
+                    schema: contribution.key().clone(),
                     first: previous.to_string(),
                     second: instance_id.to_string(),
                 });
             }
-            let contribution = registered.contribution();
             let definition =
                 serde_json::from_str(contribution.definition_json()).map_err(|source| {
                     HostError::InvalidWorldSchemaJson {
@@ -2160,7 +2164,8 @@ mod tests {
             host_access: None,
             world_data: WorldDataRuntimeControl::default(),
         };
-        let parts = prepare_world_runtime(&mut host, &home, world_id, &[instance])?;
+        let parts =
+            prepare_world_runtime(&mut host, &home, world_id, std::slice::from_ref(&instance))?;
 
         let inspection = home.open_world_storage(world_id)?;
         let session = inspection.load_session()?;
@@ -2182,7 +2187,9 @@ mod tests {
             owner.clone(),
             serde_json::json!({ "type": "object" }),
         );
-        parts.runtime.register_property_definitions(&[repeated])?;
+        parts
+            .runtime
+            .register_property_definitions(&[(instance, repeated)])?;
         assert_eq!(
             home.open_world_storage(world_id)?
                 .load_session()?
@@ -2258,7 +2265,7 @@ mod tests {
         assert!(matches!(
             host.world_data.load_item(
                 &RuntimeScopeId::new(HOST_SCOPE),
-                &ExtensionId::new("fixture.world-system"),
+                &ExtensionInstanceId::new("world-system-instance"),
                 item,
             ),
             Err(HostAccessError::Unavailable)
@@ -2338,7 +2345,144 @@ mod tests {
     }
 
     #[test]
-    fn test_should_reject_same_extension_id_with_disjoint_world_schema_keys() -> anyhow::Result<()>
+    fn test_should_isolate_same_id_wasm_property_readers_and_rebuild_bindings() -> anyhow::Result<()>
+    {
+        const READER: &[u8] =
+            include_bytes!("../../extension-engine/tests/fixtures/transport/provider.wasm");
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let first_world = home.create_world()?.id;
+        let second_world = home.create_world()?.id;
+        let first_scope = world_runtime_scope_id(first_world);
+        let second_scope = world_runtime_scope_id(second_world);
+        let property: SchemaKey = "fixture.private@1".parse()?;
+        let item = ItemId::new();
+        let owner = ExtensionInstanceId::new("reader-owner");
+        let sibling = ExtensionInstanceId::new("reader-same-logical-id");
+        let foreign_world = ExtensionInstanceId::new("reader-other-world");
+        let world_data = WorldDataRuntimeControl::default();
+        let mut engine = ExtensionEngine::new();
+        engine.attach_world_data_access(Arc::new(world_data.clone()));
+        for (instance, scope, declares) in [
+            (&owner, &first_scope, true),
+            (&sibling, &first_scope, false),
+            (&foreign_world, &second_scope, false),
+        ] {
+            let reader = engine
+                .wasm_runtime_engine()?
+                .load_component_from_bytes(ComponentId::new("reader"), READER)?;
+            let mut components: Vec<Box<dyn Component>> = vec![Box::new(reader)];
+            if declares {
+                // Another component in the exact same instance shares property authority.
+                components.push(Box::new(WorldSchemaComponent {
+                    id: ComponentId::new("schema-owner"),
+                    schemas: vec![WorldSchemaContribution::new(
+                        property.clone(),
+                        SchemaKind::Property,
+                        r#"{"type":"integer"}"#,
+                    )],
+                }));
+            }
+            engine.register_extension_instance(
+                instance.clone(),
+                scope.clone(),
+                test_manifest("fixture.same-package"),
+                components,
+            )?;
+            engine.start_extension_instance(instance)?;
+        }
+        let mut host = HostRuntime {
+            active_worlds: BTreeMap::new(),
+            engine,
+            started_instances: vec![owner.clone(), sibling.clone(), foreign_world.clone()],
+            host_shell_provider: None,
+            host_access: None,
+            world_data,
+        };
+        let first = prepare_world_runtime(
+            &mut host,
+            &home,
+            first_world,
+            &[owner.clone(), sibling.clone()],
+        )?;
+        let second = prepare_world_runtime(
+            &mut host,
+            &home,
+            second_world,
+            std::slice::from_ref(&foreign_world),
+        )?;
+        let mut seed = WorldTransaction::new();
+        seed.push_change(StateChange::CreateObject { id: item });
+        seed.push_change(StateChange::SetProperty {
+            item,
+            key: property.clone(),
+            data: serde_json::json!(73),
+        });
+        home.open_world_storage(first_world)?.apply(&seed)?;
+        host.world_data
+            .activate(first_world, first.runtime.client(), first.command_owners)?;
+        host.world_data
+            .activate(second_world, second.runtime.client(), second.command_owners)?;
+        let point = "chat/send-controls/v1";
+        let request = format!("world-property:{item}");
+        let caller = ComponentRef::new(owner.clone(), "reader");
+        let replies =
+            host.engine
+                .query_transport_contributions(&caller, point, request.as_bytes())?;
+        assert_eq!(replies.len(), 2);
+        assert_eq!(
+            replies
+                .iter()
+                .filter(|reply| reply.as_slice() == b"denied")
+                .count(),
+            1
+        );
+        let value = replies
+            .iter()
+            .find(|reply| reply.as_slice() != b"denied")
+            .expect("owner read");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(value)?["data"],
+            73
+        );
+        let mut pages = host
+            .engine
+            .query_transport_contributions(&caller, point, b"world-find")?;
+        pages.sort();
+        assert_eq!(pages, vec![b"denied".to_vec(), b"found:1".to_vec()]);
+        assert_eq!(
+            host.engine.query_transport_contributions(
+                &ComponentRef::new(foreign_world.clone(), "reader"),
+                point,
+                request.as_bytes()
+            )?,
+            vec![b"denied".to_vec()]
+        );
+        let old_client = first.runtime.client();
+        host.world_data.deactivate(first_world);
+        first.runtime.shutdown()?;
+        assert!(old_client.snapshot_for_instance(owner.clone()).is_err());
+        // Reopening the same DB without its declarations never restores authority
+        // from the stored vocabulary, even for the still-running original reader.
+        let restarted = prepare_world_runtime(&mut host, &home, first_world, &[sibling])?;
+        host.world_data.activate(
+            first_world,
+            restarted.runtime.client(),
+            restarted.command_owners,
+        )?;
+        assert_eq!(
+            host.engine
+                .query_transport_contributions(&caller, point, request.as_bytes())?,
+            vec![b"denied".to_vec(); 2]
+        );
+        restarted.runtime.shutdown()?;
+        second.runtime.shutdown()?;
+        host.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_allow_same_extension_id_with_disjoint_world_property_names() -> anyhow::Result<()>
     {
         let root = tempfile::tempdir()?;
         let home = HostHome::open(root.path().join("home"))?;
@@ -2377,21 +2521,39 @@ mod tests {
             host_access: None,
             world_data: WorldDataRuntimeControl::default(),
         };
-        assert!(matches!(
-            prepare_world_runtime(&mut host, &home, world_id, &instances),
-            Err(HostError::AmbiguousWorldExtensionInstance {
-                extension_id,
-                first,
-                second,
-            }) if extension_id == "rintawa.same-logical-extension"
-                && first == "first-version" && second == "second-version"
-        ));
-        assert!(
+        let parts = prepare_world_runtime(&mut host, &home, world_id, &instances)?;
+        assert_eq!(
             home.open_world_storage(world_id)?
                 .load_session()?
                 .properties()
-                .is_empty()
+                .len(),
+            2
         );
+        let first = parts
+            .runtime
+            .client()
+            .snapshot_for_instance(instances[0].clone())?;
+        let second = parts
+            .runtime
+            .client()
+            .snapshot_for_instance(instances[1].clone())?;
+        let item = rintawa_sdk::world::ItemId::new();
+        assert!(
+            first
+                .load_property(item, &"rintawa.test.first-property@1".parse()?)
+                .is_ok()
+        );
+        assert!(
+            first
+                .load_property(item, &"rintawa.test.second-property@1".parse()?)
+                .is_err()
+        );
+        assert!(
+            second
+                .load_property(item, &"rintawa.test.first-property@1".parse()?)
+                .is_err()
+        );
+        parts.runtime.shutdown()?;
         host.shutdown()?;
         Ok(())
     }
@@ -2834,16 +2996,19 @@ mod tests {
         let observed = Arc::new(Mutex::new(Vec::new()));
         let created = Arc::new(Mutex::new(Vec::new()));
         let mut builder = WorldRuntimeBuilder::new(home.open_world_storage(world.id)?);
-        builder.register_runtime_schema(RuntimeSchemaDefinition::new(
-            command_schema.clone(),
-            SchemaKind::Command,
-            owner.clone(),
-            serde_json::json!({
-                "type": "object",
-                "properties": {"kind": {"type": "string"}},
-                "required": ["kind"]
-            }),
-        ))?;
+        builder.register_runtime_schema(
+            ExtensionInstanceId::new(owner.as_str()),
+            RuntimeSchemaDefinition::new(
+                command_schema.clone(),
+                SchemaKind::Command,
+                owner.clone(),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"kind": {"type": "string"}},
+                    "required": ["kind"]
+                }),
+            ),
+        )?;
         builder.register_system(RecordingWorldSystem {
             command_schema: command_schema.clone(),
             property_schema: property_schema.clone(),
@@ -2851,10 +3016,13 @@ mod tests {
             created: Arc::clone(&created),
         })?;
         let runtime = builder.start()?;
-        runtime.register_property_definitions(&[PropertyDefinition::new(
-            property_schema.clone(),
-            owner,
-            serde_json::json!({"type": "object"}),
+        runtime.register_property_definitions(&[(
+            ExtensionInstanceId::new(owner.as_str()),
+            PropertyDefinition::new(
+                property_schema.clone(),
+                owner,
+                serde_json::json!({"type": "object"}),
+            ),
         )])?;
 
         let mut host = HostRuntime::start(&home)?;

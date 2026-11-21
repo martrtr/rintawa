@@ -14,7 +14,7 @@ use std::sync::{
 
 use anyhow::Result;
 use rintawa_sdk::{
-    types::ExtensionId,
+    types::{ExtensionId, ExtensionInstanceId},
     world::{ItemId, PrincipalId, SchemaKey, WorldId},
 };
 use rintawa_storage::SqliteWorldStorage;
@@ -110,8 +110,23 @@ pub fn activate_fixture_properties(
     runtime: &rintawa_world_runtime::WorldRuntime,
     schemas: &TestSchemas,
 ) -> Result<()> {
-    runtime.register_property_definitions(&fixture_definitions(schemas))?;
+    runtime.register_property_definitions(&property_bindings(&fixture_definitions(schemas)))?;
     Ok(())
+}
+
+/// Binds test metadata to explicit runtime instance identities.
+pub fn property_bindings(
+    definitions: &[PropertyDefinition],
+) -> Vec<(ExtensionInstanceId, PropertyDefinition)> {
+    definitions
+        .iter()
+        .map(|definition| {
+            (
+                ExtensionInstanceId::new(definition.owner().as_str()),
+                definition.clone(),
+            )
+        })
+        .collect()
 }
 
 /// Creates one empty World database with the fixture property vocabulary.
@@ -134,12 +149,15 @@ pub fn runtime_builder(
 ) -> Result<WorldRuntimeBuilder> {
     let mut builder = WorldRuntimeBuilder::new(storage);
     for schema in command_schemas {
-        builder.register_runtime_schema(RuntimeSchemaDefinition::new(
-            (*schema).clone(),
-            SchemaKind::Command,
-            ExtensionId::new(EXTENSION),
-            serde_json::json!({ "type": "object" }),
-        ))?;
+        builder.register_runtime_schema(
+            ExtensionInstanceId::new(EXTENSION),
+            RuntimeSchemaDefinition::new(
+                (*schema).clone(),
+                SchemaKind::Command,
+                ExtensionId::new(EXTENSION),
+                serde_json::json!({ "type": "object" }),
+            ),
+        )?;
     }
     Ok(builder)
 }

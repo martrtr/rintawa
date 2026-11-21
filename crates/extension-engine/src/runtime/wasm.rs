@@ -1380,7 +1380,9 @@ impl WorldDataHost for WasmHostState {
 }
 
 impl WasmHostState {
-    fn world_data_identity(&self) -> Result<(&RuntimeScopeId, &ExtensionId), WorldDataError> {
+    fn world_data_identity(
+        &self,
+    ) -> Result<(&RuntimeScopeId, &ExtensionInstanceId), WorldDataError> {
         if !self.world_data_access_active
             || self.world_system_snapshot.is_some()
             || self.current_execution_owner() != self.registered_owner().as_ref()
@@ -1392,7 +1394,7 @@ impl WasmHostState {
             .as_ref()
             .ok_or(WorldDataError::AccessNotActive)?;
         let owner = self
-            .extension_id
+            .instance_id
             .as_ref()
             .ok_or(WorldDataError::AccessNotActive)?;
         Ok((scope, owner))

@@ -11,16 +11,16 @@ use std::{
 };
 
 use rintawa_sdk::{
-    types::ExtensionId,
+    types::ExtensionInstanceId,
     world::{CommandId, SchemaKey, WorldId},
 };
 use rintawa_storage::SqliteWorldStorage;
 use rintawa_world::{
     DefinitionRegistration, PropertyDefinition, RuntimeSchemaDefinition, SchemaKind,
-    SchemaRegistry, StateChange, WorldCommand, WorldError, WorldSessionState, WorldTransaction,
+    SchemaRegistry, WorldCommand, WorldError, WorldSessionState, WorldTransaction,
 };
 
-use crate::{SystemError, WorldRuntimeError, WorldRuntimeResult, WorldSnapshot, WorldSystem};
+use crate::{WorldRuntimeError, WorldRuntimeResult, WorldSnapshot, WorldSystem};
 
 /// Default maximum number of commands waiting for one world worker.
 pub const DEFAULT_COMMAND_QUEUE_CAPACITY: usize = 128;
@@ -59,14 +59,16 @@ impl Default for WorldRuntimePolicy {
 #[derive(Clone)]
 struct RegisteredSystem {
     system: Arc<dyn WorldSystem>,
+    owner: ExtensionInstanceId,
 }
 
 /// Builder that binds one storage boundary to its command Systems.
 pub struct WorldRuntimeBuilder {
     storage: SqliteWorldStorage,
     policy: WorldRuntimePolicy,
-    systems: BTreeMap<SchemaKey, RegisteredSystem>,
+    systems: BTreeMap<SchemaKey, Arc<dyn WorldSystem>>,
     schemas: SchemaRegistry,
+    schema_owners: BTreeMap<SchemaKey, ExtensionInstanceId>,
 }
 
 impl WorldRuntimeBuilder {
@@ -77,6 +79,7 @@ impl WorldRuntimeBuilder {
             policy: WorldRuntimePolicy::default(),
             systems: BTreeMap::new(),
             schemas: SchemaRegistry::new(),
+            schema_owners: BTreeMap::new(),
         }
     }
 
@@ -88,16 +91,31 @@ impl WorldRuntimeBuilder {
     /// Registers one transient extension runtime-API schema.
     ///
     /// Command schemas come from exact installed packages and are compiled in
-    /// memory, independently of the durable world property vocabulary.
+    /// memory, independently of the durable world property vocabulary. The
+    /// separately supplied owner is the Host-attested instance, not the logical
+    /// package ID carried by the schema metadata.
     ///
     /// # Errors
     ///
     /// Returns a definition conflict or an invalid JSON Schema error.
     pub fn register_runtime_schema(
         &mut self,
+        owner: ExtensionInstanceId,
         definition: RuntimeSchemaDefinition,
     ) -> WorldRuntimeResult<()> {
+        if let Some(existing) = self.schema_owners.get(definition.key())
+            && existing != &owner
+        {
+            return Err(WorldError::DefinitionConflict {
+                key: definition.key().clone(),
+                existing_owner: existing.to_string(),
+                incoming_owner: owner.to_string(),
+            }
+            .into());
+        }
+        let key = definition.key().clone();
         self.schemas.register(definition)?;
+        self.schema_owners.insert(key, owner);
         Ok(())
     }
 
@@ -126,7 +144,7 @@ impl WorldRuntimeBuilder {
         if self.systems.contains_key(&schema) {
             return Err(WorldRuntimeError::DuplicateSystem(schema));
         }
-        self.systems.insert(schema, RegisteredSystem { system });
+        self.systems.insert(schema, system);
         Ok(())
     }
 
@@ -145,11 +163,19 @@ impl WorldRuntimeBuilder {
 
         let world_id = self.storage.world_id();
         let storage = Arc::new(self.storage);
-        let systems = Arc::new(self.systems);
+        let systems = Arc::new(
+            self.systems
+                .into_iter()
+                .map(|(key, system)| {
+                    let owner = self.schema_owners[&key].clone();
+                    (key, RegisteredSystem { system, owner })
+                })
+                .collect(),
+        );
         let schemas = Arc::new(self.schemas);
         let session = Arc::new(Mutex::new(session));
         // Host-installed property declarations, not the on-disk JSON vocabulary,
-        // determine the current extension-to-property authority.
+        // determine the current exact-instance property authority.
         let property_owners = Arc::new(Mutex::new(Arc::new(BTreeMap::new())));
         let (sender, receiver) = mpsc::sync_channel(self.policy.command_queue_capacity());
 
@@ -188,7 +214,7 @@ pub struct WorldRuntime {
     world_id: WorldId,
     storage: Arc<SqliteWorldStorage>,
     session: Arc<Mutex<WorldSessionState>>,
-    property_owners: Arc<Mutex<Arc<BTreeMap<SchemaKey, ExtensionId>>>>,
+    property_owners: Arc<Mutex<Arc<BTreeMap<SchemaKey, ExtensionInstanceId>>>>,
     sender: Arc<Mutex<Option<SyncSender<CommandJob>>>>,
     worker: Option<JoinHandle<()>>,
 }
@@ -201,7 +227,7 @@ pub struct WorldRuntime {
 pub struct WorldRuntimeClient {
     world_id: WorldId,
     storage: Arc<SqliteWorldStorage>,
-    property_owners: Arc<Mutex<Arc<BTreeMap<SchemaKey, ExtensionId>>>>,
+    property_owners: Arc<Mutex<Arc<BTreeMap<SchemaKey, ExtensionInstanceId>>>>,
     sender: Arc<Mutex<Option<SyncSender<CommandJob>>>>,
 }
 
@@ -238,7 +264,7 @@ impl WorldRuntime {
     /// The SQLite vocabulary deliberately contains no owner field. On every
     /// activation Host rebinds identical stored definitions from exact installed
     /// artifacts. A persisted JSON Schema alone never grants a running System
-    /// access. Conflicting owners for one key are rejected before any disk write.
+    /// access. Conflicting owners for one property name are rejected before any disk write.
     ///
     /// # Errors
     ///
@@ -246,25 +272,31 @@ impl WorldRuntime {
     /// storage error without partially publishing a batch.
     pub fn register_property_definitions(
         &self,
-        definitions: &[PropertyDefinition],
+        definitions: &[(ExtensionInstanceId, PropertyDefinition)],
     ) -> WorldRuntimeResult<Vec<DefinitionRegistration>> {
         let mut owners = self
             .property_owners
             .lock()
             .map_err(|_| WorldRuntimeError::RuntimePoisoned)?;
         let mut candidate_owners = (**owners).clone();
-        for definition in definitions {
-            if let Some(existing) =
-                candidate_owners.insert(definition.key().clone(), definition.owner().clone())
-                && existing != *definition.owner()
+        // SQLite stores one value per (item, name), so every active version of
+        // a name must share one exact owner. Validate the full batch first.
+        let mut name_owners: BTreeMap<_, _> = candidate_owners
+            .iter()
+            .map(|(key, owner)| (key.id().clone(), owner.clone()))
+            .collect();
+        for (owner, definition) in definitions {
+            if let Some(existing) = name_owners.insert(definition.key().id().clone(), owner.clone())
+                && existing != *owner
             {
                 return Err(WorldError::DefinitionConflict {
                     key: definition.key().clone(),
                     existing_owner: existing.to_string(),
-                    incoming_owner: definition.owner().to_string(),
+                    incoming_owner: owner.to_string(),
                 }
                 .into());
             }
+            candidate_owners.insert(definition.key().clone(), owner.clone());
         }
 
         let mut session = self
@@ -272,11 +304,15 @@ impl WorldRuntime {
             .lock()
             .map_err(|_| WorldRuntimeError::RuntimePoisoned)?;
         let mut candidate_session = session.clone();
-        for definition in definitions {
+        for (_, definition) in definitions {
             candidate_session.register_property(definition.clone())?;
         }
 
-        let registrations = self.storage.register_definitions(definitions)?;
+        let definitions: Vec<_> = definitions
+            .iter()
+            .map(|(_, definition)| definition.clone())
+            .collect();
+        let registrations = self.storage.register_definitions(&definitions)?;
         *session = candidate_session;
         *owners = Arc::new(candidate_owners);
         Ok(registrations)
@@ -363,7 +399,10 @@ impl WorldRuntimeClient {
     }
 
     /// Captures an owner-scoped snapshot for a verified extension identity.
-    pub fn snapshot_for_extension(&self, owner: ExtensionId) -> WorldRuntimeResult<WorldSnapshot> {
+    pub fn snapshot_for_instance(
+        &self,
+        owner: ExtensionInstanceId,
+    ) -> WorldRuntimeResult<WorldSnapshot> {
         if self
             .sender
             .lock()
@@ -465,7 +504,7 @@ fn worker_loop(
     systems: Arc<BTreeMap<SchemaKey, RegisteredSystem>>,
     schemas: Arc<SchemaRegistry>,
     session: Arc<Mutex<WorldSessionState>>,
-    property_owners: Arc<Mutex<Arc<BTreeMap<SchemaKey, ExtensionId>>>>,
+    property_owners: Arc<Mutex<Arc<BTreeMap<SchemaKey, ExtensionInstanceId>>>>,
     receiver: Receiver<CommandJob>,
 ) {
     while let Ok(job) = receiver.recv() {
@@ -486,7 +525,7 @@ fn process_command(
     systems: &BTreeMap<SchemaKey, RegisteredSystem>,
     schemas: &SchemaRegistry,
     session: &Mutex<WorldSessionState>,
-    property_owners: &Mutex<Arc<BTreeMap<SchemaKey, ExtensionId>>>,
+    property_owners: &Mutex<Arc<BTreeMap<SchemaKey, ExtensionInstanceId>>>,
     command: WorldCommand,
 ) -> WorldRuntimeResult<WorldCommandOutcome> {
     schemas.validate_payload(command.schema(), SchemaKind::Command, command.payload())?;
@@ -494,18 +533,12 @@ fn process_command(
         .get(command.schema())
         .ok_or_else(|| WorldRuntimeError::SystemUnavailable(command.schema().clone()))?;
 
-    let owner = schemas
-        .get(command.schema())
-        .ok_or_else(|| WorldError::DefinitionNotRegistered {
-            key: command.schema().clone(),
-        })?
-        .owner()
-        .clone();
     let bindings = property_owners
         .lock()
         .map_err(|_| WorldRuntimeError::RuntimePoisoned)?
         .clone();
-    let snapshot = WorldSnapshot::for_system(storage.snapshot()?, owner, bindings);
+    let snapshot =
+        WorldSnapshot::for_system(storage.snapshot()?, registered.owner.clone(), bindings);
     let output = catch_unwind(AssertUnwindSafe(|| {
         registered.system.evaluate(&snapshot, &command)
     }))
@@ -515,17 +548,26 @@ fn process_command(
         source,
     })?;
 
-    validate_output(command.schema(), session, &snapshot, &output)?;
+    validate_output(command.schema(), session, &output)?;
 
     let command_id = command.id();
-    storage.apply(&output)?;
+    storage
+        .apply_with_property_access(&output, |key| snapshot.permits_property(key))
+        .map_err(|error| match error {
+            rintawa_storage::StorageError::World(
+                source @ WorldError::PropertyAccessDenied { .. },
+            ) => WorldRuntimeError::InvalidTransaction {
+                schema: command.schema().clone(),
+                source,
+            },
+            other => WorldRuntimeError::Storage(other),
+        })?;
     Ok(WorldCommandOutcome::new(command_id))
 }
 
 fn validate_output(
     schema: &SchemaKey,
     session: &Mutex<WorldSessionState>,
-    snapshot: &WorldSnapshot,
     transaction: &WorldTransaction,
 ) -> WorldRuntimeResult<()> {
     let session = session
@@ -538,29 +580,5 @@ fn validate_output(
             source,
         })?;
 
-    for change in transaction.changes() {
-        let denied = match change {
-            StateChange::SetProperty { key, .. } if !snapshot.permits_property(key) => {
-                Some((key.clone(), "set"))
-            }
-            StateChange::RemoveProperty { key, .. } if !snapshot.permits_property(key) => {
-                Some((key.clone(), "remove"))
-            }
-            StateChange::DeleteItem { id } => snapshot
-                .foreign_property_on_delete(*id)
-                .map_err(|error| WorldRuntimeError::SystemFailed {
-                    schema: schema.clone(),
-                    source: SystemError::Read(error),
-                })?
-                .map(|key| (key, "delete")),
-            _ => None,
-        };
-        if let Some((key, operation)) = denied {
-            return Err(WorldRuntimeError::InvalidTransaction {
-                schema: schema.clone(),
-                source: WorldError::PropertyAccessDenied { key, operation },
-            });
-        }
-    }
     Ok(())
 }

@@ -12,12 +12,13 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use rintawa_sdk::{
-    types::ExtensionId,
+    types::{ExtensionId, ExtensionInstanceId},
     world::{ItemId, PrincipalId, SchemaKey},
 };
 use rintawa_storage::SqliteWorldStorage;
 use rintawa_world::{
-    PropertyDefinition, RelationDirection, StateChange, WorldError, WorldTransaction,
+    PropertyDefinition, RelationDirection, RuntimeSchemaDefinition, SchemaKind, StateChange,
+    WorldCommand, WorldError, WorldTransaction,
 };
 use rintawa_world_runtime::{
     SystemError, SystemResult, WorldReadError, WorldRuntime, WorldRuntimeError, WorldSnapshot,
@@ -26,7 +27,7 @@ use rintawa_world_runtime::{
 
 use common::{
     ScriptedSystem, activate_fixture_properties, command, create_storage, fixture_definitions, key,
-    runtime_builder,
+    property_bindings, runtime_builder,
 };
 
 fn foreign_definition() -> PropertyDefinition {
@@ -99,7 +100,7 @@ fn test_should_rollback_foreign_property_set_and_all_preceding_mutations() -> Re
     builder.register_system(ScriptedSystem::new(schemas.command.clone(), transaction))?;
     let runtime = builder.start()?;
     activate_fixture_properties(&runtime, &schemas)?;
-    runtime.register_property_definitions(std::slice::from_ref(&foreign))?;
+    runtime.register_property_definitions(&property_bindings(std::slice::from_ref(&foreign)))?;
 
     expect_denied(&runtime, &schemas.command, foreign.key(), "set")?;
     assert!(runtime.snapshot()?.load_item(item)?.is_none());
@@ -133,7 +134,7 @@ fn test_should_refuse_foreign_remove_and_preserve_property_value() -> Result<()>
     ))?;
     let runtime = builder.start()?;
     activate_fixture_properties(&runtime, &schemas)?;
-    runtime.register_property_definitions(std::slice::from_ref(&foreign))?;
+    runtime.register_property_definitions(&property_bindings(std::slice::from_ref(&foreign)))?;
 
     expect_denied(&runtime, &schemas.command, foreign.key(), "remove")?;
     assert_eq!(
@@ -168,7 +169,7 @@ fn test_should_refuse_deleting_object_that_contains_foreign_property() -> Result
     ))?;
     let runtime = builder.start()?;
     activate_fixture_properties(&runtime, &schemas)?;
-    runtime.register_property_definitions(std::slice::from_ref(&foreign))?;
+    runtime.register_property_definitions(&property_bindings(std::slice::from_ref(&foreign)))?;
 
     expect_denied(&runtime, &schemas.command, foreign.key(), "delete")?;
     assert!(runtime.snapshot()?.load_item(item)?.is_some());
@@ -213,7 +214,7 @@ fn test_should_refuse_object_deletion_that_cascades_into_foreign_relation() -> R
     ))?;
     let runtime = builder.start()?;
     activate_fixture_properties(&runtime, &schemas)?;
-    runtime.register_property_definitions(std::slice::from_ref(&foreign))?;
+    runtime.register_property_definitions(&property_bindings(std::slice::from_ref(&foreign)))?;
 
     expect_denied(&runtime, &schemas.command, foreign.key(), "delete")?;
     let snapshot = runtime.snapshot()?;
@@ -299,7 +300,7 @@ fn test_should_allow_removing_own_property_without_touching_other_value() -> Res
     ))?;
     let runtime = builder.start()?;
     activate_fixture_properties(&runtime, &schemas)?;
-    runtime.register_property_definitions(std::slice::from_ref(&foreign))?;
+    runtime.register_property_definitions(&property_bindings(std::slice::from_ref(&foreign)))?;
     runtime
         .submit(command(
             &schemas.command,
@@ -386,7 +387,7 @@ fn test_should_filter_foreign_properties_from_system_snapshot_enumeration() -> R
     })?;
     let runtime = builder.start()?;
     activate_fixture_properties(&runtime, &schemas)?;
-    runtime.register_property_definitions(&[foreign])?;
+    runtime.register_property_definitions(&property_bindings(&[foreign]))?;
     runtime
         .submit(command(
             &schemas.command,
@@ -423,7 +424,7 @@ fn test_should_reject_owner_collision_before_any_batch_persistence() -> Result<(
     let second = PropertyDefinition::new(key.clone(), ExtensionId::new("package.second"), body);
 
     assert!(matches!(
-        runtime.register_property_definitions(&[first.clone(), second.clone()]),
+        runtime.register_property_definitions(&property_bindings(&[first.clone(), second.clone()])),
         Err(WorldRuntimeError::World(
             WorldError::DefinitionConflict { .. }
         ))
@@ -431,15 +432,15 @@ fn test_should_reject_owner_collision_before_any_batch_persistence() -> Result<(
     let persisted = SqliteWorldStorage::open(directory.path().join("world.sqlite"))?;
     assert!(persisted.property_registry()?.get(&key).is_none());
 
-    runtime.register_property_definitions(std::slice::from_ref(&first))?;
+    runtime.register_property_definitions(&property_bindings(std::slice::from_ref(&first)))?;
     assert!(matches!(
-        runtime.register_property_definitions(&[second]),
+        runtime.register_property_definitions(&property_bindings(&[second])),
         Err(WorldRuntimeError::World(
             WorldError::DefinitionConflict { .. }
         ))
     ));
     assert!(persisted.property_registry()?.get(&key).is_some());
-    runtime.register_property_definitions(&[first])?;
+    runtime.register_property_definitions(&property_bindings(&[first]))?;
     runtime.shutdown()?;
     Ok(())
 }
@@ -464,7 +465,7 @@ fn test_should_not_inherit_property_authority_from_sqlite_after_restart() -> Res
     expect_denied(&runtime, &schemas.command, &schemas.identity, "set")?;
     assert!(runtime.snapshot()?.load_item(item)?.is_none());
 
-    runtime.register_property_definitions(&fixture_definitions(&schemas))?;
+    runtime.register_property_definitions(&property_bindings(&fixture_definitions(&schemas)))?;
     runtime
         .submit(command(
             &schemas.command,
@@ -621,7 +622,7 @@ fn test_should_keep_indexed_search_scoped_to_command_system_owner() -> Result<()
     })?;
     let runtime = builder.start()?;
     activate_fixture_properties(&runtime, &schemas)?;
-    runtime.register_property_definitions(std::slice::from_ref(&foreign))?;
+    runtime.register_property_definitions(&property_bindings(std::slice::from_ref(&foreign)))?;
 
     // Host has an unrestricted snapshot; extension Systems don't.
     assert_eq!(
@@ -735,6 +736,232 @@ fn test_should_deny_indexed_reads_until_active_owner_is_bound() -> Result<()> {
         })
     ));
     assert!(runtime.snapshot()?.load_item(another)?.is_none());
+    runtime.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn test_should_bind_every_version_of_a_property_name_to_one_exact_instance() -> Result<()> {
+    let (directory, storage, schemas) = create_storage()?;
+    let runtime = runtime_builder(storage, &[&schemas.command])?.start()?;
+    let logical_owner = ExtensionId::new("shared.logical-package");
+    let first = PropertyDefinition::new(
+        key("shared.versioned@1"),
+        logical_owner.clone(),
+        serde_json::json!({}),
+    );
+    let second = PropertyDefinition::new(
+        key("shared.versioned@2"),
+        logical_owner,
+        serde_json::json!({}),
+    );
+    let first_instance = ExtensionInstanceId::new("first-instance");
+    let second_instance = ExtensionInstanceId::new("second-instance");
+    // Equal package names and JSON schemas cannot turn different instances into one owner.
+    assert!(matches!(
+        runtime.register_property_definitions(&[
+            (first_instance.clone(), first.clone()),
+            (second_instance.clone(), second.clone()),
+        ]),
+        Err(WorldRuntimeError::World(
+            WorldError::DefinitionConflict { .. }
+        ))
+    ));
+    assert!(
+        SqliteWorldStorage::open(directory.path().join("world.sqlite"))?
+            .property_registry()?
+            .get(first.key())
+            .is_none()
+    );
+    runtime.register_property_definitions(&[(first_instance.clone(), first.clone())])?;
+    assert!(
+        runtime
+            .register_property_definitions(&[(second_instance, second.clone())])
+            .is_err()
+    );
+    assert!(
+        SqliteWorldStorage::open(directory.path().join("world.sqlite"))?
+            .property_registry()?
+            .get(second.key())
+            .is_none()
+    );
+    runtime.register_property_definitions(&[(first_instance, second)])?;
+    runtime.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn test_should_check_stored_version_before_replacement_and_rollback_prior_changes() -> Result<()> {
+    for prefix in ["set", "remove", "delete"] {
+        let (_directory, storage, schemas) = create_storage()?;
+        let old = PropertyDefinition::new(
+            key("shared.transition@1"),
+            ExtensionId::new(common::EXTENSION),
+            serde_json::json!({"type":"integer"}),
+        );
+        let new = PropertyDefinition::new(
+            key("shared.transition@2"),
+            ExtensionId::new(common::EXTENSION),
+            serde_json::json!({"type":"integer"}),
+        );
+        storage.register_definition(&old)?;
+        let item = ItemId::new();
+        let created = ItemId::new();
+        seed_object_property(&storage, item, old.key().clone(), serde_json::json!(1))?;
+        let mut changes = vec![StateChange::CreateObject { id: created }];
+        // A stale version-specific remove is a no-op; it cannot hide the old row.
+        if prefix == "remove" {
+            changes.push(StateChange::RemoveProperty {
+                item,
+                key: new.key().clone(),
+            });
+        }
+        if prefix == "delete" {
+            changes.push(StateChange::DeleteItem { id: item });
+        }
+        changes.push(StateChange::SetProperty {
+            item,
+            key: new.key().clone(),
+            data: serde_json::json!(2),
+        });
+        let mut builder = runtime_builder(storage, &[&schemas.command])?;
+        builder.register_system(ScriptedSystem::new(schemas.command.clone(), changes))?;
+        let runtime = builder.start()?;
+        // The vocabulary remembers v1 but only v2 is currently authorized.
+        runtime.register_property_definitions(&property_bindings(&[new]))?;
+        expect_denied(
+            &runtime,
+            &schemas.command,
+            old.key(),
+            if prefix == "delete" { "delete" } else { "set" },
+        )?;
+        assert!(runtime.snapshot()?.load_item(created)?.is_none());
+        assert_eq!(
+            runtime
+                .snapshot()?
+                .load_property(item, old.key())?
+                .expect("old value preserved")
+                .data(),
+            &serde_json::json!(1)
+        );
+        runtime.shutdown()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn test_should_apply_authorized_version_changes_and_ordered_cascade_effects() -> Result<()> {
+    let (_directory, storage, _schemas) = create_storage()?;
+    let old = PropertyDefinition::new(
+        key("shared.transition@1"),
+        ExtensionId::new(common::EXTENSION),
+        serde_json::json!({"type":"integer"}),
+    );
+    let new = PropertyDefinition::new(
+        key("shared.transition@2"),
+        ExtensionId::new(common::EXTENSION),
+        serde_json::json!({"type":"integer"}),
+    );
+    storage.register_definition(&old)?;
+    let subject = ItemId::new();
+    let object = ItemId::new();
+    let relation = ItemId::new();
+    seed_object_property(&storage, subject, old.key().clone(), serde_json::json!(1))?;
+    let transition = key("fixture.transition@1");
+    let remove_and_delete = key("fixture.remove-delete@1");
+    let mut builder = runtime_builder(storage, &[&transition, &remove_and_delete])?;
+    builder.register_system(ScriptedSystem::new(
+        transition.clone(),
+        vec![
+            StateChange::SetProperty {
+                item: subject,
+                key: new.key().clone(),
+                data: serde_json::json!(2),
+            },
+            // Removing v1 after setting v2 must preserve v2.
+            StateChange::RemoveProperty {
+                item: subject,
+                key: old.key().clone(),
+            },
+        ],
+    ))?;
+    builder.register_system(ScriptedSystem::new(
+        remove_and_delete.clone(),
+        vec![
+            StateChange::CreateObject { id: object },
+            StateChange::CreateRelation {
+                id: relation,
+                subject,
+                object,
+            },
+            StateChange::SetProperty {
+                item: relation,
+                key: new.key().clone(),
+                data: serde_json::json!(3),
+            },
+            StateChange::RemoveProperty {
+                item: subject,
+                key: new.key().clone(),
+            },
+            StateChange::DeleteItem { id: subject },
+        ],
+    ))?;
+    let runtime = builder.start()?;
+    runtime.register_property_definitions(&property_bindings(&[old, new.clone()]))?;
+    runtime
+        .submit(WorldCommand::system(transition, serde_json::json!({})))?
+        .wait()?;
+    assert_eq!(
+        runtime
+            .snapshot()?
+            .load_property(subject, new.key())?
+            .expect("transition committed")
+            .data(),
+        &serde_json::json!(2)
+    );
+    runtime
+        .submit(WorldCommand::system(
+            remove_and_delete,
+            serde_json::json!({}),
+        ))?
+        .wait()?;
+    assert!(runtime.snapshot()?.load_item(subject)?.is_none());
+    assert!(runtime.snapshot()?.load_item(relation)?.is_none());
+    assert!(runtime.snapshot()?.load_item(object)?.is_some());
+    runtime.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn test_should_deny_same_package_command_from_another_exact_instance() -> Result<()> {
+    let (_directory, storage, schemas) = create_storage()?;
+    let item = ItemId::new();
+    let command_schema = key("fixture.sibling-command@1");
+    let mut builder = rintawa_world_runtime::WorldRuntimeBuilder::new(storage);
+    builder.register_runtime_schema(
+        ExtensionInstanceId::new("sibling-instance"),
+        RuntimeSchemaDefinition::new(
+            command_schema.clone(),
+            SchemaKind::Command,
+            ExtensionId::new(common::EXTENSION),
+            serde_json::json!({"type":"object"}),
+        ),
+    )?;
+    builder.register_system(ScriptedSystem::new(
+        command_schema.clone(),
+        vec![
+            StateChange::CreateObject { id: item },
+            StateChange::SetProperty {
+                item,
+                key: schemas.identity.clone(),
+                data: serde_json::json!({"name":"spoofed"}),
+            },
+        ],
+    ))?;
+    let runtime = builder.start()?;
+    activate_fixture_properties(&runtime, &schemas)?;
+    expect_denied(&runtime, &command_schema, &schemas.identity, "set")?;
+    assert!(runtime.snapshot()?.load_item(item)?.is_none());
     runtime.shutdown()?;
     Ok(())
 }

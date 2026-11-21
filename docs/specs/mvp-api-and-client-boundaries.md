@@ -1,6 +1,6 @@
 # MVP API and client boundaries
 
-**Status: accepted design, 2026-11-21; not implemented.** The owner accepted D1–D7
+**Status: accepted design, 2026-11-21; implementation in progress.** The owner accepted D1–D7
 on the condition that UI uses general extension interaction and adds no UI-specific
 Core code. A subsequent browser review is recorded below as D8 (proposed amendment;
 not covered by the earlier acceptance). The role flag from the draft is therefore replaced by the generic
@@ -12,6 +12,9 @@ them. No product code, builds, tests or performance measurements accompany it.
 Acceptance covers this design and its stated MVP limits; it is not evidence of
 correctness, minimal implementation or release readiness. New mechanisms still
 need the concrete requirement and acceptance checks specified here.
+
+P05/D1 is implemented and verified; see [implementation progress](core-mvp-contract.md#implementation-progress).
+D6–D7 and the client implementation below remain pending.
 
 Core baseline: `fb1072a2c9169af1b36ea9cdffed31c146ed0341`; rtwKit baseline:
 `77782727020f6066be4d4c205b077dd3f9555775`. Recheck relevant source before coding.

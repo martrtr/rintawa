@@ -202,7 +202,9 @@ fn test_should_revoke_cloned_client_before_worker_join() -> Result<()> {
     runtime.shutdown()?;
 
     assert!(matches!(
-        client.snapshot_for_extension(rintawa_sdk::types::ExtensionId::new(common::EXTENSION)),
+        client.snapshot_for_instance(rintawa_sdk::types::ExtensionInstanceId::new(
+            common::EXTENSION
+        )),
         Err(WorldRuntimeError::RuntimeStopped)
     ));
     assert!(matches!(

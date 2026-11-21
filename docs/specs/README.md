@@ -7,7 +7,7 @@ P01–P04 design: D6–D7, exact guest interfaces, browser protocol, native
 release scope, initial budgets and additional acceptance checks. Read both;
 the companion's explicit choices supersede earlier open alternatives.
 
-**Status: accepted design, implementation pending.** On 2026-11-21 the owner
+**Status: accepted design, implementation in progress.** On 2026-11-21 the owner
 accepted D1–D7 subject to UI using general extension interaction without new
 UI-specific Core code. The companion records this boundary and its acceptance
 checks. The follow-up browser review adds **D8 as a proposed amendment**, not yet accepted:
@@ -17,6 +17,11 @@ checks are included in the companion; approve D8 before implementing that slice.
 Only the project owner may accept further architectural changes.
 The baseline is `fb1072a2c9169af1b36ea9cdffed31c146ed0341`, inspected on
 2026-11-21. No builds, tests or benchmarks were run for that investigation.
+
+P05/D1 now binds property authority to exact instances and validates ordered
+replacement/cascade effects inside the write transaction. Its regressions and the
+full repository check passed; see [implementation progress](core-mvp-contract.md#implementation-progress).
+P05/D6 and later implementation slices remain pending.
 
 This directory contains durable project specifications in English. Revision-specific
 audit notes and the working refactoring checklist are local engineering material

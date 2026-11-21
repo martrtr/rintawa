@@ -1,10 +1,10 @@
 # Minimal Core: boundaries and proposed amendments
 
-**Status:** Accepted design, 2026-11-21; implementation pending. The owner accepted
+**Status:** Accepted design, 2026-11-21; implementation in progress. The owner accepted
 D1–D7 subject to general extension interaction and no new UI-specific Core code.
 **Baseline:** `fb1072a2c9169af1b36ea9cdffed31c146ed0341`.
 **Scope:** SDK/WIT, Extension Engine, Host, World Runtime and Storage.
-**Evidence:** static source inspection; no builds, tests or benchmarks were run.
+**Design evidence:** static source inspection; no builds, tests or benchmarks were run during the design analysis.
 
 **Design completion:** [MVP API and client boundaries](mvp-api-and-client-boundaries.md)
 resolves P01–P04, specifies exact guest/bridge interfaces, adds D6–D7 and narrows
@@ -13,6 +13,22 @@ acceptance condition and replaces the draft UI flag with general contract lookup
 The companion also contains proposed D8 following the browser review. It is not
 covered by D1–D7 acceptance: it enables nonblocking, bidirectional hosted transport.
 Neither document proves implementation correctness or release readiness.
+
+## Implementation progress
+
+P05/D1 is implemented: property authority uses exact Host-attested instance IDs,
+all active versions of a name have one owner, and SQLite checks replacement and
+cascade effects in transaction order before COMMIT. Command admission remains
+bound to the exact declaring component. Logical package IDs remain schema metadata;
+no SQLite schema or WIT change is needed for this part.
+
+Evidence: [property authority regressions](../../crates/world-runtime/tests/property_authority_test.rs)
+and the real-WASM reader/World-reopen test in [Host runtime tests](../../crates/host/src/runtime.rs).
+The transport fixture was rebuilt from its Rust source and current WIT.
+`bash scripts/check.sh` passed, including workspace tests, clippy, SDK WASM check,
+rustdoc and secret/style checks; loopback integration tests required execution
+outside the restricted sandbox. D6/B1–B3 and the remaining implementation slices
+are pending; this result is not product or release acceptance.
 
 ## Goal and required scenarios
 
@@ -76,9 +92,10 @@ multiplayer, federation and transactions spanning Worlds are not MVP requirement
 
 ## D1. Exact identity and property authority
 
-**Proposed contract amendment.** Current property checks use logical `ExtensionId`
-and full versioned `SchemaKey`, whereas SQL replaces values by `(item, name)`.
-Command admission already checks an exact component. These boundaries must agree.
+**Accepted contract amendment; implemented in P05/D1.** At the design baseline,
+property checks used logical `ExtensionId` and full versioned `SchemaKey`, whereas
+SQL replaced values by `(item, name)`. The implementation now aligns property
+checks with exact instance bindings and ordered SQL effects.
 
 - Bind property authority to the exact Host-attested extension instance selected
   by approved artifact composition. Components in that instance share its property

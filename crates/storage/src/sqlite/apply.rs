@@ -1,7 +1,8 @@
 //! Applying one validated change set as a single SQLite transaction.
 
-use rintawa_world::{StateChange, WorldTransaction};
-use rusqlite::{TransactionBehavior, params};
+use rintawa_sdk::world::{SchemaKey, SchemaVersion};
+use rintawa_world::{StateChange, WorldError, WorldTransaction};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::{StorageError, StorageResult};
 
@@ -13,6 +14,7 @@ use crate::{StorageError, StorageResult};
 pub(super) fn apply(
     connection: &mut rusqlite::Connection,
     transaction: &WorldTransaction,
+    permits: impl Fn(&SchemaKey) -> bool,
 ) -> StorageResult<()> {
     let sqlite = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
@@ -43,12 +45,29 @@ pub(super) fn apply(
                     .map_err(|error| item_error(error, *id, "create"))?;
             }
             StateChange::DeleteItem { id } => {
+                for key in super::query::property_keys_deleted_with_item(&sqlite, *id)? {
+                    require_access(&permits, &key, "delete")?;
+                }
                 sqlite.execute(
                     "DELETE FROM items WHERE id = ?1",
                     params![id.into_bytes().as_slice()],
                 )?;
             }
             StateChange::SetProperty { item, key, data } => {
+                require_access(&permits, key, "set")?;
+                let stored_version: Option<u32> = sqlite
+                    .query_row(
+                        "SELECT version FROM properties WHERE item = ?1 AND name = ?2",
+                        params![item.into_bytes().as_slice(), key.id().as_str()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(version) = stored_version {
+                    let version = SchemaVersion::new(version)
+                        .map_err(|error| StorageError::CorruptData(error.to_string()))?;
+                    let stored_key = SchemaKey::new(key.id().clone(), version);
+                    require_access(&permits, &stored_key, "set")?;
+                }
                 sqlite.execute(
                     "INSERT INTO properties (item, name, version, data) VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT (item, name) DO UPDATE SET
@@ -63,6 +82,7 @@ pub(super) fn apply(
                 )?;
             }
             StateChange::RemoveProperty { item, key } => {
+                require_access(&permits, key, "remove")?;
                 sqlite.execute(
                     "DELETE FROM properties WHERE item = ?1 AND name = ?2 AND version = ?3",
                     params![
@@ -76,6 +96,21 @@ pub(super) fn apply(
     }
 
     sqlite.commit()?;
+    Ok(())
+}
+
+fn require_access(
+    permits: &impl Fn(&SchemaKey) -> bool,
+    key: &SchemaKey,
+    operation: &'static str,
+) -> StorageResult<()> {
+    if !permits(key) {
+        return Err(WorldError::PropertyAccessDenied {
+            key: key.clone(),
+            operation,
+        }
+        .into());
+    }
     Ok(())
 }
 

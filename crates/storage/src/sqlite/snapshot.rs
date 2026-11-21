@@ -137,16 +137,6 @@ impl SqliteWorldSnapshot {
         query::find_relations(&self.connection, targets, direction, property, after, limit)
     }
 
-    /// Returns keys on the item and its incident relations that SQLite would
-    /// remove as part of an item deletion.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the pinned state contains invalid property keys.
-    pub fn property_keys_deleted_with_item(&self, item: ItemId) -> StorageResult<Vec<SchemaKey>> {
-        query::property_keys_deleted_with_item(&self.connection, item)
-    }
-
     /// Loads every relation whose subject or object is the given item.
     ///
     /// # Errors

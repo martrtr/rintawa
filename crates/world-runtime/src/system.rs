@@ -8,7 +8,7 @@ use crate::{SystemResult, WorldSnapshot};
 /// Deterministic command evaluator for one exact versioned command schema.
 ///
 /// Systems read a pinned, property-owner-scoped snapshot and return one atomic
-/// item/property change set. The owner is taken from the registered command
+/// item/property change set. The exact instance owner is taken from the Host binding of the command
 /// schema, not from the command Principal or a guest-supplied payload. They must
 /// not perform irreversible external side effects during evaluation:
 /// the runtime validates the change set and commits it as one SQLite transaction.

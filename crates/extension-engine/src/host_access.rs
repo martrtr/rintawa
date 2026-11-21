@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use rintawa_sdk::{
     contracts::ComponentRef,
-    types::{ExtensionId, RuntimeScopeId},
+    types::{ExtensionInstanceId, RuntimeScopeId},
     world::{ItemId, SchemaKey},
 };
 use rintawa_world_runtime::WorldCommandTicket;
@@ -129,14 +129,14 @@ pub trait RuntimeContextAccess: Send + Sync {
 
 /// Host-mediated access to one active authoritative World runtime.
 ///
-/// Callers supply only their Host-attested extension identity and runtime scope;
+/// Callers supply only their Host-attested exact instance identity and runtime scope;
 /// World identity and command principal are assigned by the Host implementation.
 pub trait WorldDataAccess: Send + Sync {
     /// Loads one item from the current World snapshot.
     fn load_item(
         &self,
         scope: &RuntimeScopeId,
-        owner: &ExtensionId,
+        owner: &ExtensionInstanceId,
         item: ItemId,
     ) -> HostAccessResult<Option<String>>;
 
@@ -144,7 +144,7 @@ pub trait WorldDataAccess: Send + Sync {
     fn load_property(
         &self,
         scope: &RuntimeScopeId,
-        owner: &ExtensionId,
+        owner: &ExtensionInstanceId,
         item: ItemId,
         key: &SchemaKey,
     ) -> HostAccessResult<Option<String>>;
@@ -153,7 +153,7 @@ pub trait WorldDataAccess: Send + Sync {
     fn find_properties(
         &self,
         scope: &RuntimeScopeId,
-        owner: &ExtensionId,
+        owner: &ExtensionInstanceId,
         key: &SchemaKey,
         after: Option<ItemId>,
         limit: usize,
@@ -655,7 +655,7 @@ impl WorldDataAccess for UnavailableWorldDataAccess {
     fn load_item(
         &self,
         _: &RuntimeScopeId,
-        _: &ExtensionId,
+        _: &ExtensionInstanceId,
         _: ItemId,
     ) -> HostAccessResult<Option<String>> {
         Err(HostAccessError::Unavailable)
@@ -663,7 +663,7 @@ impl WorldDataAccess for UnavailableWorldDataAccess {
     fn load_property(
         &self,
         _: &RuntimeScopeId,
-        _: &ExtensionId,
+        _: &ExtensionInstanceId,
         _: ItemId,
         _: &SchemaKey,
     ) -> HostAccessResult<Option<String>> {
@@ -673,7 +673,7 @@ impl WorldDataAccess for UnavailableWorldDataAccess {
     fn find_properties(
         &self,
         _: &RuntimeScopeId,
-        _: &ExtensionId,
+        _: &ExtensionInstanceId,
         _: &SchemaKey,
         _: Option<ItemId>,
         _: usize,

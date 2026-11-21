@@ -6,7 +6,7 @@ use std::{
 };
 
 use rintawa_sdk::{
-    types::ExtensionId,
+    types::ExtensionInstanceId,
     world::{ItemId, SchemaKey, WorldId},
 };
 use rintawa_storage::SqliteWorldSnapshot;
@@ -62,10 +62,10 @@ pub struct WorldSnapshot {
 
 #[derive(Debug, Clone)]
 struct SystemPropertyAccess {
-    owner: ExtensionId,
+    owner: ExtensionInstanceId,
     // Immutable per-command view; a later Host registration cannot change the
     // authority of an already-running System evaluation.
-    active_owners: Arc<BTreeMap<SchemaKey, ExtensionId>>,
+    active_owners: Arc<BTreeMap<SchemaKey, ExtensionInstanceId>>,
 }
 
 impl WorldSnapshot {
@@ -80,8 +80,8 @@ impl WorldSnapshot {
 
     pub(crate) fn for_system(
         storage: SqliteWorldSnapshot,
-        owner: ExtensionId,
-        active_owners: Arc<BTreeMap<SchemaKey, ExtensionId>>,
+        owner: ExtensionInstanceId,
+        active_owners: Arc<BTreeMap<SchemaKey, ExtensionInstanceId>>,
     ) -> Self {
         let world_id = storage.world_id();
         Self {
@@ -118,7 +118,7 @@ impl WorldSnapshot {
     ///
     /// # Errors
     ///
-    /// Rejects property keys not owned by the active System's extension.
+    /// Rejects property keys not owned by the active System's exact instance.
     /// Trusted native Host snapshots are unrestricted.
     ///
     /// # Errors
@@ -256,21 +256,6 @@ impl WorldSnapshot {
         Ok(self
             .storage()?
             .find_relations(targets, direction, property, after, limit)?)
-    }
-
-    // Deleting an object cascades to its relation-items and their properties.
-    // Check all distinct keys using one pinned SQLite read before SQL DELETE;
-    // a System must not erase foreign values through ON DELETE CASCADE.
-    pub(crate) fn foreign_property_on_delete(
-        &self,
-        item: ItemId,
-    ) -> WorldReadResult<Option<SchemaKey>> {
-        for key in self.storage()?.property_keys_deleted_with_item(item)? {
-            if !self.permits_property(&key) {
-                return Ok(Some(key));
-            }
-        }
-        Ok(None)
     }
 
     /// Loads every relation whose subject or object is the given item.

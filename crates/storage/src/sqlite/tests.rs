@@ -11,7 +11,7 @@ use rintawa_world::{
 use rusqlite::Connection;
 use tempfile::TempDir;
 
-use crate::SqliteWorldStorage;
+use crate::{SqliteWorldStorage, sqlite::query};
 
 fn schema(key: &str) -> SchemaKey {
     key.parse().expect("test property name must be valid")
@@ -998,17 +998,13 @@ fn test_should_report_distinct_cascade_property_keys_from_one_query() -> anyhow:
     });
     storage.apply(&seed)?;
 
-    let snapshot = storage.snapshot()?;
-    let keys = snapshot.property_keys_deleted_with_item(a)?;
+    let connection = storage.reader()?;
+    let keys = query::property_keys_deleted_with_item(&connection, a)?;
     assert_eq!(keys, vec![first.clone(), second.clone()]);
-    let unaffected = snapshot.property_keys_deleted_with_item(b)?;
+    let unaffected = query::property_keys_deleted_with_item(&connection, b)?;
     assert!(unaffected.contains(&first));
     assert!(unaffected.contains(&second));
-    assert!(
-        snapshot
-            .property_keys_deleted_with_item(ItemId::new())?
-            .is_empty()
-    );
+    assert!(query::property_keys_deleted_with_item(&connection, ItemId::new())?.is_empty());
     Ok(())
 }
 
