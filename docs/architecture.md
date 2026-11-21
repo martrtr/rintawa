@@ -1,5 +1,9 @@
 # Architecture
 
+> This description contains historical API claims and is not an implementation
+> checklist. See [Core specifications](specs/README.md) for the accepted D1–D7
+> target boundaries and proposed D8. Acceptance does not imply implementation.
+
 Rintawa is a local-first runtime for persistent Worlds composed from immutable RTW
 packages. Core provides generic execution, storage, authority, composition and UI
 infrastructure. Product semantics live in extensions.

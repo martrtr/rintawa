@@ -2,7 +2,7 @@
 
 ## Development environment
 
-Rust 1.98.1 is the canonical development toolchain. The repository provides a
+Rust 1.99.1 is the canonical development toolchain. The repository provides a
 reproducible Nix development shell, including `cargo`, `clippy`, and `rustfmt`:
 
 ```bash
@@ -30,7 +30,7 @@ git config core.hooksPath .githooks
 ```
 
 The hook invokes the Nix shell automatically. When Nix is unavailable, it uses
-the Rust 1.98.1 toolchain selected by rustup instead.
+the Rust 1.99.1 toolchain selected by rustup instead.
 
 The SDK follows [the Rust coding style](docs/engineering/coding-style.md). Its
 public API is intentionally small; add a new public contract only after it is

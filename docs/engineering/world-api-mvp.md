@@ -1,5 +1,10 @@
 # Native World API slice
 
+> This documents an earlier native slice. Its “Not in this slice” list is not a
+> statement of current repository capabilities: guest World interfaces now exist.
+> See [Core specifications](../specs/README.md) for their actual
+> boundaries and remaining gaps.
+
 This slice exposes the four-table World read primitives through
 `rintawa_world_runtime::WorldSnapshot` and keeps command submission on
 `WorldRuntime::submit`.

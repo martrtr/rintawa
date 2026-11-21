@@ -1,5 +1,9 @@
 # Roadmap
 
+> Historical roadmap: do not restore removed APIs from this list. The
+> [Core specifications](specs/README.md) distinguish current source behavior,
+> accepted D1–D7 target contracts and the separately proposed D8 amendment.
+
 Rintawa is working toward the first `0.0.1` end-to-end MVP: import a character,
 create a persistent World, talk through world-scoped Chat, receive an AI-controlled reply,
 restart the Host and continue the same session.

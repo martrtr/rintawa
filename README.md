@@ -1,5 +1,10 @@
 # Rintawa
 
+> Architecture review (2026-11-21): start with [Core specifications](docs/specs/README.md).
+> Some descriptions below and in the older architecture/roadmap lag behind the
+> current code. D1–D7 are accepted target contracts, not implemented features;
+> the browser review proposes D8 separately. Evidence so far is static inspection.
+
 Rintawa is a local-first runtime for persistent Worlds composed from immutable RTW
 packages. Core provides generic package execution, scoped composition, authoritative World
 state and scoped extension execution. Product features and presentation are
