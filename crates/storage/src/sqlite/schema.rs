@@ -118,46 +118,13 @@ pub(super) fn validate_existing(connection: &Connection) -> StorageResult<()> {
         });
     }
 
-    let mut statement = connection.prepare(
-        "SELECT name FROM sqlite_master WHERE type = 'table'
-         AND name NOT LIKE 'sqlite_%' ORDER BY name",
-    )?;
-    let tables = statement
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    if tables != ["items", "properties", "property_registry", "world"] {
+    // Let SQLite parse the one supported DDL. Compare definitions by name, never
+    // sqlite_master row order (which differs after backup/VACUUM).
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(FOUR_TABLE_SCHEMA)?;
+    if schema_objects(connection)? != schema_objects(&expected)? {
         return Err(StorageError::CorruptData(
-            "unrecognized world schema: expected exactly four domain tables".into(),
-        ));
-    }
-
-    for trigger in [
-        "world_single_row",
-        "items_relation_endpoints_ins",
-        "items_relation_endpoints_upd",
-        "items_type_immutable",
-        "property_registry_immutable",
-    ] {
-        let present: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
-            [trigger],
-            |row| row.get(0),
-        )?;
-        if present != 1 {
-            return Err(StorageError::CorruptData(format!(
-                "unrecognized world schema: missing trigger {trigger}"
-            )));
-        }
-    }
-
-    let property_index: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'properties_by_name_version_item'",
-        [],
-        |row| row.get(0),
-    )?;
-    if property_index != 1 {
-        return Err(StorageError::CorruptData(
-            "unrecognized world schema: missing property search index".into(),
+            "unrecognized world schema: definitions differ from current DDL".into(),
         ));
     }
 
@@ -178,4 +145,16 @@ pub(super) fn validate_existing(connection: &Connection) -> StorageResult<()> {
         ));
     }
     Ok(())
+}
+
+fn schema_objects(connection: &Connection) -> StorageResult<Vec<(String, String, String, String)>> {
+    let mut statement = connection.prepare(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master
+         WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name",
+    )?;
+    Ok(statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?)
 }

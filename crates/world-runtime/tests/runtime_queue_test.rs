@@ -218,3 +218,69 @@ fn test_should_revoke_cloned_client_before_worker_join() -> Result<()> {
     drop(unused_ticket);
     Ok(())
 }
+
+#[test]
+fn test_should_release_writer_with_stale_clients_after_shutdown() -> Result<()> {
+    let (root, storage, _schemas) = create_storage()?;
+    let path = root.path().join("world.sqlite");
+    let runtime = rintawa_world_runtime::WorldRuntimeBuilder::new(storage).start()?;
+    let client = runtime.client();
+    assert!(matches!(
+        SqliteWorldStorage::open(&path),
+        Err(rintawa_storage::StorageError::WriterBusy(_))
+    ));
+    runtime.shutdown()?;
+    let reopened = SqliteWorldStorage::open(&path)?;
+    assert!(matches!(
+        client.set_manifest_metadata(serde_json::json!({"title":"stale"})),
+        Err(WorldRuntimeError::RuntimeStopped)
+    ));
+    assert!(matches!(
+        client.snapshot_for_instance(rintawa_sdk::types::ExtensionInstanceId::new("stale")),
+        Err(WorldRuntimeError::RuntimeStopped)
+    ));
+    drop(reopened);
+    Ok(())
+}
+
+#[test]
+fn test_should_serialize_metadata_behind_system_evaluation() -> Result<()> {
+    use std::{sync::mpsc, time::Duration};
+    let (_root, storage, schemas) = create_storage()?;
+    storage.update_manifest(&rintawa_world::WorldManifest::new(
+        serde_json::json!({"custom": 17}),
+    ))?;
+    let mut builder = runtime_builder(storage, &[&schemas.command])?;
+    let started = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    builder.register_system(BlockingFirstSystem {
+        command_schema: schemas.command.clone(),
+        invocations: Arc::new(AtomicUsize::new(0)),
+        started: started.clone(),
+        release: release.clone(),
+    })?;
+    let runtime = builder.start()?;
+    let command_ticket = runtime.submit(command(
+        &schemas.command,
+        PrincipalId::new(),
+        serde_json::json!({"item": ItemId::new().to_string()}),
+    ))?;
+    started.wait();
+    let client = runtime.client();
+    let (result_tx, result_rx) = mpsc::channel();
+    let updater = std::thread::spawn(move || {
+        let result = client.set_manifest_metadata(serde_json::json!({"title":"queued"}));
+        let _ = result_tx.send(result);
+    });
+    let early = result_rx.recv_timeout(Duration::from_millis(100));
+    // Always unblock the worker, including on regression, so Drop cannot hang.
+    release.wait();
+    assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+    command_ticket.wait()?;
+    let manifest = result_rx.recv_timeout(Duration::from_secs(5))??;
+    updater.join().unwrap();
+    assert_eq!(manifest.as_value()["custom"], 17);
+    assert_eq!(manifest.as_value()["metadata"]["title"], "queued");
+    runtime.shutdown()?;
+    Ok(())
+}

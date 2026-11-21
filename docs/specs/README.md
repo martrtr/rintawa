@@ -23,7 +23,8 @@ replacement/cascade effects inside the write transaction. Its regressions and th
 full repository check passed; see [implementation progress](core-mvp-contract.md#implementation-progress).
 P05/D6 is also implemented: ABI `rintawa:engine@0.0.2`, attested immediate callers,
 activation-bound hosted execution and generic selected-provider lookup. The full
-repository check passed. P05 is complete; P06 is next. D8 remains proposed.
+repository check passed. P05 is complete. P06/D4 fixes for writer delete/recreate and initial composition
+publication await narrow re-review before P07. D8 remains proposed.
 
 This directory contains durable project specifications in English. Revision-specific
 audit notes and the working refactoring checklist are local engineering material

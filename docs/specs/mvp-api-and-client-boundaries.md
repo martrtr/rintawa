@@ -14,7 +14,7 @@ correctness, minimal implementation or release readiness. New mechanisms still
 need the concrete requirement and acceptance checks specified here.
 
 P05/D1 and D6 are implemented and verified; see [implementation progress](core-mvp-contract.md#implementation-progress).
-D2–D5/D7 and the client implementation below remain pending. D8 remains proposed.
+P06/D4 is implemented. D2/D3/D5/D7 and the client implementation below remain pending. D8 remains proposed.
 
 Core baseline: `fb1072a2c9169af1b36ea9cdffed31c146ed0341`; rtwKit baseline:
 `77782727020f6066be4d4c205b077dd3f9555775`. Recheck relevant source before coding.
@@ -268,6 +268,36 @@ close-queryable: func(handle: u64) -> result<_, error>;
   The original Zenoh query deadline remains authoritative even if an idle owner
   has not polled. An idle owner may retain only the bounded stale records until
   the next cleanup; no background delivery/retry service is required.
+
+Additional D8 requirements (proposed, subject to the same owner acceptance):
+
+- Every operation above must return without waiting for another guest, a reply,
+  network progress or a Store lock. This includes declaration, reply and close;
+  overload/busy paths fail promptly. Use bounded existing transport work where
+  needed; a synchronous Zenoh wait must not stall the provider pump.
+- Host records a monotonic deadline at `begin-query` admission and carries it in
+  private transport metadata to each receiver. Dispatch and queue delays consume
+  that same budget; receipt must not restart 500 ms. Retaining a Zenoh `Query`
+  preserves the reply route, but does not itself supply deadline enforcement.
+- Bind outgoing, queued and checked-out requests to exact caller and provider
+  activations. Before handing out a request, replying or admitting a new privileged
+  operation, revalidate the relevant live activation. Stop/close rejects pending
+  routes; already-admitted effects may finish and are not rolled back. No stale
+  request or cleanup may acquire/revoke a replacement activation's authority.
+- Preserve synchronous collection semantics: return successful replies even if
+  other providers fail; errors with no successful reply return unavailable; no
+  replies returns an empty list. At deadline, collected successes may be returned;
+  an empty result never proves a mutation did not run. Do not retry automatically.
+- `reply-query` checks ownership before consuming anything. For an owned live
+  handle, a valid bounded reply attempt consumes it even if sending fails; invalid
+  payloads leave it available until close/expiry. Expired handles are removed and
+  return invalid-handle. Close immediately releases owner quota and drops buffered
+  results; any still-running worker keeps its global running slot until completion.
+  All completion paths release their remaining quota exactly once.
+
+D8 acceptance extends B10 with delayed dispatch, partial success/error/timeout,
+caller/provider stop with checked-out requests, close/reply races, replacement
+activation isolation, quota recovery and a prompt-return check for all seven calls.
 
 The browser SDK uses begin/poll internally to implement a Promise-based query;
 it pumps incoming requests to registered JavaScript handlers and sends replies.
@@ -752,6 +782,6 @@ P05 implements D6 identity/context and its immediate transport/cleanup checks.
 Continue the broader lifecycle/budget checks through P09, D7 and exact guest reads
 with P08; realize the browser protocol in rtwKit P10. D8 requires explicit owner acceptance and is a separate transport
 slice after D6 and before P10; it does not block the already accepted D1 correction.
-P05 is complete; the next implementation slice is P06. Do not make Sol
+P05 and P06 are complete; the next implementation slice is P07. Do not make Sol
 choose among the rejected alternatives unless evidence shows this contract is
 inconsistent or impossible; report a narrow amendment instead.

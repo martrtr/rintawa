@@ -39,8 +39,13 @@ and [domain authorization/atomicity tests](../../crates/host/src/runtime.rs).
 Fixtures were rebuilt from Rust sources and current WIT. `bash scripts/check.sh`
 passed, including workspace tests, clippy, SDK WASM check, rustdoc and secret/style
 checks; loopback integration tests ran outside the restricted sandbox.
-P05 is complete. P06 and later implementation slices remain pending; these checks
-are not product or release acceptance.
+P05 and P06/D4 are implemented. P06 adds OS-backed exclusive database ownership,
+transactional metadata replacement on the active writer queue, complete per-profile
+mutation locking and validation against the current DDL definitions. Stopped clients
+do not retain writable ownership. Regression checks cover another process, file
+aliases, owner crash, active metadata, concurrent profile changes and altered DDL.
+P07 and later implementation slices remain pending; these checks are not product
+or release acceptance.
 
 ## Goal and required scenarios
 
@@ -226,10 +231,10 @@ be convenience operations on the same authority boundary.
 
 ## D4. Write ownership and Host persistence
 
-**Proposed clarification of single-writer/persistence guarantees.** Separate
-`SqliteWorldStorage::open` calls currently create separate connections/Mutexes.
-SQLite serializes apply transactions, but not the preceding System evaluations.
-Host metadata and profile callers also perform separate read/modify/write steps.
+**Accepted D4; implemented in P06.** At the design baseline, separate
+`SqliteWorldStorage::open` calls created separate connections/Mutexes. SQLite
+serialized apply transactions, but not the preceding System evaluations.
+Host metadata and profile callers also performed separate read/modify/write steps.
 
 One writable owner holds the canonical World file throughout runtime operation,
 including snapshot → evaluate → commit. A second runtime/process receives an
@@ -262,6 +267,32 @@ names. Unknown structure is rejected without repair/migration. Validation must
 accept current-DDL databases after ordinary reopen/backup and must not depend on
 incidental `sqlite_master` row ordering.
 
+### P06 implementation boundaries
+
+The writable storage owns an OS file lock on the database inode until its SQLite
+writer is closed (including delete/WAL cleanup). Aliases must contend for the same
+ownership; unsupported locking fails. After acquiring the inode lock, compare its
+file identity with the pathname before opening SQLite, rejecting descriptors left
+behind by delete/recreate. Delete checks that same identity before unlinking.
+Revoked runtime clients hold weak storage
+references so they cannot retain a writer after shutdown. Profile mutations lock
+an adjacent persistent `.lock` file before loading and retain it through atomic
+publication; the lock file is never unlinked during ordinary cleanup. World
+creation takes this composition lock before publishing its database and retains
+both database ownership and the composition lock through initial overlay publication
+or rollback. Activation waits for that publication under the same lock; a missing
+World overlay is an incomplete World, not the default baseline/recipe profile.
+
+Host-only `set_manifest_metadata` replaces the JSON `metadata` block inside one
+SQL transaction and returns the resulting manifest after COMMIT. Active Host
+World-session access submits this work to the existing bounded command queue;
+HostHome's inactive operation obtains temporary write ownership and returns busy
+if another runtime owns the World. No guest metadata capability is added.
+Schema validation compares sorted definitions against the current DDL instantiated
+in memory, including all tables, indexes and triggers; no format migration occurs.
+Acceptance: A2–A4, stale clients after shutdown, active metadata ordering, concurrent
+profile mutations, failed publication and read-only inspection during ownership.
+
 ## D5. Lifecycle, budgets and API removal
 
 **Proposed implementation/ABI changes; accept the scope before implementation.**
@@ -289,6 +320,16 @@ Lifecycle invariants:
    subscriptions. Cleanup errors are returned.
 4. Crash need not drain the queue. Committed state survives reopen; unfinished
    work is not replayed. Stopping one World preserves unrelated World resources.
+
+Transport callbacks retain the exact activation captured by their declaration.
+After acquiring a lifecycle Store, dispatch must validate that captured context
+and the Store's explicit start binding before entering guest code. A successful
+stop/start may retain guest memory, but only explicit start installs a new binding;
+old callbacks never refresh authority by looking up a reused ComponentRef.
+Quarantine revokes admission only if its original activation is still current;
+late failure must not revoke replacement declarations or dependent clients.
+Regression checks cover a paused validated callback across both warm restart and
+unregister/reload, and quarantine of a retained old Store after replacement.
 
 Undeclaration does not stop an executing callback. Check activation on new
 privileged imports and bound external work. Busy/failed stop must expose incomplete

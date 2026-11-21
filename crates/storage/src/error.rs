@@ -27,6 +27,10 @@ pub enum StorageError {
     #[error("world storage already exists at {0}")]
     AlreadyExists(PathBuf),
 
+    /// Another writable owner holds this database file.
+    #[error("world storage writer is busy at {0}")]
+    WriterBusy(PathBuf),
+
     /// A requested world database does not exist.
     #[error("world storage does not exist at {0}")]
     NotFound(PathBuf),

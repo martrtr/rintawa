@@ -14,7 +14,7 @@ mod snapshot;
 mod tests;
 
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
     time::Duration,
@@ -31,6 +31,11 @@ use crate::{StorageError, StorageResult};
 
 pub use self::snapshot::SqliteWorldSnapshot;
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_WRITER_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// SQLite storage for exactly one authoritative world.
@@ -44,6 +49,8 @@ pub struct SqliteWorldStorage {
     path: PathBuf,
     world_id: WorldId,
     writer: Mutex<Connection>,
+    // Declared last: close SQLite/WAL before releasing OS ownership.
+    _ownership: File,
 }
 
 impl SqliteWorldStorage {
@@ -71,15 +78,19 @@ impl SqliteWorldStorage {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        match OpenOptions::new().write(true).create_new(true).open(path) {
-            Ok(file) => drop(file),
+        let ownership = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(StorageError::AlreadyExists(path.to_path_buf()));
             }
             Err(error) => return Err(error.into()),
-        }
-
-        match Self::initialize_new(path, world_id, manifest) {
+        };
+        match Self::initialize_new(path, world_id, manifest, ownership) {
             Ok(storage) => Ok(storage),
             Err(error) => {
                 let _ = fs::remove_file(path);
@@ -93,9 +104,18 @@ impl SqliteWorldStorage {
     /// # Errors
     ///
     /// Returns a typed error for missing entries, unsupported storage or world
-    /// versions, corrupted metadata or SQLite errors. Incompatible files remain unchanged.
+    /// versions, corrupted metadata or SQLite errors. WriterBusy means another
+    /// writable owner holds the file. Incompatible files remain unchanged.
     pub fn open(path: impl AsRef<Path>) -> StorageResult<Self> {
         let path = validate_existing_file(path.as_ref())?;
+        let ownership = OpenOptions::new().read(true).write(true).open(&path)?;
+        #[cfg(test)]
+        BEFORE_WRITER_LOCK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        lock_writer(&ownership, &path)?;
         // Reject unknown worlds before allowing the writer connection to configure WAL.
         let world_id = Self::inspect_read_only(&path)?.id();
 
@@ -106,6 +126,7 @@ impl SqliteWorldStorage {
             path,
             world_id,
             writer: Mutex::new(connection),
+            _ownership: ownership,
         })
     }
 
@@ -138,7 +159,9 @@ impl SqliteWorldStorage {
         path: &Path,
         world_id: WorldId,
         manifest: &WorldManifest,
+        ownership: File,
     ) -> StorageResult<Self> {
+        lock_writer(&ownership, path)?;
         let path = path.canonicalize()?;
         let mut connection = Connection::open(&path)?;
         configure_connection(&connection)?;
@@ -148,6 +171,7 @@ impl SqliteWorldStorage {
             path,
             world_id,
             writer: Mutex::new(connection),
+            _ownership: ownership,
         })
     }
 
@@ -252,6 +276,50 @@ impl SqliteWorldStorage {
             ],
         )?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    /// Replaces the Host metadata block atomically, preserving other manifest fields.
+    /// Returns the resulting manifest only after COMMIT. This grants no guest access.
+    pub fn set_manifest_metadata(
+        &self,
+        metadata: serde_json::Value,
+    ) -> StorageResult<WorldManifest> {
+        let mut connection = self.writer()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut document = query::load_manifest(&transaction)?;
+        document
+            .as_object_mut()
+            .ok_or_else(|| StorageError::CorruptData(String::from("manifest must be an object")))?
+            .insert(String::from("metadata"), metadata);
+        transaction.execute(
+            "UPDATE world SET manifest = ?1 WHERE id = ?2",
+            params![
+                serde_json::to_string(&document)?,
+                self.world_id.into_bytes().as_slice()
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(WorldManifest::new(document))
+    }
+
+    /// Closes SQLite and removes this database while retaining exclusive ownership.
+    pub fn delete(self) -> StorageResult<()> {
+        let Self {
+            path,
+            writer,
+            _ownership,
+            ..
+        } = self;
+        let connection = writer
+            .into_inner()
+            .map_err(|_| StorageError::ConnectionUnavailable)?;
+        connection
+            .close()
+            .map_err(|(_, error)| StorageError::Sqlite(error))?;
+        verify_owned_path(&_ownership, &path)?;
+        fs::remove_file(path)?;
+        drop(_ownership);
         Ok(())
     }
 
@@ -388,6 +456,30 @@ impl SqliteWorldStorage {
         connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         Ok(connection)
     }
+}
+
+fn lock_writer(file: &File, path: &Path) -> StorageResult<()> {
+    match file.try_lock() {
+        Ok(()) => verify_owned_path(file, path),
+        Err(TryLockError::WouldBlock) => Err(StorageError::WriterBusy(path.to_path_buf())),
+        Err(TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+// A descriptor opened before delete/recreate can lock the unlinked old inode.
+// Validate after locking; supported deleters then cannot replace this same file
+// while ownership is held. Compare file identities, not canonical path strings,
+// so hard-link aliases continue to contend for the same writer.
+fn verify_owned_path(file: &File, path: &Path) -> StorageResult<()> {
+    let locked = same_file::Handle::from_file(file.try_clone()?)?;
+    let current = same_file::Handle::from_path(path)?;
+    if locked != current {
+        return Err(StorageError::InvalidEntry {
+            path: path.to_path_buf(),
+            reason: "world database path no longer names the locked file",
+        });
+    }
+    Ok(())
 }
 
 fn validate_existing_file(path: &Path) -> StorageResult<PathBuf> {

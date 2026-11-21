@@ -4,7 +4,7 @@ use std::{
     collections::BTreeMap,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -17,7 +17,7 @@ use rintawa_sdk::{
 use rintawa_storage::SqliteWorldStorage;
 use rintawa_world::{
     DefinitionRegistration, PropertyDefinition, RuntimeSchemaDefinition, SchemaKind,
-    SchemaRegistry, WorldCommand, WorldError, WorldSessionState, WorldTransaction,
+    SchemaRegistry, WorldCommand, WorldError, WorldManifest, WorldSessionState, WorldTransaction,
 };
 
 use crate::{WorldRuntimeError, WorldRuntimeResult, WorldSnapshot, WorldSystem};
@@ -215,7 +215,7 @@ pub struct WorldRuntime {
     storage: Arc<SqliteWorldStorage>,
     session: Arc<Mutex<WorldSessionState>>,
     property_owners: Arc<Mutex<Arc<BTreeMap<SchemaKey, ExtensionInstanceId>>>>,
-    sender: Arc<Mutex<Option<SyncSender<CommandJob>>>>,
+    sender: Arc<Mutex<Option<SyncSender<WorldJob>>>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -226,9 +226,9 @@ pub struct WorldRuntime {
 #[derive(Clone)]
 pub struct WorldRuntimeClient {
     world_id: WorldId,
-    storage: Arc<SqliteWorldStorage>,
+    storage: Weak<SqliteWorldStorage>,
     property_owners: Arc<Mutex<Arc<BTreeMap<SchemaKey, ExtensionInstanceId>>>>,
-    sender: Arc<Mutex<Option<SyncSender<CommandJob>>>>,
+    sender: Arc<Mutex<Option<SyncSender<WorldJob>>>>,
 }
 
 impl WorldRuntime {
@@ -241,7 +241,7 @@ impl WorldRuntime {
     pub fn client(&self) -> WorldRuntimeClient {
         WorldRuntimeClient {
             world_id: self.world_id,
-            storage: self.storage.clone(),
+            storage: Arc::downgrade(&self.storage),
             property_owners: self.property_owners.clone(),
             sender: self.sender.clone(),
         }
@@ -338,7 +338,7 @@ impl WorldRuntime {
             response: response_sender,
         };
 
-        match sender.try_send(job) {
+        match sender.try_send(WorldJob::Command(job)) {
             Ok(()) => Ok(WorldCommandTicket {
                 command_id,
                 receiver: response_receiver,
@@ -385,14 +385,36 @@ impl WorldRuntimeClient {
             .ok_or(WorldRuntimeError::RuntimeStopped)?;
         let command_id = command.id();
         let (response_sender, response_receiver) = mpsc::channel();
-        match sender.try_send(CommandJob {
+        match sender.try_send(WorldJob::Command(CommandJob {
             command,
             response: response_sender,
-        }) {
+        })) {
             Ok(()) => Ok(WorldCommandTicket {
                 command_id,
                 receiver: response_receiver,
             }),
+            Err(TrySendError::Full(_)) => Err(WorldRuntimeError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => Err(WorldRuntimeError::RuntimeStopped),
+        }
+    }
+
+    /// Enqueues a Host-only metadata replacement and waits for COMMIT.
+    /// Uses the same bounded writer queue as domain commands.
+    pub fn set_manifest_metadata(
+        &self,
+        metadata: serde_json::Value,
+    ) -> WorldRuntimeResult<WorldManifest> {
+        let sender = self
+            .sender
+            .lock()
+            .map_err(|_| WorldRuntimeError::RuntimePoisoned)?
+            .clone()
+            .ok_or(WorldRuntimeError::RuntimeStopped)?;
+        let (response, receiver) = mpsc::channel();
+        match sender.try_send(WorldJob::Metadata { metadata, response }) {
+            Ok(()) => receiver
+                .recv()
+                .map_err(|_| WorldRuntimeError::WorkerStopped)?,
             Err(TrySendError::Full(_)) => Err(WorldRuntimeError::QueueFull),
             Err(TrySendError::Disconnected(_)) => Err(WorldRuntimeError::RuntimeStopped),
         }
@@ -417,7 +439,10 @@ impl WorldRuntimeClient {
             .map_err(|_| WorldRuntimeError::RuntimePoisoned)?
             .clone();
         Ok(WorldSnapshot::for_system(
-            self.storage.snapshot()?,
+            self.storage
+                .upgrade()
+                .ok_or(WorldRuntimeError::RuntimeStopped)?
+                .snapshot()?,
             owner,
             bindings,
         ))
@@ -483,6 +508,14 @@ impl WorldCommandTicket {
     }
 }
 
+enum WorldJob {
+    Command(CommandJob),
+    Metadata {
+        metadata: serde_json::Value,
+        response: mpsc::Sender<WorldRuntimeResult<WorldManifest>>,
+    },
+}
+
 struct CommandJob {
     command: WorldCommand,
     response: mpsc::Sender<WorldRuntimeResult<WorldCommandOutcome>>,
@@ -505,18 +538,28 @@ fn worker_loop(
     schemas: Arc<SchemaRegistry>,
     session: Arc<Mutex<WorldSessionState>>,
     property_owners: Arc<Mutex<Arc<BTreeMap<SchemaKey, ExtensionInstanceId>>>>,
-    receiver: Receiver<CommandJob>,
+    receiver: Receiver<WorldJob>,
 ) {
     while let Ok(job) = receiver.recv() {
-        let result = process_command(
-            &storage,
-            &systems,
-            &schemas,
-            &session,
-            &property_owners,
-            job.command,
-        );
-        let _ = job.response.send(result);
+        match job {
+            WorldJob::Command(job) => {
+                let result = process_command(
+                    &storage,
+                    &systems,
+                    &schemas,
+                    &session,
+                    &property_owners,
+                    job.command,
+                );
+                let _ = job.response.send(result);
+            }
+            WorldJob::Metadata { metadata, response } => {
+                let result = storage
+                    .set_manifest_metadata(metadata)
+                    .map_err(WorldRuntimeError::Storage);
+                let _ = response.send(result);
+            }
+        }
     }
 }
 

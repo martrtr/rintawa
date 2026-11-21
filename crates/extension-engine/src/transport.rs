@@ -89,6 +89,9 @@ struct OwnedSubscription {
     subscriber: Subscriber<RingChannelHandler<Sample>>,
 }
 
+#[cfg(test)]
+type CallbackHook = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
 /// One lazily opened local Zenoh session shared by an Extension Engine.
 ///
 /// Session identity and scope are supplied by the engine, never by guest payloads.
@@ -98,6 +101,10 @@ pub(crate) struct Transport {
     state: Arc<Mutex<State>>,
     active_callbacks: Arc<AtomicUsize>,
     pub(crate) contexts: ExecutionContexts,
+    #[cfg(test)]
+    pub(crate) before_callback: CallbackHook,
+    #[cfg(test)]
+    pub(crate) after_callback: CallbackHook,
 }
 
 /// One bounded callback slot, released even when trusted native code panics.
@@ -267,6 +274,10 @@ impl Transport {
         let zenoh = session(&mut state)?;
         let active_callbacks = Arc::clone(&self.active_callbacks);
         let callback = Arc::new(callback);
+        #[cfg(test)]
+        let before_callback = self.before_callback.clone();
+        #[cfg(test)]
+        let after_callback = self.after_callback.clone();
         let declaration = zenoh
             .declare_queryable(key.as_str())
             .callback(move |query: Query| {
@@ -298,6 +309,10 @@ impl Transport {
                 let contexts = contexts.clone();
                 let executing = executing.clone();
                 let callback = Arc::clone(&callback);
+                #[cfg(test)]
+                let before_callback = before_callback.clone();
+                #[cfg(test)]
+                let after_callback = after_callback.clone();
                 if let Err(error) = std::thread::Builder::new()
                     .name(String::from("rintawa-zenoh-callback"))
                     .stack_size(512 * 1024)
@@ -311,7 +326,21 @@ impl Transport {
                                 })
                                 && contexts.validate(&executing).is_ok();
                         if valid {
+                            #[cfg(test)]
+                            {
+                                let hook = before_callback.lock().unwrap().take();
+                                if let Some(hook) = hook {
+                                    hook();
+                                }
+                            }
                             callback(query, caller);
+                            #[cfg(test)]
+                            {
+                                let hook = after_callback.lock().unwrap().take();
+                                if let Some(hook) = hook {
+                                    hook();
+                                }
+                            }
                         } else {
                             let _ = query
                                 .reply_err(b"inactive caller or provider".to_vec())
@@ -516,7 +545,18 @@ impl Transport {
     }
 
     pub(crate) fn revoke_instance(&self, instance: &ExtensionInstanceId) {
-        let revoked = self.contexts.revoke_instance(instance);
+        self.revoke_instance_if(instance, None);
+    }
+
+    pub(crate) fn revoke_activation(&self, expected: &ExecutionContext) {
+        self.revoke_instance_if(&expected.principal.instance_id, Some(expected));
+    }
+
+    fn revoke_instance_if(
+        &self,
+        instance: &ExtensionInstanceId,
+        expected: Option<&ExecutionContext>,
+    ) {
         let removed = {
             let mut state = match self.state.lock() {
                 Ok(state) => state,
@@ -525,6 +565,14 @@ impl Transport {
                     poisoned.into_inner()
                 }
             };
+            // Serialize declaration cleanup with publication of replacement resources.
+            let revoked = match expected {
+                Some(expected) => self.contexts.revoke_instance_if(instance, Some(expected)),
+                None => self.contexts.revoke_instance(instance),
+            };
+            if expected.is_some() && revoked.is_empty() {
+                return;
+            }
             let mut kept = Vec::new();
             let mut removed = Vec::new();
             for declaration in std::mem::take(&mut state.queryables) {

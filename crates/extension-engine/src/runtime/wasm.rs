@@ -213,6 +213,7 @@ pub struct WasmHostState {
     scope_id: Option<RuntimeScopeId>,
     execution_owner: Option<rintawa_sdk::contracts::ComponentRef>,
     execution_context: Option<ExecutionContext>,
+    activation_context: Option<ExecutionContext>,
     registration_scope: Option<WasmRegistrationScope>,
     runtime_permissions: RuntimePermissionManager,
     task_access_active: bool,
@@ -363,6 +364,7 @@ impl WasmHostState {
             scope_id: None,
             execution_owner: None,
             execution_context: None,
+            activation_context: None,
             registration_scope: None,
             runtime_permissions,
             task_access_active: false,
@@ -780,6 +782,7 @@ impl WasmHostState {
 
     fn begin_start_execution(&mut self) {
         self.begin_guest_execution();
+        self.activation_context = self.execution_context.clone();
         self.execution_target_registration_active = true;
         self.pending_execution_targets.clear();
         self.pending_transport_points.clear();
@@ -794,17 +797,27 @@ impl WasmHostState {
     }
 
     /// Query callbacks are not lifecycle callbacks and cannot borrow privileged host entrypoints.
-    fn begin_transport_query_execution(&mut self) {
+    fn begin_transport_query_execution(
+        &mut self,
+        context: &ExecutionContext,
+    ) -> ExtensionResult<()> {
         self.discard_guest_execution();
-        self.execution_owner = self.registered_owner();
-        self.execution_context = self
-            .execution_owner
-            .as_ref()
-            .and_then(|owner| self.transport.contexts.context(owner, true).ok());
+        if self.activation_context.as_ref() != Some(context) {
+            return Err(ExtensionError::Message(String::from(
+                "stale WASM query activation",
+            )));
+        }
+        self.transport
+            .contexts
+            .validate(context)
+            .map_err(|error| ExtensionError::Message(error.to_string()))?;
+        self.execution_owner = Some(context.principal.component());
+        self.execution_context = Some(context.clone());
         self.transport_access_active = true;
         self.world_data_access_active = true;
         self.transport_queries_this_execution = 0;
         self.transport_publications_this_execution = 0;
+        Ok(())
     }
 
     fn finish_transport_query_execution(&mut self) {
@@ -1879,6 +1892,7 @@ impl WasmComponent {
         point: &str,
         query: zenoh::query::Query,
         caller: ComponentPrincipal,
+        executing: &ExecutionContext,
     ) {
         let result = (|| -> ExtensionResult<Vec<u8>> {
             let payload = query
@@ -1897,13 +1911,21 @@ impl WasmComponent {
             let mut state = runtime.try_lock().map_err(|_| {
                 ExtensionError::Message(String::from("WASM transport provider is busy"))
             })?;
+            if !state.active {
+                return Err(ExtensionError::Message(String::from(
+                    "WASM transport provider is stopped",
+                )));
+            }
             let instance = state.instance.as_mut().ok_or_else(|| {
                 ExtensionError::Message(String::from("WASM transport provider is stopped"))
             })?;
             // Bound WASM query execution to the short Zenoh deadline.
             // The full service fuel allowance can leave a Store busy after timeout.
             Self::set_callback_fuel(&mut instance.store, budget, "transport query")?;
-            instance.store.data_mut().begin_transport_query_execution();
+            instance
+                .store
+                .data_mut()
+                .begin_transport_query_execution(executing)?;
             let response = instance
                 .transport_handler
                 .as_ref()
@@ -2069,13 +2091,9 @@ struct WasmSharedRuntime {
 impl WasmSharedRuntime {
     fn quarantine(&mut self, callback: &'static str) {
         if let Some(instance) = self.instance.as_ref()
-            && let Some(owner) = instance.store.data().registered_owner()
+            && let Some(context) = instance.store.data().activation_context.as_ref()
         {
-            instance
-                .store
-                .data()
-                .transport
-                .revoke_instance(&owner.instance_id);
+            instance.store.data().transport.revoke_activation(context);
         }
         self.instance = None;
         self.failed_lifecycle_callback = Some(callback);
@@ -2343,6 +2361,12 @@ impl Component for WasmComponent {
                 let callback_runtime = self.runtime.clone();
                 let callback_budget = self.budget.clone();
                 let callback_point = point.clone();
+                let executing = self
+                    .host_services
+                    .transport
+                    .contexts
+                    .context(&owner, true)
+                    .map_err(|error| ExtensionError::Message(error.to_string()))?;
                 self.host_services
                     .transport
                     .declare(
@@ -2356,6 +2380,7 @@ impl Component for WasmComponent {
                                 &callback_point,
                                 query,
                                 caller,
+                                &executing,
                             );
                         },
                     )

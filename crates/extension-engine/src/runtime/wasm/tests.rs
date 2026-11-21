@@ -2031,3 +2031,145 @@ mod http_origin_policy_host_tests {
         ));
     }
 }
+
+fn lifecycle_review_manifest() -> rintawa_sdk::manifest::ExtensionManifest {
+    rintawa_sdk::manifest::ExtensionManifest {
+        id: ExtensionId::new("lifecycle-review"),
+        name: String::from("lifecycle-review"),
+        version: String::from("0.0.1"),
+        sdk: String::from("^0.0"),
+        components: Vec::new(),
+    }
+}
+
+#[test]
+fn test_should_reject_delayed_wasm_query_after_restart_and_reload() -> anyhow::Result<()> {
+    use crate::ExtensionEngine;
+    use rintawa_sdk::contracts::ComponentRef;
+    use std::sync::mpsc;
+    use zenoh::Wait;
+
+    for reload in [false, true] {
+        let mut engine = ExtensionEngine::new();
+        let id = ExtensionInstanceId::new("lifecycle-review");
+        let owner = ComponentRef::new(id.clone(), "runtime");
+        let load = |engine: &mut ExtensionEngine| -> anyhow::Result<_> {
+            Ok(engine.wasm_runtime_engine()?.load_component_from_bytes(
+                ComponentId::new("runtime"),
+                include_bytes!("../../../tests/fixtures/transport/provider.wasm"),
+            )?)
+        };
+        let component = load(&mut engine)?;
+        let transport = component.host_services.transport.clone();
+        engine.register_extension_instance(
+            id.clone(),
+            test_scope_id(),
+            lifecycle_review_manifest(),
+            vec![Box::new(component)],
+        )?;
+        engine.start_extension_instance(&id)?;
+        let first = engine.active_component_principal(&owner)?;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        *transport.before_callback.lock().unwrap() = Some(Box::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        }));
+        let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = observed.clone();
+        engine.declare_transport_contribution(&first, "fixture/review", move |query, _| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            let _ = query
+                .reply(query.key_expr().as_str(), b"unexpected".to_vec())
+                .wait();
+        })?;
+        // A real query times out while its validated callback is paused before Store entry.
+        let _ = engine.query_transport_contributions(
+            &first,
+            "chat/send-controls/v1",
+            b"nested:fixture/review",
+        );
+        entered_rx.recv_timeout(Duration::from_secs(5))?;
+        engine.stop_extension_instance(&id)?;
+        if reload {
+            engine.unregister_extension_instance(&id)?;
+            let fresh = load(&mut engine)?;
+            engine.register_extension_instance(
+                id.clone(),
+                test_scope_id(),
+                lifecycle_review_manifest(),
+                vec![Box::new(fresh)],
+            )?;
+        }
+        engine.start_extension_instance(&id)?;
+        let replacement = engine.active_component_principal(&owner)?;
+        assert_ne!(first.activation, replacement.activation);
+        // Keep a replacement observer so any old guest nested query would be visible.
+        let calls = observed.clone();
+        engine.declare_transport_contribution(
+            &replacement,
+            "fixture/review",
+            move |query, _| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                let _ = query
+                    .reply(query.key_expr().as_str(), b"unexpected".to_vec())
+                    .wait();
+            },
+        )?;
+        *transport.after_callback.lock().unwrap() = Some(Box::new(move || {
+            finished_tx.send(()).unwrap();
+        }));
+        release_tx.send(())?;
+        finished_rx.recv_timeout(Duration::from_secs(5))?;
+        assert_eq!(observed.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            engine.query_transport_contributions(&replacement, "chat/send-controls/v1", b"ping")?,
+            vec![b"wasm:ping".to_vec()]
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_should_not_revoke_replacement_activation_on_old_store_quarantine() -> anyhow::Result<()> {
+    let mut engine = crate::ExtensionEngine::new();
+    let id = ExtensionInstanceId::new("lifecycle-review");
+    let owner = rintawa_sdk::contracts::ComponentRef::new(id.clone(), "runtime");
+    let mut old_runtime = None;
+    let mut first = None;
+    for iteration in 0..2 {
+        let component = engine.wasm_runtime_engine()?.load_component_from_bytes(
+            ComponentId::new("runtime"),
+            include_bytes!("../../../tests/fixtures/transport/provider.wasm"),
+        )?;
+        if iteration == 0 {
+            old_runtime = Some(component.runtime.clone());
+        }
+        engine.register_extension_instance(
+            id.clone(),
+            test_scope_id(),
+            lifecycle_review_manifest(),
+            vec![Box::new(component)],
+        )?;
+        engine.start_extension_instance(&id)?;
+        if iteration == 0 {
+            first = Some(engine.active_component_principal(&owner)?);
+            engine.stop_extension_instance(&id)?;
+            engine.unregister_extension_instance(&id)?;
+        }
+    }
+    let replacement = engine.active_component_principal(&owner)?;
+    assert_ne!(first.unwrap().activation, replacement.activation);
+    old_runtime
+        .unwrap()
+        .lock()
+        .unwrap()
+        .quarantine("transport query");
+    assert_eq!(engine.active_component_principal(&owner)?, replacement);
+    assert_eq!(
+        engine.query_transport_contributions(&replacement, "chat/send-controls/v1", b"ping")?,
+        vec![b"wasm:ping".to_vec()]
+    );
+    Ok(())
+}

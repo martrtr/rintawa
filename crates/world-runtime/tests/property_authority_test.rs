@@ -429,8 +429,9 @@ fn test_should_reject_owner_collision_before_any_batch_persistence() -> Result<(
             WorldError::DefinitionConflict { .. }
         ))
     ));
-    let persisted = SqliteWorldStorage::open(directory.path().join("world.sqlite"))?;
-    assert!(persisted.property_registry()?.get(&key).is_none());
+    let persisted =
+        || SqliteWorldStorage::load_session_read_only(directory.path().join("world.sqlite"));
+    assert!(persisted()?.properties().get(&key).is_none());
 
     runtime.register_property_definitions(&property_bindings(std::slice::from_ref(&first)))?;
     assert!(matches!(
@@ -439,7 +440,7 @@ fn test_should_reject_owner_collision_before_any_batch_persistence() -> Result<(
             WorldError::DefinitionConflict { .. }
         ))
     ));
-    assert!(persisted.property_registry()?.get(&key).is_some());
+    assert!(persisted()?.properties().get(&key).is_some());
     runtime.register_property_definitions(&property_bindings(&[first]))?;
     runtime.shutdown()?;
     Ok(())
@@ -768,8 +769,8 @@ fn test_should_bind_every_version_of_a_property_name_to_one_exact_instance() -> 
         ))
     ));
     assert!(
-        SqliteWorldStorage::open(directory.path().join("world.sqlite"))?
-            .property_registry()?
+        SqliteWorldStorage::load_session_read_only(directory.path().join("world.sqlite"))?
+            .properties()
             .get(first.key())
             .is_none()
     );
@@ -780,8 +781,8 @@ fn test_should_bind_every_version_of_a_property_name_to_one_exact_instance() -> 
             .is_err()
     );
     assert!(
-        SqliteWorldStorage::open(directory.path().join("world.sqlite"))?
-            .property_registry()?
+        SqliteWorldStorage::load_session_read_only(directory.path().join("world.sqlite"))?
+            .properties()
             .get(second.key())
             .is_none()
     );

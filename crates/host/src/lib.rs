@@ -608,6 +608,14 @@ pub struct HostHome {
     worlds_directory: PathBuf,
 }
 
+#[cfg(test)]
+type InitialCompositionHook = Box<dyn FnOnce(WorldId)>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_INITIAL_COMPOSITION: std::cell::RefCell<Option<InitialCompositionHook>> = const { std::cell::RefCell::new(None) };
+}
+
 impl HostHome {
     /// Opens or creates one local Rintawa home.
     pub fn open(root: impl AsRef<Path>) -> HostResult<Self> {
@@ -666,13 +674,26 @@ impl HostHome {
             }
 
             let database = directory.join(WORLD_DATABASE_FILE);
+            // Retain this guard through initial publication AND rollback. Waiters
+            // must never successfully mutate a profile that creation later erases.
+            let mut _composition_lock = None;
+            let mut created_storage = None;
             let creation: HostResult<WorldSummary> = (|| {
+                _composition_lock = Some(CompositionProfile::lock(
+                    &directory.join(WORLD_COMPOSITION_FILE),
+                )?);
                 let metadata = WorldMetadata::new("New World", None, None)?;
                 let manifest = metadata.write_to_manifest(&WorldManifest::default())?;
-                let storage =
-                    SqliteWorldStorage::create_with_manifest(&database, world_id, &manifest)?;
+                let storage = created_storage.insert(SqliteWorldStorage::create_with_manifest(
+                    &database, world_id, &manifest,
+                )?);
                 let state = storage.load_session()?;
-                drop(storage);
+                #[cfg(test)]
+                BEFORE_INITIAL_COMPOSITION.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() {
+                        hook(world_id);
+                    }
+                });
                 let scope_id = world_runtime_scope_id(world_id);
                 let profile = default_world.materialize_all(scope_id);
                 self.save_world_composition(world_id, &profile)?;
@@ -681,7 +702,14 @@ impl HostHome {
             match creation {
                 Ok(summary) => return Ok(summary),
                 Err(error) => {
-                    if let Err(cleanup) = std::fs::remove_dir_all(&directory) {
+                    let cleanup: HostResult<()> = (|| {
+                        if let Some(storage) = created_storage.take() {
+                            storage.delete()?;
+                        }
+                        std::fs::remove_dir_all(&directory)?;
+                        Ok(())
+                    })();
+                    if let Err(cleanup) = cleanup {
                         return Err(HostError::WorldCreateRollbackFailed {
                             creation: error.to_string(),
                             cleanup: cleanup.to_string(),
@@ -734,6 +762,8 @@ impl HostHome {
 
     /// Updates human-facing metadata atomically in world.manifest.
     ///
+    /// This obtains temporary ownership for an inactive World. For an active World,
+    /// use Host World-session access, which submits metadata to its existing writer.
     /// The cover, when supplied, must already exist in the immutable host asset store.
     ///
     /// # Errors
@@ -747,14 +777,24 @@ impl HostHome {
         cover: Option<rintawa_artifacts::AssetRef>,
     ) -> HostResult<WorldSummary> {
         let storage = self.open_world_storage(world_id)?;
+        let metadata = self.validate_world_metadata(title, description, cover)?;
+        storage.set_manifest_metadata(
+            serde_json::to_value(metadata)
+                .map_err(|error| HostError::InvalidWorldMetadata(error.to_string()))?,
+        )?;
+        world_summary(&storage.load_session()?)
+    }
+
+    fn validate_world_metadata(
+        &self,
+        title: impl Into<String>,
+        description: Option<String>,
+        cover: Option<rintawa_artifacts::AssetRef>,
+    ) -> HostResult<WorldMetadata> {
         if let Some(reference) = &cover {
             self.asset_store.verify(reference)?;
         }
-        let metadata = WorldMetadata::new(title, description, cover)?;
-        let current = storage.load_session()?;
-        let manifest = metadata.write_to_manifest(current.manifest())?;
-        storage.update_manifest(&manifest)?;
-        world_summary(&storage.load_session()?)
+        WorldMetadata::new(title, description, cover)
     }
 
     /// Deletes one inactive persistent World including its exact world composition.
@@ -766,9 +806,10 @@ impl HostHome {
     /// Returns an error when the World does not exist, its directory identity is unsafe,
     /// or the host cannot remove the validated World directory.
     pub fn delete_world(&self, world_id: WorldId) -> HostResult<()> {
+        let _profile_lock = self.lock_composition_scope(&world_runtime_scope_id(world_id))?;
         let directory = self.worlds_directory.join(world_id.to_string());
         let storage = open_world_database(&directory, world_id)?;
-        drop(storage);
+        storage.delete()?;
         std::fs::remove_dir_all(directory)?;
         Ok(())
     }
@@ -823,7 +864,15 @@ impl HostHome {
 
     /// Loads the exact composition overlay persisted with one world.
     pub fn load_world_composition(&self, world_id: WorldId) -> HostResult<CompositionProfile> {
+        let _profile_lock = self.lock_composition_scope(&world_runtime_scope_id(world_id))?;
+        self.load_world_composition_locked(world_id)
+    }
+
+    fn load_world_composition_locked(&self, world_id: WorldId) -> HostResult<CompositionProfile> {
         let path = self.world_composition_path(world_id)?;
+        // Only baseline/recipe absence denotes a default profile. A World must
+        // have finished publishing its initial overlay before it can activate.
+        std::fs::metadata(&path)?;
         let profile = CompositionProfile::load(&path)?;
         profile.validate_scope(&world_runtime_scope_id(world_id))?;
         Ok(profile)
@@ -839,8 +888,7 @@ impl HostHome {
     }
 
     fn world_composition_path(&self, world_id: WorldId) -> HostResult<PathBuf> {
-        let storage = self.open_world_storage(world_id)?;
-        drop(storage);
+        self.load_world_state(world_id)?;
         Ok(self
             .worlds_directory
             .join(world_id.to_string())
@@ -878,6 +926,28 @@ impl HostHome {
             PersistedCompositionScope::DefaultWorld => self.load_default_world_recipe(),
             PersistedCompositionScope::World(world_id) => self.load_world_composition(world_id),
         }
+    }
+
+    fn load_composition_for_scope_locked(
+        &self,
+        scope_id: &RuntimeScopeId,
+    ) -> HostResult<CompositionProfile> {
+        match self.persisted_composition_scope(scope_id)? {
+            PersistedCompositionScope::Baseline => self.load_profile(),
+            PersistedCompositionScope::DefaultWorld => self.load_default_world_recipe(),
+            PersistedCompositionScope::World(world_id) => {
+                self.load_world_composition_locked(world_id)
+            }
+        }
+    }
+
+    fn lock_composition_scope(&self, scope_id: &RuntimeScopeId) -> HostResult<std::fs::File> {
+        let path = match self.persisted_composition_scope(scope_id)? {
+            PersistedCompositionScope::Baseline => self.profile_path.clone(),
+            PersistedCompositionScope::DefaultWorld => self.default_world_profile_path.clone(),
+            PersistedCompositionScope::World(id) => self.world_composition_path(id)?,
+        };
+        CompositionProfile::lock(&path)
     }
 
     fn save_composition_for_scope(
@@ -962,6 +1032,16 @@ impl HostHome {
         digest: &ArtifactDigest,
         enabled: Option<bool>,
     ) -> HostResult<InstalledActivation> {
+        let _profile_lock = self.lock_composition_scope(&scope_id)?;
+        self.select_stored_rtw_in_scope_locked(scope_id, digest, enabled)
+    }
+
+    fn select_stored_rtw_in_scope_locked(
+        &self,
+        scope_id: RuntimeScopeId,
+        digest: &ArtifactDigest,
+        enabled: Option<bool>,
+    ) -> HostResult<InstalledActivation> {
         let archive = self.store.open_artifact(digest)?;
         let content = archive.manifest().content.clone();
         if content.to_string() != EXTENSION_CONTENT_V1 {
@@ -973,7 +1053,7 @@ impl HostHome {
         let manifest =
             RtwExtensionLoader::new().read_stored_manifest(&engine, &self.store, digest)?;
         let composition_scope = self.persisted_composition_scope(&scope_id)?;
-        let mut profile = self.load_composition_for_scope(&scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(&scope_id)?;
         let subject = manifest.id.to_string();
         let instance_id = match composition_scope {
             PersistedCompositionScope::Baseline => ExtensionInstanceId::new(subject.clone()),
@@ -1067,7 +1147,8 @@ impl HostHome {
             .find(|activation| activation.subject == subject)
             .ok_or_else(|| HostError::ActivationNotFound(subject.to_string()))?;
         let default_scope = RuntimeScopeId::new(DEFAULT_WORLD_SCOPE);
-        let recipe = self.load_default_world_recipe()?;
+        let _profile_lock = self.lock_composition_scope(&default_scope)?;
+        let mut recipe = self.load_default_world_recipe()?;
         let has_recipe_activation = recipe
             .activations
             .iter()
@@ -1075,12 +1156,13 @@ impl HostHome {
 
         if !world_default {
             if has_recipe_activation {
-                self.remove_activation_in_scope(&default_scope, subject)?;
+                recipe.remove_activation(subject)?;
+                self.save_default_world_recipe(&recipe)?;
             }
             return Ok(());
         }
 
-        let selected = self.select_stored_rtw_in_scope(
+        let selected = self.select_stored_rtw_in_scope_locked(
             default_scope.clone(),
             &activation.artifact,
             Some(true),
@@ -1185,7 +1267,8 @@ impl HostHome {
         subject: &str,
         enabled: bool,
     ) -> HostResult<()> {
-        let mut profile = self.load_composition_for_scope(scope_id)?;
+        let _profile_lock = self.lock_composition_scope(scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(scope_id)?;
         profile.set_enabled(subject, enabled)?;
         self.save_composition_for_scope(scope_id, &profile)
     }
@@ -1202,7 +1285,8 @@ impl HostHome {
         scope_id: &RuntimeScopeId,
         subject: &str,
     ) -> HostResult<()> {
-        let mut profile = self.load_composition_for_scope(scope_id)?;
+        let _profile_lock = self.lock_composition_scope(scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(scope_id)?;
         profile.remove_activation(subject)?;
         self.save_composition_for_scope(scope_id, &profile)
     }
@@ -1226,7 +1310,8 @@ impl HostHome {
         key: String,
         value: String,
     ) -> HostResult<()> {
-        let mut profile = self.load_composition_for_scope(&scope_id)?;
+        let _profile_lock = self.lock_composition_scope(&scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(&scope_id)?;
         profile.set_preference(scope_id.clone(), owner, key, value)?;
         self.save_composition_for_scope(&scope_id, &profile)
     }
@@ -1238,7 +1323,8 @@ impl HostHome {
         owner: &ComponentRef,
         key: &str,
     ) -> HostResult<()> {
-        let mut profile = self.load_composition_for_scope(scope_id)?;
+        let _profile_lock = self.lock_composition_scope(scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(scope_id)?;
         profile.delete_preference(scope_id, owner, key)?;
         self.save_composition_for_scope(scope_id, &profile)
     }
@@ -1309,7 +1395,8 @@ impl HostHome {
         owner: ComponentRef,
         permission: RuntimePermission,
     ) -> HostResult<()> {
-        let mut profile = self.load_composition_for_scope(&scope_id)?;
+        let _profile_lock = self.lock_composition_scope(&scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(&scope_id)?;
         let activation = profile
             .activations
             .iter()
@@ -1368,7 +1455,8 @@ impl HostHome {
         owner: &ComponentRef,
         permission: RuntimePermission,
     ) -> HostResult<()> {
-        let mut profile = self.load_composition_for_scope(scope_id)?;
+        let _profile_lock = self.lock_composition_scope(scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(scope_id)?;
         profile.revoke_runtime_permission(scope_id, owner, permission);
         self.save_composition_for_scope(scope_id, &profile)
     }
@@ -1407,7 +1495,8 @@ impl HostHome {
     ) -> HostResult<()> {
         let canonical_origin =
             canonical_http_loopback_origin(origin).ok_or(HostError::InvalidHttpLoopbackOrigin)?;
-        let mut profile = self.load_composition_for_scope(&scope_id)?;
+        let _profile_lock = self.lock_composition_scope(&scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(&scope_id)?;
         let has_http_grant = profile.runtime_permissions.iter().any(|grant| {
             grant.scope_id == scope_id
                 && grant.instance_id == owner.instance_id
@@ -1437,7 +1526,8 @@ impl HostHome {
     ) -> HostResult<()> {
         let canonical_origin =
             canonical_http_loopback_origin(origin).ok_or(HostError::InvalidHttpLoopbackOrigin)?;
-        let mut profile = self.load_composition_for_scope(scope_id)?;
+        let _profile_lock = self.lock_composition_scope(scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(scope_id)?;
         profile.revoke_http_loopback_origin(scope_id, owner, &canonical_origin);
         self.save_composition_for_scope(scope_id, &profile)
     }
@@ -1460,7 +1550,8 @@ impl HostHome {
         provider: ComponentRef,
     ) -> HostResult<()> {
         validate_transport_point(point).map_err(|_| HostError::InvalidAuthoritativePoint)?;
-        let mut profile = self.load_composition_for_scope(&scope_id)?;
+        let _profile_lock = self.lock_composition_scope(&scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(&scope_id)?;
         let activation = profile
             .activations
             .iter()
@@ -1507,7 +1598,8 @@ impl HostHome {
         point: &str,
     ) -> HostResult<()> {
         validate_transport_point(point).map_err(|_| HostError::InvalidAuthoritativePoint)?;
-        let mut profile = self.load_composition_for_scope(scope_id)?;
+        let _profile_lock = self.lock_composition_scope(scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(scope_id)?;
         profile.clear_authoritative_provider(scope_id, point);
         self.save_composition_for_scope(scope_id, &profile)
     }
@@ -1522,7 +1614,8 @@ impl HostHome {
         contract: ContractKey,
         provider: ComponentRef,
     ) -> HostResult<()> {
-        let mut profile = self.load_composition_for_scope(&scope_id)?;
+        let _profile_lock = self.lock_composition_scope(&scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(&scope_id)?;
         let activation = profile
             .activations
             .iter()
@@ -1551,7 +1644,8 @@ impl HostHome {
         scope_id: &RuntimeScopeId,
         contract: &ContractKey,
     ) -> HostResult<()> {
-        let mut profile = self.load_composition_for_scope(scope_id)?;
+        let _profile_lock = self.lock_composition_scope(scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(scope_id)?;
         profile.clear_preferred_provider(scope_id, contract);
         self.save_composition_for_scope(scope_id, &profile)
     }
@@ -1699,4 +1793,179 @@ fn world_summary(state: &WorldSessionState) -> HostResult<WorldSummary> {
         description: metadata.description().map(str::to_string),
         cover: metadata.cover().cloned(),
     })
+}
+
+#[cfg(test)]
+mod creation_review_tests {
+    use super::*;
+    use std::{sync::mpsc, time::Duration};
+
+    #[test]
+    fn test_should_preserve_mutation_during_initial_composition_publication() -> anyhow::Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path())?;
+        let creator_home = HostHome::open(root.path())?;
+        let (ready, paused) = mpsc::channel();
+        let (resume, release) = mpsc::channel();
+        let creator = std::thread::spawn(move || {
+            BEFORE_INITIAL_COMPOSITION.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |world| {
+                    ready.send(world).unwrap();
+                    release.recv_timeout(Duration::from_secs(10)).unwrap();
+                }));
+            });
+            creator_home.create_world()
+        });
+        let world = paused.recv_timeout(Duration::from_secs(5))?;
+        let path = home
+            .worlds_directory
+            .join(world.to_string())
+            .join(WORLD_COMPOSITION_FILE);
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_extension("toml.lock"))?;
+        let owner = ComponentRef::new("review-owner", "runtime");
+        let scope = world_runtime_scope_id(world);
+        // On the broken implementation no creator lock exists, so complete the
+        // mutation before resuming creation: its confirmed result must survive.
+        match probe.try_lock() {
+            Ok(()) => {
+                drop(probe);
+                home.set_preference(
+                    scope.clone(),
+                    owner.clone(),
+                    "review-key".into(),
+                    "confirmed".into(),
+                )?;
+                resume.send(())?;
+                creator.join().unwrap()?;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let mutation_home = HostHome::open(root.path())?;
+                let mutation_owner = owner.clone();
+                let mutation_scope = scope.clone();
+                let mutation = std::thread::spawn(move || {
+                    mutation_home.set_preference(
+                        mutation_scope,
+                        mutation_owner,
+                        "review-key".into(),
+                        "confirmed".into(),
+                    )
+                });
+                resume.send(())?;
+                creator.join().unwrap()?;
+                mutation.join().unwrap()?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        assert_eq!(
+            home.get_preference(&scope, &owner, "review-key")?,
+            Some("confirmed".into()),
+            "initial composition overwrote a confirmed profile mutation"
+        );
+        Ok(())
+    }
+    #[test]
+    fn test_should_serialize_activate_and_delete_with_initial_composition() -> anyhow::Result<()> {
+        for delete in [false, true] {
+            let root = tempfile::tempdir()?;
+            let home = HostHome::open(root.path())?;
+            let creator_home = HostHome::open(root.path())?;
+            let (ready, paused) = mpsc::channel();
+            let (resume, release) = mpsc::channel();
+            let creator = std::thread::spawn(move || {
+                BEFORE_INITIAL_COMPOSITION.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move |world| {
+                        ready.send(world).unwrap();
+                        release.recv_timeout(Duration::from_secs(10)).unwrap();
+                    }));
+                });
+                creator_home.create_world()
+            });
+            let world = paused.recv_timeout(Duration::from_secs(5))?;
+            let composition = home
+                .worlds_directory
+                .join(world.to_string())
+                .join(WORLD_COMPOSITION_FILE);
+            assert!(!composition.exists());
+            // This is a deterministic observation of the creator's ownership,
+            // independent of whether the lifecycle worker has been scheduled.
+            let probe = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(composition.with_extension("toml.lock"))?;
+            let locked = matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock));
+            drop(probe);
+            let actor_home = HostHome::open(root.path())?;
+            let (attempt, attempted) = mpsc::channel();
+            let actor = std::thread::spawn(move || -> anyhow::Result<()> {
+                let mut runtime = crate::HostRuntime::start(&actor_home)?;
+                attempt.send(())?;
+                if delete {
+                    actor_home.delete_world(world)?;
+                    assert!(!composition.exists());
+                } else {
+                    runtime.activate_world(&actor_home, world)?;
+                    assert!(
+                        composition.is_file(),
+                        "activation observed an unpublished overlay"
+                    );
+                    assert!(runtime.is_world_active(world));
+                }
+                runtime.shutdown()?;
+                Ok(())
+            });
+            attempted.recv_timeout(Duration::from_secs(5))?;
+            resume.send(())?;
+            let creation = creator.join().unwrap();
+            let action = actor.join().unwrap();
+            assert!(locked, "creation failed to retain the composition lock");
+            creation?;
+            action?;
+            if !delete {
+                home.delete_world(world)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_incomplete_overlay_after_failed_creation() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path())?;
+        // Force atomic profile publication to fail, after the database is ready.
+        BEFORE_INITIAL_COMPOSITION.with(|hook| {
+            let directory = home.worlds_directory.clone();
+            *hook.borrow_mut() = Some(Box::new(move |world| {
+                std::fs::create_dir(
+                    directory
+                        .join(world.to_string())
+                        .join(WORLD_COMPOSITION_FILE),
+                )
+                .unwrap();
+            }));
+        });
+        assert!(home.create_world().is_err());
+        assert!(home.list_worlds()?.is_empty());
+        assert_eq!(std::fs::read_dir(&home.worlds_directory)?.count(), 0);
+        // Missing overlays in an interrupted creation must not become an empty
+        // default profile that could be activated as a completed World.
+        let world = home.create_world()?;
+        let overlay = home
+            .worlds_directory
+            .join(world.id.to_string())
+            .join(WORLD_COMPOSITION_FILE);
+        std::fs::remove_file(overlay)?;
+        assert!(home.load_world_composition(world.id).is_err());
+        let mut runtime = crate::HostRuntime::start(&home)?;
+        assert!(runtime.activate_world(&home, world.id).is_err());
+        assert!(!runtime.is_world_active(world.id));
+        runtime.shutdown()?;
+        home.delete_world(world.id)?;
+        Ok(())
+    }
 }

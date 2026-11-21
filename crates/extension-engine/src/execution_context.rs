@@ -136,7 +136,23 @@ impl ExecutionContexts {
     }
 
     pub(crate) fn revoke_instance(&self, instance: &ExtensionInstanceId) -> Vec<ComponentRef> {
+        self.revoke_instance_if(instance, None)
+    }
+
+    pub(crate) fn revoke_instance_if(
+        &self,
+        instance: &ExtensionInstanceId,
+        expected: Option<&ExecutionContext>,
+    ) -> Vec<ComponentRef> {
         let mut view = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(expected) = expected
+            && !view
+                .bindings
+                .get(&expected.principal.component())
+                .is_some_and(|binding| binding.context == *expected)
+        {
+            return Vec::new();
+        }
         let mut revoked = Vec::new();
         view.bindings.retain(|owner, binding| {
             let keep = &owner.instance_id != instance

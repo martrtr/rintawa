@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    fs::{File, OpenOptions},
     io::Write,
     path::Path,
 };
@@ -268,6 +269,29 @@ impl Default for CompositionProfile {
 }
 
 impl CompositionProfile {
+    // Atomic rename changes the profile inode. Lock a stable adjacent file instead;
+    // never unlink it while other handles/processes might be waiting on it.
+    pub(crate) fn lock(path: &Path) -> HostResult<File> {
+        let lock_path = path.with_extension("toml.lock");
+        if let Ok(metadata) = std::fs::symlink_metadata(&lock_path)
+            && (metadata.file_type().is_symlink() || !metadata.is_file())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "profile lock must be a regular file",
+            )
+            .into());
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
+        file.lock()?;
+        Ok(file)
+    }
+
     pub(crate) fn load(path: &Path) -> HostResult<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -824,6 +848,64 @@ impl CompositionProfile {
         self.preferences.retain(|preference| {
             preference.scope_id != removed.scope_id || preference.instance_id != removed.instance_id
         });
+        Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn test_should_preserve_profile_when_temporary_publication_fails() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("profile.toml");
+        let original = CompositionProfile::default();
+        original.save(&path)?;
+        let before = std::fs::read(&path)?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o555))?;
+        // Privileged CI users may bypass directory permissions; this fault is
+        // exercised only where the filesystem can enforce it.
+        if NamedTempFile::new_in(directory.path()).is_ok() {
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755))?;
+            eprintln!("directory write denial cannot be enforced for this user");
+            return Ok(());
+        }
+        let mut changed = original;
+        changed.set_preference(
+            RuntimeScopeId::new("host"),
+            ComponentRef::new("owner", "runtime"),
+            "key".into(),
+            "new".into(),
+        )?;
+        let result = changed.save(&path);
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755))?;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(path)?, before);
+        assert_eq!(std::fs::read_dir(directory.path())?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_not_block_an_independent_profile() -> anyhow::Result<()> {
+        use std::{sync::mpsc, time::Duration};
+        let directory = tempfile::tempdir()?;
+        let first = directory.path().join("first.toml");
+        let second = directory.path().join("second.toml");
+        let guard = CompositionProfile::lock(&first)?;
+        let (done, receiver) = mpsc::channel();
+        let updater = std::thread::spawn(move || {
+            let result = (|| -> HostResult<()> {
+                let _guard = CompositionProfile::lock(&second)?;
+                CompositionProfile::default().save(&second)
+            })();
+            let _ = done.send(result);
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(5));
+        drop(guard);
+        updater.join().unwrap();
+        result??;
         Ok(())
     }
 }

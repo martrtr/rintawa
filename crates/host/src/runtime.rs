@@ -350,6 +350,7 @@ struct LocalHostAccess {
     home_root: PathBuf,
     user_resources: UserResourceRuntimeControl,
     world_sessions: WorldSessionRuntimeControl,
+    world_data: WorldDataRuntimeControl,
 }
 
 impl LocalHostAccess {
@@ -357,11 +358,13 @@ impl LocalHostAccess {
         home_root: &Path,
         user_resources: UserResourceRuntimeControl,
         world_sessions: WorldSessionRuntimeControl,
+        world_data: WorldDataRuntimeControl,
     ) -> Self {
         Self {
             home_root: home_root.to_path_buf(),
             user_resources,
             world_sessions,
+            world_data,
         }
     }
 
@@ -603,10 +606,36 @@ impl WorldSessionAccess for LocalHostAccess {
                 })
             })
             .transpose()?;
-        let world = self
-            .home()?
-            .update_world_metadata(world_id, title, description.map(str::to_string), cover)
-            .map_err(map_host_access_error)?;
+        let home = self.home()?;
+        let client = self
+            .world_data
+            .state
+            .lock()
+            .map_err(|_| HostAccessError::Unavailable)?
+            .worlds
+            .get(&world_id)
+            .map(|world| world.client.clone());
+        let world = if let Some(client) = client {
+            let metadata = home
+                .validate_world_metadata(title, description.map(str::to_string), cover)
+                .map_err(map_host_access_error)?;
+            let manifest = client
+                .set_manifest_metadata(
+                    serde_json::to_value(metadata).map_err(|_| HostAccessError::Unavailable)?,
+                )
+                .map_err(|_| HostAccessError::Unavailable)?;
+            let metadata = crate::world_metadata::WorldMetadata::from_manifest(&manifest)
+                .map_err(map_host_access_error)?;
+            WorldSummary {
+                id: world_id,
+                title: metadata.title().to_string(),
+                description: metadata.description().map(str::to_string),
+                cover: metadata.cover().cloned(),
+            }
+        } else {
+            home.update_world_metadata(world_id, title, description.map(str::to_string), cover)
+                .map_err(map_host_access_error)?
+        };
         self.world_sessions.summary(world)
     }
 
@@ -1114,6 +1143,7 @@ impl HostRuntime {
             home.root(),
             user_resources,
             world_sessions,
+            world_data.clone(),
         ));
         let artifact_store_access: Arc<dyn ArtifactStoreAccess> = access.clone();
         let asset_store_access: Arc<dyn AssetStoreAccess> = access.clone();
@@ -2005,6 +2035,7 @@ mod tests {
             root.path(),
             UserResourceRuntimeControl::default(),
             WorldSessionRuntimeControl::default(),
+            WorldDataRuntimeControl::default(),
         );
         let world_id = WorldId::new();
         assert_eq!(
@@ -2180,8 +2211,7 @@ mod tests {
         let parts =
             prepare_world_runtime(&mut host, &home, world_id, std::slice::from_ref(&instance))?;
 
-        let inspection = home.open_world_storage(world_id)?;
-        let session = inspection.load_session()?;
+        let session = home.load_world_state(world_id)?;
         let registered = session
             .properties()
             .get(&property)
@@ -2203,13 +2233,7 @@ mod tests {
         parts
             .runtime
             .register_property_definitions(&[(instance, repeated)])?;
-        assert_eq!(
-            home.open_world_storage(world_id)?
-                .load_session()?
-                .properties()
-                .len(),
-            1
-        );
+        assert_eq!(home.load_world_state(world_id)?.properties().len(), 1);
 
         parts.runtime.shutdown()?;
         host.shutdown()?;
@@ -2616,6 +2640,22 @@ mod tests {
             host_access: None,
             world_data,
         };
+        let mut seed = WorldTransaction::new();
+        seed.push_change(StateChange::CreateObject { id: item });
+        seed.push_change(StateChange::SetProperty {
+            item,
+            key: property.clone(),
+            data: serde_json::json!(73),
+        });
+        {
+            let storage = home.open_world_storage(first_world)?;
+            storage.register_definition(&PropertyDefinition::new(
+                property.clone(),
+                ExtensionId::new("fixture.same-package"),
+                serde_json::json!({"type":"integer"}),
+            ))?;
+            storage.apply(&seed)?;
+        }
         let first = prepare_world_runtime(
             &mut host,
             &home,
@@ -2628,14 +2668,6 @@ mod tests {
             second_world,
             std::slice::from_ref(&foreign_world),
         )?;
-        let mut seed = WorldTransaction::new();
-        seed.push_change(StateChange::CreateObject { id: item });
-        seed.push_change(StateChange::SetProperty {
-            item,
-            key: property.clone(),
-            data: serde_json::json!(73),
-        });
-        home.open_world_storage(first_world)?.apply(&seed)?;
         host.world_data
             .activate(first_world, first.runtime.client(), first.command_owners)?;
         host.world_data
@@ -2749,13 +2781,7 @@ mod tests {
             world_data: WorldDataRuntimeControl::default(),
         };
         let parts = prepare_world_runtime(&mut host, &home, world_id, &instances)?;
-        assert_eq!(
-            home.open_world_storage(world_id)?
-                .load_session()?
-                .properties()
-                .len(),
-            2
-        );
+        assert_eq!(home.load_world_state(world_id)?.properties().len(), 2);
         let first = parts
             .runtime
             .client()
@@ -2830,12 +2856,7 @@ mod tests {
             Err(HostError::AmbiguousWorldSchemaDeclaration { schema, .. })
                 if schema == property
         ));
-        assert!(
-            home.open_world_storage(world_id)?
-                .load_session()?
-                .properties()
-                .is_empty()
-        );
+        assert!(home.load_world_state(world_id)?.properties().is_empty());
         host.shutdown()?;
         Ok(())
     }
@@ -2882,12 +2903,7 @@ mod tests {
             prepare_world_runtime(&mut host, &home, world_id, &[instance]),
             Err(HostError::InvalidWorldSchemaJson { schema, .. }) if schema == invalid
         ));
-        assert!(
-            home.open_world_storage(world_id)?
-                .load_session()?
-                .properties()
-                .is_empty()
-        );
+        assert!(home.load_world_state(world_id)?.properties().is_empty());
         assert!(host.active_worlds.is_empty());
         host.shutdown()?;
         Ok(())
@@ -3001,6 +3017,7 @@ mod tests {
             home.root(),
             UserResourceRuntimeControl::default(),
             WorldSessionRuntimeControl::default(),
+            WorldDataRuntimeControl::default(),
         );
         let imported = AssetStoreAccess::import_asset(&access, b"portrait", "Image/PNG")
             .map_err(|error| anyhow::anyhow!("asset host access failed: {error:?}"))?;
@@ -3299,12 +3316,15 @@ mod tests {
             items[0]
         };
         assert!(
-            home.open_world_storage(world.id)?
+            host.active_worlds[&world.id]
+                .runtime
+                .snapshot()?
                 .load_item(item)?
                 .is_some()
         );
-        let persisted = home
-            .open_world_storage(world.id)?
+        let persisted = host.active_worlds[&world.id]
+            .runtime
+            .snapshot()?
             .load_property(item, &property_schema)?;
         assert_eq!(
             persisted
@@ -3535,6 +3555,57 @@ mod tests {
         assert_eq!(failures[0].operation, HostCleanupOperation::Stop);
         assert_eq!(failures[1].instance_id, first);
         assert_eq!(failures[1].operation, HostCleanupOperation::Stop);
+        Ok(())
+    }
+    #[test]
+    fn test_should_update_active_world_metadata_through_its_writer_queue() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path())?;
+        let world = home.create_world()?;
+        {
+            let storage = home.open_world_storage(world.id)?;
+            storage.update_manifest(&rintawa_world::WorldManifest::new(
+                serde_json::json!({"custom": 31, "metadata":{"title":"original"}}),
+            ))?;
+        }
+        let mut host = HostRuntime::start(&home)?;
+        host.activate_world(&home, world.id)?;
+        assert!(matches!(
+            home.update_world_metadata(world.id, "bypass", None, None),
+            Err(HostError::Storage(
+                rintawa_storage::StorageError::WriterBusy(_)
+            ))
+        ));
+        assert!(matches!(
+            home.delete_world(world.id),
+            Err(HostError::Storage(
+                rintawa_storage::StorageError::WriterBusy(_)
+            ))
+        ));
+        let access = host.host_access.as_ref().unwrap().clone();
+        let id = world.id.to_string();
+        let other = access.clone();
+        let other_id = id.clone();
+        let updater = std::thread::spawn(move || {
+            WorldSessionAccess::set_metadata(&*other, &other_id, "one", Some("first"), None)
+        });
+        let second = WorldSessionAccess::set_metadata(&*access, &id, "two", None, None)
+            .map_err(|error| anyhow::anyhow!("metadata error: {error:?}"))?;
+        assert_eq!(second.title, "two");
+        updater
+            .join()
+            .unwrap()
+            .map_err(|error| anyhow::anyhow!("metadata error: {error:?}"))?;
+        let state = home.load_world_state(world.id)?;
+        assert_eq!(state.manifest().as_value()["custom"], 31);
+        let metadata = crate::world_metadata::WorldMetadata::from_manifest(state.manifest())?;
+        assert!(
+            metadata.title() == "one" && metadata.description() == Some("first")
+                || metadata.title() == "two" && metadata.description().is_none()
+        );
+        host.deactivate_world(world.id)?;
+        home.update_world_metadata(world.id, "inactive", None, None)?;
+        host.shutdown()?;
         Ok(())
     }
 }

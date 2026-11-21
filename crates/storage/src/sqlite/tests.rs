@@ -1049,3 +1049,185 @@ fn test_should_reject_oversized_indexed_property_page_without_truncation() -> an
     assert_eq!(second.len(), 1);
     Ok(())
 }
+
+#[test]
+fn test_should_exclude_other_writers_and_release_on_crash() -> anyhow::Result<()> {
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Command, Stdio},
+    };
+    let (directory, storage) = temp_world();
+    let path = storage.path().to_path_buf();
+    assert!(matches!(
+        SqliteWorldStorage::open(&path),
+        Err(crate::StorageError::WriterBusy(_))
+    ));
+    assert_eq!(
+        SqliteWorldStorage::load_session_read_only(&path)?.id(),
+        storage.world_id()
+    );
+    #[cfg(unix)]
+    {
+        let alias = directory.path().join("alias.sqlite");
+        std::fs::hard_link(&path, &alias)?;
+        assert!(matches!(
+            SqliteWorldStorage::open(&alias),
+            Err(crate::StorageError::WriterBusy(_))
+        ));
+        std::fs::remove_file(alias)?;
+    }
+    let other = SqliteWorldStorage::create(directory.path().join("other.sqlite"), WorldId::new())?;
+    drop(other);
+    drop(storage);
+    let mut child = Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "sqlite::tests::test_writer_process_probe",
+            "--nocapture",
+        ])
+        .env("RINTAWA_WRITER_PROBE_PATH", &path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let output = BufReader::new(child.stdout.take().unwrap());
+    let ready = output
+        .lines()
+        .any(|line| line.is_ok_and(|line| line == "writer-ready"));
+    assert!(ready, "writer child failed before acquiring ownership");
+    assert!(matches!(
+        SqliteWorldStorage::open(&path),
+        Err(crate::StorageError::WriterBusy(_))
+    ));
+    assert!(SqliteWorldStorage::load_session_read_only(&path).is_ok());
+    child.kill()?;
+    child.wait()?;
+    let reopened = SqliteWorldStorage::open(&path)?;
+    drop(reopened);
+    SqliteWorldStorage::open(&path)?;
+    Ok(())
+}
+
+#[test]
+fn test_writer_process_probe() -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+    let Some(path) = std::env::var_os("RINTAWA_WRITER_PROBE_PATH") else {
+        return Ok(());
+    };
+    let _storage = SqliteWorldStorage::open(path)?;
+    println!("writer-ready");
+    std::io::stdout().flush()?;
+    std::io::stdin().read_exact(&mut [0])?;
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_altered_ddl_without_modifying_database() -> anyhow::Result<()> {
+    use crate::sqlite::schema::{FOUR_TABLE_SCHEMA, STORAGE_SCHEMA_VERSION};
+    for (from, to) in [
+        ("CHECK (type IN (1, 2))", "CHECK (type IN (1, 2, 3))"),
+        (
+            "CREATE INDEX items_by_subject ON items(subject)",
+            "CREATE INDEX items_by_subject ON items(object)",
+        ),
+        ("WHEN OLD.type <> NEW.type", "WHEN 0"),
+    ] {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("world.sqlite");
+        let connection = Connection::open(&path)?;
+        assert!(FOUR_TABLE_SCHEMA.contains(from));
+        connection.execute_batch(&FOUR_TABLE_SCHEMA.replace(from, to))?;
+        connection.pragma_update(None, "user_version", STORAGE_SCHEMA_VERSION)?;
+        connection.execute(
+            "INSERT INTO world VALUES (?1, '{}')",
+            [WorldId::new().into_bytes().as_slice()],
+        )?;
+        drop(connection);
+        let before = std::fs::read(&path)?;
+        assert!(matches!(
+            SqliteWorldStorage::open(&path),
+            Err(crate::StorageError::CorruptData(_))
+        ));
+        assert_eq!(std::fs::read(&path)?, before);
+        assert_eq!(std::fs::read_dir(directory.path())?.count(), 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_should_accept_current_schema_after_vacuum_backup() -> anyhow::Result<()> {
+    let (directory, storage) = temp_world();
+    let path = storage.path().to_path_buf();
+    let world = storage.world_id();
+    drop(storage);
+    let backup = directory.path().join("backup.sqlite");
+    let connection = Connection::open(&path)?;
+    connection.execute("VACUUM INTO ?1", [backup.to_str().unwrap()])?;
+    drop(connection);
+    assert_eq!(SqliteWorldStorage::open(path)?.world_id(), world);
+    assert_eq!(SqliteWorldStorage::open(backup)?.world_id(), world);
+    Ok(())
+}
+
+#[test]
+fn test_should_replace_metadata_atomically_and_preserve_other_manifest_fields() -> anyhow::Result<()>
+{
+    let (_directory, storage) = temp_world();
+    storage.update_manifest(&rintawa_world::WorldManifest::new(
+        serde_json::json!({"custom": 7}),
+    ))?;
+    for title in ["one", "two"] {
+        let manifest = storage.set_manifest_metadata(serde_json::json!({"title":title}))?;
+        assert_eq!(manifest.as_value()["metadata"]["title"], title);
+        assert_eq!(manifest.as_value()["custom"], 7);
+    }
+    assert_eq!(
+        storage.load_session()?.manifest().as_value()["metadata"]["title"],
+        "two"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_detached_writer_descriptor_after_delete_recreate() -> anyhow::Result<()> {
+    use std::{sync::mpsc, time::Duration};
+    for keep_alias in [false, true] {
+        let (directory, original) = temp_world();
+        let path = original.path().to_path_buf();
+        if keep_alias {
+            std::fs::hard_link(&path, directory.path().join("old-inode.sqlite"))?;
+        }
+        let opener_path = path.clone();
+        let (opened, ready) = mpsc::channel();
+        let (resume, paused) = mpsc::channel();
+        let opener = std::thread::spawn(move || {
+            crate::sqlite::BEFORE_WRITER_LOCK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    opened.send(()).unwrap();
+                    paused.recv_timeout(Duration::from_secs(10)).unwrap();
+                }));
+            });
+            SqliteWorldStorage::open(opener_path)
+        });
+        ready.recv_timeout(Duration::from_secs(5))?;
+        original.delete()?;
+        let replacement = SqliteWorldStorage::create(&path, WorldId::new())?;
+        resume.send(())?;
+        let delayed = opener.join().unwrap();
+        assert!(
+            delayed.is_err(),
+            "a lock on a deleted inode admitted a second writer for the replacement database"
+        );
+        assert_eq!(
+            SqliteWorldStorage::load_session_read_only(&path)?.id(),
+            replacement.world_id()
+        );
+        assert!(matches!(
+            SqliteWorldStorage::open(&path),
+            Err(crate::StorageError::WriterBusy(_))
+        ));
+        drop(replacement);
+        SqliteWorldStorage::open(&path)?;
+    }
+
+    Ok(())
+}
