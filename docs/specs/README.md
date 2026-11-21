@@ -21,7 +21,9 @@ The baseline is `fb1072a2c9169af1b36ea9cdffed31c146ed0341`, inspected on
 P05/D1 now binds property authority to exact instances and validates ordered
 replacement/cascade effects inside the write transaction. Its regressions and the
 full repository check passed; see [implementation progress](core-mvp-contract.md#implementation-progress).
-P05/D6 and later implementation slices remain pending.
+P05/D6 is also implemented: ABI `rintawa:engine@0.0.2`, attested immediate callers,
+activation-bound hosted execution and generic selected-provider lookup. The full
+repository check passed. P05 is complete; P06 is next. D8 remains proposed.
 
 This directory contains durable project specifications in English. Revision-specific
 audit notes and the working refactoring checklist are local engineering material

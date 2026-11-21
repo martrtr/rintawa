@@ -1,4 +1,4 @@
-package rintawa:engine@0.0.1;
+package rintawa:engine@0.0.2;
 
 /// Host operations available throughout a WASM component lifecycle.
 interface host {
@@ -154,12 +154,20 @@ interface runtime-context {
         rejected,
     }
 
+    record principal {
+        instance-id: string,
+        component-id: string,
+        activation: u64,
+    }
+
     record context {
         scope-id: string,
         world-id: option<string>,
+        principal: principal,
     }
 
     current: func() -> result<context, error>;
+    selected-providers: func(contract-id: string, version: u32) -> result<list<principal>, error>;
 }
 
 /// Owner-scoped cooperative background tasks.
@@ -778,7 +786,8 @@ interface transport {
 
 /// Optional WASM provider callback, invoked with host-attested identity.
 interface transport-handler {
-    on-query: func(point: string, payload: list<u8>) -> list<u8>;
+    use runtime-context.{principal};
+    on-query: func(point: string, payload: list<u8>, caller: principal) -> list<u8>;
 }
 
 /// Optional callback surface for components that schedule background tasks.

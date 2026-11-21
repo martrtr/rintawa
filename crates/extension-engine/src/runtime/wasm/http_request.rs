@@ -85,6 +85,7 @@ enum WorkerEvent {
 /// Each handle is bound to its initiating component principal.
 pub(super) struct OwnedHttpRequest {
     pub(super) owner: ComponentRef,
+    activation: u64,
     receiver: Receiver<WorkerEvent>,
     cancelled: Arc<AtomicBool>,
     local_origin: Option<Url>,
@@ -172,6 +173,12 @@ impl WasmHostState {
         self.http_requests.insert(
             handle,
             OwnedHttpRequest {
+                activation: self
+                    .execution_context
+                    .as_ref()
+                    .ok_or(HttpRequestError::PermissionDenied)?
+                    .principal
+                    .activation,
                 owner,
                 receiver,
                 cancelled,
@@ -239,7 +246,13 @@ impl HttpRequestHost for WasmHostState {
         let Some(request) = self.http_requests.get_mut(&handle) else {
             return Err(HttpRequestError::UnknownHandle);
         };
-        if request.owner != owner {
+        if request.owner != owner
+            || Some(request.activation)
+                != self
+                    .execution_context
+                    .as_ref()
+                    .map(|context| context.principal.activation)
+        {
             return Err(HttpRequestError::UnknownHandle);
         }
         // A revoked origin cannot be used to drain response bytes previously
@@ -297,7 +310,13 @@ impl HttpRequestHost for WasmHostState {
         let Some(request) = self.http_requests.get(&handle) else {
             return Err(HttpRequestError::UnknownHandle);
         };
-        if request.owner != owner {
+        if request.owner != owner
+            || Some(request.activation)
+                != self
+                    .execution_context
+                    .as_ref()
+                    .map(|context| context.principal.activation)
+        {
             return Err(HttpRequestError::UnknownHandle);
         }
         self.http_requests.remove(&handle);
@@ -575,6 +594,26 @@ fn map_transport_error(error: reqwest::Error) -> HttpRequestError {
 }
 
 #[cfg(test)]
+fn test_execute_as(state: &mut WasmHostState, principal: ComponentRef) {
+    let contexts = &state.transport.contexts;
+    if contexts.context(&principal, true).is_err() {
+        contexts
+            .begin(
+                principal.clone(),
+                rintawa_sdk::types::RuntimeScopeId::new("http-test"),
+            )
+            .expect("test execution binding");
+        contexts.activate_instance(&principal.instance_id);
+    }
+    state.execution_context = Some(
+        contexts
+            .context(&principal, false)
+            .expect("live test binding"),
+    );
+    state.execution_owner = Some(principal);
+}
+
+#[cfg(test)]
 mod tests {
     use std::{
         sync::{
@@ -624,7 +663,7 @@ mod tests {
             .runtime_permissions
             .grant(principal.clone(), RuntimePermission::HttpRequest)
             .expect("test grant should succeed");
-        state.execution_owner = Some(principal);
+        test_execute_as(&mut state, principal);
         state.http_request_access_active = true;
         state
     }
@@ -809,7 +848,7 @@ mod tests {
             Err(HttpRequestError::AccessNotActive)
         ));
         state.http_request_access_active = true;
-        state.execution_owner = Some(owner("example"));
+        test_execute_as(&mut state, owner("example"));
         assert!(matches!(
             HttpRequestHost::start(&mut state, make_request("POST", "https://example.com/")),
             Err(HttpRequestError::PermissionDenied)
@@ -886,7 +925,7 @@ mod tests {
             .runtime_permissions
             .grant(second.clone(), RuntimePermission::HttpRequest)
             .expect("second grant should succeed");
-        state.execution_owner = Some(second);
+        test_execute_as(&mut state, second);
         assert!(matches!(
             HttpRequestHost::poll(&mut state, handle, 32),
             Err(HttpRequestError::UnknownHandle)
@@ -896,12 +935,40 @@ mod tests {
             Err(HttpRequestError::UnknownHandle)
         ));
         assert!(!cancelled.load(Ordering::Acquire));
-        state.execution_owner = Some(owner("first"));
+        test_execute_as(&mut state, owner("first"));
         HttpRequestHost::close(&mut state, handle).expect("owner close should succeed");
         assert!(matches!(
             HttpRequestHost::poll(&mut state, handle, 32),
             Err(HttpRequestError::UnknownHandle)
         ));
+    }
+
+    #[test]
+    fn test_should_reject_http_handles_retained_from_an_earlier_activation() {
+        let mut state = state_with_owner("same-component");
+        let principal = owner("same-component");
+        let (handle, _sender, cancelled) = insert_fake_request(&mut state, principal.clone());
+        // An incomplete stop may retain a worker until later cleanup. A new
+        // activation must never gain access to that worker's buffered response.
+        state
+            .transport
+            .contexts
+            .revoke_instance(&principal.instance_id);
+        test_execute_as(&mut state, principal.clone());
+        assert!(matches!(
+            HttpRequestHost::poll(&mut state, handle, 32),
+            Err(HttpRequestError::UnknownHandle)
+        ));
+        assert!(matches!(
+            HttpRequestHost::close(&mut state, handle),
+            Err(HttpRequestError::UnknownHandle)
+        ));
+        assert!(!cancelled.load(Ordering::Acquire));
+        state.revoke_runtime_resources_for_owner(&principal);
+        assert!(cancelled.load(Ordering::Acquire));
+        let (fresh, _sender, _) = insert_fake_request(&mut state, principal);
+        assert_ne!(handle, fresh);
+        HttpRequestHost::close(&mut state, fresh).expect("new activation owns the fresh handle");
     }
 
     #[test]
@@ -1091,7 +1158,7 @@ mod revocation_tests {
             .runtime_permissions
             .grant(owner.clone(), RuntimePermission::HttpRequest)
             .expect("test grant should succeed");
-        state.execution_owner = Some(owner.clone());
+        test_execute_as(&mut state, owner.clone());
         state.http_request_access_active = true;
         let (_sender, receiver) = mpsc::sync_channel(1);
         let cancellation = Arc::new(AtomicBool::new(false));
@@ -1135,7 +1202,7 @@ mod loopback_http_integration_tests {
             .runtime_permissions
             .grant(principal.clone(), RuntimePermission::HttpRequest)
             .expect("test permission should be granted");
-        state.execution_owner = Some(principal);
+        test_execute_as(&mut state, principal);
         state.http_request_access_active = true;
         state
     }
@@ -1321,7 +1388,7 @@ mod loopback_http_integration_tests {
             .runtime_permissions
             .grant(second.clone(), RuntimePermission::HttpRequest)
             .expect("second grant should succeed");
-        state.execution_owner = Some(second);
+        test_execute_as(&mut state, second);
         assert!(matches!(
             HttpRequestHost::start(
                 &mut state,
@@ -1388,7 +1455,7 @@ mod http_origin_revocation_tests {
             .approve_http_loopback_origin(principal.clone(), origin)
             .expect("exact origin should be approved");
 
-        state.execution_owner = Some(principal.clone());
+        test_execute_as(&mut state, principal.clone());
         state.http_request_access_active = true;
 
         let (sender, receiver) = mpsc::sync_channel(4);

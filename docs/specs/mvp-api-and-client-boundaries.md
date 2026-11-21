@@ -13,8 +13,8 @@ Acceptance covers this design and its stated MVP limits; it is not evidence of
 correctness, minimal implementation or release readiness. New mechanisms still
 need the concrete requirement and acceptance checks specified here.
 
-P05/D1 is implemented and verified; see [implementation progress](core-mvp-contract.md#implementation-progress).
-D6–D7 and the client implementation below remain pending.
+P05/D1 and D6 are implemented and verified; see [implementation progress](core-mvp-contract.md#implementation-progress).
+D2–D5/D7 and the client implementation below remain pending. D8 remains proposed.
 
 Core baseline: `fb1072a2c9169af1b36ea9cdffed31c146ed0341`; rtwKit baseline:
 `77782727020f6066be4d4c205b077dd3f9555775`. Recheck relevant source before coding.
@@ -100,17 +100,17 @@ speculative machinery; they do not prove that it will never be needed.
 
 ## 2. D6: attested callers and delegated transport
 
-Evidence: [transport](../../crates/extension-engine/src/transport.rs) currently
-accepts a scope without a caller in `query`; [WASM imports](../../crates/extension-engine/src/runtime/wasm.rs)
-reject delegated transport and use the provider Store's scope in `runtime-context`.
-[Target callbacks](../../crates/extension-engine/src/runtime/wasm/target_provider.rs)
-already receive the dependent `ComponentContext`; tasks already retain an owner.
-Use those existing boundaries, without a second broker or guest-selected scope.
+At the design baseline, [transport](../../crates/extension-engine/src/transport.rs)
+accepted only a scope in `query`, while [WASM imports](../../crates/extension-engine/src/runtime/wasm.rs)
+rejected delegated transport and used the provider Store's scope. P05/D6 now binds
+both to Host-attested execution contexts. [Target callbacks](../../crates/extension-engine/src/runtime/wasm/target_provider.rs)
+use the dependent's existing `ComponentContext`; tasks retain its exact activation
+and scope. No second broker or guest-selected scope is introduced.
 
 ### Exact WIT amendment
 
-Extend `runtime-context` and replace the handler signature in the next incompatible
-WIT package `rintawa:engine@0.0.2`:
+The implemented incompatible WIT package `rintawa:engine@0.0.2` extends
+`runtime-context` and replaces the handler signature:
 
 ```wit
 // In runtime-context:
@@ -748,10 +748,10 @@ Owner acceptance of D1–D7 is recorded above, including the no-UI-specific-Core
 condition and B9. All web wire/session/frame/theme behavior remains in rtwKit.
 Core provides only general transport, context, lifecycle, permissions, World and
 CAS primitives. No parallel UI mutation path or service bus may be introduced.
-Implement D6 identity/context with P05, its transport/cleanup
-checks through P09, D7 and exact guest reads with P08; realize the browser protocol
-in rtwKit P10. D8 requires explicit owner acceptance and is a separate transport
+P05 implements D6 identity/context and its immediate transport/cleanup checks.
+Continue the broader lifecycle/budget checks through P09, D7 and exact guest reads
+with P08; realize the browser protocol in rtwKit P10. D8 requires explicit owner acceptance and is a separate transport
 slice after D6 and before P10; it does not block the already accepted D1 correction.
-P05 may now start when assigned. Do not make Sol
+P05 is complete; the next implementation slice is P06. Do not make Sol
 choose among the rejected alternatives unless evidence shows this contract is
 inconsistent or impossible; report a narrow amendment instead.

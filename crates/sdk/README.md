@@ -45,7 +45,12 @@ targets.
 The experimental Portable UI SDK model, World-presentation and UI Layer
 WIT interfaces have been removed during the architecture rebuild.
 Older RTWs compiled against them are incompatible. There is no UI compatibility
-shim or implemented replacement interaction transport in Core yet.
+shim. General extension interaction is available through the embedded Zenoh
+transport and `rintawa:engine@0.0.2`; the browser UI protocol is still separate.
+Query handlers receive the attested immediate caller, while `runtime-context`
+exposes the executing principal/scope and selected contract providers. Native
+transport wrappers take the SDK's `ComponentPrincipal`, obtained from the Engine
+for a live activation. A retained principal is invalid after stop/restart.
 
 Presentation technology is likewise outside this SDK. A shell, UI layer, TUI,
 3D frontend, or Web frontend should advertise the role it provides through
@@ -94,8 +99,8 @@ authoritative runtime and extensions:
 extension Systems. A System returns one atomic item/property change set and no
 post-COMMIT signal or event proposal. No dedicated World Projection or World signal
 transport is part of this MVP. The active command System may read or modify only
-properties whose versioned definitions are bound to that System's extension owner
-by the Host. Deleting items is also rejected if its SQLite cascade would erase
+properties whose versioned definitions are bound to that System's exact extension instance by the Host. Components within
+that instance share property authority; a logical package ID alone grants none. Deleting items is also rejected if its SQLite cascade would erase
 foreign-owned property data. A matching stored JSON Schema is not authorization;
 owner bindings are rebuilt from installed artifacts on every World activation.
 Native World read snapshots now offer bounded keyset lookup of properties by exact

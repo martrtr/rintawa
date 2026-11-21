@@ -16,6 +16,7 @@ mod composition;
 mod context;
 mod engine;
 mod errors;
+mod execution_context;
 mod execution_targets;
 mod host_access;
 mod loader;
@@ -62,6 +63,19 @@ pub use transport::{TransportError, validate_transport_point};
 
 #[cfg(test)]
 mod tests {
+    fn test_principal(
+        engine: &crate::ExtensionEngine,
+        owner: &rintawa_sdk::contracts::ComponentRef,
+    ) -> rintawa_sdk::contracts::ComponentPrincipal {
+        engine
+            .active_component_principal(owner)
+            .unwrap_or_else(|_| rintawa_sdk::contracts::ComponentPrincipal {
+                instance_id: owner.instance_id.clone(),
+                component_id: owner.component_id.clone(),
+                activation: 0,
+            })
+    }
+
     use super::*;
     use crate::secrets::InMemorySecretVault;
     use rintawa_sdk::prelude::*;
@@ -249,49 +263,77 @@ mod tests {
         let guessed = ComponentRef::new("missing", "runtime");
         let point = "chat/send-controls/v1";
         assert!(matches!(
-            engine.query_transport_contributions(&chat_a, point, b"render"),
+            engine.query_transport_contributions(
+                &test_principal(&engine, &chat_a),
+                point,
+                b"render"
+            ),
             Err(TransportError::Inactive)
         ));
         for id in ["chat-a", "dice-a", "chat-b"] {
             engine.start_extension_instance(&ExtensionInstanceId::new(id))?;
         }
         assert!(matches!(
-            engine.declare_transport_contribution(&guessed, point, |_| {}),
+            engine.declare_transport_contribution(
+                &test_principal(&engine, &guessed),
+                point,
+                |_, _| {}
+            ),
             Err(TransportError::Inactive)
         ));
-        engine.declare_transport_contribution(&chat_a, point, |query| {
-            let _ = query
-                .reply(query.key_expr().as_str(), b"emoji".to_vec())
-                .wait();
-        })?;
-        engine.declare_transport_contribution(&dice_a, point, |query| {
-            let _ = query
-                .reply(query.key_expr().as_str(), b"dice".to_vec())
-                .wait();
-        })?;
-        let mut all = engine.query_transport_contributions(&chat_a, point, b"render")?;
+        engine.declare_transport_contribution(
+            &test_principal(&engine, &chat_a),
+            point,
+            |query, _caller| {
+                let _ = query
+                    .reply(query.key_expr().as_str(), b"emoji".to_vec())
+                    .wait();
+            },
+        )?;
+        engine.declare_transport_contribution(
+            &test_principal(&engine, &dice_a),
+            point,
+            |query, _caller| {
+                let _ = query
+                    .reply(query.key_expr().as_str(), b"dice".to_vec())
+                    .wait();
+            },
+        )?;
+        let mut all = engine.query_transport_contributions(
+            &test_principal(&engine, &chat_a),
+            point,
+            b"render",
+        )?;
         all.sort();
         assert_eq!(all, vec![b"dice".to_vec(), b"emoji".to_vec()]);
         assert!(
             engine
-                .query_transport_contributions(&chat_b, point, b"render")?
+                .query_transport_contributions(&test_principal(&engine, &chat_b), point, b"render")?
                 .is_empty()
         );
 
         engine.stop_extension_instance(&ExtensionInstanceId::new("dice-a"))?;
         assert_eq!(
-            engine.query_transport_contributions(&chat_a, point, b"render")?,
+            engine.query_transport_contributions(
+                &test_principal(&engine, &chat_a),
+                point,
+                b"render"
+            )?,
             vec![b"emoji".to_vec()]
         );
         assert!(matches!(
-            engine.query_transport_contributions(&dice_a, point, b"render"),
+            engine.query_transport_contributions(
+                &test_principal(&engine, &dice_a),
+                point,
+                b"render"
+            ),
             Err(TransportError::Inactive)
         ));
         engine.stop_extension_instance(&ExtensionInstanceId::new("chat-a"))?;
         engine.start_extension_instance(&ExtensionInstanceId::new("chat-a"))?;
         assert!(
             engine
-                .query_transport_contributions(&chat_a, point, b"render")?
+                .query_transport_contributions(&test_principal(&engine, &chat_a), point, b"render")?
                 .is_empty()
         );
         engine.stop_extension_instance(&ExtensionInstanceId::new("chat-b"))?;

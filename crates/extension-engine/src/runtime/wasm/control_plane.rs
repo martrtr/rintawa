@@ -94,6 +94,12 @@ impl AssetStoreHost for WasmHostState {
         self.asset_uploads.insert(
             handle,
             super::PendingAssetUpload {
+                owner: self
+                    .execution_context
+                    .as_ref()
+                    .ok_or(AssetStoreError::AccessNotActive)?
+                    .principal
+                    .clone(),
                 expected_size,
                 media_type,
                 bytes: Vec::new(),
@@ -104,6 +110,18 @@ impl AssetStoreHost for WasmHostState {
 
     fn append_upload(&mut self, handle: u64, bytes: Vec<u8>) -> Result<(), AssetStoreError> {
         self.require_asset_import_access()?;
+        let owner = &self
+            .execution_context
+            .as_ref()
+            .ok_or(AssetStoreError::AccessNotActive)?
+            .principal;
+        if !self
+            .asset_uploads
+            .get(&handle)
+            .is_some_and(|upload| &upload.owner == owner)
+        {
+            return Err(AssetStoreError::Rejected);
+        }
         if bytes.is_empty() || bytes.len() > self.max_host_message_bytes {
             return Err(AssetStoreError::MessageTooLarge);
         }
@@ -125,6 +143,18 @@ impl AssetStoreHost for WasmHostState {
 
     fn finish_upload(&mut self, handle: u64) -> Result<WitAssetRef, AssetStoreError> {
         self.require_asset_import_access()?;
+        let owner = &self
+            .execution_context
+            .as_ref()
+            .ok_or(AssetStoreError::AccessNotActive)?
+            .principal;
+        if !self
+            .asset_uploads
+            .get(&handle)
+            .is_some_and(|upload| &upload.owner == owner)
+        {
+            return Err(AssetStoreError::Rejected);
+        }
         let complete = self
             .asset_uploads
             .get(&handle)
@@ -141,6 +171,18 @@ impl AssetStoreHost for WasmHostState {
 
     fn cancel_upload(&mut self, handle: u64) -> Result<(), AssetStoreError> {
         self.require_asset_import_access()?;
+        let owner = &self
+            .execution_context
+            .as_ref()
+            .ok_or(AssetStoreError::AccessNotActive)?
+            .principal;
+        if !self
+            .asset_uploads
+            .get(&handle)
+            .is_some_and(|upload| &upload.owner == owner)
+        {
+            return Err(AssetStoreError::Rejected);
+        }
         self.asset_uploads
             .remove(&handle)
             .map(|_| ())
@@ -235,6 +277,12 @@ impl UserResourcesHost for WasmHostState {
         self.user_resource_uploads.insert(
             handle,
             super::PendingUserResourceUpload {
+                owner: self
+                    .execution_context
+                    .as_ref()
+                    .ok_or(UserResourceError::AccessNotActive)?
+                    .principal
+                    .clone(),
                 expected_size,
                 media_type,
                 name,
@@ -246,6 +294,18 @@ impl UserResourcesHost for WasmHostState {
 
     fn append_upload(&mut self, handle: u64, bytes: Vec<u8>) -> Result<(), UserResourceError> {
         self.require_user_resource_import_access()?;
+        let owner = &self
+            .execution_context
+            .as_ref()
+            .ok_or(UserResourceError::AccessNotActive)?
+            .principal;
+        if !self
+            .user_resource_uploads
+            .get(&handle)
+            .is_some_and(|upload| &upload.owner == owner)
+        {
+            return Err(UserResourceError::Rejected);
+        }
         if bytes.is_empty() || bytes.len() > self.max_host_message_bytes {
             return Err(UserResourceError::MessageTooLarge);
         }
@@ -267,6 +327,18 @@ impl UserResourcesHost for WasmHostState {
 
     fn finish_upload(&mut self, handle: u64) -> Result<WitUserResourceRef, UserResourceError> {
         self.require_user_resource_import_access()?;
+        let owner = &self
+            .execution_context
+            .as_ref()
+            .ok_or(UserResourceError::AccessNotActive)?
+            .principal;
+        if !self
+            .user_resource_uploads
+            .get(&handle)
+            .is_some_and(|upload| &upload.owner == owner)
+        {
+            return Err(UserResourceError::Rejected);
+        }
         let complete = self
             .user_resource_uploads
             .get(&handle)
@@ -283,6 +355,18 @@ impl UserResourcesHost for WasmHostState {
 
     fn cancel_upload(&mut self, handle: u64) -> Result<(), UserResourceError> {
         self.require_user_resource_import_access()?;
+        let owner = &self
+            .execution_context
+            .as_ref()
+            .ok_or(UserResourceError::AccessNotActive)?
+            .principal;
+        if !self
+            .user_resource_uploads
+            .get(&handle)
+            .is_some_and(|upload| &upload.owner == owner)
+        {
+            return Err(UserResourceError::Rejected);
+        }
         self.user_resource_uploads
             .remove(&handle)
             .map(|_| ())
@@ -548,9 +632,11 @@ impl WasmHostState {
             return Err(PreferenceError::AccessNotActive);
         }
         let scope_id = self
-            .scope_id
-            .clone()
-            .ok_or(PreferenceError::AccessNotActive)?;
+            .execution_context
+            .as_ref()
+            .ok_or(PreferenceError::AccessNotActive)?
+            .scope
+            .clone();
         let owner = self
             .current_execution_owner()
             .cloned()

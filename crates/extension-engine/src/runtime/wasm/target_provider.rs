@@ -125,6 +125,9 @@ impl WasmTargetProviderEndpoint {
             .resource_table
             .delete(source_resource)
             .map_err(|error| RtwComponentHostError::Host(error.to_string()));
+        if result.is_err() {
+            runtime.quarantine("target load");
+        }
         let provider_result = result?;
         cleanup?;
         provider_result.map_err(|error| {
@@ -200,6 +203,7 @@ impl WasmTargetProviderEndpoint {
                     .store
                     .data_mut()
                     .cancel_target_component_registration();
+                runtime.quarantine("target register");
                 Err(error)
             }
         }
@@ -213,6 +217,33 @@ impl WasmTargetProviderEndpoint {
         let mut runtime = self.runtime_for_callback()?;
         let instance = Self::live_instance_for_callback(&mut runtime)?;
         WasmComponent::set_callback_fuel(&mut instance.store, &self.budget, "target start")?;
+        let executing = instance
+            .store
+            .data()
+            .transport
+            .contexts
+            .context(&owner, true)
+            .map_err(|error| ExtensionError::Message(error.to_string()))?;
+        if &executing.scope != ctx.runtime_scope_id() {
+            return Err(ExtensionError::Message(String::from(
+                "hosted scope mismatch",
+            )));
+        }
+        let provider =
+            instance.store.data().registered_owner().ok_or_else(|| {
+                ExtensionError::Message(String::from("missing provider identity"))
+            })?;
+        instance
+            .store
+            .data()
+            .transport
+            .contexts
+            .bind_provider(&executing, provider)
+            .map_err(|error| ExtensionError::Message(error.to_string()))?;
+        instance
+            .store
+            .data_mut()
+            .revoke_runtime_resources_for_owner(&owner);
         instance
             .store
             .data_mut()
@@ -235,7 +266,11 @@ impl WasmTargetProviderEndpoint {
                 let error = map_wit_target_host_error("start", error);
                 Err(instance.store.data_mut().abort_guest_execution(error))
             }
-            Err(error) => Err(instance.store.data_mut().abort_guest_execution(error)),
+            Err(error) => {
+                let error = instance.store.data_mut().abort_guest_execution(error);
+                runtime.quarantine("target start");
+                Err(error)
+            }
         }
     }
 
@@ -262,6 +297,7 @@ impl WasmTargetProviderEndpoint {
                 ))),
             ),
         };
+        let mut trapped = false;
         let result = if let Some(error) = lock_failure {
             Err(error)
         } else {
@@ -275,7 +311,10 @@ impl WasmTargetProviderEndpoint {
                         Some(provider) => provider
                             .rintawa_engine_target_provider()
                             .call_stop_component(&mut instance.store, handle)
-                            .map_err(|error| WasmComponent::execution_error("target stop", error))
+                            .map_err(|error| {
+                                trapped = true;
+                                WasmComponent::execution_error("target stop", error)
+                            })
                             .and_then(|result| {
                                 result.map_err(|error| map_wit_target_host_error("stop", error))
                             }),
@@ -294,6 +333,9 @@ impl WasmTargetProviderEndpoint {
                 .data_mut()
                 .revoke_runtime_resources_for_owner(&owner);
         }
+        if trapped {
+            runtime.quarantine("target stop");
+        }
         result
     }
 
@@ -301,7 +343,7 @@ impl WasmTargetProviderEndpoint {
         let mut runtime = self.runtime_for_callback()?;
         let instance = Self::live_instance_for_callback(&mut runtime)?;
         WasmComponent::set_callback_fuel(&mut instance.store, &self.budget, "target drop")?;
-        instance
+        let result = instance
             .target_provider
             .as_ref()
             .ok_or_else(|| {
@@ -309,8 +351,11 @@ impl WasmTargetProviderEndpoint {
             })?
             .rintawa_engine_target_provider()
             .call_drop_component(&mut instance.store, handle)
-            .map_err(|error| WasmComponent::execution_error("target drop", error))?
-            .map_err(|error| map_wit_target_host_error("drop", error))
+            .map_err(|error| WasmComponent::execution_error("target drop", error));
+        if result.is_err() {
+            runtime.quarantine("target drop");
+        }
+        result?.map_err(|error| map_wit_target_host_error("drop", error))
     }
 }
 

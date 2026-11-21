@@ -15,9 +15,9 @@ pub use crate::api::{LogLevel, LoggerApi};
 pub use crate::context::{ComponentContext, RegistrationContext};
 
 pub use crate::contracts::{
-    ComponentRef, ContractConsumer, ContractDefinition, ContractGrantRequirement, ContractKey,
-    ContractProvider, ContractResolutionPolicy, ContractVersion, HOST_SHELL_CONTRACT_ID,
-    HOST_SHELL_CONTRACT_VERSION, host_shell_contract_key,
+    ComponentPrincipal, ComponentRef, ContractConsumer, ContractDefinition,
+    ContractGrantRequirement, ContractKey, ContractProvider, ContractResolutionPolicy,
+    ContractVersion, HOST_SHELL_CONTRACT_ID, HOST_SHELL_CONTRACT_VERSION, host_shell_contract_key,
 };
 pub use crate::contributions::{ContributionDescriptor, ContributionKind};
 

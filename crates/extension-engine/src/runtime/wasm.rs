@@ -17,8 +17,8 @@ use std::{
 use rintawa_sdk::{
     context::{ComponentContext, RegistrationContext},
     contracts::{
-        ContractConsumer, ContractDefinition, ContractGrantRequirement, ContractKey,
-        ContractProvider, ContractResolutionPolicy, ContractVersion,
+        ComponentPrincipal, ContractConsumer, ContractDefinition, ContractGrantRequirement,
+        ContractKey, ContractProvider, ContractResolutionPolicy, ContractVersion,
     },
     contributions::{ContributionDescriptor, ContributionKind, WorldSchemaContribution},
     errors::{ExtensionError, ExtensionResult},
@@ -39,6 +39,7 @@ use zenoh::Wait;
 
 use crate::{
     errors::{EngineError, EngineResult},
+    execution_context::ExecutionContext,
     execution_targets::ExecutionTargetRegistry,
     host_access::{HostAccessError, HostAccessServices},
     runtime_permissions::RuntimePermissionManager,
@@ -63,10 +64,10 @@ use crate::runtime::wasm::network::{
     build_bounded_https_client, is_allowed_domain_destination_with_source, is_allowed_public_ip,
 };
 
-const TARGET_PROVIDER_EXPORT_NAME: &str = "rintawa:engine/target-provider@0.0.1";
-const TASK_HANDLER_EXPORT_NAME: &str = "rintawa:engine/task-handler@0.0.1";
-const TRANSPORT_HANDLER_EXPORT_NAME: &str = "rintawa:engine/transport-handler@0.0.1";
-const WORLD_SYSTEM_EXPORT_NAME: &str = "rintawa:engine/world-system@0.0.1";
+const TARGET_PROVIDER_EXPORT_NAME: &str = "rintawa:engine/target-provider@0.0.2";
+const TASK_HANDLER_EXPORT_NAME: &str = "rintawa:engine/task-handler@0.0.2";
+const TRANSPORT_HANDLER_EXPORT_NAME: &str = "rintawa:engine/transport-handler@0.0.2";
+const WORLD_SYSTEM_EXPORT_NAME: &str = "rintawa:engine/world-system@0.0.2";
 
 // Generated WIT bindings expose protocol names verbatim and are not hand-documented.
 #[allow(missing_docs)]
@@ -157,6 +158,7 @@ use bindings::rintawa::engine::{
     },
     runtime_context::{
         Context as WitRuntimeContext, Error as RuntimeContextError, Host as RuntimeContextHost,
+        Principal as WitPrincipal,
     },
     runtime_policy::{
         ArtifactPolicy as WitRuntimeArtifactPolicy, ComponentPolicy as WitRuntimePolicyComponent,
@@ -188,6 +190,7 @@ use world_system_bindings::exports::rintawa::engine::world_system::Error as Worl
 
 #[derive(Debug)]
 struct PendingAssetUpload {
+    owner: ComponentPrincipal,
     expected_size: usize,
     media_type: String,
     bytes: Vec<u8>,
@@ -195,6 +198,7 @@ struct PendingAssetUpload {
 
 #[derive(Debug)]
 struct PendingUserResourceUpload {
+    owner: ComponentPrincipal,
     expected_size: usize,
     media_type: String,
     name: Option<String>,
@@ -208,6 +212,7 @@ pub struct WasmHostState {
     instance_id: Option<ExtensionInstanceId>,
     scope_id: Option<RuntimeScopeId>,
     execution_owner: Option<rintawa_sdk::contracts::ComponentRef>,
+    execution_context: Option<ExecutionContext>,
     registration_scope: Option<WasmRegistrationScope>,
     runtime_permissions: RuntimePermissionManager,
     task_access_active: bool,
@@ -287,6 +292,7 @@ struct WasmRegistrations {
 }
 
 struct ActiveWasmTask {
+    context: ExecutionContext,
     owner: rintawa_sdk::contracts::ComponentRef,
     interval: Duration,
     next_due: Instant,
@@ -356,6 +362,7 @@ impl WasmHostState {
             instance_id: None,
             scope_id: None,
             execution_owner: None,
+            execution_context: None,
             registration_scope: None,
             runtime_permissions,
             task_access_active: false,
@@ -450,6 +457,7 @@ impl WasmHostState {
 
     fn begin_target_component_registration(&mut self) -> ExtensionResult<()> {
         self.execution_owner = None;
+        self.execution_context = None;
         self.task_access_active = false;
         self.network_access_active = false;
         self.host_access_active = false;
@@ -511,7 +519,14 @@ impl WasmHostState {
     }
 
     fn current_execution_owner(&self) -> Option<&rintawa_sdk::contracts::ComponentRef> {
-        self.execution_owner.as_ref()
+        let owner = self.execution_owner.as_ref()?;
+        let executing = self.execution_context.as_ref()?;
+        self.transport
+            .contexts
+            .context(owner, true)
+            .ok()
+            .filter(|bound| bound == executing)?;
+        Some(owner)
     }
 
     fn validate_execution_owner(&self, ctx: &dyn ComponentContext) -> ExtensionResult<()> {
@@ -539,6 +554,7 @@ impl WasmHostState {
     fn discard_guest_execution(&mut self) {
         self.registration_scope = None;
         self.execution_owner = None;
+        self.execution_context = None;
         self.task_access_active = false;
         self.network_access_active = false;
         self.host_access_active = false;
@@ -704,6 +720,10 @@ impl WasmHostState {
     /// Opens the normal guest execution scope for the provider component itself.
     fn begin_guest_execution(&mut self) {
         self.execution_owner = self.registered_owner();
+        self.execution_context = self
+            .execution_owner
+            .as_ref()
+            .and_then(|owner| self.transport.contexts.context(owner, true).ok());
         self.task_access_active = true;
         self.network_access_active = true;
         self.host_access_active = true;
@@ -718,6 +738,7 @@ impl WasmHostState {
     }
 
     fn begin_delegated_guest_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
+        self.execution_context = self.transport.contexts.context(&owner, true).ok();
         self.execution_owner = Some(owner);
         self.task_access_active = true;
         self.network_access_active = true;
@@ -736,6 +757,7 @@ impl WasmHostState {
     }
 
     fn begin_delegated_task_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
+        self.execution_context = self.transport.contexts.context(&owner, true).ok();
         self.execution_owner = Some(owner);
         self.task_access_active = true;
         self.network_access_active = true;
@@ -775,6 +797,10 @@ impl WasmHostState {
     fn begin_transport_query_execution(&mut self) {
         self.discard_guest_execution();
         self.execution_owner = self.registered_owner();
+        self.execution_context = self
+            .execution_owner
+            .as_ref()
+            .and_then(|owner| self.transport.contexts.context(owner, true).ok());
         self.transport_access_active = true;
         self.world_data_access_active = true;
         self.transport_queries_this_execution = 0;
@@ -797,6 +823,7 @@ impl WasmHostState {
         self.execution_target_registration_active = false;
 
         self.execution_owner = None;
+        self.execution_context = None;
     }
 
     fn abort_guest_execution(&mut self, operation_error: ExtensionError) -> ExtensionError {
@@ -824,6 +851,10 @@ impl WasmHostState {
     }
 
     fn revoke_runtime_resources_for_owner(&mut self, owner: &rintawa_sdk::contracts::ComponentRef) {
+        self.asset_uploads
+            .retain(|_, upload| upload.owner.component() != *owner);
+        self.user_resource_uploads
+            .retain(|_, upload| upload.owner.component() != *owner);
         self.active_tasks.retain(|_, task| &task.owner != owner);
         self.network_handles
             .retain(|_, resource| &resource.owner != owner);
@@ -1004,29 +1035,72 @@ impl HostOperations for WasmHostState {
     }
 }
 
+fn wit_principal(principal: ComponentPrincipal) -> WitPrincipal {
+    WitPrincipal {
+        instance_id: principal.instance_id.to_string(),
+        component_id: principal.component_id.to_string(),
+        activation: principal.activation,
+    }
+}
+
+impl WasmHostState {
+    fn active_execution_context(&self) -> Result<&ExecutionContext, RuntimeContextError> {
+        if self.world_system_snapshot.is_some() {
+            return Err(RuntimeContextError::AccessNotActive);
+        }
+        let context = self
+            .execution_context
+            .as_ref()
+            .ok_or(RuntimeContextError::AccessNotActive)?;
+        self.transport
+            .contexts
+            .validate(context)
+            .map_err(|error| match error {
+                TransportError::Unavailable => RuntimeContextError::Unavailable,
+                _ => RuntimeContextError::AccessNotActive,
+            })?;
+        Ok(context)
+    }
+}
+
 impl RuntimeContextHost for WasmHostState {
     fn current(&mut self) -> Result<WitRuntimeContext, RuntimeContextError> {
-        self.current_execution_owner()
-            .ok_or(RuntimeContextError::AccessNotActive)?;
-        let scope_id = self
-            .scope_id
-            .as_ref()
-            .cloned()
-            .ok_or(RuntimeContextError::Rejected)?;
+        let context = self.active_execution_context()?;
         let world_id = self
             .host_access
             .runtime_context
-            .world_id_for_scope(&scope_id)
+            .world_id_for_scope(&context.scope)
             .map_err(|error| match error {
-                crate::host_access::HostAccessError::Unavailable => {
-                    RuntimeContextError::Unavailable
-                }
+                HostAccessError::Unavailable => RuntimeContextError::Unavailable,
                 _ => RuntimeContextError::Rejected,
             })?;
         Ok(WitRuntimeContext {
-            scope_id: scope_id.to_string(),
-            world_id: world_id.map(|world_id| world_id.to_string()),
+            scope_id: context.scope.to_string(),
+            world_id: world_id.map(|id| id.to_string()),
+            principal: wit_principal(context.principal.clone()),
         })
+    }
+
+    fn selected_providers(
+        &mut self,
+        contract_id: String,
+        version: u32,
+    ) -> Result<Vec<WitPrincipal>, RuntimeContextError> {
+        let executing = self.active_execution_context()?;
+        if version == 0 || contract_id.is_empty() || contract_id.len() > self.max_host_message_bytes
+        {
+            return Err(RuntimeContextError::Rejected);
+        }
+        let contract = ContractKey::new(contract_id, ContractVersion::new(version));
+        self.transport
+            .contexts
+            .selected(executing, &contract, &self.secrets)
+            .map(|principals| principals.into_iter().map(wit_principal).collect())
+            .map_err(|error| match error {
+                TransportError::Inactive => RuntimeContextError::AccessNotActive,
+                TransportError::Unavailable => RuntimeContextError::Unavailable,
+                _ => RuntimeContextError::Rejected,
+            })
     }
 }
 
@@ -1064,6 +1138,10 @@ impl RuntimeTasksHost for WasmHostState {
         self.active_tasks.insert(
             handle,
             ActiveWasmTask {
+                context: self
+                    .execution_context
+                    .clone()
+                    .ok_or(RuntimeTaskError::RuntimeNotActive)?,
                 owner,
                 interval,
                 next_due: Instant::now() + interval,
@@ -1085,7 +1163,7 @@ impl RuntimeTasksHost for WasmHostState {
         let Some(task) = self.active_tasks.get(&handle) else {
             return Err(RuntimeTaskError::UnknownTask);
         };
-        if task.owner != owner {
+        if task.owner != owner || self.execution_context.as_ref() != Some(&task.context) {
             return Err(RuntimeTaskError::UnknownTask);
         }
         self.active_tasks.remove(&handle);
@@ -1465,71 +1543,39 @@ impl TransportHost for WasmHostState {
     }
 
     fn publish(&mut self, point: String, payload: Vec<u8>) -> Result<(), TransportApiError> {
-        if !self.transport_access_active
-            || self.execution_target_registration_active
-            || self.current_execution_owner() != self.registered_owner().as_ref()
-        {
-            return Err(TransportApiError::AccessNotActive);
-        }
+        let executing = self.transport_execution_context()?.clone();
         if self.transport_publications_this_execution >= 32 {
             return Err(TransportApiError::LimitExceeded);
         }
         self.transport_publications_this_execution += 1;
-        let scope = self
-            .scope_id
-            .as_ref()
-            .ok_or(TransportApiError::AccessNotActive)?;
-        let owner = self
-            .registered_owner()
-            .ok_or(TransportApiError::AccessNotActive)?;
         self.transport
-            .publish(&owner, scope, &point, &payload)
+            .publish(
+                &executing.principal.component(),
+                &executing.scope,
+                &point,
+                &payload,
+            )
             .map_err(map_transport_error)
     }
 
     fn subscribe(&mut self, point: String) -> Result<u64, TransportApiError> {
-        if !self.transport_access_active
-            || self.current_execution_owner() != self.registered_owner().as_ref()
-        {
-            return Err(TransportApiError::AccessNotActive);
-        }
-        let scope = self
-            .scope_id
-            .as_ref()
-            .ok_or(TransportApiError::AccessNotActive)?;
-        let owner = self
-            .registered_owner()
-            .ok_or(TransportApiError::AccessNotActive)?;
+        let executing = self.transport_execution_context()?;
         self.transport
-            .subscribe(&owner, scope, &point)
+            .subscribe(&executing.principal, &executing.scope, &point)
             .map_err(map_transport_error)
     }
 
     fn poll(&mut self, handle: u64) -> Result<Vec<Vec<u8>>, TransportApiError> {
-        if !self.transport_access_active
-            || self.current_execution_owner() != self.registered_owner().as_ref()
-        {
-            return Err(TransportApiError::AccessNotActive);
-        }
-        let owner = self
-            .registered_owner()
-            .ok_or(TransportApiError::AccessNotActive)?;
+        let executing = self.transport_execution_context()?;
         self.transport
-            .poll(&owner, handle)
+            .poll(&executing.principal, handle)
             .map_err(map_transport_error)
     }
 
     fn unsubscribe(&mut self, handle: u64) -> Result<(), TransportApiError> {
-        if !self.transport_access_active
-            || self.current_execution_owner() != self.registered_owner().as_ref()
-        {
-            return Err(TransportApiError::AccessNotActive);
-        }
-        let owner = self
-            .registered_owner()
-            .ok_or(TransportApiError::AccessNotActive)?;
+        let executing = self.transport_execution_context()?;
         self.transport
-            .unsubscribe(&owner, handle)
+            .unsubscribe(&executing.principal, handle)
             .map_err(map_transport_error)
     }
 
@@ -1538,24 +1584,27 @@ impl TransportHost for WasmHostState {
         point: String,
         payload: Vec<u8>,
     ) -> Result<Vec<Vec<u8>>, TransportApiError> {
-        if !self.transport_access_active
-            || self.current_execution_owner() != self.registered_owner().as_ref()
-        {
-            return Err(TransportApiError::AccessNotActive);
-        }
-        let scope_id = self
-            .scope_id
-            .clone()
-            .ok_or(TransportApiError::AccessNotActive)?;
-        // A callback may make nested calls, but cannot make unbounded
-        // blocking host imports without consuming WASM fuel.
+        let executing = self.transport_execution_context()?.clone();
         if self.transport_queries_this_execution >= 8 {
             return Err(TransportApiError::LimitExceeded);
         }
         self.transport_queries_this_execution += 1;
         self.transport
-            .query(&scope_id, &point, &payload)
+            .query(&executing, &point, &payload)
             .map_err(map_transport_error)
+    }
+}
+
+impl WasmHostState {
+    fn transport_execution_context(&self) -> Result<&ExecutionContext, TransportApiError> {
+        if !self.transport_access_active {
+            return Err(TransportApiError::AccessNotActive);
+        }
+        self.active_execution_context()
+            .map_err(|error| match error {
+                RuntimeContextError::Unavailable => TransportApiError::Unavailable,
+                _ => TransportApiError::AccessNotActive,
+            })
     }
 }
 
@@ -1795,6 +1844,12 @@ pub struct WasmWorldSystemEndpoint {
     runtime: Arc<Mutex<WasmSystemRuntime>>,
 }
 
+impl Drop for WasmComponent {
+    fn drop(&mut self) {
+        self.world_system_active.store(false, Ordering::Release);
+    }
+}
+
 impl WasmComponent {
     pub(crate) fn supports_execution_target_provider(&self) -> bool {
         self.component
@@ -1823,6 +1878,7 @@ impl WasmComponent {
         budget: &WasmExecutionBudget,
         point: &str,
         query: zenoh::query::Query,
+        caller: ComponentPrincipal,
     ) {
         let result = (|| -> ExtensionResult<Vec<u8>> {
             let payload = query
@@ -1857,15 +1913,23 @@ impl WasmComponent {
                 .and_then(|handler| {
                     handler
                         .rintawa_engine_transport_handler()
-                        .call_on_query(&mut instance.store, point, &payload)
+                        .call_on_query(
+                            &mut instance.store,
+                            point,
+                            &payload,
+                            &transport_bindings::rintawa::engine::runtime_context::Principal {
+                                instance_id: caller.instance_id.to_string(),
+                                component_id: caller.component_id.to_string(),
+                                activation: caller.activation,
+                            },
+                        )
                         .map_err(|error| Self::execution_error("transport query", error))
                 });
             instance.store.data_mut().finish_transport_query_execution();
             if response.is_err() {
                 // A trapped Component Model instance cannot be re-entered.
                 // Keep the Host running, but require an explicit component reload.
-                state.instance = None;
-                state.failed_lifecycle_callback = Some("transport query");
+                state.quarantine("transport query");
             }
             let response = response?;
             if response.len() > MAX_PAYLOAD_BYTES {
@@ -2000,6 +2064,23 @@ struct WasmSharedRuntime {
     instance: Option<WasmInstance>,
     failed_lifecycle_callback: Option<&'static str>,
     active: bool,
+}
+
+impl WasmSharedRuntime {
+    fn quarantine(&mut self, callback: &'static str) {
+        if let Some(instance) = self.instance.as_ref()
+            && let Some(owner) = instance.store.data().registered_owner()
+        {
+            instance
+                .store
+                .data()
+                .transport
+                .revoke_instance(&owner.instance_id);
+        }
+        self.instance = None;
+        self.failed_lifecycle_callback = Some(callback);
+        self.active = false;
+    }
 }
 
 struct WasmSystemRuntime {
@@ -2196,6 +2277,14 @@ impl Component for WasmComponent {
             instance.store.data().validate_execution_owner(ctx)?;
             Self::set_callback_fuel(&mut instance.store, &budget, "start")?;
 
+            let owner =
+                instance.store.data().registered_owner().ok_or_else(|| {
+                    ExtensionError::Message(String::from("missing start identity"))
+                })?;
+            instance
+                .store
+                .data_mut()
+                .revoke_runtime_resources_for_owner(&owner);
             instance.store.data_mut().begin_start_execution();
 
             let start_result = instance
@@ -2240,8 +2329,7 @@ impl Component for WasmComponent {
         };
 
         if guest_failed {
-            runtime.instance = None;
-            runtime.failed_lifecycle_callback = Some("start");
+            runtime.quarantine("start");
         }
         drop(runtime);
         result?;
@@ -2257,14 +2345,20 @@ impl Component for WasmComponent {
                 let callback_point = point.clone();
                 self.host_services
                     .transport
-                    .declare(&owner, ctx.runtime_scope_id(), &point, move |query| {
-                        Self::respond_to_transport_query(
-                            &callback_runtime,
-                            &callback_budget,
-                            &callback_point,
-                            query,
-                        );
-                    })
+                    .declare(
+                        &owner,
+                        ctx.runtime_scope_id(),
+                        &point,
+                        move |query, caller| {
+                            Self::respond_to_transport_query(
+                                &callback_runtime,
+                                &callback_budget,
+                                &callback_point,
+                                query,
+                                caller,
+                            );
+                        },
+                    )
                     .map_err(|error| {
                         ExtensionError::Message(format!(
                             "could not declare WASM transport point: {error}"
@@ -2353,8 +2447,7 @@ impl Component for WasmComponent {
         };
 
         if let Err(error) = stop_result {
-            runtime.instance = None;
-            runtime.failed_lifecycle_callback = Some("stop");
+            runtime.quarantine("stop");
             return Err(error);
         }
 
@@ -2392,6 +2485,18 @@ impl Component for WasmComponent {
                     {
                         continue;
                     }
+                    let task_context = instance.store.data().active_tasks[&handle].context.clone();
+                    if instance
+                        .store
+                        .data()
+                        .transport
+                        .contexts
+                        .validate(&task_context)
+                        .is_err()
+                    {
+                        instance.store.data_mut().active_tasks.remove(&handle);
+                        continue;
+                    }
                     Self::set_runtime_task_fuel(&mut instance.store, &budget, "runtime task")?;
                     let is_root_owner = task_owner == root_owner;
                     if is_root_owner {
@@ -2416,6 +2521,7 @@ impl Component for WasmComponent {
                             guest_failed = true;
                             instance.store.data_mut().abort_guest_execution(error)
                         } else {
+                            guest_failed = true;
                             instance.store.data_mut().discard_guest_execution();
                             instance
                                 .store
@@ -2444,8 +2550,7 @@ impl Component for WasmComponent {
             }
         };
         if guest_failed {
-            runtime.instance = None;
-            runtime.failed_lifecycle_callback = Some("runtime task");
+            runtime.quarantine("runtime task");
         }
         result
     }

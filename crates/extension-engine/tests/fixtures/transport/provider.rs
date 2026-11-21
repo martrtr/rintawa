@@ -9,7 +9,12 @@ struct Fixture;
 
 impl exports::rintawa::engine::guest::Guest for Fixture {
     fn register() {
-        use rintawa::engine::transport;
+        use rintawa::engine::{registration, transport};
+        registration::define_contract("fixture.backend", 1, registration::ResolutionPolicy::Single)
+            .expect("backend definition");
+        registration::provide_contract("fixture.backend", 1, &[]).expect("backend provider");
+        registration::provide_contract("rintawa.host.shell", 1, &[])
+            .expect("generic shell binding");
         assert!(transport::declare("chat/send-controls/v1").is_err());
         assert!(transport::query("chat/send-controls/v1", b"ping").is_err());
         assert!(transport::subscribe("chat/updates/v1").is_err());
@@ -28,9 +33,12 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
             }
             Err(error) => panic!("unexpected transport declaration error: {error:?}"),
         }
+        match transport::declare("fixture/caller") {
+            Ok(()) | Err(transport::Error::NotSelected) => {}
+            Err(error) => panic!("caller point: {error:?}"),
+        }
         assert!(transport::publish("chat/updates/v1", b"start-not-committed").is_err());
-        let handle = transport::subscribe("chat/updates/v1").expect("subscribe on start");
-        *SUBSCRIPTION.lock().expect("fixture subscription lock") = Some(handle);
+        assert!(transport::subscribe("chat/updates/v1").is_err());
     }
 
     fn stop() {
@@ -42,8 +50,62 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
 }
 
 impl exports::rintawa::engine::transport_handler::Guest for Fixture {
-    fn on_query(point: String, payload: Vec<u8>) -> Vec<u8> {
-        assert_eq!(point, "chat/send-controls/v1");
+    fn on_query(
+        point: String,
+        payload: Vec<u8>,
+        caller: rintawa::engine::runtime_context::Principal,
+    ) -> Vec<u8> {
+        assert!(point == "chat/send-controls/v1" || point == "fixture/caller");
+        if let Some(forward) = payload.strip_prefix(b"forward:") {
+            let split = forward
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .expect("forward point delimiter");
+            let point = std::str::from_utf8(&forward[..split]).expect("forward point");
+            return rintawa::engine::transport::query(point, &forward[split + 1..])
+                .expect("forward query")
+                .remove(0);
+        }
+        let mut subscription = SUBSCRIPTION.lock().expect("fixture subscription lock");
+        if subscription.is_none() {
+            *subscription = Some(
+                rintawa::engine::transport::subscribe("chat/updates/v1")
+                    .expect("active subscription"),
+            );
+        }
+        drop(subscription);
+        if let Some(id) = payload.strip_prefix(b"selected:") {
+            let id = std::str::from_utf8(id).expect("contract ID");
+            return match rintawa::engine::runtime_context::selected_providers(id, 1) {
+                Ok(providers) => providers
+                    .into_iter()
+                    .map(|principal| {
+                        format!(
+                            "{}|{}|{}",
+                            principal.instance_id, principal.component_id, principal.activation
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .into_bytes(),
+                Err(rintawa::engine::runtime_context::Error::Rejected) => b"rejected".to_vec(),
+                Err(error) => format!("error:{error:?}").into_bytes(),
+            };
+        }
+        if payload.starts_with(b"identity:") {
+            return format!(
+                "{}|{}|{}",
+                caller.instance_id, caller.component_id, caller.activation
+            )
+            .into_bytes();
+        }
+        if payload.starts_with(b"nested:") {
+            let point = std::str::from_utf8(&payload[b"nested:".len()..]).expect("nested point");
+            return rintawa::engine::transport::query(point, b"identity:spoofed")
+                .expect("nested query")
+                .remove(0);
+        }
+
         if let Some(item) = payload.strip_prefix(b"world-property:") {
             let item = std::str::from_utf8(item).expect("fixture item ID");
             return match rintawa::engine::world_data::load_property(item, "fixture.private@1") {
@@ -54,7 +116,8 @@ impl exports::rintawa::engine::transport_handler::Guest for Fixture {
             };
         }
         if payload == b"world-find" {
-            return match rintawa::engine::world_data::find_properties("fixture.private@1", None, 1) {
+            return match rintawa::engine::world_data::find_properties("fixture.private@1", None, 1)
+            {
                 Ok(values) => format!("found:{}", values.len()).into_bytes(),
                 Err(rintawa::engine::world_data::Error::AccessDenied) => b"denied".to_vec(),
                 Err(error) => format!("error:{error:?}").into_bytes(),
@@ -66,7 +129,10 @@ impl exports::rintawa::engine::transport_handler::Guest for Fixture {
             return b"published".to_vec();
         }
         if payload == b"drain-events" {
-            let handle = SUBSCRIPTION.lock().expect("fixture lock").expect("active handle");
+            let handle = SUBSCRIPTION
+                .lock()
+                .expect("fixture lock")
+                .expect("active handle");
             let events = rintawa::engine::transport::poll(handle).expect("WASM poll");
             return format!("events:{}", events.len()).into_bytes();
         }

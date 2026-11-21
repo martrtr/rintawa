@@ -83,5 +83,5 @@
             (with "stop" (func $stop-lifted))
             (with "handle-service" (func $handle-service-lifted))
         ))
-        (export "rintawa:engine/guest@0.0.1" (instance $guest-instance))
+        (export "rintawa:engine/guest@0.0.2" (instance $guest-instance))
     )

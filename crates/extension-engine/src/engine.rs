@@ -8,7 +8,9 @@ use std::{
 
 use rintawa_sdk::{
     context::ComponentContext,
-    contracts::{ComponentRef, ContractDefinition, ContractKey, ContractResolutionPolicy},
+    contracts::{
+        ComponentPrincipal, ComponentRef, ContractDefinition, ContractKey, ContractResolutionPolicy,
+    },
     contributions::{ContributionDescriptor, WorldSchemaContribution},
     errors::{ExtensionError, ExtensionResult},
     manifest::ExtensionManifest,
@@ -31,6 +33,7 @@ use crate::{
         OwnedWorldSchemaContribution, RegistrationBuffers,
     },
     errors::{ComponentStopFailure, EngineError, EngineResult},
+    execution_context::{ExecutionContext, ScopeSelection},
     execution_targets::{ExecutionTargetDependency, ExecutionTargetRegistry},
     host_access::{
         ArtifactStoreAccess, AssetStoreAccess, CompositionAccess, HostAccessServices,
@@ -190,6 +193,17 @@ impl Default for ExtensionEngine {
     }
 }
 
+impl Drop for ExtensionEngine {
+    fn drop(&mut self) {
+        // Revoke admission and break declaration/provider Store ownership cycles.
+        // Already-admitted callbacks retain the resources they still need.
+        for instance in self.extensions.keys() {
+            self.transport.revoke_instance(instance);
+            self.execution_targets.revoke_instance(instance);
+        }
+    }
+}
+
 impl ExtensionEngine {
     /// Creates a new, empty [`ExtensionEngine`].
     pub fn new() -> Self {
@@ -207,17 +221,16 @@ impl ExtensionEngine {
         preference_access: Arc<dyn PreferenceAccess>,
         runtime_policy_access: Arc<dyn RuntimePolicyAccess>,
     ) -> Self {
-        Self {
-            host_access: HostAccessServices::new(
-                artifact_store_access,
-                asset_store_access,
-                world_session_access,
-                composition_access,
-                preference_access,
-                runtime_policy_access,
-            ),
-            ..Self::default()
-        }
+        let mut engine = Self::new();
+        engine.host_access = HostAccessServices::new(
+            artifact_store_access,
+            asset_store_access,
+            world_session_access,
+            composition_access,
+            preference_access,
+            runtime_policy_access,
+        );
+        engine
     }
 
     /// Attaches Host-owned resolution of opaque runtime scopes to World identity.
@@ -448,15 +461,17 @@ impl ExtensionEngine {
     /// declarations, and Zenoh failures.
     pub fn declare_transport_contribution<F>(
         &self,
-        owner: &ComponentRef,
+        owner: &ComponentPrincipal,
         point: &str,
         callback: F,
     ) -> Result<(), TransportError>
     where
-        F: Fn(zenoh::query::Query) + Send + Sync + 'static,
+        F: Fn(zenoh::query::Query, ComponentPrincipal) + Send + Sync + 'static,
     {
-        let scope = self.transport_scope(owner)?;
-        self.transport.declare(owner, &scope, point, callback)
+        let context = self.transport_context(owner)?;
+        let scope = context.scope;
+        self.transport
+            .declare(&owner.component(), &scope, point, callback)
     }
 
     /// Collects all live contributions under one point within the caller's scope.
@@ -470,12 +485,12 @@ impl ExtensionEngine {
     /// requests or replies, and transport failures.
     pub fn query_transport_contributions(
         &self,
-        caller: &ComponentRef,
+        caller: &ComponentPrincipal,
         point: &str,
         payload: &[u8],
     ) -> Result<Vec<Vec<u8>>, TransportError> {
-        let scope = self.transport_scope(caller)?;
-        self.transport.query(&scope, point, payload)
+        let context = self.transport_context(caller)?;
+        self.transport.query(&context, point, payload)
     }
 
     /// Publishes a non-durable notification within the caller's World scope.
@@ -484,12 +499,14 @@ impl ExtensionEngine {
     /// Rejects inactive callers, invalid names, oversized payloads or Zenoh failures.
     pub fn publish_transport_notification(
         &self,
-        caller: &ComponentRef,
+        caller: &ComponentPrincipal,
         point: &str,
         payload: &[u8],
     ) -> Result<(), TransportError> {
-        let scope = self.transport_scope(caller)?;
-        self.transport.publish(caller, &scope, point, payload)
+        let context = self.transport_context(caller)?;
+        let scope = context.scope.clone();
+        self.transport
+            .publish(&caller.component(), &scope, point, payload)
     }
 
     /// Subscribes to notifications with a bounded buffer; no durable delivery.
@@ -498,10 +515,11 @@ impl ExtensionEngine {
     /// Rejects inactive callers, invalid names, exhausted limits or Zenoh failures.
     pub fn subscribe_transport_notifications(
         &self,
-        caller: &ComponentRef,
+        caller: &ComponentPrincipal,
         point: &str,
     ) -> Result<u64, TransportError> {
-        let scope = self.transport_scope(caller)?;
+        let context = self.transport_context(caller)?;
+        let scope = context.scope.clone();
         self.transport.subscribe(caller, &scope, point)
     }
 
@@ -511,10 +529,10 @@ impl ExtensionEngine {
     /// Rejects inactive callers, foreign handles or Zenoh failures.
     pub fn poll_transport_notifications(
         &self,
-        caller: &ComponentRef,
+        caller: &ComponentPrincipal,
         handle: u64,
     ) -> Result<Vec<Vec<u8>>, TransportError> {
-        self.transport_scope(caller)?;
+        self.transport_context(caller)?;
         self.transport.poll(caller, handle)
     }
 
@@ -524,27 +542,33 @@ impl ExtensionEngine {
     /// Rejects inactive callers, foreign handles or Zenoh failures.
     pub fn unsubscribe_transport_notifications(
         &self,
-        caller: &ComponentRef,
+        caller: &ComponentPrincipal,
         handle: u64,
     ) -> Result<(), TransportError> {
-        self.transport_scope(caller)?;
+        self.transport_context(caller)?;
         self.transport.unsubscribe(caller, handle)
     }
 
-    fn transport_scope(&self, owner: &ComponentRef) -> Result<RuntimeScopeId, TransportError> {
-        let extension = self
-            .extensions
-            .get(&owner.instance_id)
-            .ok_or(TransportError::Inactive)?;
-        if extension.state != ExtensionState::Active
-            || !extension
-                .components
-                .iter()
-                .any(|component| component.id() == &owner.component_id)
-        {
+    /// Returns the current Host-attested activation of an active component.
+    ///
+    /// # Errors
+    /// Rejects stopped, unknown or quarantined components.
+    pub fn active_component_principal(
+        &self,
+        owner: &ComponentRef,
+    ) -> Result<ComponentPrincipal, TransportError> {
+        Ok(self.transport.contexts.context(owner, false)?.principal)
+    }
+
+    fn transport_context(
+        &self,
+        owner: &ComponentPrincipal,
+    ) -> Result<ExecutionContext, TransportError> {
+        let context = self.transport.contexts.context(&owner.component(), false)?;
+        if context.principal != *owner {
             return Err(TransportError::Inactive);
         }
-        Ok(extension.scope_id.clone())
+        Ok(context)
     }
 
     /// Parses and validates an extension manifest from a TOML string.
@@ -636,6 +660,7 @@ impl ExtensionEngine {
     /// host-owned workers are stopped.
     pub fn clear_platform_contract_definitions_in_scope(&mut self, scope_id: &RuntimeScopeId) {
         self.platform_contract_definitions.remove(scope_id);
+        self.refresh_runtime_context_view();
     }
 
     fn define_platform_contract_in_scope(
@@ -676,6 +701,7 @@ impl ExtensionEngine {
             .entry(scope_id)
             .or_default()
             .insert(contract, definition);
+        self.refresh_runtime_context_view();
         Ok(())
     }
 
@@ -1105,9 +1131,20 @@ impl ExtensionEngine {
                     });
                 }
             }
-            for contrib in &ext.contributions {
+        }
+        for component in &ext.components {
+            if let Err(error) = self.transport.contexts.begin(
+                ComponentRef::new(instance_id.clone(), component.id().clone()),
+                ext.scope_id.clone(),
+            ) {
+                self.transport.revoke_instance(instance_id);
+                return Err(EngineError::InvalidState(error.to_string()));
+            }
+        }
+        if ext.state == ExtensionState::Stopped {
+            for contribution in &ext.contributions {
                 self.active_contributions
-                    .insert((ext.scope_id.clone(), contrib.descriptor.id.clone()));
+                    .insert((ext.scope_id.clone(), contribution.descriptor.id.clone()));
             }
         }
 
@@ -1193,6 +1230,8 @@ impl ExtensionEngine {
         }
 
         ext.state = ExtensionState::Active;
+        self.transport.contexts.activate_instance(instance_id);
+        self.refresh_runtime_context_view();
         Ok(())
     }
 
@@ -1324,6 +1363,7 @@ impl ExtensionEngine {
         self.execution_targets
             .revoke_instance(&concrete_instance_id);
         ext.state = ExtensionState::Stopped;
+        self.refresh_runtime_context_view();
 
         if stop_failures.is_empty() {
             Ok(())
@@ -1432,6 +1472,7 @@ impl ExtensionEngine {
             .entry(scope_id.clone())
             .or_default()
             .insert(contract.clone(), provider.clone());
+        self.refresh_runtime_context_view();
     }
 
     /// Selects a currently registered preferred provider inside one exact runtime scope.
@@ -1477,6 +1518,7 @@ impl ExtensionEngine {
                 self.preferred_contract_providers.remove(scope_id);
             }
         }
+        self.refresh_runtime_context_view();
     }
 
     /// Removes every preferred-provider selection in one exact runtime scope.
@@ -1488,6 +1530,7 @@ impl ExtensionEngine {
         scope_id: &RuntimeScopeId,
     ) {
         self.preferred_contract_providers.remove(scope_id);
+        self.refresh_runtime_context_view();
     }
 
     /// Executes one cooperative runtime pump across every active component.
@@ -1652,6 +1695,45 @@ impl ExtensionEngine {
             &active_instances,
             &definition_dependencies,
         )?)
+    }
+
+    fn refresh_runtime_context_view(&self) {
+        let mut scopes: HashMap<RuntimeScopeId, ScopeSelection> = self
+            .platform_contract_definitions
+            .iter()
+            .map(|(scope, definitions)| {
+                (
+                    scope.clone(),
+                    ScopeSelection {
+                        definitions: definitions.clone(),
+                        ..ScopeSelection::default()
+                    },
+                )
+            })
+            .collect();
+        for extension in self
+            .extensions
+            .values()
+            .filter(|extension| extension.state == ExtensionState::Active)
+        {
+            let scope = scopes.entry(extension.scope_id.clone()).or_default();
+            for owned in &extension.contract_definitions {
+                scope
+                    .definitions
+                    .insert(owned.definition.contract.clone(), owned.definition.clone());
+            }
+            scope
+                .providers
+                .extend(extension.contract_providers.iter().cloned());
+        }
+        for (scope, selection) in &mut scopes {
+            selection.preferred = self
+                .preferred_contract_providers
+                .get(scope)
+                .cloned()
+                .unwrap_or_default();
+        }
+        self.transport.contexts.replace_selection(scopes);
     }
 
     /// Resolves active contract composition in the default runtime scope.

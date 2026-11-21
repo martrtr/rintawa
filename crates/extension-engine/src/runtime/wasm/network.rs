@@ -31,6 +31,7 @@ pub(super) enum NetworkHandleKind {
 
 pub(super) struct OwnedNetworkHandle {
     pub(super) owner: ComponentRef,
+    activation: u64,
     pub(super) kind: NetworkHandleKind,
 }
 
@@ -54,8 +55,20 @@ impl WasmHostState {
             .next_network_handle
             .checked_add(1)
             .ok_or(NetworkError::Unavailable)?;
-        self.network_handles
-            .insert(handle, OwnedNetworkHandle { owner, kind });
+        let activation = self
+            .execution_context
+            .as_ref()
+            .ok_or(NetworkError::PermissionDenied)?
+            .principal
+            .activation;
+        self.network_handles.insert(
+            handle,
+            OwnedNetworkHandle {
+                owner,
+                activation,
+                kind,
+            },
+        );
         Ok(handle)
     }
 }
@@ -140,7 +153,13 @@ impl NetworkHost for WasmHostState {
             let Some(resource) = self.network_handles.get(&listener) else {
                 return Err(NetworkError::UnknownHandle);
             };
-            if resource.owner != owner {
+            if resource.owner != owner
+                || Some(resource.activation)
+                    != self
+                        .execution_context
+                        .as_ref()
+                        .map(|context| context.principal.activation)
+            {
                 return Err(NetworkError::UnknownHandle);
             }
             let NetworkHandleKind::Listener(listener) = &resource.kind else {
@@ -177,7 +196,13 @@ impl NetworkHost for WasmHostState {
         let Some(resource) = self.network_handles.get_mut(&socket) else {
             return Err(NetworkError::UnknownHandle);
         };
-        if resource.owner != owner {
+        if resource.owner != owner
+            || Some(resource.activation)
+                != self
+                    .execution_context
+                    .as_ref()
+                    .map(|context| context.principal.activation)
+        {
             return Err(NetworkError::UnknownHandle);
         }
         let NetworkHandleKind::Stream(stream) = &mut resource.kind else {
@@ -218,7 +243,13 @@ impl NetworkHost for WasmHostState {
         let Some(resource) = self.network_handles.get_mut(&socket) else {
             return Err(NetworkError::UnknownHandle);
         };
-        if resource.owner != owner {
+        if resource.owner != owner
+            || Some(resource.activation)
+                != self
+                    .execution_context
+                    .as_ref()
+                    .map(|context| context.principal.activation)
+        {
             return Err(NetworkError::UnknownHandle);
         }
         let NetworkHandleKind::Stream(stream) = &mut resource.kind else {
@@ -242,7 +273,13 @@ impl NetworkHost for WasmHostState {
         let Some(resource) = self.network_handles.get(&handle) else {
             return Err(NetworkError::UnknownHandle);
         };
-        if resource.owner != owner {
+        if resource.owner != owner
+            || Some(resource.activation)
+                != self
+                    .execution_context
+                    .as_ref()
+                    .map(|context| context.principal.activation)
+        {
             return Err(NetworkError::UnknownHandle);
         }
         self.network_handles.remove(&handle);

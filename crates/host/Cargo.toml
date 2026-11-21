@@ -26,4 +26,5 @@ rintawa-world = { path = "../world" }
 rintawa-world-runtime = { path = "../world-runtime" }
 
 [dev-dependencies]
+zenoh = { version = "=1.10.2", default-features = false }
 anyhow.workspace = true

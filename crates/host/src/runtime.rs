@@ -1965,6 +1965,19 @@ fn bootstrap_batch_error(
 
 #[cfg(test)]
 mod tests {
+    fn test_principal(
+        engine: &rintawa_extension_engine::ExtensionEngine,
+        owner: &rintawa_sdk::contracts::ComponentRef,
+    ) -> rintawa_sdk::contracts::ComponentPrincipal {
+        engine
+            .active_component_principal(owner)
+            .unwrap_or_else(|_| rintawa_sdk::contracts::ComponentPrincipal {
+                instance_id: owner.instance_id.clone(),
+                component_id: owner.component_id.clone(),
+                activation: 0,
+            })
+    }
+
     use super::*;
     use rintawa_sdk::{
         context::RegistrationContext,
@@ -2345,6 +2358,210 @@ mod tests {
     }
 
     #[test]
+    fn test_should_enforce_domain_caller_rules_on_all_entries_and_rollback_a_denied_second_action()
+    -> anyhow::Result<()> {
+        use rintawa_sdk::contracts::ComponentPrincipal;
+        use rintawa_world_runtime::{SystemError, WorldRuntimeClient};
+        use zenoh::Wait;
+        struct RestrictedMove {
+            command: SchemaKey,
+            property: SchemaKey,
+            allowed: ComponentPrincipal,
+            item: ItemId,
+        }
+        impl WorldSystem for RestrictedMove {
+            fn command_schema(&self) -> &SchemaKey {
+                &self.command
+            }
+            fn evaluate(
+                &self,
+                _: &WorldSnapshot,
+                command: &WorldCommand,
+            ) -> SystemResult<WorldTransaction> {
+                let caller: ComponentPrincipal =
+                    serde_json::from_value(command.payload()["caller"].clone())
+                        .map_err(|error| SystemError::Failed(error.to_string()))?;
+                let items: Vec<ItemId> = serde_json::from_value(command.payload()["items"].clone())
+                    .map_err(|error| SystemError::Failed(error.to_string()))?;
+                let marker: ItemId = serde_json::from_value(command.payload()["marker"].clone())
+                    .map_err(|error| SystemError::Failed(error.to_string()))?;
+                let mut transaction = WorldTransaction::new();
+                transaction.push_change(StateChange::CreateObject { id: marker });
+                for item in items {
+                    if caller != self.allowed || item != self.item {
+                        return Err(SystemError::Rejected(String::from(
+                            "caller cannot move this item",
+                        )));
+                    }
+                    transaction.push_change(StateChange::SetProperty {
+                        item,
+                        key: self.property.clone(),
+                        data: command.payload()["value"].clone(),
+                    });
+                }
+                Ok(transaction)
+            }
+        }
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let world = home.create_world()?.id;
+        let scope = world_runtime_scope_id(world);
+        let storage = home.open_world_storage(world)?;
+        let x = ItemId::new();
+        let y = ItemId::new();
+        let property: SchemaKey = "fixture.position@1".parse()?;
+        let command: SchemaKey = "fixture.move@1".parse()?;
+        let definition = PropertyDefinition::new(
+            property.clone(),
+            ExtensionId::new("domain.owner"),
+            serde_json::json!({"type":"integer"}),
+        );
+        storage.register_definition(&definition)?;
+        let mut seed = WorldTransaction::new();
+        for id in [x, y] {
+            seed.push_change(StateChange::CreateObject { id });
+            seed.push_change(StateChange::SetProperty {
+                item: id,
+                key: property.clone(),
+                data: serde_json::json!(0),
+            });
+        }
+        storage.apply(&seed)?;
+        let mut engine = ExtensionEngine::new();
+        let owner = ComponentRef::new("domain", "runtime");
+        for (point, selected) in [
+            ("chat/send-controls/v1", ComponentRef::new("a", "runtime")),
+            ("fixture/caller", ComponentRef::new("b", "runtime")),
+            ("fixture/move", owner.clone()),
+            ("fixture/move-alternate", owner.clone()),
+        ] {
+            engine.set_authoritative_transport_provider_in_scope(&scope, point, &selected)?;
+        }
+        for instance in ["a", "b"] {
+            let component = engine.wasm_runtime_engine()?.load_component_from_bytes(
+                ComponentId::new("runtime"),
+                include_bytes!("../../extension-engine/tests/fixtures/transport/provider.wasm"),
+            )?;
+            engine.register_extension_instance(
+                ExtensionInstanceId::new(instance),
+                scope.clone(),
+                test_manifest("same.logical.client"),
+                vec![Box::new(component)],
+            )?;
+            engine.start_extension_instance(&ExtensionInstanceId::new(instance))?;
+        }
+        engine.register_extension_instance(
+            owner.instance_id.clone(),
+            scope,
+            test_manifest("domain.owner"),
+            vec![Box::new(WorldSchemaComponent {
+                id: owner.component_id.clone(),
+                schemas: Vec::new(),
+            })],
+        )?;
+        engine.start_extension_instance(&owner.instance_id)?;
+        let allowed = engine.active_component_principal(&ComponentRef::new("a", "runtime"))?;
+        let domain = engine.active_component_principal(&owner)?;
+        let mut builder = WorldRuntimeBuilder::new(storage);
+        builder.register_runtime_schema(
+            owner.instance_id.clone(),
+            RuntimeSchemaDefinition::new(
+                command.clone(),
+                SchemaKind::Command,
+                ExtensionId::new("domain.owner"),
+                serde_json::json!({"type":"object"}),
+            ),
+        )?;
+        builder.register_system(RestrictedMove {
+            command: command.clone(),
+            property: property.clone(),
+            allowed: allowed.clone(),
+            item: x,
+        })?;
+        let runtime = builder.start()?;
+        runtime.register_property_definitions(&[(owner.instance_id.clone(), definition)])?;
+        for point in ["fixture/move", "fixture/move-alternate"] {
+            let client: WorldRuntimeClient = runtime.client();
+            let schema = command.clone();
+            engine.declare_transport_contribution(&domain, point, move |query, caller| {
+                let bytes = query.payload().expect("domain payload").to_bytes();
+                let mut payload: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("domain JSON");
+                // Domain entry owns the attestation; a claimed caller is overwritten.
+                payload["caller"] = serde_json::to_value(caller).expect("attested caller");
+                let committed = client
+                    .submit(WorldCommand::system(schema.clone(), payload))
+                    .and_then(|ticket| ticket.wait())
+                    .is_ok();
+                query
+                    .reply(
+                        query.key_expr().as_str(),
+                        if committed {
+                            b"ok".to_vec()
+                        } else {
+                            b"denied".to_vec()
+                        },
+                    )
+                    .wait()
+                    .expect("domain result");
+            })?;
+        }
+        for (frontend, items, value, expected) in [
+            ("chat/send-controls/v1", vec![x], 7, "ok"),
+            ("chat/send-controls/v1", vec![y], 8, "denied"),
+            ("fixture/caller", vec![x], 8, "denied"),
+            ("chat/send-controls/v1", vec![x, y], 9, "denied"),
+        ] {
+            for endpoint in ["fixture/move", "fixture/move-alternate"] {
+                let marker = ItemId::new();
+                let request = serde_json::json!({"caller":allowed,"items":items,"marker":marker,"value":value});
+                let payload = format!("forward:{endpoint}\n{request}");
+                assert_eq!(
+                    engine.query_transport_contributions(&domain, frontend, payload.as_bytes())?,
+                    vec![expected.as_bytes().to_vec()]
+                );
+                assert_eq!(
+                    runtime.snapshot()?.load_item(marker)?.is_some(),
+                    expected == "ok"
+                );
+            }
+        }
+        assert_eq!(
+            runtime
+                .snapshot()?
+                .load_property(x, &property)?
+                .expect("X")
+                .data(),
+            &serde_json::json!(7)
+        );
+        assert_eq!(
+            runtime
+                .snapshot()?
+                .load_property(y, &property)?
+                .expect("Y")
+                .data(),
+            &serde_json::json!(0)
+        );
+        engine.stop_extension_instance(&allowed.instance_id)?;
+        engine.start_extension_instance(&allowed.instance_id)?;
+        let request =
+            serde_json::json!({"caller":allowed,"items":[x],"marker":ItemId::new(),"value":99});
+        assert_eq!(
+            engine.query_transport_contributions(
+                &domain,
+                "chat/send-controls/v1",
+                format!("forward:fixture/move\n{request}").as_bytes()
+            )?,
+            vec![b"denied".to_vec()]
+        );
+        runtime.shutdown()?;
+        for instance in ["a", "b", "domain"] {
+            engine.stop_extension_instance(&ExtensionInstanceId::new(instance))?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_should_isolate_same_id_wasm_property_readers_and_rebuild_bindings() -> anyhow::Result<()>
     {
         const READER: &[u8] =
@@ -2426,9 +2643,11 @@ mod tests {
         let point = "chat/send-controls/v1";
         let request = format!("world-property:{item}");
         let caller = ComponentRef::new(owner.clone(), "reader");
-        let replies =
-            host.engine
-                .query_transport_contributions(&caller, point, request.as_bytes())?;
+        let replies = host.engine.query_transport_contributions(
+            &test_principal(&host.engine, &caller),
+            point,
+            request.as_bytes(),
+        )?;
         assert_eq!(replies.len(), 2);
         assert_eq!(
             replies
@@ -2445,14 +2664,19 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(value)?["data"],
             73
         );
-        let mut pages = host
-            .engine
-            .query_transport_contributions(&caller, point, b"world-find")?;
+        let mut pages = host.engine.query_transport_contributions(
+            &test_principal(&host.engine, &caller),
+            point,
+            b"world-find",
+        )?;
         pages.sort();
         assert_eq!(pages, vec![b"denied".to_vec(), b"found:1".to_vec()]);
         assert_eq!(
             host.engine.query_transport_contributions(
-                &ComponentRef::new(foreign_world.clone(), "reader"),
+                &test_principal(
+                    &host.engine,
+                    &ComponentRef::new(foreign_world.clone(), "reader")
+                ),
                 point,
                 request.as_bytes()
             )?,
@@ -2471,8 +2695,11 @@ mod tests {
             restarted.command_owners,
         )?;
         assert_eq!(
-            host.engine
-                .query_transport_contributions(&caller, point, request.as_bytes())?,
+            host.engine.query_transport_contributions(
+                &test_principal(&host.engine, &caller),
+                point,
+                request.as_bytes()
+            )?,
             vec![b"denied".to_vec(); 2]
         );
         restarted.runtime.shutdown()?;

@@ -22,13 +22,25 @@ cascade effects in transaction order before COMMIT. Command admission remains
 bound to the exact declaring component. Logical package IDs remain schema metadata;
 no SQLite schema or WIT change is needed for this part.
 
-Evidence: [property authority regressions](../../crates/world-runtime/tests/property_authority_test.rs)
-and the real-WASM reader/World-reopen test in [Host runtime tests](../../crates/host/src/runtime.rs).
-The transport fixture was rebuilt from its Rust source and current WIT.
-`bash scripts/check.sh` passed, including workspace tests, clippy, SDK WASM check,
-rustdoc and secret/style checks; loopback integration tests required execution
-outside the restricted sandbox. D6/B1–B3 and the remaining implementation slices
-are pending; this result is not product or release acceptance.
+P05/D6 is implemented in the incompatible `rintawa:engine@0.0.2` ABI.
+Queries carry the immediate caller's Host-attested activation outside payload bytes;
+ordinary and hosted callbacks use their bound scope. Hosted tasks retain that
+context, and stop/trap/drop revoke admission and owned resources. Generic
+`selected-providers` reads the existing resolver's active selection without
+re-entering the Engine. Native transport wrappers take `ComponentPrincipal`;
+`active_component_principal` obtains the current admitted activation. Retained
+principals and subscription/upload/task handles do not authorize a new activation.
+Hosted callback declarations and World-data remain unavailable. D8 is not implemented.
+
+Evidence: [property authority regressions](../../crates/world-runtime/tests/property_authority_test.rs),
+[real WASM caller/selection tests](../../crates/extension-engine/tests/wasm_transport_test.rs),
+[hosted two-World/Store failure probe](../../crates/extension-engine/tests/artifact_loader_test.rs),
+and [domain authorization/atomicity tests](../../crates/host/src/runtime.rs).
+Fixtures were rebuilt from Rust sources and current WIT. `bash scripts/check.sh`
+passed, including workspace tests, clippy, SDK WASM check, rustdoc and secret/style
+checks; loopback integration tests ran outside the restricted sandbox.
+P05 is complete. P06 and later implementation slices remain pending; these checks
+are not product or release acceptance.
 
 ## Goal and required scenarios
 
@@ -124,12 +136,11 @@ This is coarse admission of approved packages, not a multi-user authorization
 model. Protecting item existence against every other admitted System requires
 an explicit additional decision.
 
-Other extensions obtain domain data through the owner's published API. The
-current transport does not supply authenticated caller identity to providers;
-active components in a scope can call its points. D6 now proposes attested callers
-and domain-owner checks for restricted methods. Until implemented, these points
-are public within their World. Never implement per-caller ACL from a claimed
-`owner` in JSON. Component identity does not authenticate a human browser user.
+Other extensions obtain domain data through the owner's published API. D6 now
+supplies the authenticated immediate component caller to query providers. The
+trusted owner enforces its per-caller/item rules at every mutation entry; Core
+does not infer them from JSON claims or provide an item ACL. Component identity
+does not authenticate a human browser user.
 
 ## D2. One guest command completion model
 

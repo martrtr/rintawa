@@ -13,10 +13,12 @@ use std::{
 };
 
 use rintawa_sdk::{
-    contracts::ComponentRef,
+    contracts::{ComponentPrincipal, ComponentRef},
     types::{ExtensionInstanceId, RuntimeScopeId},
 };
 use thiserror::Error;
+
+use crate::execution_context::{ExecutionContext, ExecutionContexts};
 use zenoh::{
     Config, Session, Wait,
     handlers::{RingChannel, RingChannelHandler},
@@ -82,7 +84,7 @@ struct OwnedQueryable {
 }
 
 struct OwnedSubscription {
-    owner: ComponentRef,
+    owner: ComponentPrincipal,
     handle: u64,
     subscriber: Subscriber<RingChannelHandler<Sample>>,
 }
@@ -95,6 +97,7 @@ struct OwnedSubscription {
 pub(crate) struct Transport {
     state: Arc<Mutex<State>>,
     active_callbacks: Arc<AtomicUsize>,
+    pub(crate) contexts: ExecutionContexts,
 }
 
 /// One bounded callback slot, released even when trusted native code panics.
@@ -231,9 +234,14 @@ impl Transport {
         callback: F,
     ) -> Result<(), TransportError>
     where
-        F: Fn(Query) + Send + Sync + 'static,
+        F: Fn(Query, ComponentPrincipal) + Send + Sync + 'static,
     {
         let key = scoped_key(scope, point)?;
+        let executing = self.contexts.context(owner, true)?;
+        if executing.scope != *scope {
+            return Err(TransportError::Inactive);
+        }
+        let contexts = self.contexts.clone();
         let mut state = self.state.lock().map_err(|_| TransportError::Unavailable)?;
         if let Some(selected) = state.authoritative.get(&(scope.clone(), point.to_string()))
             && selected != owner
@@ -274,14 +282,41 @@ impl Transport {
                     let _ = query.reply_err(b"provider busy".to_vec()).wait();
                     return;
                 }
+                let caller = query.attachment().and_then(|attachment| {
+                    let bytes = attachment.to_bytes();
+                    if bytes.len() > 1024 * 1024 {
+                        return None;
+                    }
+                    serde_json::from_slice::<ComponentPrincipal>(&bytes).ok()
+                });
+                let Some(caller) = caller else {
+                    let _ = query.reply_err(b"missing caller".to_vec()).wait();
+                    active_callbacks.fetch_sub(1, Ordering::AcqRel);
+                    return;
+                };
                 let permit = CallbackPermit(Arc::clone(&active_callbacks));
+                let contexts = contexts.clone();
+                let executing = executing.clone();
                 let callback = Arc::clone(&callback);
                 if let Err(error) = std::thread::Builder::new()
                     .name(String::from("rintawa-zenoh-callback"))
                     .stack_size(512 * 1024)
                     .spawn(move || {
                         let _permit = permit;
-                        callback(query);
+                        let valid =
+                            contexts
+                                .context(&caller.component(), false)
+                                .is_ok_and(|context| {
+                                    context.principal == caller && context.scope == executing.scope
+                                })
+                                && contexts.validate(&executing).is_ok();
+                        if valid {
+                            callback(query, caller);
+                        } else {
+                            let _ = query
+                                .reply_err(b"inactive caller or provider".to_vec())
+                                .wait();
+                        }
                     })
                 {
                     // Thread creation failure must not leak a callback slot.
@@ -300,10 +335,12 @@ impl Transport {
 
     pub(crate) fn query(
         &self,
-        scope: &RuntimeScopeId,
+        executing: &ExecutionContext,
         point: &str,
         payload: &[u8],
     ) -> Result<Vec<Vec<u8>>, TransportError> {
+        self.contexts.validate(executing)?;
+        let scope = &executing.scope;
         let key = scoped_key(scope, point)?;
         if payload.len() > MAX_PAYLOAD_BYTES {
             return Err(TransportError::LimitExceeded);
@@ -322,6 +359,10 @@ impl Transport {
         let replies = zenoh
             .get(key)
             .payload(payload.to_vec())
+            .attachment(
+                serde_json::to_vec(&executing.principal)
+                    .map_err(|_| TransportError::Unavailable)?,
+            )
             .target(QueryTarget::All)
             .consolidation(ConsolidationMode::None)
             .timeout(QUERY_TIMEOUT)
@@ -386,7 +427,7 @@ impl Transport {
 
     pub(crate) fn subscribe(
         &self,
-        owner: &ComponentRef,
+        owner: &ComponentPrincipal,
         scope: &RuntimeScopeId,
         point: &str,
     ) -> Result<u64, TransportError> {
@@ -422,7 +463,7 @@ impl Transport {
 
     pub(crate) fn poll(
         &self,
-        owner: &ComponentRef,
+        owner: &ComponentPrincipal,
         handle: u64,
     ) -> Result<Vec<Vec<u8>>, TransportError> {
         let state = self.state.lock().map_err(|_| TransportError::Unavailable)?;
@@ -453,7 +494,7 @@ impl Transport {
 
     pub(crate) fn unsubscribe(
         &self,
-        owner: &ComponentRef,
+        owner: &ComponentPrincipal,
         handle: u64,
     ) -> Result<(), TransportError> {
         let subscription = {
@@ -475,6 +516,7 @@ impl Transport {
     }
 
     pub(crate) fn revoke_instance(&self, instance: &ExtensionInstanceId) {
+        let revoked = self.contexts.revoke_instance(instance);
         let removed = {
             let mut state = match self.state.lock() {
                 Ok(state) => state,
@@ -486,7 +528,9 @@ impl Transport {
             let mut kept = Vec::new();
             let mut removed = Vec::new();
             for declaration in std::mem::take(&mut state.queryables) {
-                if &declaration.owner.instance_id == instance {
+                if &declaration.owner.instance_id == instance
+                    || revoked.contains(&declaration.owner)
+                {
                     removed.push(declaration.declaration);
                 } else {
                     kept.push(declaration);
@@ -496,7 +540,9 @@ impl Transport {
             let mut kept_subscriptions = Vec::new();
             let mut removed_subscriptions = Vec::new();
             for subscription in std::mem::take(&mut state.subscriptions) {
-                if &subscription.owner.instance_id == instance {
+                if &subscription.owner.instance_id == instance
+                    || revoked.contains(&subscription.owner.component())
+                {
                     removed_subscriptions.push(subscription.subscriber);
                 } else {
                     kept_subscriptions.push(subscription);
@@ -526,6 +572,113 @@ mod tests {
         ComponentRef::new(instance, "component")
     }
 
+    fn admit(
+        transport: &Transport,
+        owner: &ComponentRef,
+        scope: &RuntimeScopeId,
+    ) -> Result<ExecutionContext, TransportError> {
+        if let Ok(context) = transport.contexts.context(owner, false) {
+            return Ok(context);
+        }
+        transport.contexts.begin(owner.clone(), scope.clone())?;
+        transport.contexts.activate_instance(&owner.instance_id);
+        transport.contexts.context(owner, false)
+    }
+    fn principal(transport: &Transport, owner: &ComponentRef) -> ComponentPrincipal {
+        transport
+            .contexts
+            .context(owner, false)
+            .map(|context| context.principal)
+            .unwrap_or_else(|_| ComponentPrincipal {
+                instance_id: owner.instance_id.clone(),
+                component_id: owner.component_id.clone(),
+                activation: 0,
+            })
+    }
+    fn declare<F>(
+        transport: &Transport,
+        owner: &ComponentRef,
+        scope: &RuntimeScopeId,
+        point: &str,
+        callback: F,
+    ) -> Result<(), TransportError>
+    where
+        F: Fn(Query, ComponentPrincipal) + Send + Sync + 'static,
+    {
+        transport.check_declaration(owner, scope, point)?;
+        admit(transport, owner, scope)?;
+        transport.declare(owner, scope, point, callback)
+    }
+    fn query(
+        transport: &Transport,
+        scope: &RuntimeScopeId,
+        point: &str,
+        payload: &[u8],
+    ) -> Result<Vec<Vec<u8>>, TransportError> {
+        let context = admit(transport, &owner(&format!("test-caller:{}", scope)), scope)?;
+        transport.query(&context, point, payload)
+    }
+    fn subscribe(
+        transport: &Transport,
+        owner: &ComponentRef,
+        scope: &RuntimeScopeId,
+        point: &str,
+    ) -> Result<u64, TransportError> {
+        let context = admit(transport, owner, scope)?;
+        transport.subscribe(&context.principal, scope, point)
+    }
+
+    #[test]
+    fn test_should_reject_missing_foreign_and_stale_caller_metadata_before_dispatch()
+    -> Result<(), TransportError> {
+        let transport = Transport::default();
+        let scope = RuntimeScopeId::new("world-a");
+        let point = "fixture/attestation";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        declare(
+            &transport,
+            &owner("provider"),
+            &scope,
+            point,
+            move |query, _caller| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                let _ = query
+                    .reply(query.key_expr().as_str(), b"ok".to_vec())
+                    .wait();
+            },
+        )?;
+        let caller = admit(&transport, &owner("caller"), &scope)?;
+        let foreign = admit(
+            &transport,
+            &owner("foreign"),
+            &RuntimeScopeId::new("world-b"),
+        )?;
+        let mut stale = caller.principal.clone();
+        stale.activation += 1;
+        let zenoh = {
+            let mut state = transport
+                .state
+                .lock()
+                .map_err(|_| TransportError::Unavailable)?;
+            session(&mut state)?
+        };
+        for metadata in [None, Some(serde_json::to_vec(&foreign.principal).expect("foreign metadata")), Some(serde_json::to_vec(&stale).expect("stale metadata")), Some(br#"{"instance_id":"caller","component_id":"component","activation":0,"scope":"world-a"}"#.to_vec())] {
+            let request = zenoh.get(scoped_key(&scope, point)?).payload(b"claim-caller".to_vec()).timeout(QUERY_TIMEOUT);
+            let replies = match metadata { Some(bytes) => request.attachment(bytes).wait(), None => request.wait() }.map_err(|_| TransportError::Unavailable)?;
+            let replies: Vec<_> = replies.into_iter().collect();
+            assert_eq!(replies.len(), 1);
+            assert!(replies[0].result().is_err());
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            transport.query(&caller, point, b"valid")?,
+            vec![b"ok".to_vec()]
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
     #[test]
     fn test_should_isolate_scopes_and_drop_instance_declarations() -> Result<(), TransportError> {
         let transport = Transport::default();
@@ -534,31 +687,43 @@ mod tests {
         let instance_a = owner("one");
         let instance_b = owner("two");
         let point = "chat/send-controls/v1";
-        transport.declare(&instance_a, &scope_a, point, |query| {
-            let _ = query
-                .reply(query.key_expr().as_str(), b"dice".to_vec())
-                .wait();
-        })?;
-        transport.declare(&instance_b, &scope_a, point, |query| {
-            let _ = query
-                .reply(query.key_expr().as_str(), b"emoji".to_vec())
-                .wait();
-        })?;
-        let mut replies = transport.query(&scope_a, point, b"render")?;
+        declare(
+            &transport,
+            &instance_a,
+            &scope_a,
+            point,
+            |query, _caller| {
+                let _ = query
+                    .reply(query.key_expr().as_str(), b"dice".to_vec())
+                    .wait();
+            },
+        )?;
+        declare(
+            &transport,
+            &instance_b,
+            &scope_a,
+            point,
+            |query, _caller| {
+                let _ = query
+                    .reply(query.key_expr().as_str(), b"emoji".to_vec())
+                    .wait();
+            },
+        )?;
+        let mut replies = query(&transport, &scope_a, point, b"render")?;
         replies.sort();
         assert_eq!(replies, vec![b"dice".to_vec(), b"emoji".to_vec()]);
-        assert!(transport.query(&scope_b, point, b"render")?.is_empty());
+        assert!(query(&transport, &scope_b, point, b"render")?.is_empty());
         assert!(matches!(
-            transport.declare(&instance_a, &scope_a, point, |_| {}),
+            declare(&transport, &instance_a, &scope_a, point, |_, _| {}),
             Err(TransportError::Duplicate)
         ));
         transport.revoke_instance(&instance_a.instance_id);
         assert_eq!(
-            transport.query(&scope_a, point, b"render")?,
+            query(&transport, &scope_a, point, b"render")?,
             vec![b"emoji".to_vec()]
         );
         transport.revoke_instance(&instance_b.instance_id);
-        assert!(transport.query(&scope_a, point, b"render")?.is_empty());
+        assert!(query(&transport, &scope_a, point, b"render")?.is_empty());
         Ok(())
     }
 
@@ -571,19 +736,19 @@ mod tests {
         let fast = owner("fast");
         let point = "ui/panels/v1";
 
-        transport.declare(&slow, &scope, point, |query| {
+        declare(&transport, &slow, &scope, point, |query, _caller| {
             std::thread::sleep(QUERY_TIMEOUT + Duration::from_millis(250));
             let _ = query
                 .reply(query.key_expr().as_str(), b"late".to_vec())
                 .wait();
         })?;
-        transport.declare(&fast, &scope, point, |query| {
+        declare(&transport, &fast, &scope, point, |query, _caller| {
             let _ = query
                 .reply(query.key_expr().as_str(), b"ready".to_vec())
                 .wait();
         })?;
         let started = std::time::Instant::now();
-        let replies = transport.query(&scope, point, b"render")?;
+        let replies = query(&transport, &scope, point, b"render")?;
         let elapsed = started.elapsed();
         assert_eq!(replies, vec![b"ready".to_vec()]);
         assert!(
@@ -602,14 +767,14 @@ mod tests {
         let start = std::time::Instant::now();
         for _ in 0..samples {
             assert_eq!(
-                transport.query(&scope, point, b"render")?,
+                query(&transport, &scope, point, b"render")?,
                 vec![b"ready".to_vec()]
             );
         }
         let avg = start.elapsed() / samples;
         println!("local Zenoh single-provider reply: {avg:?} mean over {samples} queries");
         transport.revoke_instance(&fast.instance_id);
-        assert!(transport.query(&scope, point, b"render")?.is_empty());
+        assert!(query(&transport, &scope, point, b"render")?.is_empty());
         Ok(())
     }
 
@@ -630,7 +795,7 @@ mod tests {
             Err(TransportError::NotSelected)
         ));
         assert!(matches!(
-            transport.declare(&other, &host, point, |_| {}),
+            declare(&transport, &other, &host, point, |_, _| {}),
             Err(TransportError::NotSelected)
         ));
         assert!(matches!(
@@ -638,26 +803,26 @@ mod tests {
             Err(TransportError::NotSelected)
         ));
         assert!(matches!(
-            transport.query(&host, point, b"hello"),
+            query(&transport, &host, point, b"hello"),
             Err(TransportError::Unavailable)
         ));
 
-        transport.declare(&selected, &host, point, |query| {
+        declare(&transport, &selected, &host, point, |query, _caller| {
             let _ = query
                 .reply(query.key_expr().as_str(), b"host".to_vec())
                 .wait();
         })?;
-        transport.declare(&other, &world, point, |query| {
+        declare(&transport, &other, &world, point, |query, _caller| {
             let _ = query
                 .reply(query.key_expr().as_str(), b"world".to_vec())
                 .wait();
         })?;
         assert_eq!(
-            transport.query(&host, point, b"hello")?,
+            query(&transport, &host, point, b"hello")?,
             vec![b"host".to_vec()]
         );
         assert_eq!(
-            transport.query(&world, point, b"hello")?,
+            query(&transport, &world, point, b"hello")?,
             vec![b"world".to_vec()]
         );
 
@@ -667,26 +832,27 @@ mod tests {
         ));
         transport.revoke_instance(&selected.instance_id);
         assert!(matches!(
-            transport.query(&host, point, b"hello"),
+            query(&transport, &host, point, b"hello"),
             Err(TransportError::Unavailable)
         ));
         assert!(matches!(
-            transport.declare(&other, &host, point, |_| {}),
+            declare(&transport, &other, &host, point, |_, _| {}),
             Err(TransportError::NotSelected)
         ));
         assert_eq!(
-            transport.query(&world, point, b"hello")?,
+            query(&transport, &world, point, b"hello")?,
             vec![b"world".to_vec()]
         );
 
         transport.clear_authoritative_in_scope(&host);
-        transport.declare(&other, &host, point, |query| {
+        let fallback = owner("fallback");
+        declare(&transport, &fallback, &host, point, |query, _caller| {
             let _ = query
                 .reply(query.key_expr().as_str(), b"fallback".to_vec())
                 .wait();
         })?;
         assert_eq!(
-            transport.query(&host, point, b"hello")?,
+            query(&transport, &host, point, b"hello")?,
             vec![b"fallback".to_vec()]
         );
         Ok(())
@@ -701,14 +867,14 @@ mod tests {
         let scope_b = RuntimeScopeId::new("world-b");
         let point = "world/state/changed";
 
-        let handle = transport.subscribe(&owner_a, &scope_a, point)?;
-        let foreign = transport.subscribe(&owner_b, &scope_b, point)?;
+        let handle = subscribe(&transport, &owner_a, &scope_a, point)?;
+        let foreign = subscribe(&transport, &owner_b, &scope_b, point)?;
         assert!(matches!(
-            transport.poll(&owner_b, handle),
+            transport.poll(&principal(&transport, &owner_b), handle),
             Err(TransportError::UnknownSubscription)
         ));
         assert!(matches!(
-            transport.unsubscribe(&owner_b, handle),
+            transport.unsubscribe(&principal(&transport, &owner_b), handle),
             Err(TransportError::UnknownSubscription)
         ));
         assert!(matches!(
@@ -724,29 +890,33 @@ mod tests {
         }
         // The Zenoh ring itself discards the oldest events; Core has no queue.
         std::thread::sleep(Duration::from_millis(50));
-        let mut received = transport.poll(&owner_a, handle)?;
+        let mut received = transport.poll(&principal(&transport, &owner_a), handle)?;
         assert_eq!(received.len(), MAX_EVENTS_PER_POLL);
-        received.extend(transport.poll(&owner_a, handle)?);
+        received.extend(transport.poll(&principal(&transport, &owner_a), handle)?);
         assert_eq!(received.len(), MAX_EVENTS_PER_SUBSCRIPTION);
         assert_eq!(received.first(), Some(&b"04".to_vec()));
         assert_eq!(received.last(), Some(&b"19".to_vec()));
-        assert!(transport.poll(&owner_b, foreign)?.is_empty());
+        assert!(
+            transport
+                .poll(&principal(&transport, &owner_b), foreign)?
+                .is_empty()
+        );
 
         transport.revoke_instance(&owner_a.instance_id);
         assert!(matches!(
-            transport.poll(&owner_a, handle),
+            transport.poll(&principal(&transport, &owner_a), handle),
             Err(TransportError::UnknownSubscription)
         ));
-        let replacement = transport.subscribe(&owner_a, &scope_a, point)?;
+        let replacement = subscribe(&transport, &owner_a, &scope_a, point)?;
         assert_ne!(replacement, handle);
-        transport.unsubscribe(&owner_a, replacement)?;
+        transport.unsubscribe(&principal(&transport, &owner_a), replacement)?;
         assert!(matches!(
-            transport.unsubscribe(&owner_a, replacement),
+            transport.unsubscribe(&principal(&transport, &owner_a), replacement),
             Err(TransportError::UnknownSubscription)
         ));
         transport.revoke_instance(&owner_b.instance_id);
         assert!(matches!(
-            transport.poll(&owner_b, foreign),
+            transport.poll(&principal(&transport, &owner_b), foreign),
             Err(TransportError::UnknownSubscription)
         ));
         Ok(())
@@ -758,12 +928,17 @@ mod tests {
         let scope = RuntimeScopeId::new("world");
         for invalid in ["", "**", "../secret", "chat//controls", "chat/*", "/global"] {
             assert!(matches!(
-                transport.query(&scope, invalid, b"render"),
+                query(&transport, &scope, invalid, b"render"),
                 Err(TransportError::InvalidName)
             ));
         }
         assert!(matches!(
-            transport.query(&scope, "chat/input", &vec![0; MAX_PAYLOAD_BYTES + 1]),
+            query(
+                &transport,
+                &scope,
+                "chat/input",
+                &vec![0; MAX_PAYLOAD_BYTES + 1]
+            ),
             Err(TransportError::LimitExceeded)
         ));
         Ok(())

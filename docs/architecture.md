@@ -279,11 +279,21 @@ protocol. Core does not supply compatibility shims or claim a working Web UI.
 World lifecycle, native authoritative commands, persistent state, CAS and
 permission checks remain independent of presentation.
 
-A replacement interaction transport has **not** been integrated. The proposed
-Zenoh approach is an experiment that must first prove query/reply, publish/
-subscribe, authenticated ownership, World scope isolation, cancellation and
-resource bounds on real native/WASM boundaries. UI formats and component
-contributions will belong to the consuming extensions, not new Core widget DTOs.
+General extension interaction now uses the embedded, network-isolated Zenoh
+transport. In `rintawa:engine@0.0.2`, query handlers receive an attested immediate
+caller with an activation discriminator; app payloads cannot choose it. Native
+wrappers require a live `ComponentPrincipal`. `runtime-context.current` reports
+the executing component's scope/World/principal, including hosted tasks, and
+`selected-providers` reads the existing contract selection policy in that scope.
+Registration, teardown and incomplete activation cannot query or publish.
+
+Hosted subscriptions/uploads/tasks belong to the dependent activation. Stopping
+one dependent revokes its resources; a failed shared provider invalidates all its
+clients. Components in unrelated Stores/Worlds remain usable. Hosted callback
+queryables and World-data are unavailable. The proposed nonblocking D8 transport
+and browser runtime are separate, unfinished slices; no Core UI formats or widget
+DTOs are introduced. Existing `0.0.1` WASM components must be rebuilt against the
+new WIT. See [the accepted contract](specs/mvp-api-and-client-boundaries.md).
 
 ## Standard product composition
 

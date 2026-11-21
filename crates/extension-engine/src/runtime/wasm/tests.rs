@@ -32,6 +32,21 @@ fn test_scope_id() -> RuntimeScopeId {
 
 fn begin_test_registration(state: &mut WasmHostState, extension_id: ExtensionId) {
     state
+        .transport
+        .contexts
+        .begin(
+            rintawa_sdk::contracts::ComponentRef::new(
+                test_instance_id(),
+                state.component_id.clone(),
+            ),
+            test_scope_id(),
+        )
+        .unwrap();
+    state
+        .transport
+        .contexts
+        .activate_instance(&test_instance_id());
+    state
         .begin_registration(extension_id, test_instance_id(), test_scope_id())
         .unwrap();
 }
@@ -1375,6 +1390,18 @@ fn test_should_require_delegated_principal_own_runtime_permissions() {
 
     let dependent_owner =
         rintawa_sdk::contracts::ComponentRef::new("dependent-instance", "hosted-component");
+    state
+        .transport
+        .contexts
+        .begin(
+            dependent_owner.clone(),
+            RuntimeScopeId::new("dependent-world"),
+        )
+        .unwrap();
+    state
+        .transport
+        .contexts
+        .activate_instance(&dependent_owner.instance_id);
     state.begin_delegated_guest_execution(dependent_owner.clone());
     assert!(matches!(
         RuntimeTasksHost::spawn_periodic(&mut state, 10),
@@ -1425,6 +1452,56 @@ fn test_should_not_inherit_world_data_access_in_delegated_execution() {
 
     state.begin_guest_execution();
     assert!(state.world_data_identity().is_ok());
+}
+
+#[test]
+fn test_should_reject_task_and_network_handles_retained_from_an_earlier_activation() {
+    let mut state = WasmHostState::new(ComponentId::new("runtime"));
+    begin_test_registration(&mut state, ExtensionId::new("runtime.provider"));
+    state.finish_registration().unwrap();
+    state.task_handler_available = true;
+    let owner = state.registered_owner().unwrap();
+    for permission in [
+        RuntimePermission::BackgroundTask,
+        RuntimePermission::LoopbackListen,
+    ] {
+        state
+            .runtime_permissions
+            .grant(owner.clone(), permission)
+            .unwrap();
+    }
+    state.begin_guest_execution();
+    let task = RuntimeTasksHost::spawn_periodic(&mut state, 10).unwrap();
+    let listener = NetworkHost::listen_loopback(&mut state, 0).unwrap();
+    state.transport.contexts.revoke_instance(&owner.instance_id);
+    state
+        .transport
+        .contexts
+        .begin(owner.clone(), test_scope_id())
+        .unwrap();
+    state
+        .transport
+        .contexts
+        .activate_instance(&owner.instance_id);
+    state.begin_guest_execution();
+    assert!(matches!(
+        RuntimeTasksHost::cancel(&mut state, task),
+        Err(RuntimeTaskError::UnknownTask)
+    ));
+    assert!(matches!(
+        NetworkHost::accept(&mut state, listener.handle),
+        Err(NetworkError::UnknownHandle)
+    ));
+    assert!(matches!(
+        NetworkHost::close(&mut state, listener.handle),
+        Err(NetworkError::UnknownHandle)
+    ));
+    state.revoke_runtime_resources_for_owner(&owner);
+    assert!(state.active_tasks.is_empty());
+    assert!(state.network_handles.is_empty());
+    let fresh = RuntimeTasksHost::spawn_periodic(&mut state, 10).unwrap();
+    assert_ne!(task, fresh);
+    RuntimeTasksHost::cancel(&mut state, fresh).unwrap();
 }
 
 #[test]
@@ -1598,9 +1675,30 @@ fn test_should_revoke_delegated_resources_when_provider_lock_is_poisoned() {
         let instance = component
             .ensure_instance(&mut runtime)
             .expect("ordinary test component should instantiate");
+        instance
+            .store
+            .data()
+            .transport
+            .contexts
+            .begin(owner.clone(), test_scope_id())
+            .unwrap();
+        instance
+            .store
+            .data()
+            .transport
+            .contexts
+            .activate_instance(&owner.instance_id);
+        let task_context = instance
+            .store
+            .data()
+            .transport
+            .contexts
+            .context(&owner, false)
+            .expect("test context");
         instance.store.data_mut().active_tasks.insert(
             7,
             ActiveWasmTask {
+                context: task_context,
                 owner: owner.clone(),
                 interval: Duration::from_millis(10),
                 next_due: Instant::now(),

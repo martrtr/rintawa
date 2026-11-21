@@ -94,6 +94,28 @@ impl ComponentRef {
     }
 }
 
+/// Host-attested identity of one component activation.
+///
+/// Activation is nonzero and never reused within a Host process. It is a
+/// discriminator, not a secret or authority issued by application payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComponentPrincipal {
+    /// Exact installed runtime instance.
+    pub instance_id: ExtensionInstanceId,
+    /// Component within that instance.
+    pub component_id: ComponentId,
+    /// Host-generated activation discriminator.
+    pub activation: u64,
+}
+
+impl ComponentPrincipal {
+    /// Returns the component reference without its activation lifetime.
+    pub fn component(&self) -> ComponentRef {
+        ComponentRef::new(self.instance_id.clone(), self.component_id.clone())
+    }
+}
+
 /// Determines how providers of one contract are composed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
