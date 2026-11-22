@@ -2358,3 +2358,135 @@ fn test_asset_readers_check_permissions_before_io_and_isolate_shared_store_conte
     assert!(state.asset_readers.is_empty());
     Ok(())
 }
+
+#[test]
+fn test_blocking_import_allowance_is_shared_charges_errors_and_resets_on_callback() {
+    let mut state = WasmHostState::new(ComponentId::new("budget"));
+    state.blocking_import_remaining = Duration::from_millis(2);
+    let failed = state.blocking_import(Duration::from_secs(1), "exhausted", |maximum| {
+        assert!(maximum <= Duration::from_millis(2));
+        std::thread::sleep(Duration::from_millis(3));
+        Err::<(), _>("operation failed")
+    });
+    assert_eq!(failed, Err("operation failed"));
+    assert_eq!(
+        state.blocking_import(Duration::from_secs(1), "exhausted", |_| panic!(
+            "must not enter blocking work"
+        )),
+        Err::<(), _>("exhausted")
+    );
+    state.begin_guest_execution();
+    assert_eq!(state.blocking_import_remaining, Duration::from_secs(1));
+}
+
+#[test]
+fn test_busy_wasm_stop_retains_exact_instance_and_readers_until_retry() -> anyhow::Result<()> {
+    use rintawa_sdk::contracts::ComponentRef;
+    let mut engine = crate::ExtensionEngine::new();
+    let id = ExtensionInstanceId::new("lifecycle-review");
+    let owner = ComponentRef::new(id.clone(), "runtime");
+    let component = engine.wasm_runtime_engine()?.load_component_from_bytes(
+        ComponentId::new("runtime"),
+        include_bytes!("../../../tests/fixtures/transport/provider.wasm"),
+    )?;
+    let runtime = component.runtime.clone();
+    engine.register_extension_instance(
+        id.clone(),
+        test_scope_id(),
+        lifecycle_review_manifest(),
+        vec![Box::new(component)],
+    )?;
+    engine.start_extension_instance(&id)?;
+    let principal = engine.active_component_principal(&owner)?;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("asset");
+    std::fs::write(&path, b"abcdef")?;
+    let mut active = runtime.lock().unwrap();
+    let state = active.instance.as_mut().unwrap().store.data_mut();
+    state.host_access.asset_store = Arc::new(FileAssetAccess {
+        path,
+        opens: std::sync::atomic::AtomicUsize::new(0),
+    });
+    state
+        .runtime_permissions
+        .grant(owner.clone(), RuntimePermission::AssetRead)
+        .unwrap();
+    state.begin_guest_execution();
+    let handle = state
+        .open_asset_reader(WitAssetRef {
+            digest: "sha256:test".into(),
+            size: 6,
+            media_type: "image/png".into(),
+        })
+        .unwrap();
+    assert!(engine.stop_extension_instance(&id).is_err());
+    assert_eq!(
+        engine.extension_instance_state(&id),
+        Some(crate::ExtensionState::Stopping)
+    );
+    assert!(engine.active_component_principal(&owner).is_err());
+    assert!(engine.unregister_extension_instance(&id).is_err());
+    assert!(state.asset_readers.contains_key(&handle));
+    assert!(matches!(
+        engine.query_transport_contributions(&principal, "fixture/caller", b"new"),
+        Err(TransportError::Inactive)
+    ));
+    state.finish_guest_execution();
+    drop(active);
+    engine.stop_extension_instance(&id)?;
+    assert_eq!(
+        engine.extension_instance_state(&id),
+        Some(crate::ExtensionState::Stopped)
+    );
+    assert!(
+        runtime
+            .lock()
+            .unwrap()
+            .instance
+            .as_ref()
+            .unwrap()
+            .store
+            .data()
+            .asset_readers
+            .is_empty()
+    );
+    engine.unregister_extension_instance(&id)?;
+    Ok(())
+}
+
+#[test]
+fn test_guest_shared_memory_growth_cannot_bypass_aggregate_pair_limit() -> anyhow::Result<()> {
+    let runtime = WasmRuntimeEngine::with_execution_budget(WasmExecutionBudget {
+        max_memory_bytes: 2 * 65536,
+        ..Default::default()
+    })?;
+    let prefix = r#"(component
+      (core module $shared
+        (memory 1 2 shared)
+        (func (export "grow")
+          i32.const 1 memory.grow i32.const -1 i32.eq if unreachable end
+          memory.size i32.const 2 i32.ne if unreachable end))
+      (core instance $shared (instantiate $shared))
+      (core module $grower
+        (import "shared" "grow" (func $grow))
+        (func $start call $grow) (start $start))
+      (core instance (instantiate $grower (with "shared" (instance $shared))))"#;
+    let wat = include_str!("../../../tests/fixtures/stateful_component.wat").replacen(
+        "(component",
+        prefix,
+        1,
+    );
+    let component = runtime.load_component_from_bytes(ComponentId::new("probe"), wat.as_bytes())?;
+    let shared = component.runtime.clone();
+    let mut guard = shared.lock().unwrap();
+    match component.ensure_instance(&mut guard) {
+        Ok(_) => panic!("shared growth plus ordinary memory must exceed the pair budget"),
+        Err(error) => assert!(
+            error
+                .to_string()
+                .contains("component pair linear-memory budget exhausted"),
+            "{error}"
+        ),
+    }
+    Ok(())
+}

@@ -284,3 +284,56 @@ fn test_should_serialize_metadata_behind_system_evaluation() -> Result<()> {
     runtime.shutdown()?;
     Ok(())
 }
+
+#[test]
+fn test_pending_command_bytes_include_evaluation_and_release_after_completion() -> Result<()> {
+    let (_root, storage, schemas) = create_storage()?;
+    let started = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let first_command = command(
+        &schemas.command,
+        PrincipalId::new(),
+        serde_json::json!({"item":ItemId::new().to_string(),"padding":"x".repeat(4096)}),
+    );
+    let bytes = serde_json::to_vec(&first_command)?.len();
+    let mut builder = runtime_builder(storage, &[&schemas.command])?;
+    builder.set_policy(WorldRuntimePolicy::new(128).with_pending_command_bytes(bytes));
+    builder.register_system(BlockingFirstSystem {
+        command_schema: schemas.command.clone(),
+        invocations: Arc::new(AtomicUsize::new(0)),
+        started: started.clone(),
+        release: release.clone(),
+    })?;
+    let runtime = builder.start()?;
+    let first = runtime.submit(first_command)?;
+    started.wait();
+    let request = || {
+        command(
+            &schemas.command,
+            PrincipalId::new(),
+            serde_json::json!({"item":ItemId::new().to_string()}),
+        )
+    };
+    let rejected = runtime.client().submit(request());
+    // Always release before asserting: failed assertions cannot strand a worker.
+    release.wait();
+    assert!(matches!(
+        rejected,
+        Err(WorldRuntimeError::PendingCommandBytesExceeded)
+    ));
+    first.wait()?;
+    runtime.client().submit(request())?.wait()?;
+    // A rejected command also frees its serialized reservation.
+    assert!(
+        runtime
+            .submit(WorldCommand::system(
+                schemas.command.clone(),
+                serde_json::json!({})
+            ))?
+            .wait()
+            .is_err()
+    );
+    runtime.submit(request())?.wait()?;
+    runtime.shutdown()?;
+    Ok(())
+}

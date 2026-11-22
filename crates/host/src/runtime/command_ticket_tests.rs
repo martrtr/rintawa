@@ -626,3 +626,5 @@ fn test_guest_stop_releases_pending_tickets_without_cancelling_admitted_work() -
 }
 
 mod data_primitive_tests;
+
+mod lifecycle_budget_tests;

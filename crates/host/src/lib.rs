@@ -311,6 +311,12 @@ pub enum HostError {
     /// A World manifest has invalid or absent human-facing metadata.
     #[error("invalid World manifest metadata: {0}")]
     InvalidWorldMetadata(String),
+    /// Shutdown has closed Host admission; the caller may retry cleanup only.
+    #[error("Host is stopping; new activation is refused")]
+    HostStopping,
+    /// Host admission refuses more than eight active/draining Worlds.
+    #[error("active World admission limit (8) exceeded")]
+    ActiveWorldLimitExceeded,
     /// A world runtime is already active in this host process.
     #[error("world `{0}` is already active")]
     WorldAlreadyActive(WorldId),

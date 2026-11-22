@@ -121,11 +121,14 @@ impl NetworkHost for WasmHostState {
                 RuntimePermissionCheck::Unavailable => NetworkError::Unavailable,
             })?;
         let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
-        let stream = TcpStream::connect_timeout(
-            &address.into(),
+        let stream = self.blocking_import(
             Duration::from_millis(self.loopback_connect_timeout_ms),
-        )
-        .map_err(|_| NetworkError::Unavailable)?;
+            NetworkError::Unavailable,
+            |timeout| {
+                TcpStream::connect_timeout(&address.into(), timeout)
+                    .map_err(|_| NetworkError::Unavailable)
+            },
+        )?;
         stream
             .set_nonblocking(true)
             .map_err(|_| NetworkError::Unavailable)?;
@@ -298,75 +301,91 @@ impl HttpFetchHost for WasmHostState {
                 RuntimePermissionCheck::Unavailable => HttpFetchError::Unavailable,
             })?;
 
-        let requested_limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
-        let response_limit = requested_limit.min(self.max_http_fetch_bytes);
-        let timeout = Duration::from_millis(self.http_fetch_timeout_ms);
-        let mut current = Url::parse(&url).map_err(|_| HttpFetchError::InvalidUrl)?;
+        let limit = (max_bytes as usize).min(self.max_http_fetch_bytes);
+        let redirects = self.max_http_redirects;
+        self.blocking_import(
+            Duration::from_millis(self.http_fetch_timeout_ms),
+            HttpFetchError::Unavailable,
+            |timeout| bounded_http_get(&url, limit, redirects, timeout),
+        )
+    }
+}
+fn bounded_http_get(
+    url: &str,
+    response_limit: usize,
+    max_redirects: usize,
+    timeout: Duration,
+) -> Result<WitHttpResponse, HttpFetchError> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut current = Url::parse(url).map_err(|_| HttpFetchError::InvalidUrl)?;
 
-        for redirect_count in 0..=self.max_http_redirects {
-            let client = build_bounded_https_client(&current, timeout)?;
-            let response = client
-                .get(current.clone())
-                .header(reqwest::header::USER_AGENT, "Rintawa/0.0.1")
-                .send()
-                .map_err(map_http_request_error)?;
+    for redirect_count in 0..=max_redirects {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(HttpFetchError::Unavailable);
+        }
+        let client = build_bounded_https_client(&current, remaining)?;
+        let response = client
+            .get(current.clone())
+            .header(reqwest::header::USER_AGENT, "Rintawa/0.0.1")
+            .send()
+            .map_err(map_http_request_error)?;
 
-            let status = response.status();
-            if is_followed_redirect(status) {
-                if redirect_count >= self.max_http_redirects {
-                    return Err(HttpFetchError::TooManyRedirects);
-                }
-                let location = response
-                    .headers()
-                    .get(LOCATION)
-                    .ok_or(HttpFetchError::InvalidUrl)?
-                    .to_str()
-                    .map_err(|_| HttpFetchError::InvalidUrl)?;
-                current = current
-                    .join(location)
-                    .map_err(|_| HttpFetchError::InvalidUrl)?;
-                continue;
+        let status = response.status();
+        if is_followed_redirect(status) {
+            if redirect_count >= max_redirects {
+                return Err(HttpFetchError::TooManyRedirects);
             }
-
-            if response
-                .content_length()
-                .is_some_and(|length| length > u64::try_from(response_limit).unwrap_or(u64::MAX))
-            {
-                return Err(HttpFetchError::ResponseTooLarge);
-            }
-
-            let content_type = response
+            let location = response
                 .headers()
-                .get(CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            let final_url = current.to_string();
-            let mut body = Vec::with_capacity(
-                response_limit
-                    .min(response.content_length().unwrap_or(0) as usize)
-                    .min(1024 * 1024),
-            );
-            let read_limit = u64::try_from(response_limit)
-                .unwrap_or(u64::MAX)
-                .saturating_add(1);
-            response
-                .take(read_limit)
-                .read_to_end(&mut body)
-                .map_err(|_| HttpFetchError::Unavailable)?;
-            if body.len() > response_limit {
-                return Err(HttpFetchError::ResponseTooLarge);
-            }
-
-            return Ok(WitHttpResponse {
-                status: status.as_u16(),
-                final_url,
-                content_type,
-                body,
-            });
+                .get(LOCATION)
+                .ok_or(HttpFetchError::InvalidUrl)?
+                .to_str()
+                .map_err(|_| HttpFetchError::InvalidUrl)?;
+            current = current
+                .join(location)
+                .map_err(|_| HttpFetchError::InvalidUrl)?;
+            continue;
         }
 
-        Err(HttpFetchError::TooManyRedirects)
+        if response
+            .content_length()
+            .is_some_and(|length| length > u64::try_from(response_limit).unwrap_or(u64::MAX))
+        {
+            return Err(HttpFetchError::ResponseTooLarge);
+        }
+
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let final_url = current.to_string();
+        let mut body = Vec::with_capacity(
+            response_limit
+                .min(response.content_length().unwrap_or(0) as usize)
+                .min(1024 * 1024),
+        );
+        let read_limit = u64::try_from(response_limit)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        response
+            .take(read_limit)
+            .read_to_end(&mut body)
+            .map_err(|_| HttpFetchError::Unavailable)?;
+        if body.len() > response_limit {
+            return Err(HttpFetchError::ResponseTooLarge);
+        }
+
+        return Ok(WitHttpResponse {
+            status: status.as_u16(),
+            final_url,
+            content_type,
+            body,
+        });
     }
+
+    Err(HttpFetchError::TooManyRedirects)
 }
 
 pub(super) fn build_bounded_https_client(

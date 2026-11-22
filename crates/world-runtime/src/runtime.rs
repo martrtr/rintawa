@@ -3,11 +3,13 @@
 use std::{
     collections::BTreeMap,
     panic::{AssertUnwindSafe, catch_unwind},
+    sync::atomic::{AtomicUsize, Ordering},
     sync::{
         Arc, Mutex, Weak,
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use rintawa_sdk::{
@@ -32,6 +34,7 @@ pub const MAX_COMMAND_QUEUE_CAPACITY: usize = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorldRuntimePolicy {
     command_queue_capacity: usize,
+    pending_command_bytes: usize,
 }
 
 impl WorldRuntimePolicy {
@@ -41,7 +44,14 @@ impl WorldRuntimePolicy {
     pub const fn new(command_queue_capacity: usize) -> Self {
         Self {
             command_queue_capacity,
+            pending_command_bytes: 8 * 1024 * 1024,
         }
+    }
+
+    /// Replaces the total serialized command budget, including evaluating work.
+    pub const fn with_pending_command_bytes(mut self, maximum: usize) -> Self {
+        self.pending_command_bytes = maximum;
+        self
     }
 
     /// Returns the maximum number of commands waiting in the worker queue.
@@ -198,6 +208,10 @@ impl WorldRuntimeBuilder {
             })
             .map_err(WorldRuntimeError::WorkerSpawn)?;
 
+        let pending = Arc::new(PendingCommands {
+            used: AtomicUsize::new(0),
+            maximum: self.policy.pending_command_bytes,
+        });
         Ok(WorldRuntime {
             world_id,
             storage,
@@ -205,6 +219,7 @@ impl WorldRuntimeBuilder {
             property_owners,
             sender: Arc::new(Mutex::new(Some(sender))),
             worker: Some(worker),
+            pending,
         })
     }
 }
@@ -217,6 +232,7 @@ pub struct WorldRuntime {
     property_owners: Arc<Mutex<Arc<BTreeMap<SchemaKey, ExtensionInstanceId>>>>,
     sender: Arc<Mutex<Option<SyncSender<WorldJob>>>>,
     worker: Option<JoinHandle<()>>,
+    pending: Arc<PendingCommands>,
 }
 
 /// Cloneable, lifecycle-revocable access to one active World runtime.
@@ -227,6 +243,7 @@ pub struct WorldRuntime {
 pub struct WorldRuntimeClient {
     world_id: WorldId,
     storage: Weak<SqliteWorldStorage>,
+    pending: Arc<PendingCommands>,
     property_owners: Arc<Mutex<Arc<BTreeMap<SchemaKey, ExtensionInstanceId>>>>,
     sender: Arc<Mutex<Option<SyncSender<WorldJob>>>>,
 }
@@ -242,6 +259,7 @@ impl WorldRuntime {
         WorldRuntimeClient {
             world_id: self.world_id,
             storage: Arc::downgrade(&self.storage),
+            pending: self.pending.clone(),
             property_owners: self.property_owners.clone(),
             sender: self.sender.clone(),
         }
@@ -333,7 +351,9 @@ impl WorldRuntime {
             .ok_or(WorldRuntimeError::RuntimeStopped)?;
         let command_id = command.id();
         let (response_sender, response_receiver) = mpsc::channel();
+        let reservation = PendingReservation::new(self.pending.clone(), &command)?;
         let job = CommandJob {
+            reservation,
             command,
             response: response_sender,
         };
@@ -354,6 +374,35 @@ impl WorldRuntime {
     ///
     /// Returns WorkerPanicked when an internal runtime panic escaped the worker.
     pub fn shutdown(mut self) -> WorldRuntimeResult<()> {
+        self.stop_worker()
+    }
+
+    /// Closes queue admission while retaining Systems and writer for graceful drain.
+    pub fn close_admission(&self) -> WorldRuntimeResult<()> {
+        self.sender
+            .lock()
+            .map_err(|_| WorldRuntimeError::RuntimePoisoned)?
+            .take();
+        Ok(())
+    }
+
+    /// Closes admission and waits at most `timeout` for graceful drain.
+    /// A busy result retains the worker and writer for a later retry.
+    pub fn shutdown_timeout(&mut self, timeout: Duration) -> WorldRuntimeResult<()> {
+        self.close_admission()?;
+        let deadline = Instant::now() + timeout;
+        while self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            if Instant::now() >= deadline {
+                return Err(WorldRuntimeError::ShutdownBusy);
+            }
+            thread::sleep(
+                Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
         self.stop_worker()
     }
 
@@ -385,7 +434,9 @@ impl WorldRuntimeClient {
             .ok_or(WorldRuntimeError::RuntimeStopped)?;
         let command_id = command.id();
         let (response_sender, response_receiver) = mpsc::channel();
+        let reservation = PendingReservation::new(self.pending.clone(), &command)?;
         match sender.try_send(WorldJob::Command(CommandJob {
+            reservation,
             command,
             response: response_sender,
         })) {
@@ -516,7 +567,52 @@ enum WorldJob {
     },
 }
 
+struct PendingCommands {
+    used: AtomicUsize,
+    maximum: usize,
+}
+struct PendingReservation {
+    pending: Arc<PendingCommands>,
+    bytes: usize,
+}
+impl PendingReservation {
+    fn new(pending: Arc<PendingCommands>, command: &WorldCommand) -> WorldRuntimeResult<Self> {
+        // Count the complete serialized envelope without retaining a second buffer.
+        struct Counter(usize);
+        impl std::io::Write for Counter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self
+                    .0
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| std::io::Error::other("command size overflow"))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut counter = Counter(0);
+        serde_json::to_writer(&mut counter, command)
+            .map_err(|_| WorldRuntimeError::PendingCommandBytesExceeded)?;
+        let bytes = counter.0;
+        pending
+            .used
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes)
+                    .filter(|next| *next <= pending.maximum)
+            })
+            .map_err(|_| WorldRuntimeError::PendingCommandBytesExceeded)?;
+        Ok(Self { pending, bytes })
+    }
+}
+impl Drop for PendingReservation {
+    fn drop(&mut self) {
+        self.pending.used.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
 struct CommandJob {
+    reservation: PendingReservation,
     command: WorldCommand,
     response: mpsc::Sender<WorldRuntimeResult<WorldCommandOutcome>>,
 }
@@ -551,6 +647,7 @@ fn worker_loop(
                     &property_owners,
                     job.command,
                 );
+                drop(job.reservation);
                 let _ = job.response.send(result);
             }
             WorldJob::Metadata { metadata, response } => {

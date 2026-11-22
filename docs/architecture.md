@@ -314,6 +314,25 @@ Read/close check permissions again; stop, trap and Store drop release readers.
 Handles are never reused in the process. Browser serving/channel cleanup is separate
 rtwKit work. These accepted additions require rebuilding guest WIT bindings.
 
+WASM components own one lifecycle Store and one shared System Store across all
+command schemas. Host policy bounds combined linear memory to 64 MiB per pair and
+512 MiB across live engine Stores, with failed growth rolled back and Store drop
+releasing charges. Browser/native buffers and compiler memory are outside that
+linear-memory budget. Admission allows eight active/draining Worlds and 128 active
+or incompletely stopped components, including hosted components. Pending serialized
+World commands are capped at 8 MiB, counting queued and evaluating work until its
+result is ready, alongside the 128-job queue cap.
+
+Ordinary/task blocking connect/query/legacy fetch imports share a one-second
+allowance, including failed waits. Fuel separately bounds guest CPU work. Host
+shutdown closes admission before draining accepted World commands; Systems remain
+available during drain. A five-second drain timeout preserves the worker, writer
+and components for retry. `HostRuntime::shutdown` now borrows `&mut self` for that
+reason. Busy component stop retains a `Stopping` instance and its live resources;
+unregister cannot bypass cleanup. Arbitrary native code/OS I/O, including system
+DNS resolution, cannot be forcibly terminated by these timeouts. The explicit
+trusted consuming World shutdown and Drop still wait for their worker.
+
 ## Standard product composition
 
 The historical standard experience was implemented by rtwKit packages.

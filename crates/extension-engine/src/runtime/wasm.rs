@@ -32,7 +32,7 @@ use rintawa_world::{WorldCommand, WorldTransaction};
 use rintawa_world_runtime::{SystemError, SystemResult, WorldReadError, WorldSnapshot};
 use tracing::{debug, error, info, trace, warn};
 use wasmtime::{
-    Engine, Store, StoreLimits, Trap,
+    Engine, Store, Trap,
     component::{Component as WasmtimeComponent, Instance, Linker, Resource, ResourceTable},
 };
 use zenoh::Wait;
@@ -48,7 +48,7 @@ use crate::{
 };
 
 mod asset_read;
-mod budget;
+pub(crate) mod budget;
 mod control_plane;
 mod http_request;
 mod network;
@@ -222,6 +222,7 @@ struct OwnedWorldDataTicket {
 pub struct WasmHostState {
     component_id: ComponentId,
     random_bytes_this_execution: usize,
+    blocking_import_remaining: Duration,
     asset_readers: HashMap<u64, asset_read::AssetReader>,
     extension_id: Option<ExtensionId>,
     instance_id: Option<ExtensionInstanceId>,
@@ -279,7 +280,7 @@ pub struct WasmHostState {
     world_system_snapshot: Option<WorldSnapshot>,
     world_data_access_active: bool,
     world_data_tickets: HashMap<u64, OwnedWorldDataTicket>,
-    resource_limits: StoreLimits,
+    resource_limits: budget::LinearMemoryLimiter,
     resource_table: ResourceTable,
 }
 
@@ -325,6 +326,7 @@ struct WasmHostServices {
     transport: Transport,
     runtime_permissions: RuntimePermissionManager,
     host_access: HostAccessServices,
+    memory: Arc<budget::MemoryBudget>,
 }
 
 impl WasmHostServices {
@@ -334,6 +336,7 @@ impl WasmHostServices {
             secrets,
             runtime_permissions: RuntimePermissionManager::default(),
             host_access: HostAccessServices::unavailable(),
+            memory: Arc::new(budget::MemoryBudget::new(512 * 1024 * 1024)),
         }
     }
 }
@@ -359,21 +362,40 @@ impl WasmHostState {
         )
     }
 
+    #[cfg(test)]
     fn with_host_services_and_budget(
         component_id: ComponentId,
         host_services: WasmHostServices,
         task_handler_available: bool,
         budget: &WasmExecutionBudget,
     ) -> Self {
+        let pair = Arc::new(budget::MemoryBudget::new(budget.max_memory_bytes));
+        Self::with_component_budget(
+            component_id,
+            host_services,
+            task_handler_available,
+            budget,
+            pair,
+        )
+    }
+    fn with_component_budget(
+        component_id: ComponentId,
+        host_services: WasmHostServices,
+        task_handler_available: bool,
+        budget: &WasmExecutionBudget,
+        pair: Arc<budget::MemoryBudget>,
+    ) -> Self {
         let WasmHostServices {
             secrets,
             transport,
             runtime_permissions,
             host_access,
+            memory,
         } = host_services;
         Self {
             component_id,
             random_bytes_this_execution: 0,
+            blocking_import_remaining: Duration::from_secs(1),
             asset_readers: HashMap::new(),
             extension_id: None,
             instance_id: None,
@@ -431,7 +453,7 @@ impl WasmHostState {
             world_system_snapshot: None,
             world_data_access_active: false,
             world_data_tickets: HashMap::new(),
-            resource_limits: budget.store_limits(),
+            resource_limits: budget::LinearMemoryLimiter::new(budget, pair, memory),
             resource_table: ResourceTable::new(),
         }
     }
@@ -570,6 +592,7 @@ impl WasmHostState {
 
     fn discard_guest_execution(&mut self) {
         self.random_bytes_this_execution = 0;
+        self.blocking_import_remaining = Duration::from_secs(1);
         self.registration_scope = None;
         self.execution_owner = None;
         self.execution_context = None;
@@ -737,6 +760,7 @@ impl WasmHostState {
     /// Opens the normal guest execution scope for the provider component itself.
     fn begin_guest_execution(&mut self) {
         self.random_bytes_this_execution = 0;
+        self.blocking_import_remaining = Duration::from_secs(1);
         self.execution_owner = self.registered_owner();
         self.execution_context = self
             .execution_owner
@@ -757,6 +781,7 @@ impl WasmHostState {
 
     fn begin_delegated_guest_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
         self.random_bytes_this_execution = 0;
+        self.blocking_import_remaining = Duration::from_secs(1);
         self.execution_context = self.transport.contexts.context(&owner, true).ok();
         self.execution_owner = Some(owner);
         self.task_access_active = true;
@@ -777,6 +802,7 @@ impl WasmHostState {
 
     fn begin_delegated_task_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
         self.random_bytes_this_execution = 0;
+        self.blocking_import_remaining = Duration::from_secs(1);
         self.execution_context = self.transport.contexts.context(&owner, true).ok();
         self.execution_owner = Some(owner);
         self.task_access_active = true;
@@ -1740,13 +1766,38 @@ impl TransportHost for WasmHostState {
             return Err(TransportApiError::LimitExceeded);
         }
         self.transport_queries_this_execution += 1;
-        self.transport
-            .query(&executing, &point, &payload)
-            .map_err(map_transport_error)
+        let transport = self.transport.clone();
+        self.blocking_import(
+            Duration::from_millis(500),
+            TransportApiError::Unavailable,
+            |timeout| {
+                transport
+                    .query_with_timeout(&executing, &point, &payload, timeout)
+                    .map_err(map_transport_error)
+            },
+        )
     }
 }
 
 impl WasmHostState {
+    fn blocking_import<T, E>(
+        &mut self,
+        maximum: Duration,
+        exhausted: E,
+        action: impl FnOnce(Duration) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let allowance = maximum.min(self.blocking_import_remaining);
+        if allowance.is_zero() {
+            return Err(exhausted);
+        }
+        let started = Instant::now();
+        let result = action(allowance);
+        self.blocking_import_remaining = self
+            .blocking_import_remaining
+            .saturating_sub(started.elapsed());
+        result
+    }
+
     fn transport_execution_context(&self) -> Result<&ExecutionContext, TransportApiError> {
         if !self.transport_access_active {
             return Err(TransportApiError::AccessNotActive);
@@ -1826,7 +1877,10 @@ impl WasmRuntimeEngine {
         budget: WasmExecutionBudget,
     ) -> EngineResult<Self> {
         Self::with_host_services_and_budget(
-            WasmHostServices::standalone(secrets),
+            WasmHostServices {
+                memory: Arc::new(budget::MemoryBudget::new(budget.max_total_memory_bytes)),
+                ..WasmHostServices::standalone(secrets)
+            },
             ExecutionTargetRegistry::default(),
             budget,
         )
@@ -1838,6 +1892,7 @@ impl WasmRuntimeEngine {
         execution_targets: ExecutionTargetRegistry,
         runtime_permissions: RuntimePermissionManager,
         host_access: HostAccessServices,
+        memory: Arc<budget::MemoryBudget>,
     ) -> EngineResult<Self> {
         Self::with_host_services_and_budget(
             WasmHostServices {
@@ -1845,6 +1900,7 @@ impl WasmRuntimeEngine {
                 transport,
                 runtime_permissions,
                 host_access,
+                memory,
             },
             execution_targets,
             WasmExecutionBudget::default(),
@@ -1912,6 +1968,8 @@ impl WasmRuntimeEngine {
             transport_handler_available,
             world_system_handler_available,
             world_system_active: Arc::new(AtomicBool::new(false)),
+            system_runtime: Arc::new(Mutex::new(WasmSystemRuntime { instance: None })),
+            pair_memory: Arc::new(budget::MemoryBudget::new(self.budget.max_memory_bytes)),
             budget: self.budget.clone(),
             active: false,
             runtime: Arc::new(Mutex::new(WasmSharedRuntime {
@@ -1975,6 +2033,8 @@ pub struct WasmComponent {
     transport_handler_available: bool,
     world_system_handler_available: bool,
     world_system_active: Arc<AtomicBool>,
+    system_runtime: Arc<Mutex<WasmSystemRuntime>>,
+    pair_memory: Arc<budget::MemoryBudget>,
     budget: WasmExecutionBudget,
     active: bool,
     runtime: Arc<Mutex<WasmSharedRuntime>>,
@@ -1992,6 +2052,7 @@ pub struct WasmWorldSystemEndpoint {
     host_services: WasmHostServices,
     budget: WasmExecutionBudget,
     active: Arc<AtomicBool>,
+    pair_memory: Arc<budget::MemoryBudget>,
     runtime: Arc<Mutex<WasmSystemRuntime>>,
 }
 
@@ -2020,7 +2081,8 @@ impl WasmComponent {
                 host_services: self.host_services.clone(),
                 budget: self.budget.clone(),
                 active: self.world_system_active.clone(),
-                runtime: Arc::new(Mutex::new(WasmSystemRuntime { instance: None })),
+                runtime: self.system_runtime.clone(),
+                pair_memory: self.pair_memory.clone(),
             })
     }
 
@@ -2156,12 +2218,18 @@ impl WasmWorldSystemEndpoint {
         let mut runtime = self.runtime.try_lock().map_err(|_| {
             SystemError::Failed(String::from("WASM World System is busy or unavailable"))
         })?;
+        if !self.active.load(Ordering::Acquire) {
+            return Err(SystemError::Failed(String::from(
+                "WASM World System is not active",
+            )));
+        }
         if runtime.instance.is_none() {
-            let host_state = WasmHostState::with_host_services_and_budget(
+            let host_state = WasmHostState::with_component_budget(
                 ComponentId::new("world-system"),
                 self.host_services.clone(),
                 false,
                 &self.budget,
+                self.pair_memory.clone(),
             );
             let mut store = Store::new(&self.engine, host_state);
             store.limiter(|state| &mut state.resource_limits);
@@ -2314,11 +2382,12 @@ impl WasmComponent {
         }
 
         if runtime.instance.is_none() {
-            let host_state = WasmHostState::with_host_services_and_budget(
+            let host_state = WasmHostState::with_component_budget(
                 self.id.clone(),
                 self.host_services.clone(),
                 self.task_handler_available,
                 &self.budget,
+                self.pair_memory.clone(),
             );
             let mut store = Store::new(&self.engine, host_state);
             store.limiter(|state| &mut state.resource_limits);
@@ -2566,13 +2635,17 @@ impl Component for WasmComponent {
     fn stop(&mut self, _ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
         self.active = false;
         self.world_system_active.store(false, Ordering::Release);
+        // An independently evaluating System also owns live state until completion.
+        let mut system = match self.system_runtime.try_lock() {
+            Ok(system) => system,
+            Err(TryLockError::WouldBlock) => return Err(ExtensionError::CleanupBusy),
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
         let budget = self.budget.clone();
         let (mut runtime, lock_failure) = match self.runtime.try_lock() {
             Ok(runtime) => (runtime, None),
             Err(TryLockError::WouldBlock) => {
-                return Err(ExtensionError::Message(String::from(
-                    "WASM runtime state is busy",
-                )));
+                return Err(ExtensionError::CleanupBusy);
             }
             Err(TryLockError::Poisoned(poisoned)) => (
                 poisoned.into_inner(),
@@ -2582,6 +2655,7 @@ impl Component for WasmComponent {
             ),
         };
         runtime.active = false;
+        system.instance = None;
         let stop_result = if let Some(instance) = runtime.instance.as_mut() {
             let result = if let Some(error) = lock_failure {
                 Err(error)

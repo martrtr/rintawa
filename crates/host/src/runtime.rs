@@ -43,6 +43,8 @@ use crate::{
 };
 
 #[cfg(test)]
+mod activation_cleanup_tests;
+#[cfg(test)]
 mod command_ticket_tests;
 
 /// Maximum one-shot user resources retained by one HostRuntime.
@@ -491,7 +493,10 @@ impl WorldDataAccess for WorldDataRuntimeControl {
         self.command_client(scope, owner, &schema)?
             .submit(WorldCommand::system(schema, payload))
             .map_err(|error| match error {
-                rintawa_world_runtime::WorldRuntimeError::QueueFull => HostAccessError::QueueFull,
+                rintawa_world_runtime::WorldRuntimeError::QueueFull
+                | rintawa_world_runtime::WorldRuntimeError::PendingCommandBytesExceeded => {
+                    HostAccessError::QueueFull
+                }
                 rintawa_world_runtime::WorldRuntimeError::RuntimeStopped => {
                     HostAccessError::Unavailable
                 }
@@ -1141,6 +1146,8 @@ pub struct HostRuntime {
     // Active worlds are declared before the Engine so implicit field drop also
     // tears down command execution before provider component state disappears.
     active_worlds: BTreeMap<WorldId, ActiveWorld>,
+    pending_world_cleanup: BTreeMap<WorldId, ActivatedComposition>,
+    shutting_down: bool,
     engine: ExtensionEngine,
     started_instances: Vec<ExtensionInstanceId>,
     host_shell_provider: Option<ComponentRef>,
@@ -1195,7 +1202,8 @@ impl HostRuntime {
             ContractResolutionPolicy::Single,
         )?;
 
-        let activated = activate_composition(&mut engine, home, &profile, &host_scope)?;
+        let mut activated = ActivatedComposition::default();
+        activate_composition(&mut engine, home, &profile, &host_scope, &mut activated)?;
         let registered = activated.registered_instances;
         let started = activated.started_instances;
         let mut host_shell_provider = None;
@@ -1235,6 +1243,8 @@ impl HostRuntime {
 
         Ok(Self {
             active_worlds: BTreeMap::new(),
+            shutting_down: false,
+            pending_world_cleanup: BTreeMap::new(),
             engine,
             started_instances: started,
             host_shell_provider,
@@ -1274,28 +1284,40 @@ impl HostRuntime {
     }
 
     fn activate_world_inner(&mut self, home: &HostHome, world_id: WorldId) -> HostResult<()> {
+        if self.shutting_down {
+            return Err(HostError::HostStopping);
+        }
+        // Cleanup from a previous failed activation must finish before reloading IDs.
+        if self.pending_world_cleanup.contains_key(&world_id) {
+            self.deactivate_world_inner(world_id)?;
+        }
         if self.active_worlds.contains_key(&world_id) {
             return Err(HostError::WorldAlreadyActive(world_id));
         }
 
+        if self.active_worlds.len() + self.pending_world_cleanup.len() >= 8 {
+            return Err(HostError::ActiveWorldLimitExceeded);
+        }
         let profile = home.load_world_composition(world_id)?;
         let scope_id = world_runtime_scope_id(world_id);
-        let overlay = match activate_composition(&mut self.engine, home, &profile, &scope_id) {
-            Ok(overlay) => overlay,
-            Err(error) => {
-                clear_world_scope_topology(&mut self.engine, &scope_id);
-                return Err(error);
+        let mut overlay = ActivatedComposition::default();
+        if let Err(error) =
+            activate_composition(&mut self.engine, home, &profile, &scope_id, &mut overlay)
+        {
+            if !overlay.registered_instances.is_empty() {
+                self.pending_world_cleanup.insert(world_id, overlay);
             }
-        };
+            clear_world_scope_topology(&mut self.engine, &scope_id);
+            return Err(error);
+        }
         let prepared = prepare_world_runtime(self, home, world_id, &overlay.registered_instances);
         let runtime_parts = match prepared {
             Ok(parts) => parts,
             Err(error) => {
-                let cleanup_failures = cleanup_instances(
-                    &mut self.engine,
-                    &overlay.started_instances,
-                    &overlay.registered_instances,
-                );
+                let cleanup_failures = overlay.cleanup(&mut self.engine);
+                if !overlay.registered_instances.is_empty() {
+                    self.pending_world_cleanup.insert(world_id, overlay);
+                }
                 clear_world_scope_topology(&mut self.engine, &scope_id);
                 if cleanup_failures.is_empty() {
                     return Err(error);
@@ -1307,11 +1329,11 @@ impl HostRuntime {
             }
         };
 
-        self.world_data.activate(
+        let ingress = self.world_data.activate(
             world_id,
             runtime_parts.runtime.client(),
             runtime_parts.command_owners.clone(),
-        )?;
+        );
         self.active_worlds.insert(
             world_id,
             ActiveWorld {
@@ -1320,6 +1342,10 @@ impl HostRuntime {
                 started_instances: overlay.started_instances,
             },
         );
+        if let Err(error) = ingress {
+            self.deactivate_world_inner(world_id)?;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -1327,8 +1353,8 @@ impl HostRuntime {
     ///
     /// # Errors
     ///
-    /// Returns WorldNotActive when the world is not running, or the runtime
-    /// shutdown failure after the world has been removed from the active set.
+    /// Returns WorldNotActive, a busy drain, or cleanup failures. Incomplete Worlds
+    /// retain ownership/admission slots for retry; new operations are refused.
     pub fn deactivate_world(&mut self, world_id: WorldId) -> HostResult<()> {
         let result = self.deactivate_world_inner(world_id);
         let status_result = self.record_world_session_result(world_id, &result);
@@ -1339,21 +1365,56 @@ impl HostRuntime {
     }
 
     fn deactivate_world_inner(&mut self, world_id: WorldId) -> HostResult<()> {
+        self.deactivate_world_with_timeout(world_id, std::time::Duration::from_secs(5))
+    }
+    fn deactivate_world_with_timeout(
+        &mut self,
+        world_id: WorldId,
+        timeout: std::time::Duration,
+    ) -> HostResult<()> {
+        if let Some(overlay) = self.pending_world_cleanup.get_mut(&world_id) {
+            self.engine
+                .close_scope_admission(&world_runtime_scope_id(world_id));
+            let cleanup_failures = overlay.cleanup(&mut self.engine);
+            if !cleanup_failures.is_empty() {
+                return Err(HostError::ShutdownFailed(Box::new(HostShutdownFailures {
+                    world_failures: Vec::new(),
+                    cleanup_failures,
+                })));
+            }
+            self.pending_world_cleanup.remove(&world_id);
+            clear_world_scope_topology(&mut self.engine, &world_runtime_scope_id(world_id));
+            return Ok(());
+        }
         let active = self
             .active_worlds
-            .remove(&world_id)
+            .get_mut(&world_id)
             .ok_or(HostError::WorldNotActive(world_id))?;
         self.world_data.deactivate(world_id);
-        let (world_failures, cleanup_failures) =
-            cleanup_active_world(&mut self.engine, world_id, active);
-        if world_failures.is_empty() && cleanup_failures.is_empty() {
-            Ok(())
-        } else {
-            Err(HostError::ShutdownFailed(Box::new(HostShutdownFailures {
-                world_failures,
+        self.engine
+            .close_scope_admission(&world_runtime_scope_id(world_id));
+        active.runtime.shutdown_timeout(timeout)?;
+        let cleanup_failures = cleanup_instances(
+            &mut self.engine,
+            &active.started_instances,
+            &active.registered_instances,
+        );
+        // Failed cleanup retains the entry and the exact pending instances for retry.
+        active
+            .started_instances
+            .retain(|id| self.engine.extension_instance_state(id).is_some());
+        active
+            .registered_instances
+            .retain(|id| self.engine.extension_instance_state(id).is_some());
+        if !cleanup_failures.is_empty() {
+            return Err(HostError::ShutdownFailed(Box::new(HostShutdownFailures {
+                world_failures: Vec::new(),
                 cleanup_failures,
-            })))
+            })));
         }
+        self.active_worlds.remove(&world_id);
+        clear_world_scope_topology(&mut self.engine, &world_runtime_scope_id(world_id));
+        Ok(())
     }
 
     /// Executes one authoritative command in an active world.
@@ -1425,7 +1486,9 @@ impl HostRuntime {
             .map_err(|_| HostError::WorldSessionControlUnavailable)?;
         let mut handled = 0_usize;
         for (world_id, desired_active) in requests {
-            if desired_active == self.is_world_active(world_id) {
+            if desired_active == self.is_world_active(world_id)
+                && !self.pending_world_cleanup.contains_key(&world_id)
+            {
                 access
                     .world_sessions
                     .record_outcome(world_id, desired_active, None)?;
@@ -1451,24 +1514,64 @@ impl HostRuntime {
     /// The returned duration is the earliest requested next wake-up. `None` means
     /// no active component currently owns scheduled cooperative work.
     pub fn poll_runtime(&mut self) -> HostResult<Option<Duration>> {
+        if self.shutting_down {
+            return Ok(None);
+        }
         self.pump_world_session_requests()?;
         let engine_delay = self.engine.poll_runtime()?;
         self.pump_world_session_requests()?;
         Ok(engine_delay)
     }
 
-    /// Stops every active world, then unregisters baseline runtime instances.
-    pub fn shutdown(mut self) -> HostResult<()> {
-        if let Ok(mut state) = self.world_data.state.lock() {
-            state.worlds.clear();
+    /// Closes admission, then gracefully drains Worlds and stops baseline instances.
+    /// Waits at most five seconds for World work; incomplete state remains owned
+    /// by this Host for retry. Arbitrary native callbacks/OS I/O are not terminated.
+    pub fn shutdown(&mut self) -> HostResult<()> {
+        self.shutting_down = true;
+        let mut world_failures = Vec::new();
+        let mut cleanup_failures = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        self.engine
+            .close_scope_admission(&RuntimeScopeId::new(HOST_SCOPE));
+        for (world_id, active) in &self.active_worlds {
+            self.world_data.deactivate(*world_id);
+            self.engine
+                .close_scope_admission(&world_runtime_scope_id(*world_id));
+            active.runtime.close_admission()?;
         }
-        let (world_failures, mut cleanup_failures) =
-            shutdown_worlds(&mut self.active_worlds, &mut self.engine);
-        cleanup_failures.extend(cleanup_instances(
-            &mut self.engine,
-            &self.started_instances,
-            &self.started_instances,
-        ));
+        let mut ids: Vec<_> = self
+            .active_worlds
+            .keys()
+            .chain(self.pending_world_cleanup.keys())
+            .copied()
+            .collect();
+        ids.sort_unstable();
+        for world_id in ids.into_iter().rev() {
+            match self.deactivate_world_with_timeout(
+                world_id,
+                deadline.saturating_duration_since(std::time::Instant::now()),
+            ) {
+                Ok(()) => {}
+                Err(HostError::WorldRuntime(error)) => {
+                    world_failures.push(WorldRuntimeCleanupFailure { world_id, error })
+                }
+                Err(HostError::ShutdownFailed(failures)) => {
+                    world_failures.extend(failures.world_failures);
+                    cleanup_failures.extend(failures.cleanup_failures);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // Baseline providers remain available while any World still drains.
+        if self.active_worlds.is_empty() && self.pending_world_cleanup.is_empty() {
+            cleanup_failures.extend(cleanup_instances(
+                &mut self.engine,
+                &self.started_instances,
+                &self.started_instances,
+            ));
+            self.started_instances
+                .retain(|id| self.engine.extension_instance_state(id).is_some());
+        }
         if world_failures.is_empty() && cleanup_failures.is_empty() {
             Ok(())
         } else {
@@ -1561,9 +1664,22 @@ fn bounded_world_session_diagnostic(value: &str) -> String {
     value[..end].to_string()
 }
 
+#[derive(Default)]
 struct ActivatedComposition {
     registered_instances: Vec<ExtensionInstanceId>,
     started_instances: Vec<ExtensionInstanceId>,
+}
+
+impl ActivatedComposition {
+    fn cleanup(&mut self, engine: &mut ExtensionEngine) -> Vec<HostCleanupFailure> {
+        let failures =
+            cleanup_instances(engine, &self.started_instances, &self.registered_instances);
+        self.started_instances
+            .retain(|id| engine.extension_instance_state(id).is_some());
+        self.registered_instances
+            .retain(|id| engine.extension_instance_state(id).is_some());
+        failures
+    }
 }
 
 fn activate_composition(
@@ -1571,13 +1687,14 @@ fn activate_composition(
     home: &HostHome,
     profile: &CompositionProfile,
     scope_id: &RuntimeScopeId,
-) -> HostResult<ActivatedComposition> {
+    ownership: &mut ActivatedComposition,
+) -> HostResult<()> {
     profile.validate_scope(scope_id)?;
     engine.clear_preferred_contract_provider_policies_in_scope(scope_id);
     engine.clear_authoritative_transport_providers_in_scope(scope_id);
     let loader = RtwExtensionLoader::new();
-    let mut registered = Vec::new();
-    let mut started = Vec::new();
+    let registered = &mut ownership.registered_instances;
+    let started = &mut ownership.started_instances;
 
     let result: HostResult<()> = (|| {
         let activations: Vec<_> = profile
@@ -1757,7 +1874,7 @@ fn activate_composition(
     })();
 
     if let Err(error) = result {
-        let cleanup_failures = cleanup_instances(engine, &started, &registered);
+        let cleanup_failures = ownership.cleanup(engine);
         engine.clear_preferred_contract_provider_policies_in_scope(scope_id);
         engine.clear_authoritative_transport_providers_in_scope(scope_id);
         if cleanup_failures.is_empty() {
@@ -1769,10 +1886,7 @@ fn activate_composition(
         })));
     }
 
-    Ok(ActivatedComposition {
-        registered_instances: registered,
-        started_instances: started,
-    })
+    Ok(())
 }
 
 /// One immutable world schema declared by an exact installed extension artifact.
@@ -1868,44 +1982,10 @@ fn installed_world_schemas(
     });
     Ok(schemas)
 }
-fn cleanup_active_world(
-    engine: &mut ExtensionEngine,
-    world_id: WorldId,
-    active: ActiveWorld,
-) -> (Vec<WorldRuntimeCleanupFailure>, Vec<HostCleanupFailure>) {
-    let mut world_failures = Vec::new();
-    if let Err(error) = active.runtime.shutdown() {
-        world_failures.push(WorldRuntimeCleanupFailure { world_id, error });
-    }
-    let cleanup_failures = cleanup_instances(
-        engine,
-        &active.started_instances,
-        &active.registered_instances,
-    );
-    clear_world_scope_topology(engine, &world_runtime_scope_id(world_id));
-    (world_failures, cleanup_failures)
-}
-
 fn clear_world_scope_topology(engine: &mut ExtensionEngine, scope_id: &RuntimeScopeId) {
     engine.clear_preferred_contract_provider_policies_in_scope(scope_id);
     engine.clear_authoritative_transport_providers_in_scope(scope_id);
     engine.clear_platform_contract_definitions_in_scope(scope_id);
-}
-
-fn shutdown_worlds(
-    active_worlds: &mut BTreeMap<WorldId, ActiveWorld>,
-    engine: &mut ExtensionEngine,
-) -> (Vec<WorldRuntimeCleanupFailure>, Vec<HostCleanupFailure>) {
-    let worlds = std::mem::take(active_worlds);
-    let mut world_failures = Vec::new();
-    let mut cleanup_failures = Vec::new();
-    for (world_id, active) in worlds.into_iter().rev() {
-        let (mut world_errors, mut extension_errors) =
-            cleanup_active_world(engine, world_id, active);
-        world_failures.append(&mut world_errors);
-        cleanup_failures.append(&mut extension_errors);
-    }
-    (world_failures, cleanup_failures)
 }
 
 fn cleanup_instances(
@@ -1936,6 +2016,7 @@ fn cleanup_instances(
                 operation: HostCleanupOperation::Stop,
                 error,
             });
+            continue;
         }
         record_unregister_failure(engine, instance_id, &mut failures);
     }
@@ -2225,6 +2306,8 @@ mod tests {
 
         let mut host = HostRuntime {
             active_worlds: BTreeMap::new(),
+            shutting_down: false,
+            pending_world_cleanup: BTreeMap::new(),
             engine,
             started_instances: Vec::new(),
             host_shell_provider: None,
@@ -2310,6 +2393,8 @@ mod tests {
 
         let mut host = HostRuntime {
             active_worlds: BTreeMap::new(),
+            shutting_down: false,
+            pending_world_cleanup: BTreeMap::new(),
             engine,
             started_instances: Vec::new(),
             host_shell_provider: None,
@@ -2657,6 +2742,8 @@ mod tests {
         }
         let mut host = HostRuntime {
             active_worlds: BTreeMap::new(),
+            shutting_down: false,
+            pending_world_cleanup: BTreeMap::new(),
             engine,
             started_instances: vec![owner.clone(), sibling.clone(), foreign_world.clone()],
             host_shell_provider: None,
@@ -2797,6 +2884,8 @@ mod tests {
 
         let mut host = HostRuntime {
             active_worlds: BTreeMap::new(),
+            shutting_down: false,
+            pending_world_cleanup: BTreeMap::new(),
             engine,
             started_instances: Vec::new(),
             host_shell_provider: None,
@@ -2868,6 +2957,8 @@ mod tests {
 
         let mut host = HostRuntime {
             active_worlds: BTreeMap::new(),
+            shutting_down: false,
+            pending_world_cleanup: BTreeMap::new(),
             engine,
             started_instances: Vec::new(),
             host_shell_provider: None,
@@ -2916,6 +3007,8 @@ mod tests {
 
         let mut host = HostRuntime {
             active_worlds: BTreeMap::new(),
+            shutting_down: false,
+            pending_world_cleanup: BTreeMap::new(),
             engine,
             started_instances: Vec::new(),
             host_shell_provider: None,

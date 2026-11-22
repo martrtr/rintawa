@@ -20,6 +20,10 @@ pub enum ExtensionError {
         reason: String,
     },
 
+    /// Stop cannot release state still used by a callback; retry after it finishes.
+    #[error("component cleanup is busy; ownership retained for retry")]
+    CleanupBusy,
+
     /// An execution budget enforced by the host was exhausted.
     #[error("execution budget for `{resource}` was exhausted during `{operation}`")]
     ExecutionBudgetExceeded {

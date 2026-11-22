@@ -100,6 +100,14 @@ pub enum WorldRuntimeError {
     #[error("world command queue is full")]
     QueueFull,
 
+    /// Serialized queued and evaluating commands exhaust the World byte budget.
+    #[error("world pending-command byte budget exceeded")]
+    PendingCommandBytesExceeded,
+
+    /// Graceful shutdown is incomplete; worker/writer ownership is retained.
+    #[error("world shutdown is busy; retry after admitted work finishes")]
+    ShutdownBusy,
+
     /// The worker has already stopped accepting commands.
     #[error("world runtime is stopped")]
     RuntimeStopped,

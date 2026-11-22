@@ -55,6 +55,8 @@ pub enum ExtensionState {
     Registered,
     /// Extension components are active.
     Active,
+    /// Admission is closed; incomplete callback cleanup remains owned for retry.
+    Stopping,
     /// Host-owned contributions are deactivated.
     ///
     /// A transition can still return [`EngineError::StopFailed`] when one or
@@ -102,6 +104,7 @@ struct ManagedExtension {
     scope_id: RuntimeScopeId,
     manifest: ExtensionManifest,
     state: ExtensionState,
+    pending_stop: HashSet<ComponentId>,
     components: Vec<ManagedComponent>,
     contributions: Vec<OwnedContribution>,
     world_schemas: Vec<OwnedWorldSchemaContribution>,
@@ -130,10 +133,12 @@ impl ManagedComponent {
     }
 
     fn stop(&self, context: &mut dyn ComponentContext) -> ExtensionResult<()> {
-        let mut component = self
-            .handle
-            .lock()
-            .map_err(|_| ExtensionError::Message(String::from("component lock was poisoned")))?;
+        let mut component = self.handle.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => ExtensionError::CleanupBusy,
+            std::sync::TryLockError::Poisoned(_) => {
+                ExtensionError::Message(String::from("component lock was poisoned"))
+            }
+        })?;
         component.stop(context)
     }
 }
@@ -156,6 +161,7 @@ pub struct ExtensionEngine {
         HashMap<RuntimeScopeId, HashMap<ContractKey, ContractDefinition>>,
     execution_targets: ExecutionTargetRegistry,
     host_access: HostAccessServices,
+    memory: Arc<crate::runtime::MemoryBudget>,
 }
 
 /// Runtime scope used by legacy convenience APIs that do not specify one.
@@ -189,6 +195,7 @@ impl Default for ExtensionEngine {
             platform_contract_definitions: HashMap::new(),
             execution_targets: ExecutionTargetRegistry::default(),
             host_access: HostAccessServices::unavailable(),
+            memory: Arc::new(crate::runtime::MemoryBudget::new(512 * 1024 * 1024)),
         }
     }
 }
@@ -267,6 +274,7 @@ impl ExtensionEngine {
             platform_contract_definitions: HashMap::new(),
             execution_targets: ExecutionTargetRegistry::default(),
             host_access: HostAccessServices::unavailable(),
+            memory: Arc::new(crate::runtime::MemoryBudget::new(512 * 1024 * 1024)),
         }
     }
 
@@ -424,6 +432,7 @@ impl ExtensionEngine {
             self.execution_targets.clone(),
             self.runtime_permissions.clone(),
             self.host_access.clone(),
+            self.memory.clone(),
         )
     }
 
@@ -837,6 +846,7 @@ impl ExtensionEngine {
             scope_id,
             manifest,
             state: ExtensionState::Registered,
+            pending_stop: HashSet::new(),
             components,
             contributions: extension_contributions,
             world_schemas,
@@ -1110,6 +1120,24 @@ impl ExtensionEngine {
             return Ok(());
         }
 
+        if state == ExtensionState::Stopping {
+            return Err(EngineError::InvalidState(
+                "component cleanup is incomplete".into(),
+            ));
+        }
+        let occupied: usize = self
+            .extensions
+            .values()
+            .filter(|ext| matches!(ext.state, ExtensionState::Active | ExtensionState::Stopping))
+            .map(|ext| ext.components.len())
+            .sum();
+        let requested = self.extensions[instance_id].components.len();
+        if occupied.saturating_add(requested) > 128 {
+            return Err(EngineError::InvalidState(
+                "active component admission limit (128) exceeded".into(),
+            ));
+        }
+
         self.plan_extension_activation(std::slice::from_ref(instance_id))?;
 
         let ext = self
@@ -1178,6 +1206,9 @@ impl ExtensionEngine {
                 let mut failed_stop_context =
                     EngineComponentContext::new(identity, &self.secrets, false);
                 if let Err(stop_error) = comp.stop(&mut failed_stop_context) {
+                    if matches!(stop_error, ExtensionError::CleanupBusy) {
+                        ext.pending_stop.insert(comp.id().clone());
+                    }
                     rollback_failures.push(ComponentStopFailure {
                         component_id: failed_component_id.clone(),
                         reason: stop_error.to_string(),
@@ -1194,6 +1225,9 @@ impl ExtensionEngine {
                     );
                     let mut stop_ctx = EngineComponentContext::new(identity, &self.secrets, false);
                     if let Err(stop_error) = comp_to_stop.stop(&mut stop_ctx) {
+                        if matches!(stop_error, ExtensionError::CleanupBusy) {
+                            ext.pending_stop.insert(comp_to_stop.id().clone());
+                        }
                         rollback_failures.push(ComponentStopFailure {
                             component_id,
                             reason: stop_error.to_string(),
@@ -1212,6 +1246,9 @@ impl ExtensionEngine {
                     }
                 }
 
+                if !ext.pending_stop.is_empty() {
+                    ext.state = ExtensionState::Stopping;
+                }
                 if rollback_failures.is_empty() {
                     return Err(EngineError::LifecycleFailed {
                         extension_id: logical_id.to_string(),
@@ -1309,6 +1346,18 @@ impl ExtensionEngine {
         }
     }
 
+    /// Closes transport/privileged admission in a scope while admitted Systems drain.
+    /// Components remain owned and must subsequently be stopped/unregistered.
+    pub fn close_scope_admission(&mut self, scope: &RuntimeScopeId) {
+        for (id, ext) in &mut self.extensions {
+            if &ext.scope_id == scope && ext.state == ExtensionState::Active {
+                ext.state = ExtensionState::Stopping;
+                self.transport.revoke_instance(id);
+            }
+        }
+        self.refresh_runtime_context_view();
+    }
+
     fn stop_extension_instance_inner(
         &mut self,
         instance_id: &ExtensionInstanceId,
@@ -1338,7 +1387,12 @@ impl ExtensionEngine {
         self.transport.revoke_instance(&concrete_instance_id);
 
         let mut stop_failures = Vec::new();
+        let retrying = !ext.pending_stop.is_empty();
+        let mut pending = HashSet::new();
         for comp in ext.components.iter_mut().rev() {
+            if retrying && !ext.pending_stop.contains(comp.id()) {
+                continue;
+            }
             let component_id = comp.id().as_str().to_string();
             let identity = ComponentIdentity::new(
                 logical_id.clone(),
@@ -1348,6 +1402,9 @@ impl ExtensionEngine {
             );
             let mut ctx = EngineComponentContext::new(identity, &self.secrets, false);
             if let Err(err) = comp.stop(&mut ctx) {
+                if matches!(err, ExtensionError::CleanupBusy) {
+                    pending.insert(comp.id().clone());
+                }
                 stop_failures.push(ComponentStopFailure {
                     component_id,
                     reason: err.to_string(),
@@ -1362,7 +1419,12 @@ impl ExtensionEngine {
 
         self.execution_targets
             .revoke_instance(&concrete_instance_id);
-        ext.state = ExtensionState::Stopped;
+        ext.pending_stop = pending;
+        ext.state = if !ext.pending_stop.is_empty() {
+            ExtensionState::Stopping
+        } else {
+            ExtensionState::Stopped
+        };
         self.refresh_runtime_context_view();
 
         if stop_failures.is_empty() {
@@ -1400,7 +1462,7 @@ impl ExtensionEngine {
     ) -> EngineResult<()> {
         self.ensure_execution_target_provider_not_in_use(instance_id)?;
         if let Some(ext) = self.extensions.get(instance_id) {
-            if ext.state == ExtensionState::Active {
+            if matches!(ext.state, ExtensionState::Active | ExtensionState::Stopping) {
                 self.stop_extension_instance(instance_id)?;
             }
         } else {

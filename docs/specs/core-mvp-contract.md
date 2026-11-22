@@ -54,8 +54,12 @@ OS entropy and permission-checked sequential CAS readers. Real WASM acceptance
 creates domain rows without native seeding and checks pinned System reads, bounds,
 World/property isolation, PNG resource import and reading its saved ref after
 HostRuntime restart. Unit fault injection covers entropy failure and reader cleanup
-in a shared Store/failed start. P09 and later slices remain pending; browser
-rendering/serving/disconnect and product release acceptance are not claimed.
+in a shared Store/failed start. P09 implements D5 lifecycle/resource bounds: shared
+System Store ownership, aggregate
+linear-memory accounting, World/component admission, pending-command bytes and
+retryable stop. Host shutdown borrows the runtime so incomplete cleanup remains
+owned. P10 and later slices remain pending; browser rendering/serving/disconnect
+and product release acceptance are not claimed. D5 API removals remain P12 work.
 
 ## Goal and required scenarios
 
@@ -337,7 +341,7 @@ profile mutations, failed publication and read-only inspection during ownership.
 
 ## D5. Lifecycle, budgets and API removal
 
-**Proposed implementation/ABI changes; accept the scope before implementation.**
+**Accepted D5; P09 lifecycle/resource implementation awaits R1 re-review. API removals remain P12 work.**
 
 Use one lifecycle Store and at most one System Store per exact WASM component.
 All its command schemas share the System endpoint. Evaluation receives command
@@ -350,6 +354,38 @@ of admitted components/Worlds. Numeric budgets are Host policy, not ABI. Reject
 admission before irreversible allocation/publication. Preserve fuel and HTTP/
 transport quotas. Defaults need measurements; eliminating budget multiplication
 through additional Stores does not depend on a benchmark result.
+
+### P09 implementation boundaries
+
+The existing WASM component owns one shared System runtime, separate from its
+lifecycle runtime. Concrete limiters charge memory growth across all memories in
+both Stores and the engine's live Stores, rolling back failed growth and releasing
+charges on Store drop. Admission counts hosted components without inventing JS
+linear-memory allocations. World command byte reservations include queued and
+evaluating serialized commands and are released on every completion/error path.
+
+Shutdown closes World/transport admission first, drains admitted World work while
+its Systems remain available, and retains incomplete ownership for retry.
+`HostRuntime::shutdown(&mut self)` keeps the Host reachable on busy and closes
+activation permanently once shutdown begins. `WorldRuntime::shutdown_timeout`
+retains its worker/writer on timeout; trusted consuming World shutdown/Drop remain
+explicitly blocking paths. No background teardown service is introduced.
+Busy component cleanup must remain retryable and cannot unregister live state.
+Failed World activation retains its registered/started instance lists in Host when
+rollback is incomplete, including failures before a worker exists. This private
+cleanup record counts toward World admission, is separate from active World state,
+and is revisited by deactivate, shutdown or a later activation attempt. Retry
+prunes already-unregistered instances; successful component cleanup is not repeated.
+The record is removed only when cleanup finishes, before reloading that World.
+No writer, persistence record or background service is created for failed activation.
+Ordinary/task blocking imports share one cumulative allowance, including failed
+waits; nonblocking operations do not receive a fabricated waiting timeout. Tests
+cover independent Worlds, shared System state, memory/admission ceilings, pending
+bytes and stop/trap/failed start. Store/component contention can return busy
+immediately; World drain waits at most five seconds in total per Host shutdown.
+OS DNS resolution and arbitrary native callbacks/OS I/O cannot be hard-terminated;
+request/connect/query waits are capped to remaining allowance and actual blocking
+elapsed time is charged, including errors. No universal resource registry is added.
 
 Lifecycle invariants:
 

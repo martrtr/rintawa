@@ -14,7 +14,9 @@ correctness, minimal implementation or release readiness. New mechanisms still
 need the concrete requirement and acceptance checks specified here.
 
 P05/D1 and D6 are implemented and verified; see [implementation progress](core-mvp-contract.md#implementation-progress).
-P06/D4 and P07/D2 are implemented. D3/D5/D7 and the client implementation below remain pending. D8 remains proposed.
+P06/D4, P07/D2 and P08/D3+D7 are implemented. P09 implements the D5
+lifecycle/resource slice; its API removals remain P12 work. The client implementation
+below remains pending. D8 remains proposed.
 
 Core baseline: `fb1072a2c9169af1b36ea9cdffed31c146ed0341`; rtwKit baseline:
 `77782727020f6066be4d4c205b077dd3f9555775`. Recheck relevant source before coding.

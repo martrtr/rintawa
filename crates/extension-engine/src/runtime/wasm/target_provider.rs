@@ -286,9 +286,7 @@ impl WasmTargetProviderEndpoint {
         let (mut runtime, lock_failure) = match self.runtime.try_lock() {
             Ok(runtime) => (runtime, None),
             Err(TryLockError::WouldBlock) => {
-                return Err(ExtensionError::Message(String::from(
-                    "WASM target-provider runtime is busy",
-                )));
+                return Err(ExtensionError::CleanupBusy);
             }
             Err(TryLockError::Poisoned(poisoned)) => (
                 poisoned.into_inner(),

@@ -368,6 +368,19 @@ impl Transport {
         point: &str,
         payload: &[u8],
     ) -> Result<Vec<Vec<u8>>, TransportError> {
+        self.query_with_timeout(executing, point, payload, QUERY_TIMEOUT)
+    }
+    pub(crate) fn query_with_timeout(
+        &self,
+        executing: &ExecutionContext,
+        point: &str,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<Vec<u8>>, TransportError> {
+        let timeout = timeout.min(QUERY_TIMEOUT);
+        if timeout.is_zero() {
+            return Err(TransportError::Unavailable);
+        }
         self.contexts.validate(executing)?;
         let scope = &executing.scope;
         let key = scoped_key(scope, point)?;
@@ -394,7 +407,7 @@ impl Transport {
             )
             .target(QueryTarget::All)
             .consolidation(ConsolidationMode::None)
-            .timeout(QUERY_TIMEOUT)
+            .timeout(timeout)
             .wait()
             .map_err(|_| TransportError::Unavailable)?;
         let mut values = Vec::new();

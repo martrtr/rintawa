@@ -28,6 +28,8 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
             "fixture.pinned",
             "fixture.pair",
             "fixture.system-limits",
+            "fixture.system-counter-a",
+            "fixture.system-counter-b",
         ] {
             world_registration::register_world_schema(
                 command,
@@ -57,6 +59,7 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
     }
 
     fn start() {
+        LIFECYCLE_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(rintawa::engine::host::random_bytes(16).unwrap().len(), 16);
         assert!(rintawa::engine::world_data::new_item_ids(1).is_err());
         if let Ok(reference) = import_fixture_asset() {
@@ -123,6 +126,9 @@ impl exports::rintawa::engine::world_system::Guest for Fixture {
     }
 }
 
+static LIFECYCLE_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SYSTEM_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn graph_system(
     command: &serde_json::Value,
 ) -> Option<Result<String, exports::rintawa::engine::world_system::Error>> {
@@ -130,6 +136,15 @@ fn graph_system(
     let payload = &command["payload"];
     let set = |item: &str, name: &str, value: serde_json::Value| serde_json::json!({"operation":"set-property","item":item,"key":{"id":name,"version":1},"data":value});
     let changes = match command["schema"].as_str()? {
+        "fixture.system-counter-a@1" | "fixture.system-counter-b@1" => {
+            assert!(!LIFECYCLE_STARTED.load(std::sync::atomic::Ordering::Relaxed));
+            let count = SYSTEM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            assert_eq!(count, payload["expected"].as_u64().unwrap());
+            return Some(Ok(
+                serde_json::json!({"changes":[{"operation":"create-object","id":payload["item"]}]})
+                    .to_string(),
+            ));
+        }
         "fixture.graph@1" => {
             let ids: Vec<String> = serde_json::from_value(payload["ids"].clone()).unwrap();
             assert_eq!(ids.len(), 3);

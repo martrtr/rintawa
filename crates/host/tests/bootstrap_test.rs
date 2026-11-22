@@ -178,7 +178,7 @@ fn test_should_persist_local_install_enable_disable_and_restart() -> anyhow::Res
     reopened.set_enabled("example.bootstrap", true)?;
     let restarted = HostHome::open(&home_path)?;
     assert!(restarted.list_activations()?[0].enabled);
-    let runtime = HostRuntime::start(&restarted)?;
+    let mut runtime = HostRuntime::start(&restarted)?;
     assert_eq!(runtime.host_shell_provider(), None);
     runtime.shutdown()?;
     Ok(())
@@ -861,7 +861,7 @@ permission = "loopback-listen"
     fs::write(&profile_path, profile_source)?;
 
     let error = match HostRuntime::start(&home) {
-        Ok(runtime) => {
+        Ok(mut runtime) => {
             runtime.shutdown()?;
             anyhow::bail!("stale runtime permission must not expand manifest policy");
         }
@@ -1087,7 +1087,7 @@ fn test_should_fail_explicit_unavailable_host_shell_without_fallback() -> anyhow
     )?;
 
     let error = match HostRuntime::start(&home) {
-        Ok(runtime) => {
+        Ok(mut runtime) => {
             runtime.shutdown()?;
             anyhow::bail!("explicit unavailable Host Shell selection should fail startup");
         }
@@ -1116,7 +1116,7 @@ fn test_should_revisit_deferred_activation_after_runtime_provider_starts() -> an
     assert_eq!(profile.activations[0].subject, "bootstrap.target-dependent");
     assert_eq!(profile.activations[1].subject, "bootstrap.target-provider");
 
-    let runtime = HostRuntime::start(&home)?;
+    let mut runtime = HostRuntime::start(&home)?;
     runtime.shutdown()?;
     Ok(())
 }
@@ -1130,7 +1130,7 @@ fn test_should_report_fixed_point_when_required_execution_target_never_appears()
     home.install_local_rtw(&dependent, Some(true))?;
 
     let error = match HostRuntime::start(&home) {
-        Ok(runtime) => {
+        Ok(mut runtime) => {
             runtime.shutdown()?;
             anyhow::bail!("bootstrap should not ignore a permanently deferred activation");
         }

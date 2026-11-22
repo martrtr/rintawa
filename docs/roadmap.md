@@ -20,6 +20,8 @@ World and interaction API cuts. The foundation and old integration code include:
   same-ID impostor rejection; World-schema owners sharing one logical ExtensionId
   across multiple installed instances are refused until finer property ownership exists;
 - one bounded single-writer command queue per World and multi-World runtime supervision;
+- shared lifecycle/System memory accounting, World/component admission, pending-command
+  byte limits and retryable graceful shutdown; native/OS I/O is not hard-terminated;
 - a repeatable clean CLI home smoke test (`world-create`, `world-list`, `world-info`,
   `run --once`) and Host restart tests including an item-owned CAS `AssetRef` and
   relation persistence. These do not prove the later Chat/Narrator end-to-end MVP;

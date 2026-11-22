@@ -5,3 +5,5 @@
 mod wasm;
 
 pub use wasm::{WasmComponent, WasmExecutionBudget, WasmRuntimeEngine, WasmWorldSystemEndpoint};
+
+pub(crate) use wasm::budget::MemoryBudget;
