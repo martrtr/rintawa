@@ -21,10 +21,12 @@ struct Fixture;
 
 impl exports::rintawa::engine::guest::Guest for Fixture {
     fn register() {
+        assert!(rintawa::engine::host::monotonic_millis().is_err());
         assert!(rintawa::engine::host::random_bytes(16).is_err());
     }
 
     fn start() {
+        rintawa::engine::host::monotonic_millis().expect("provider start clock");
         assert_eq!(rintawa::engine::host::random_bytes(16).unwrap().len(), 16);
         let result = rintawa::engine::execution_targets::register_target("test.wasm-target@1");
         assert!(result.is_ok());
@@ -63,6 +65,7 @@ impl exports::rintawa::engine::target_provider::Guest for Fixture {
         handle: u64,
     ) -> Result<(), exports::rintawa::engine::target_provider::Error> {
         assert!(rintawa::engine::host::random_bytes(16).is_err());
+        assert!(rintawa::engine::host::monotonic_millis().is_err());
         if COMPONENTS.lock().unwrap().contains_key(&handle) {
             Ok(())
         } else {
@@ -74,6 +77,7 @@ impl exports::rintawa::engine::target_provider::Guest for Fixture {
         handle: u64,
     ) -> Result<(), exports::rintawa::engine::target_provider::Error> {
         assert_eq!(rintawa::engine::host::random_bytes(16).unwrap().len(), 16);
+        rintawa::engine::host::monotonic_millis().expect("dependent start clock");
         if !COMPONENTS.lock().unwrap().contains_key(&handle) {
             return Err(exports::rintawa::engine::target_provider::Error::UnknownComponent);
         }
@@ -106,6 +110,7 @@ impl exports::rintawa::engine::target_provider::Guest for Fixture {
 
 impl exports::rintawa::engine::task_handler::Guest for Fixture {
     fn on_task(task: u64) {
+        rintawa::engine::host::monotonic_millis().expect("ordinary/delegated task clock");
         assert_eq!(rintawa::engine::host::random_bytes(16).unwrap().len(), 16);
         use rintawa::engine::{runtime_context, transport, user_resources};
         let component = *TASKS.lock().unwrap().get(&task).expect("known task");

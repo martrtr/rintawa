@@ -682,6 +682,10 @@ their own DOM/Canvas; controls and popovers stay within their frame viewport.
 
 ### DockView and extension contributions
 
+The owner accepted the [panel identity and layout amendment](browser-layout-amendment.md)
+on 2026-11-22. Its exact restoreKey and shell-only ui.layout.get/set/reset operations
+refine the catalog, allowlist and persistence requirements below.
+
 Use `dockview-react` in the rtwKit Web UI shell for tabs, groups, splits and docking;
 do not implement another layout manager. Its [upstream documentation](https://github.com/dockview/dockview)
 also describes layout serialization. Pin a compatible release and check its shipped

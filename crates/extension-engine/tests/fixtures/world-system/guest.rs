@@ -40,6 +40,7 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
             .unwrap();
         }
         assert!(rintawa::engine::host::random_bytes(16).is_err());
+        assert!(rintawa::engine::host::monotonic_millis().is_err());
         for command in [
             "fixture.commit",
             "fixture.reject",
@@ -59,6 +60,7 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
     }
 
     fn start() {
+        rintawa::engine::host::monotonic_millis().expect("start clock");
         LIFECYCLE_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(rintawa::engine::host::random_bytes(16).unwrap().len(), 16);
         assert!(rintawa::engine::world_data::new_item_ids(1).is_err());
@@ -68,6 +70,7 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
         rintawa::engine::transport::declare("fixture/commands").expect("command point");
     }
     fn stop() {
+        assert!(rintawa::engine::host::monotonic_millis().is_err());
         assert!(rintawa::engine::host::random_bytes(16).is_err());
         if let Some(ticket) = *LAST_TICKET.lock().unwrap() {
             assert!(matches!(
@@ -85,6 +88,7 @@ impl exports::rintawa::engine::world_system::Guest for Fixture {
         let command: serde_json::Value = serde_json::from_str(&command_json).map_err(|error| {
             exports::rintawa::engine::world_system::Error::Failed(error.to_string())
         })?;
+        assert!(rintawa::engine::host::monotonic_millis().is_err());
         assert!(rintawa::engine::host::random_bytes(16).is_err());
         assert!(rintawa::engine::world_data::new_item_ids(1).is_err());
         if let Some(result) = graph_system(&command) {

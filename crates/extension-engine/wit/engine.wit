@@ -15,6 +15,9 @@ interface host {
     log: func(level: log-level, message: string);
     variant random-error { access-not-active, invalid-request, unavailable }
     random-bytes: func(count: u32) -> result<list<u8>, random-error>;
+    variant clock-error { access-not-active, unavailable }
+    /// Process-relative monotonic milliseconds; OS sleep may pause this clock.
+    monotonic-millis: func() -> result<u64, clock-error>;
 
 }
 

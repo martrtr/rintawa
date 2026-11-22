@@ -2201,6 +2201,46 @@ fn test_should_never_report_lost_command_outcomes_as_definite_failure() {
 }
 
 #[test]
+fn test_monotonic_clock_is_process_relative_and_rejects_inactive_or_stale_execution() {
+    let mut first = WasmHostState::new(ComponentId::new("runtime"));
+    assert!(matches!(
+        HostOperations::monotonic_millis(&mut first),
+        Err(ClockError::AccessNotActive)
+    ));
+    begin_test_registration(&mut first, ExtensionId::new("clock"));
+    assert!(matches!(
+        HostOperations::monotonic_millis(&mut first),
+        Err(ClockError::AccessNotActive)
+    ));
+    first.finish_registration().unwrap();
+    first.begin_start_execution();
+    let before = HostOperations::monotonic_millis(&mut first).unwrap();
+    first.discard_guest_execution();
+    std::thread::sleep(Duration::from_millis(15));
+
+    // A different Store must see the same epoch, even with no intervening pump.
+    let mut second = WasmHostState::new(ComponentId::new("second"));
+    begin_test_registration(&mut second, ExtensionId::new("clock-second"));
+    second.finish_registration().unwrap();
+    second.begin_guest_execution();
+    let after = HostOperations::monotonic_millis(&mut second).unwrap();
+    assert!(after >= before + 10);
+    assert!(HostOperations::monotonic_millis(&mut second).unwrap() >= after);
+    second
+        .transport
+        .contexts
+        .revoke_instance(&test_instance_id());
+    assert!(matches!(
+        HostOperations::monotonic_millis(&mut second),
+        Err(ClockError::AccessNotActive)
+    ));
+    assert!(matches!(
+        clock_millis_from_duration(Duration::MAX),
+        Err(ClockError::Unavailable)
+    ));
+}
+
+#[test]
 fn test_entropy_requires_execution_uses_os_failure_and_resets_each_callback() {
     let mut state = WasmHostState::new(ComponentId::new("runtime"));
     assert!(matches!(

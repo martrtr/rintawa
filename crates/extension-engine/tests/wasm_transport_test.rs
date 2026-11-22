@@ -519,3 +519,30 @@ fn test_should_attest_immediate_callers_reject_stale_activations_and_match_selec
 
 #[path = "wasm_transport_test/nonblocking_tests.rs"]
 mod nonblocking_tests;
+
+#[test]
+fn test_wasm_clock_advances_between_callbacks_without_a_runtime_pump() -> Result<()> {
+    let mut engine = ExtensionEngine::new();
+    let component = engine
+        .wasm_runtime_engine()?
+        .load_component_from_bytes(ComponentId::new("runtime"), PROVIDER)?;
+    engine.register_extension_instance(
+        "clock".into(),
+        "clock-world".into(),
+        manifest("clock"),
+        vec![Box::new(component)],
+    )?;
+    engine.start_extension_instance(&"clock".into())?;
+    let owner = engine.active_component_principal(&ComponentRef::new("clock", "runtime"))?;
+    let read = || -> Result<u64> {
+        let values = engine.query_transport_contributions(&owner, "fixture/caller", b"clock")?;
+        anyhow::ensure!(values.len() == 1, "one clock provider");
+        Ok(u64::from_be_bytes(values[0].as_slice().try_into()?))
+    };
+    let before = read()?;
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    let after = read()?;
+    anyhow::ensure!(after >= before + 15, "clock paused with the pump");
+    engine.stop_extension_instance(&"clock".into())?;
+    Ok(())
+}

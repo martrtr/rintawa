@@ -9,6 +9,7 @@ struct Fixture;
 
 impl exports::rintawa::engine::guest::Guest for Fixture {
     fn register() {
+        assert!(rintawa::engine::host::monotonic_millis().is_err());
         use rintawa::engine::{registration, transport};
         registration::define_contract("fixture.backend", 1, registration::ResolutionPolicy::Single)
             .expect("backend definition");
@@ -24,6 +25,7 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
     }
 
     fn start() {
+        rintawa::engine::host::monotonic_millis().expect("start clock");
         use rintawa::engine::transport;
         assert!(transport::declare_polled("fixture/not-yet-active").is_err());
         assert!(transport::begin_query("fixture/not-yet-active", b"no").is_err());
@@ -46,6 +48,7 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
     }
 
     fn stop() {
+        assert!(rintawa::engine::host::monotonic_millis().is_err());
         assert!(rintawa::engine::transport::declare("chat/send-controls/v1").is_err());
         assert!(rintawa::engine::transport::query("chat/send-controls/v1", b"ping").is_err());
         assert!(rintawa::engine::transport::publish("chat/updates/v1", b"stop").is_err());
@@ -60,6 +63,9 @@ impl exports::rintawa::engine::transport_handler::Guest for Fixture {
         caller: rintawa::engine::runtime_context::Principal,
     ) -> Vec<u8> {
         assert!(point == "chat/send-controls/v1" || point == "fixture/caller");
+        if payload == b"clock" {
+            return rintawa::engine::host::monotonic_millis().unwrap().to_be_bytes().to_vec();
+        }
         if let Some(result) = d8_control(&payload) {
             return result;
         }

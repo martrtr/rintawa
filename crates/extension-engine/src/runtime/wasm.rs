@@ -8,7 +8,7 @@ use std::{
     io::Read,
     path::Path,
     sync::{
-        Arc, Mutex, MutexGuard, TryLockError,
+        Arc, Mutex, MutexGuard, OnceLock, TryLockError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -146,7 +146,7 @@ use bindings::rintawa::engine::{
         ArtifactError as TargetArtifactError, Host as ExecutionTargetsHost, HostArtifactSource,
         RegistrationError as TargetRegistrationError,
     },
-    host::{Host as HostOperations, LogLevel, RandomError},
+    host::{ClockError, Host as HostOperations, LogLevel, RandomError},
     http_fetch::{Error as HttpFetchError, Host as HttpFetchHost, Response as WitHttpResponse},
     http_request::{
         Error as HttpRequestError, Event as WitHttpEvent, Header as WitHttpHeader,
@@ -1106,6 +1106,26 @@ fn map_target_artifact_error(error: rintawa_artifacts::RtwError) -> TargetArtifa
 }
 
 impl HostOperations for WasmHostState {
+    fn monotonic_millis(&mut self) -> Result<u64, ClockError> {
+        let context = self
+            .execution_context
+            .as_ref()
+            .filter(|context| {
+                self.world_system_snapshot.is_none()
+                    && self.execution_owner.as_ref() == Some(&context.principal.component())
+            })
+            .ok_or(ClockError::AccessNotActive)?;
+        self.transport
+            .contexts
+            .try_validate_execution(context, true)
+            .map_err(|error| match error {
+                TransportError::Unavailable => ClockError::Unavailable,
+                _ => ClockError::AccessNotActive,
+            })?;
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        clock_millis_from_duration(EPOCH.get_or_init(Instant::now).elapsed())
+    }
+
     fn random_bytes(&mut self, count: u32) -> Result<Vec<u8>, RandomError> {
         self.random_bytes_with(count, |bytes| getrandom::fill(bytes).map_err(|_| ()))
     }
@@ -1119,6 +1139,10 @@ impl HostOperations for WasmHostState {
             LogLevel::Error => error!(target: "wasm_plugin", plugin = %id, "{message}"),
         }
     }
+}
+
+fn clock_millis_from_duration(elapsed: Duration) -> Result<u64, ClockError> {
+    u64::try_from(elapsed.as_millis()).map_err(|_| ClockError::Unavailable)
 }
 
 fn wit_principal(principal: ComponentPrincipal) -> WitPrincipal {
