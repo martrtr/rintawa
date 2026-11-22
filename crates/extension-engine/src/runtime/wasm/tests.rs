@@ -99,6 +99,9 @@ impl ArtifactStoreAccess for RecordingScopedHostAccess {
 }
 
 impl AssetStoreAccess for RecordingScopedHostAccess {
+    fn open_asset(&self, _: &str, _: u64, _: &str) -> HostAccessResult<std::fs::File> {
+        Err(HostAccessError::Unavailable)
+    }
     fn import_asset(&self, bytes: &[u8], media_type: &str) -> HostAccessResult<ImportedAsset> {
         Ok(ImportedAsset {
             digest: String::from(
@@ -2195,4 +2198,163 @@ fn test_should_never_report_lost_command_outcomes_as_definite_failure() {
     };
     assert!(text.len() <= MAX_COMMAND_FAILURE_BYTES);
     assert!(text.is_char_boundary(text.len()));
+}
+
+#[test]
+fn test_entropy_requires_execution_uses_os_failure_and_resets_each_callback() {
+    let mut state = WasmHostState::new(ComponentId::new("runtime"));
+    assert!(matches!(
+        HostOperations::random_bytes(&mut state, 16),
+        Err(RandomError::AccessNotActive)
+    ));
+    begin_test_registration(&mut state, ExtensionId::new("entropy"));
+    assert!(matches!(
+        HostOperations::random_bytes(&mut state, 16),
+        Err(RandomError::AccessNotActive)
+    ));
+    state.finish_registration().unwrap();
+    state.begin_guest_execution();
+    assert!(matches!(
+        state.random_bytes_with(16, |_| Err(())),
+        Err(RandomError::Unavailable)
+    ));
+    for _ in 0..15 {
+        assert_eq!(
+            HostOperations::random_bytes(&mut state, 256).unwrap().len(),
+            256
+        );
+    }
+    assert_eq!(
+        HostOperations::random_bytes(&mut state, 240).unwrap().len(),
+        240
+    );
+    assert!(matches!(
+        HostOperations::random_bytes(&mut state, 1),
+        Err(RandomError::InvalidRequest)
+    ));
+    state.begin_guest_execution();
+    assert_eq!(
+        HostOperations::random_bytes(&mut state, 256).unwrap().len(),
+        256
+    );
+    state.discard_guest_execution();
+    assert!(matches!(
+        HostOperations::random_bytes(&mut state, 16),
+        Err(RandomError::AccessNotActive)
+    ));
+}
+
+struct FileAssetAccess {
+    path: std::path::PathBuf,
+    opens: std::sync::atomic::AtomicUsize,
+}
+impl AssetStoreAccess for FileAssetAccess {
+    fn import_asset(&self, _: &[u8], _: &str) -> HostAccessResult<ImportedAsset> {
+        Err(HostAccessError::Unavailable)
+    }
+    fn read_asset(&self, _: &str, _: u64, _: &str, _: usize) -> HostAccessResult<Vec<u8>> {
+        Err(HostAccessError::Unavailable)
+    }
+    fn open_asset(&self, _: &str, _: u64, _: &str) -> HostAccessResult<std::fs::File> {
+        self.opens.fetch_add(1, Ordering::Relaxed);
+        std::fs::File::open(&self.path).map_err(|_| HostAccessError::Unavailable)
+    }
+}
+
+#[test]
+fn test_asset_readers_check_permissions_before_io_and_isolate_shared_store_contexts()
+-> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("asset");
+    std::fs::write(&path, b"abcdef")?;
+    let access = Arc::new(FileAssetAccess {
+        path,
+        opens: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut state = WasmHostState::new(ComponentId::new("provider"));
+    state.host_access.asset_store = access.clone();
+    begin_test_registration(&mut state, ExtensionId::new("provider"));
+    state.finish_registration().unwrap();
+    state.begin_guest_execution();
+    let reference = || WitAssetRef {
+        digest: "sha256:test".into(),
+        size: 6,
+        media_type: "image/png".into(),
+    };
+    assert!(matches!(
+        state.open_asset_reader(reference()),
+        Err(AssetStoreError::PermissionDenied)
+    ));
+    assert_eq!(access.opens.load(Ordering::Relaxed), 0);
+    let provider = state.registered_owner().unwrap();
+    state
+        .runtime_permissions
+        .grant(provider.clone(), RuntimePermission::AssetRead)
+        .unwrap();
+    let handle = state.open_asset_reader(reference()).unwrap();
+    assert_eq!(state.read_asset_reader(handle, 2).unwrap(), b"ab");
+    // Delegated components in the same Store cannot use provider grants or handles.
+    let dependent = rintawa_sdk::contracts::ComponentRef::new("dependent", "runtime");
+    state
+        .transport
+        .contexts
+        .begin(dependent.clone(), RuntimeScopeId::new("other-world"))?;
+    state
+        .transport
+        .contexts
+        .activate_instance(&dependent.instance_id);
+    state.begin_delegated_guest_execution(dependent.clone());
+    assert_eq!(
+        HostOperations::random_bytes(&mut state, 16).unwrap().len(),
+        16
+    );
+    assert!(matches!(
+        state.open_asset_reader(reference()),
+        Err(AssetStoreError::PermissionDenied)
+    ));
+    state
+        .runtime_permissions
+        .grant(dependent.clone(), RuntimePermission::AssetRead)
+        .unwrap();
+    assert!(matches!(
+        state.read_asset_reader(handle, 1),
+        Err(AssetStoreError::InvalidAsset)
+    ));
+    let foreign = state.open_asset_reader(reference()).unwrap();
+    state.revoke_runtime_resources_for_owner(&dependent);
+    assert!(!state.asset_readers.contains_key(&foreign));
+    assert!(state.asset_readers.contains_key(&handle));
+    state.begin_guest_execution();
+    assert_eq!(state.read_asset_reader(handle, 2).unwrap(), b"cd");
+    // A replacement activation rejects even an uncleared old reader.
+    state
+        .transport
+        .contexts
+        .begin(provider.clone(), test_scope_id())?;
+    state
+        .transport
+        .contexts
+        .activate_instance(&provider.instance_id);
+    state.begin_guest_execution();
+    assert!(matches!(
+        state.read_asset_reader(handle, 1),
+        Err(AssetStoreError::InvalidAsset)
+    ));
+    state.revoke_runtime_resources_for_owner(&provider);
+    assert!(state.asset_readers.is_empty());
+    // Failed start cleanup also closes readers acquired before activation.
+    state
+        .transport
+        .contexts
+        .begin(provider.clone(), test_scope_id())?;
+    state.begin_start_execution();
+    assert_eq!(
+        HostOperations::random_bytes(&mut state, 16).unwrap().len(),
+        16
+    );
+    let fresh = state.open_asset_reader(reference()).unwrap();
+    assert_ne!(fresh, handle);
+    state.abort_guest_execution(ExtensionError::Message("failed start".into()));
+    assert!(state.asset_readers.is_empty());
+    Ok(())
 }

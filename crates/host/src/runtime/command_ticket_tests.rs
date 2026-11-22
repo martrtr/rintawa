@@ -114,6 +114,8 @@ id = "runtime"
 kind = "runtime"
 target = "rintawa.runtime.wasm-component@1"
 entry = "component.wasm"
+[components.permissions]
+runtime = ["asset-import", "asset-read", "user-resource-import", "user-resource-read"]
 "#
         ),
     )?;
@@ -127,13 +129,32 @@ entry = "component.wasm"
 }
 impl Fixture {
     fn new(capacity: usize) -> anyhow::Result<Self> {
+        Self::with_permissions(capacity, &[])
+    }
+    fn with_permissions(
+        capacity: usize,
+        permissions: &[rintawa_sdk::runtime_permissions::RuntimePermission],
+    ) -> anyhow::Result<Self> {
         let root = tempfile::tempdir()?;
         let home = HostHome::open(root.path().join("home"))?;
         let world = home.create_world()?.id;
         let digest = artifact(root.path(), &home, "backend", BACKEND)?;
         let consumer_digest = artifact(root.path(), &home, "consumer", CONSUMER)?;
         let data = WorldDataRuntimeControl::default();
-        let mut engine = ExtensionEngine::new();
+        let access = Arc::new(crate::runtime::LocalHostAccess::new(
+            home.root(),
+            crate::runtime::UserResourceRuntimeControl::default(),
+            crate::runtime::WorldSessionRuntimeControl::default(),
+            data.clone(),
+        ));
+        let mut engine = ExtensionEngine::with_host_access(
+            access.clone(),
+            access.clone(),
+            access.clone(),
+            access.clone(),
+            access.clone(),
+            access,
+        );
         engine.attach_world_data_access(Arc::new(data.clone()));
         for (id, digest) in [("backend", &digest), ("consumer", &consumer_digest)] {
             RtwExtensionLoader::new().load_stored_extension(
@@ -143,6 +164,15 @@ impl Fixture {
                 ExtensionInstanceId::new(id),
                 world_runtime_scope_id(world),
             )?;
+            if id == "backend" {
+                for permission in permissions {
+                    engine.grant_requested_runtime_permission_for_instance(
+                        &ExtensionInstanceId::new(id),
+                        &rintawa_sdk::types::ComponentId::new("runtime"),
+                        *permission,
+                    )?;
+                }
+            }
             engine.start_extension_instance(&ExtensionInstanceId::new(id))?;
         }
         let consumer =
@@ -594,3 +624,5 @@ fn test_guest_stop_releases_pending_tickets_without_cancelling_admitted_work() -
     }
     Ok(())
 }
+
+mod data_primitive_tests;

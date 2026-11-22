@@ -24,6 +24,28 @@ impl From<rintawa_storage::StorageError> for WorldReadError {
     }
 }
 
+impl WorldReadError {
+    /// Whether arguments or the requested exact property version are invalid.
+    pub fn invalid_request(&self) -> bool {
+        matches!(
+            self,
+            Self::Storage(
+                rintawa_storage::StorageError::StalePropertyVersion { .. }
+                    | rintawa_storage::StorageError::InvalidQueryPageSize { .. }
+                    | rintawa_storage::StorageError::InvalidQueryBatchSize { .. }
+                    | rintawa_storage::StorageError::InvalidPropertyReadKeyCount { .. }
+            )
+        )
+    }
+    /// Whether the native read result exceeds its bounded byte budget.
+    pub fn message_too_large(&self) -> bool {
+        matches!(
+            self,
+            Self::Storage(rintawa_storage::StorageError::QueryPageTooLarge { .. })
+        )
+    }
+}
+
 /// Result type used by snapshot reads.
 pub type WorldReadResult<T> = Result<T, WorldReadError>;
 

@@ -185,6 +185,13 @@ Oversized pages return a read error rather than a truncated success. Relation
 queries can batch up to 64 target item IDs and
 page through deduplicated relation-items, again in ID order. These are direct
 read primitives, not the retired Projection service or a new extension transport.
+Ordinary WASM guests have bounded batch reads and relation/property pages over one
+owner-scoped snapshot per call. System imports read their command's pinned snapshot.
+Raw batches allow at most 64 item IDs/64 keys; pages allow 256 rows. The guest limit
+is 1 MiB of complete JSON, including page string escaping; invalid arguments,
+foreign properties and oversized results return distinct errors. Host-generated
+UUIDv7 item IDs (1..64 per call) reserve no rows and grant no authority.
+
 The authorization gate is applied to indexed property searches before querying;
 relation structure does not grant access to foreign property values. Deletion
 checks inspect distinct affected property keys through one joined SQLite query
@@ -294,6 +301,18 @@ queryables and World-data are unavailable. The proposed nonblocking D8 transport
 and browser runtime are separate, unfinished slices; no Core UI formats or widget
 DTOs are introduced. Existing `0.0.1` WASM components must be rebuilt against the
 new WIT. See [the accepted contract](specs/mvp-api-and-client-boundaries.md).
+
+WASM `host.random-bytes` uses OS cryptographic entropy with no fallback: 1..256 bytes
+per call and 4096 per callback. It is available in start and ordinary/delegated
+callbacks, and unavailable in registration, System evaluation and stop.
+
+The `asset-read` permission allows known exact refs from the installation-wide CAS;
+it does not provide World-private media access or listing. Open verifies a file once,
+then sequential reads return at most 65536 bytes, with empty bytes at EOF. Eight
+readers per activation retain File descriptors, bound to the exact executing context.
+Read/close check permissions again; stop, trap and Store drop release readers.
+Handles are never reused in the process. Browser serving/channel cleanup is separate
+rtwKit work. These accepted additions require rebuilding guest WIT bindings.
 
 ## Standard product composition
 

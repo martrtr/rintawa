@@ -398,6 +398,15 @@ fn canonical_scope_world_id(scope_id: &RuntimeScopeId) -> Option<WorldId> {
 }
 
 impl WorldDataAccess for WorldDataRuntimeControl {
+    fn snapshot(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ExtensionInstanceId,
+    ) -> HostAccessResult<WorldSnapshot> {
+        self.client(scope)?
+            .snapshot_for_instance(owner.clone())
+            .map_err(|_| HostAccessError::Unavailable)
+    }
     fn load_item(
         &self,
         scope: &RuntimeScopeId,
@@ -431,6 +440,8 @@ impl WorldDataAccess for WorldDataRuntimeControl {
                 rintawa_world_runtime::WorldReadError::PropertyAccessDenied(_) => {
                     HostAccessError::Rejected
                 }
+                other if other.invalid_request() => HostAccessError::InvalidRequest,
+                other if other.message_too_large() => HostAccessError::MessageTooLarge,
                 _ => HostAccessError::Unavailable,
             })?;
         value
@@ -449,7 +460,7 @@ impl WorldDataAccess for WorldDataRuntimeControl {
         limit: usize,
     ) -> HostAccessResult<Vec<String>> {
         if !(1..=256).contains(&limit) {
-            return Err(HostAccessError::Rejected);
+            return Err(HostAccessError::InvalidRequest);
         }
         self.client(scope)?
             .snapshot_for_instance(owner.clone())
@@ -459,6 +470,8 @@ impl WorldDataAccess for WorldDataRuntimeControl {
                 rintawa_world_runtime::WorldReadError::PropertyAccessDenied(_) => {
                     HostAccessError::Rejected
                 }
+                other if other.invalid_request() => HostAccessError::InvalidRequest,
+                other if other.message_too_large() => HostAccessError::MessageTooLarge,
                 _ => HostAccessError::Unavailable,
             })?
             .into_iter()
@@ -505,6 +518,20 @@ impl ArtifactStoreAccess for LocalHostAccess {
 }
 
 impl AssetStoreAccess for LocalHostAccess {
+    fn open_asset(
+        &self,
+        digest: &str,
+        size: u64,
+        media_type: &str,
+    ) -> HostAccessResult<std::fs::File> {
+        let digest = AssetDigest::parse(digest).map_err(|_| HostAccessError::InvalidDigest)?;
+        let reference =
+            AssetRef::new(digest, size, media_type).map_err(|_| HostAccessError::InvalidAsset)?;
+        self.home()?
+            .asset_store()
+            .open_asset(&reference)
+            .map_err(map_asset_store_read_error)
+    }
     fn import_asset(&self, bytes: &[u8], media_type: &str) -> HostAccessResult<ImportedAsset> {
         let home = self.home()?;
         let imported = home
@@ -530,14 +557,7 @@ impl AssetStoreAccess for LocalHostAccess {
         if size == 0 || size > maximum_bytes {
             return Err(HostAccessError::Rejected);
         }
-        let digest = AssetDigest::parse(digest).map_err(|_| HostAccessError::InvalidDigest)?;
-        let reference =
-            AssetRef::new(digest, size, media_type).map_err(|_| HostAccessError::InvalidAsset)?;
-        let file = self
-            .home()?
-            .asset_store()
-            .open_asset(&reference)
-            .map_err(map_asset_store_read_error)?;
+        let file = self.open_asset(digest, size, media_type)?;
         let capacity = usize::try_from(size).map_err(|_| HostAccessError::Rejected)?;
         let mut bytes = Vec::with_capacity(capacity);
         file.take(maximum_bytes.saturating_add(1))
@@ -1055,14 +1075,14 @@ fn map_asset_import_error(error: rintawa_artifacts::AssetError) -> HostAccessErr
 fn map_asset_store_read_error(error: rintawa_artifacts::AssetError) -> HostAccessError {
     match error {
         rintawa_artifacts::AssetError::InvalidDigest(_) => HostAccessError::InvalidDigest,
-        rintawa_artifacts::AssetError::InvalidMediaType { .. } => HostAccessError::InvalidAsset,
-        rintawa_artifacts::AssetError::StoredAssetNotFound(_) => HostAccessError::NotFound,
-        rintawa_artifacts::AssetError::Io(_)
-        | rintawa_artifacts::AssetError::UnsupportedSource(_)
-        | rintawa_artifacts::AssetError::AssetTooLarge { .. }
+        rintawa_artifacts::AssetError::InvalidMediaType { .. }
         | rintawa_artifacts::AssetError::StoreCorruption(_)
         | rintawa_artifacts::AssetError::SizeMismatch { .. }
-        | rintawa_artifacts::AssetError::InvalidStoreEntry { .. } => HostAccessError::Unavailable,
+        | rintawa_artifacts::AssetError::InvalidStoreEntry { .. }
+        | rintawa_artifacts::AssetError::AssetTooLarge { .. } => HostAccessError::InvalidAsset,
+        rintawa_artifacts::AssetError::StoredAssetNotFound(_) => HostAccessError::NotFound,
+        rintawa_artifacts::AssetError::Io(_)
+        | rintawa_artifacts::AssetError::UnsupportedSource(_) => HostAccessError::Unavailable,
     }
 }
 

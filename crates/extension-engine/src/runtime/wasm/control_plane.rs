@@ -47,6 +47,15 @@ impl ArtifactStoreHost for WasmHostState {
 }
 
 impl AssetStoreHost for WasmHostState {
+    fn open_asset(&mut self, reference: WitAssetRef) -> Result<u64, AssetStoreError> {
+        self.open_asset_reader(reference)
+    }
+    fn read_asset(&mut self, handle: u64, maximum_bytes: u32) -> Result<Vec<u8>, AssetStoreError> {
+        self.read_asset_reader(handle, maximum_bytes)
+    }
+    fn close_asset(&mut self, handle: u64) -> Result<(), AssetStoreError> {
+        self.close_asset_reader(handle)
+    }
     fn import_asset(
         &mut self,
         bytes: Vec<u8>,
@@ -479,6 +488,8 @@ fn map_user_resource_access_error(error: HostAccessError) -> UserResourceError {
         | HostAccessError::InvalidPermission
         | HostAccessError::InvalidPreference
         | HostAccessError::PreferenceQuotaExceeded
+        | HostAccessError::InvalidRequest
+        | HostAccessError::MessageTooLarge
         | HostAccessError::Rejected => UserResourceError::Rejected,
     }
 }
@@ -1264,6 +1275,8 @@ fn map_world_session_access_error(error: HostAccessError) -> WorldSessionError {
         | HostAccessError::InvalidPermission
         | HostAccessError::InvalidPreference
         | HostAccessError::PreferenceQuotaExceeded
+        | HostAccessError::InvalidRequest
+        | HostAccessError::MessageTooLarge
         | HostAccessError::Rejected => WorldSessionError::Rejected,
     }
 }
@@ -1282,6 +1295,8 @@ fn map_artifact_store_access_error(error: HostAccessError) -> ArtifactStoreError
         | HostAccessError::InvalidPermission
         | HostAccessError::InvalidPreference
         | HostAccessError::PreferenceQuotaExceeded
+        | HostAccessError::InvalidRequest
+        | HostAccessError::MessageTooLarge
         | HostAccessError::Rejected => ArtifactStoreError::Rejected,
     }
 }
@@ -1300,6 +1315,8 @@ fn map_asset_store_access_error(error: HostAccessError) -> AssetStoreError {
         | HostAccessError::InvalidPermission
         | HostAccessError::InvalidPreference
         | HostAccessError::PreferenceQuotaExceeded
+        | HostAccessError::InvalidRequest
+        | HostAccessError::MessageTooLarge
         | HostAccessError::Rejected => AssetStoreError::Rejected,
     }
 }
@@ -1317,6 +1334,8 @@ fn map_preference_access_error(error: HostAccessError) -> PreferenceError {
         | HostAccessError::NotFound
         | HostAccessError::UnsupportedContent
         | HostAccessError::InvalidPermission
+        | HostAccessError::InvalidRequest
+        | HostAccessError::MessageTooLarge
         | HostAccessError::Rejected => PreferenceError::Rejected,
     }
 }
@@ -1334,6 +1353,8 @@ fn map_runtime_policy_access_error(error: HostAccessError) -> RuntimePolicyError
         | HostAccessError::UnsupportedContent
         | HostAccessError::InvalidPreference
         | HostAccessError::PreferenceQuotaExceeded
+        | HostAccessError::InvalidRequest
+        | HostAccessError::MessageTooLarge
         | HostAccessError::Rejected => RuntimePolicyError::Rejected,
     }
 }
@@ -1351,6 +1372,8 @@ fn map_composition_access_error(error: HostAccessError) -> CompositionError {
         | HostAccessError::InvalidPermission
         | HostAccessError::InvalidPreference
         | HostAccessError::PreferenceQuotaExceeded
+        | HostAccessError::InvalidRequest
+        | HostAccessError::MessageTooLarge
         | HostAccessError::Rejected => CompositionError::Rejected,
         HostAccessError::Unavailable => CompositionError::Unavailable,
     }

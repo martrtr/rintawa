@@ -20,9 +20,12 @@ static SUBSCRIPTIONS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new())
 struct Fixture;
 
 impl exports::rintawa::engine::guest::Guest for Fixture {
-    fn register() {}
+    fn register() {
+        assert!(rintawa::engine::host::random_bytes(16).is_err());
+    }
 
     fn start() {
+        assert_eq!(rintawa::engine::host::random_bytes(16).unwrap().len(), 16);
         let result = rintawa::engine::execution_targets::register_target("test.wasm-target@1");
         assert!(result.is_ok());
         if let Ok(task) = rintawa::engine::runtime_tasks::spawn_periodic(10) {
@@ -59,6 +62,7 @@ impl exports::rintawa::engine::target_provider::Guest for Fixture {
     fn register_component(
         handle: u64,
     ) -> Result<(), exports::rintawa::engine::target_provider::Error> {
+        assert!(rintawa::engine::host::random_bytes(16).is_err());
         if COMPONENTS.lock().unwrap().contains_key(&handle) {
             Ok(())
         } else {
@@ -69,6 +73,7 @@ impl exports::rintawa::engine::target_provider::Guest for Fixture {
     fn start_component(
         handle: u64,
     ) -> Result<(), exports::rintawa::engine::target_provider::Error> {
+        assert_eq!(rintawa::engine::host::random_bytes(16).unwrap().len(), 16);
         if !COMPONENTS.lock().unwrap().contains_key(&handle) {
             return Err(exports::rintawa::engine::target_provider::Error::UnknownComponent);
         }
@@ -101,6 +106,7 @@ impl exports::rintawa::engine::target_provider::Guest for Fixture {
 
 impl exports::rintawa::engine::task_handler::Guest for Fixture {
     fn on_task(task: u64) {
+        assert_eq!(rintawa::engine::host::random_bytes(16).unwrap().len(), 16);
         use rintawa::engine::{runtime_context, transport, user_resources};
         let component = *TASKS.lock().unwrap().get(&task).expect("known task");
         let current = runtime_context::current().expect("attested task context");

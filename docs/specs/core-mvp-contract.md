@@ -49,8 +49,13 @@ P07/D2 is implemented: command receivers survive ordinary callbacks, close relea
 quota without cancellation, and stop/trap/reload revoke old tickets. Real RTW/WASM
 acceptance covers pending/commit/rollback, queue and ticket limits, foreign handles,
 reopen and reply loss. Unknown completion is unavailable, never a definite failure.
-P08 and later implementation slices remain pending; these checks are not product
-or release acceptance.
+P08/D3+D7 is implemented: bounded guest batch/graph reads, Host-generated IDs,
+OS entropy and permission-checked sequential CAS readers. Real WASM acceptance
+creates domain rows without native seeding and checks pinned System reads, bounds,
+World/property isolation, PNG resource import and reading its saved ref after
+HostRuntime restart. Unit fault injection covers entropy failure and reader cleanup
+in a shared Store/failed start. P09 and later slices remain pending; browser
+rendering/serving/disconnect and product release acceptance are not claimed.
 
 ## Goal and required scenarios
 
@@ -216,10 +221,10 @@ rule of the particular command.
 
 ## D3. Sufficient guest World primitives
 
-**Proposed public API addition.** Expose existing native primitives through the
-current interfaces rather than adding a query language. The current ordinary
-guest has single reads/property pages; its System snapshot lacks native graph
-queries. Host-generated item IDs are also absent from the guest boundary.
+**Accepted D3; implemented in P08.** Existing native primitives are exposed through
+the current interfaces. At the design baseline, ordinary guests had only single
+reads/property pages, and System snapshots lacked graph queries. P08 adds these
+adapters and Host-generated item IDs without a query language.
 
 | Addition | Required behavior |
 | --- | --- |
@@ -244,6 +249,27 @@ A bounded Chat page can be reread after updates.
 Generated IDs do not attest ownership. Incoming UUID validation and authorization
 remain separate. Trusted native APIs remain available; existing single reads may
 be convenience operations on the same authority boundary.
+
+### P08 implementation boundaries
+
+Guest batch/graph adapters reuse the owner-scoped `WorldSnapshot`. An ordinary
+call obtains one snapshot through Host access; System calls reuse the installed
+pinned snapshot. Validate raw counts/bytes before deduplication and check complete
+JSON encoding, including page string escaping. Existing single-version mismatch
+remains invalid-request; batch reads omit absent exact versions.
+
+D7 uses the OS cryptographic source (no fallback), with a per-callback allowance.
+Asset readers retain the verified CAS File and exact executing context; admission
+checks permission and the eight-reader quota before opening/hashing. Read/close
+revalidate that context and permission. Process-wide handles never alias a new
+activation; owner cleanup and Store drop close descriptors. No verified-file cache,
+asset table, UI serving path or new scheduler is introduced. Host access adds only
+an owner-scoped snapshot and verified asset-open capability needed by these adapters.
+Acceptance covers A6–A7 and the Host/guest portions of B6–B7 through real WASM,
+plus typed error/limit, injected entropy failure and failed-start cleanup checks.
+A PNG crosses a user-resource ref into CAS, its ref is committed by a guest System,
+and a fresh Host reads the saved ref with import permission revoked. Browser
+rendering, active-content serving and channel disconnect ownership remain P10 work.
 
 ## D4. Write ownership and Host persistence
 

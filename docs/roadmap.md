@@ -28,7 +28,11 @@ World and interaction API cuts. The foundation and old integration code include:
   been retired; no replacement transport is integrated;
 - historical World Manager and shared Manage workspace packages (not currently
   compatible with the reduced UI ABI);
-- bounded file/resource ingress and streaming asset upload;
+- bounded file/resource ingress, streaming asset upload and permission-checked
+  sequential CAS readers; a real WASM PNG import/ref/Host-restart path is covered,
+  with browser rendering still deferred;
+- owner-scoped guest batch/graph reads, Host-generated UUIDv7 IDs and bounded OS
+  entropy, covered by real RTW fixtures;
 - earlier Tavern/Character and Chat integration work that requires migration to
   the replacement extension interaction and UI protocols before it can be used.
   These old package paths are historical, not verified end-to-end functionality.

@@ -111,6 +111,10 @@ pub enum HostAccessError {
     PreferenceQuotaExceeded,
     /// Host policy or persistent state rejected the operation.
     Rejected,
+    /// A bounded read has invalid arguments or an exact-version mismatch.
+    InvalidRequest,
+    /// A read exceeds the serialized result byte limit.
+    MessageTooLarge,
     /// The capability is not attached to this host runtime.
     Unavailable,
 }
@@ -132,6 +136,12 @@ pub trait RuntimeContextAccess: Send + Sync {
 /// Callers supply only their Host-attested exact instance identity and runtime scope;
 /// World identity and command principal are assigned by the Host implementation.
 pub trait WorldDataAccess: Send + Sync {
+    /// Captures one owner-scoped snapshot for a bounded guest batch/graph operation.
+    fn snapshot(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ExtensionInstanceId,
+    ) -> HostAccessResult<rintawa_world_runtime::WorldSnapshot>;
     /// Loads one item from the current World snapshot.
     fn load_item(
         &self,
@@ -177,6 +187,13 @@ pub trait ArtifactStoreAccess: Send + Sync {
 
 /// Generic immutable raw-asset store operations.
 pub trait AssetStoreAccess: Send + Sync {
+    /// Opens a verified CAS reader at offset zero without copying the entire asset.
+    fn open_asset(
+        &self,
+        digest: &str,
+        size: u64,
+        media_type: &str,
+    ) -> HostAccessResult<std::fs::File>;
     /// Imports exact bytes and returns their immutable digest/size/media reference.
     fn import_asset(&self, bytes: &[u8], media_type: &str) -> HostAccessResult<ImportedAsset>;
 
@@ -496,6 +513,9 @@ impl ArtifactStoreAccess for UnavailableArtifactStoreAccess {
 struct UnavailableAssetStoreAccess;
 
 impl AssetStoreAccess for UnavailableAssetStoreAccess {
+    fn open_asset(&self, _: &str, _: u64, _: &str) -> HostAccessResult<std::fs::File> {
+        Err(HostAccessError::Unavailable)
+    }
     fn import_asset(&self, _bytes: &[u8], _media_type: &str) -> HostAccessResult<ImportedAsset> {
         Err(HostAccessError::Unavailable)
     }
@@ -652,6 +672,13 @@ impl RuntimeContextAccess for UnavailableRuntimeContextAccess {
 struct UnavailableWorldDataAccess;
 
 impl WorldDataAccess for UnavailableWorldDataAccess {
+    fn snapshot(
+        &self,
+        _: &RuntimeScopeId,
+        _: &ExtensionInstanceId,
+    ) -> HostAccessResult<rintawa_world_runtime::WorldSnapshot> {
+        Err(HostAccessError::Unavailable)
+    }
     fn load_item(
         &self,
         _: &RuntimeScopeId,

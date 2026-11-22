@@ -13,6 +13,8 @@ interface host {
 
     /// Logs a message to the host's tracing system.
     log: func(level: log-level, message: string);
+    variant random-error { access-not-active, invalid-request, unavailable }
+    random-bytes: func(count: u32) -> result<list<u8>, random-error>;
 
 }
 
@@ -94,6 +96,7 @@ interface world-registration {
 /// Read-only calls available only while the Host is evaluating one World System.
 /// Every call is served from that command's already-pinned, owner-scoped snapshot.
 interface world-system-snapshot {
+    enum direction { outgoing, incoming, either }
     variant error {
         access-not-active,
         invalid-request,
@@ -105,6 +108,9 @@ interface world-system-snapshot {
     load-item: func(id: string) -> result<option<string>, error>;
     load-property: func(item: string, key: string) -> result<option<string>, error>;
     properties-of: func(item: string) -> result<list<string>, error>;
+    read: func(items: list<string>, properties: list<string>) -> result<string, error>;
+    find-relations: func(targets: list<string>, direction: direction, property: option<string>, after: option<string>, limit: u32) -> result<list<string>, error>;
+    find-properties: func(key: string, after: option<string>, limit: u32) -> result<list<string>, error>;
 }
 
 /// One authoritative World System implementation supplied by a WASM component.
@@ -122,6 +128,7 @@ interface world-system {
 
 /// Ordinary World reads and asynchronous command submission for a world-scoped guest.
 interface world-data {
+    use world-system-snapshot.{direction};
     type ticket = u64;
 
     variant error {
@@ -142,6 +149,9 @@ interface world-data {
     load-item: func(id: string) -> result<option<string>, error>;
     load-property: func(item: string, key: string) -> result<option<string>, error>;
     find-properties: func(key: string, after: option<string>, limit: u32) -> result<list<string>, error>;
+    read: func(items: list<string>, properties: list<string>) -> result<string, error>;
+    find-relations: func(targets: list<string>, direction: direction, property: option<string>, after: option<string>, limit: u32) -> result<list<string>, error>;
+    new-item-ids: func(count: u32) -> result<list<string>, error>;
     submit: func(schema: string, payload-json: string) -> result<ticket, error>;
     poll: func(ticket: ticket) -> result<ticket-status, error>;
     /// Release the receiver without cancelling an admitted command.
@@ -376,6 +386,10 @@ interface asset-store {
     /// Imports exact bytes under a canonical media type and returns an AssetRef.
     /// Intended for small payloads that fit comfortably inside one callback budget.
     import-asset: func(bytes: list<u8>, media-type: string) -> result<asset-ref, error>;
+
+    open-asset: func(reference: asset-ref) -> result<u64, error>;
+    read-asset: func(handle: u64, maximum-bytes: u32) -> result<list<u8>, error>;
+    close-asset: func(handle: u64) -> result<_, error>;
 
     /// Starts one bounded host-owned streaming asset upload.
     /// The declared size reserves quota but does not allocate the complete buffer eagerly.

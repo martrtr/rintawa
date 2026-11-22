@@ -47,11 +47,13 @@ use crate::{
     transport::{MAX_PAYLOAD_BYTES, Transport, TransportError, validate_transport_point},
 };
 
+mod asset_read;
 mod budget;
 mod control_plane;
 mod http_request;
 mod network;
 mod target_provider;
+mod world_reads;
 
 pub use crate::runtime::wasm::budget::WasmExecutionBudget;
 
@@ -144,7 +146,7 @@ use bindings::rintawa::engine::{
         ArtifactError as TargetArtifactError, Host as ExecutionTargetsHost, HostArtifactSource,
         RegistrationError as TargetRegistrationError,
     },
-    host::{Host as HostOperations, LogLevel},
+    host::{Host as HostOperations, LogLevel, RandomError},
     http_fetch::{Error as HttpFetchError, Host as HttpFetchHost, Response as WitHttpResponse},
     http_request::{
         Error as HttpRequestError, Event as WitHttpEvent, Header as WitHttpHeader,
@@ -183,7 +185,10 @@ use bindings::rintawa::engine::{
     world_sessions::{
         Error as WorldSessionError, Host as WorldSessionsHost, Summary as WitWorldSummary,
     },
-    world_system_snapshot::{Error as WorldSystemSnapshotError, Host as WorldSystemSnapshotHost},
+    world_system_snapshot::{
+        Direction as WitDirection, Error as WorldSystemSnapshotError,
+        Host as WorldSystemSnapshotHost,
+    },
 };
 use target_provider_bindings::TargetProviderPlugin;
 use task_bindings::TaskPlugin;
@@ -216,6 +221,8 @@ struct OwnedWorldDataTicket {
 /// Internal host state stored inside the Wasmtime Store context.
 pub struct WasmHostState {
     component_id: ComponentId,
+    random_bytes_this_execution: usize,
+    asset_readers: HashMap<u64, asset_read::AssetReader>,
     extension_id: Option<ExtensionId>,
     instance_id: Option<ExtensionInstanceId>,
     scope_id: Option<RuntimeScopeId>,
@@ -366,6 +373,8 @@ impl WasmHostState {
         } = host_services;
         Self {
             component_id,
+            random_bytes_this_execution: 0,
+            asset_readers: HashMap::new(),
             extension_id: None,
             instance_id: None,
             scope_id: None,
@@ -560,6 +569,7 @@ impl WasmHostState {
     }
 
     fn discard_guest_execution(&mut self) {
+        self.random_bytes_this_execution = 0;
         self.registration_scope = None;
         self.execution_owner = None;
         self.execution_context = None;
@@ -726,6 +736,7 @@ impl WasmHostState {
 
     /// Opens the normal guest execution scope for the provider component itself.
     fn begin_guest_execution(&mut self) {
+        self.random_bytes_this_execution = 0;
         self.execution_owner = self.registered_owner();
         self.execution_context = self
             .execution_owner
@@ -745,6 +756,7 @@ impl WasmHostState {
     }
 
     fn begin_delegated_guest_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
+        self.random_bytes_this_execution = 0;
         self.execution_context = self.transport.contexts.context(&owner, true).ok();
         self.execution_owner = Some(owner);
         self.task_access_active = true;
@@ -764,6 +776,7 @@ impl WasmHostState {
     }
 
     fn begin_delegated_task_execution(&mut self, owner: rintawa_sdk::contracts::ComponentRef) {
+        self.random_bytes_this_execution = 0;
         self.execution_context = self.transport.contexts.context(&owner, true).ok();
         self.execution_owner = Some(owner);
         self.task_access_active = true;
@@ -869,6 +882,8 @@ impl WasmHostState {
     }
 
     fn revoke_runtime_resources_for_owner(&mut self, owner: &rintawa_sdk::contracts::ComponentRef) {
+        self.asset_readers
+            .retain(|_, reader| reader.context.principal.component() != *owner);
         self.asset_uploads
             .retain(|_, upload| upload.owner.component() != *owner);
         self.user_resource_uploads
@@ -937,6 +952,26 @@ impl WasmHostState {
                 SecretAccessError::NotFound => SecretError::NotFound,
                 SecretAccessError::Unavailable => SecretError::Unavailable,
             })
+    }
+}
+
+impl WasmHostState {
+    fn random_bytes_with(
+        &mut self,
+        count: u32,
+        fill: impl FnOnce(&mut [u8]) -> Result<(), ()>,
+    ) -> Result<Vec<u8>, RandomError> {
+        if self.world_system_snapshot.is_some() || self.current_execution_owner().is_none() {
+            return Err(RandomError::AccessNotActive);
+        }
+        let count = count as usize;
+        if !(1..=256).contains(&count) || self.random_bytes_this_execution + count > 4096 {
+            return Err(RandomError::InvalidRequest);
+        }
+        self.random_bytes_this_execution += count;
+        let mut bytes = vec![0; count];
+        fill(&mut bytes).map_err(|_| RandomError::Unavailable)?;
+        Ok(bytes)
     }
 }
 
@@ -1043,6 +1078,9 @@ fn map_target_artifact_error(error: rintawa_artifacts::RtwError) -> TargetArtifa
 }
 
 impl HostOperations for WasmHostState {
+    fn random_bytes(&mut self, count: u32) -> Result<Vec<u8>, RandomError> {
+        self.random_bytes_with(count, |bytes| getrandom::fill(bytes).map_err(|_| ()))
+    }
     fn log(&mut self, level: LogLevel, message: String) {
         let id = &self.component_id;
         match level {
@@ -1286,7 +1324,52 @@ impl WorldRegistrationHost for WasmHostState {
 }
 
 impl WorldSystemSnapshotHost for WasmHostState {
+    fn read(
+        &mut self,
+        items: Vec<String>,
+        properties: Vec<String>,
+    ) -> Result<String, WorldSystemSnapshotError> {
+        world_reads::read(
+            self.world_system_snapshot()?,
+            items,
+            properties,
+            self.max_host_message_bytes,
+        )
+    }
+    fn find_relations(
+        &mut self,
+        targets: Vec<String>,
+        direction: WitDirection,
+        property: Option<String>,
+        after: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<String>, WorldSystemSnapshotError> {
+        world_reads::find_relations(
+            self.world_system_snapshot()?,
+            targets,
+            direction,
+            property,
+            after,
+            limit,
+            self.max_host_message_bytes,
+        )
+    }
+    fn find_properties(
+        &mut self,
+        key: String,
+        after: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<String>, WorldSystemSnapshotError> {
+        world_reads::find_properties(
+            self.world_system_snapshot()?,
+            key,
+            after,
+            limit,
+            self.max_host_message_bytes,
+        )
+    }
     fn load_item(&mut self, id: String) -> Result<Option<String>, WorldSystemSnapshotError> {
+        world_reads::input_size([&id], self.max_host_message_bytes)?;
         let id = id
             .parse::<ItemId>()
             .map_err(|_| WorldSystemSnapshotError::InvalidRequest)?;
@@ -1303,6 +1386,7 @@ impl WorldSystemSnapshotHost for WasmHostState {
         item: String,
         key: String,
     ) -> Result<Option<String>, WorldSystemSnapshotError> {
+        world_reads::input_size([&item, &key], self.max_host_message_bytes)?;
         let item = item
             .parse::<ItemId>()
             .map_err(|_| WorldSystemSnapshotError::InvalidRequest)?;
@@ -1319,23 +1403,16 @@ impl WorldSystemSnapshotHost for WasmHostState {
     }
 
     fn properties_of(&mut self, item: String) -> Result<Vec<String>, WorldSystemSnapshotError> {
+        world_reads::input_size([&item], self.max_host_message_bytes)?;
         let item = item
             .parse::<ItemId>()
             .map_err(|_| WorldSystemSnapshotError::InvalidRequest)?;
-        let mut total_bytes = 0_usize;
-        self.world_system_snapshot()?
-            .properties_of(item)
-            .map_err(map_world_system_read_error)?
-            .into_iter()
-            .map(|property| {
-                let encoded = self.encode_world_system_read(property)?;
-                total_bytes = total_bytes.saturating_add(encoded.len());
-                if total_bytes > self.max_host_message_bytes {
-                    return Err(WorldSystemSnapshotError::MessageTooLarge);
-                }
-                Ok(encoded)
-            })
-            .collect()
+        world_reads::pages(
+            self.world_system_snapshot()?
+                .properties_of(item)
+                .map_err(map_world_system_read_error)?,
+            self.max_host_message_bytes,
+        )
     }
 }
 
@@ -1356,6 +1433,8 @@ impl WasmHostState {
 fn map_world_system_read_error(error: WorldReadError) -> WorldSystemSnapshotError {
     match error {
         WorldReadError::PropertyAccessDenied(_) => WorldSystemSnapshotError::AccessDenied,
+        other if other.invalid_request() => WorldSystemSnapshotError::InvalidRequest,
+        other if other.message_too_large() => WorldSystemSnapshotError::MessageTooLarge,
         WorldReadError::SnapshotUnavailable | WorldReadError::Storage(_) => {
             WorldSystemSnapshotError::Unavailable
         }
@@ -1363,6 +1442,42 @@ fn map_world_system_read_error(error: WorldReadError) -> WorldSystemSnapshotErro
 }
 
 impl WorldDataHost for WasmHostState {
+    fn read(
+        &mut self,
+        items: Vec<String>,
+        properties: Vec<String>,
+    ) -> Result<String, WorldDataError> {
+        let snapshot = self.guest_world_snapshot()?;
+        world_reads::read(&snapshot, items, properties, self.max_host_message_bytes)
+            .map_err(world_reads::ordinary_error)
+    }
+    fn find_relations(
+        &mut self,
+        targets: Vec<String>,
+        direction: WitDirection,
+        property: Option<String>,
+        after: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<String>, WorldDataError> {
+        let snapshot = self.guest_world_snapshot()?;
+        world_reads::find_relations(
+            &snapshot,
+            targets,
+            direction,
+            property,
+            after,
+            limit,
+            self.max_host_message_bytes,
+        )
+        .map_err(world_reads::ordinary_error)
+    }
+    fn new_item_ids(&mut self, count: u32) -> Result<Vec<String>, WorldDataError> {
+        if !(1..=64).contains(&count) {
+            return Err(WorldDataError::InvalidRequest);
+        }
+        drop(self.guest_world_snapshot()?);
+        Ok((0..count).map(|_| ItemId::new().to_string()).collect())
+    }
     fn load_item(&mut self, id: String) -> Result<Option<String>, WorldDataError> {
         let (scope, owner) = self.world_data_identity()?;
         self.check_world_data_bytes(id.len())?;
@@ -1406,28 +1521,9 @@ impl WorldDataHost for WasmHostState {
         after: Option<String>,
         limit: u32,
     ) -> Result<Vec<String>, WorldDataError> {
-        let (scope, owner) = self.world_data_identity()?;
-        self.check_world_data_bytes(
-            key.len()
-                .saturating_add(after.as_ref().map_or(0, String::len)),
-        )?;
-        let key = key
-            .parse::<SchemaKey>()
-            .map_err(|_| WorldDataError::InvalidRequest)?;
-        let after = after
-            .map(|value| {
-                value
-                    .parse::<ItemId>()
-                    .map_err(|_| WorldDataError::InvalidRequest)
-            })
-            .transpose()?;
-        let values = self
-            .host_access
-            .world_data
-            .find_properties(scope, owner, &key, after, limit as usize)
-            .map_err(map_world_data_error)?;
-        self.check_world_data_results(&values)?;
-        Ok(values)
+        let snapshot = self.guest_world_snapshot()?;
+        world_reads::find_properties(&snapshot, key, after, limit, self.max_host_message_bytes)
+            .map_err(world_reads::ordinary_error)
     }
 
     fn submit(&mut self, schema: String, payload_json: String) -> Result<u64, WorldDataError> {
@@ -1499,6 +1595,14 @@ impl WorldDataHost for WasmHostState {
 }
 
 impl WasmHostState {
+    fn guest_world_snapshot(&self) -> Result<WorldSnapshot, WorldDataError> {
+        let (scope, owner) = self.world_data_identity()?;
+        self.host_access
+            .world_data
+            .snapshot(scope, owner)
+            .map_err(map_world_data_error)
+    }
+
     fn world_data_identity(
         &self,
     ) -> Result<(&RuntimeScopeId, &ExtensionInstanceId), WorldDataError> {
@@ -1508,6 +1612,8 @@ impl WasmHostState {
         {
             return Err(WorldDataError::AccessNotActive);
         }
+        self.active_execution_context()
+            .map_err(|_| WorldDataError::AccessNotActive)?;
         let scope = self
             .scope_id
             .as_ref()
@@ -1529,15 +1635,6 @@ impl WasmHostState {
     fn check_world_data_result(&self, value: Option<&str>) -> Result<(), WorldDataError> {
         self.check_world_data_bytes(value.map_or(0, str::len))
     }
-
-    fn check_world_data_results(&self, values: &[String]) -> Result<(), WorldDataError> {
-        values.iter().try_fold(0_usize, |total, value| {
-            let total = total.saturating_add(value.len());
-            self.check_world_data_bytes(total)?;
-            Ok(total)
-        })?;
-        Ok(())
-    }
 }
 
 fn world_command_failure(
@@ -1554,6 +1651,8 @@ fn world_command_failure(
 fn map_world_data_error(error: HostAccessError) -> WorldDataError {
     match error {
         HostAccessError::QueueFull => WorldDataError::QueueFull,
+        HostAccessError::InvalidRequest => WorldDataError::InvalidRequest,
+        HostAccessError::MessageTooLarge => WorldDataError::MessageTooLarge,
         HostAccessError::Rejected => WorldDataError::AccessDenied,
         HostAccessError::Unavailable => WorldDataError::Unavailable,
         _ => WorldDataError::InvalidRequest,
@@ -2094,7 +2193,7 @@ impl WasmWorldSystemEndpoint {
             .handler
             .rintawa_engine_world_system()
             .call_evaluate(&mut instance.store, &command_json)
-            .map_err(|error| SystemError::Failed(format!("WASM World System failed: {error}")));
+            .map_err(|error| SystemError::Failed(format!("WASM World System failed: {error:#}")));
         instance.store.data_mut().finish_world_system_execution();
 
         let response = match response {

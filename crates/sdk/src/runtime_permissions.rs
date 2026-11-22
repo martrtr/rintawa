@@ -25,6 +25,8 @@ pub enum RuntimePermission {
     ArtifactImport,
     /// Allows importing bounded immutable raw assets into the local asset store.
     AssetImport,
+    /// Allows reading known exact refs from the installation-wide immutable asset CAS.
+    AssetRead,
     /// Allows creating bounded ephemeral user-selected resources for semantic import workflows.
     UserResourceImport,
     /// Allows reading exact opaque ephemeral resources explicitly passed to the component.
@@ -53,6 +55,7 @@ impl fmt::Display for RuntimePermission {
             Self::HttpRequest => formatter.write_str("http-request"),
             Self::ArtifactImport => formatter.write_str("artifact-import"),
             Self::AssetImport => formatter.write_str("asset-import"),
+            Self::AssetRead => formatter.write_str("asset-read"),
             Self::UserResourceImport => formatter.write_str("user-resource-import"),
             Self::UserResourceRead => formatter.write_str("user-resource-read"),
             Self::WorldSessionRead => formatter.write_str("world-session-read"),
@@ -89,6 +92,7 @@ impl FromStr for RuntimePermission {
             "http-request" => Ok(Self::HttpRequest),
             "artifact-import" => Ok(Self::ArtifactImport),
             "asset-import" => Ok(Self::AssetImport),
+            "asset-read" => Ok(Self::AssetRead),
             "user-resource-import" => Ok(Self::UserResourceImport),
             "user-resource-read" => Ok(Self::UserResourceRead),
             "world-session-read" => Ok(Self::WorldSessionRead),
@@ -124,7 +128,12 @@ mod tests {
     }
 
     #[test]
-    fn test_should_round_trip_asset_import_permission() {
+    fn test_should_round_trip_asset_permissions() {
+        assert_eq!(RuntimePermission::AssetRead.to_string(), "asset-read");
+        assert_eq!(
+            "asset-read".parse::<RuntimePermission>(),
+            Ok(RuntimePermission::AssetRead)
+        );
         assert_eq!(RuntimePermission::AssetImport.to_string(), "asset-import");
         assert_eq!(
             "asset-import".parse::<RuntimePermission>(),

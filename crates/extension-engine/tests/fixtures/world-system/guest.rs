@@ -13,6 +13,31 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
             r#"{"type":"integer"}"#,
         )
         .expect("value property schema");
+        for (name, version, schema) in [
+            ("fixture.label", 1, r#"{"type":"string"}"#),
+            ("fixture.label", 2, r#"{"type":"string"}"#),
+            ("fixture.edge", 1, r#"{"type":"boolean"}"#),
+            ("fixture.asset", 1, r#"{"type":"object"}"#),
+        ] {
+            world_registration::register_world_schema(name, version, SchemaKind::Property, schema)
+                .unwrap();
+        }
+        for command in [
+            "fixture.graph",
+            "fixture.set-label",
+            "fixture.pinned",
+            "fixture.pair",
+            "fixture.system-limits",
+        ] {
+            world_registration::register_world_schema(
+                command,
+                1,
+                SchemaKind::Command,
+                r#"{"type":"object"}"#,
+            )
+            .unwrap();
+        }
+        assert!(rintawa::engine::host::random_bytes(16).is_err());
         for command in [
             "fixture.commit",
             "fixture.reject",
@@ -32,9 +57,15 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
     }
 
     fn start() {
+        assert_eq!(rintawa::engine::host::random_bytes(16).unwrap().len(), 16);
+        assert!(rintawa::engine::world_data::new_item_ids(1).is_err());
+        if let Ok(reference) = import_fixture_asset() {
+            *IMPORTED_ASSET.lock().unwrap() = Some(reference);
+        }
         rintawa::engine::transport::declare("fixture/commands").expect("command point");
     }
     fn stop() {
+        assert!(rintawa::engine::host::random_bytes(16).is_err());
         if let Some(ticket) = *LAST_TICKET.lock().unwrap() {
             assert!(matches!(
                 rintawa::engine::world_data::close(ticket),
@@ -51,6 +82,11 @@ impl exports::rintawa::engine::world_system::Guest for Fixture {
         let command: serde_json::Value = serde_json::from_str(&command_json).map_err(|error| {
             exports::rintawa::engine::world_system::Error::Failed(error.to_string())
         })?;
+        assert!(rintawa::engine::host::random_bytes(16).is_err());
+        assert!(rintawa::engine::world_data::new_item_ids(1).is_err());
+        if let Some(result) = graph_system(&command) {
+            return result;
+        }
         let item = command["payload"]["item"].as_str().ok_or_else(|| {
             exports::rintawa::engine::world_system::Error::Failed(String::from("missing item"))
         })?;
@@ -87,6 +123,148 @@ impl exports::rintawa::engine::world_system::Guest for Fixture {
     }
 }
 
+fn graph_system(
+    command: &serde_json::Value,
+) -> Option<Result<String, exports::rintawa::engine::world_system::Error>> {
+    use rintawa::engine::world_system_snapshot as snapshot;
+    let payload = &command["payload"];
+    let set = |item: &str, name: &str, value: serde_json::Value| serde_json::json!({"operation":"set-property","item":item,"key":{"id":name,"version":1},"data":value});
+    let changes = match command["schema"].as_str()? {
+        "fixture.graph@1" => {
+            let ids: Vec<String> = serde_json::from_value(payload["ids"].clone()).unwrap();
+            assert_eq!(ids.len(), 3);
+            let before: serde_json::Value =
+                serde_json::from_str(&snapshot::read(&ids, &["fixture.value@1".into()]).unwrap())
+                    .unwrap();
+            assert!(before["items"].as_array().unwrap().is_empty());
+            assert!(
+                snapshot::find_relations(&ids, snapshot::Direction::Either, None, None, 256)
+                    .unwrap()
+                    .is_empty()
+            );
+            let mut changes = vec![
+                serde_json::json!({"operation":"create-object","id":ids[0]}),
+                serde_json::json!({"operation":"create-object","id":ids[1]}),
+                serde_json::json!({"operation":"create-relation","id":ids[2],"subject":ids[0],"object":ids[1]}),
+                set(&ids[0], "fixture.value", serde_json::json!(7)),
+                set(&ids[1], "fixture.value", serde_json::json!(7)),
+                set(&ids[0], "fixture.label", serde_json::json!("first")),
+                set(&ids[1], "fixture.label", serde_json::json!("second")),
+                set(&ids[2], "fixture.edge", serde_json::json!(true)),
+            ];
+            if let Some(reference) = payload.get("asset") {
+                changes.push(set(&ids[0], "fixture.asset", reference.clone()));
+            }
+            changes
+        }
+        "fixture.set-label@1" => {
+            // Avoid spending the default System CPU budget walking a large JSON
+            // Value: the fixture generates only these two known JSON characters.
+            let unit = if payload["escaped"] == true {
+                "\\\""
+            } else {
+                "x"
+            };
+            let data = unit.repeat(payload["size"].as_u64().unwrap() as usize);
+            let item = payload["item"].as_str().unwrap();
+            return Some(Ok(format!(
+                r#"{{"changes":[{{"operation":"set-property","item":"{item}","key":{{"id":"fixture.label","version":1}},"data":"{data}"}}]}}"#
+            )));
+        }
+        "fixture.pair@1" => payload["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| {
+                set(
+                    id.as_str().unwrap(),
+                    "fixture.value",
+                    payload["value"].clone(),
+                )
+            })
+            .collect(),
+        "fixture.pinned@1" => {
+            let ids: Vec<String> = serde_json::from_value(payload["ids"].clone()).unwrap();
+            let batch: serde_json::Value =
+                serde_json::from_str(&snapshot::read(&ids, &["fixture.value@1".into()]).unwrap())
+                    .unwrap();
+            for record in batch["properties"].as_array().unwrap() {
+                assert_eq!(record["data"], payload["expected"]);
+            }
+            assert_eq!(
+                snapshot::find_relations(
+                    &ids,
+                    snapshot::Direction::Either,
+                    Some("fixture.edge@1"),
+                    None,
+                    256
+                )
+                .unwrap()
+                .len(),
+                1
+            );
+            assert_eq!(
+                snapshot::find_properties("fixture.value@1", None, 256)
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert!(matches!(
+                snapshot::read(&[], &["foreign.key@1".into()]),
+                Err(snapshot::Error::AccessDenied)
+            ));
+            vec![set(&ids[0], "fixture.value", payload["expected"].clone())]
+        }
+        "fixture.system-limits@1" => {
+            assert!(matches!(
+                snapshot::find_properties("fixture.label@1", None, 256),
+                Err(snapshot::Error::MessageTooLarge)
+            ));
+            assert!(matches!(
+                snapshot::find_relations(&[], snapshot::Direction::Either, None, None, 0),
+                Err(snapshot::Error::InvalidRequest)
+            ));
+            vec![set(
+                payload["item"].as_str().unwrap(),
+                "fixture.value",
+                serde_json::json!(7),
+            )]
+        }
+        _ => return None,
+    };
+    Some(Ok(serde_json::json!({"changes":changes}).to_string()))
+}
+
+static IMPORTED_ASSET: std::sync::Mutex<Option<rintawa::engine::asset_store::AssetRef>> =
+    std::sync::Mutex::new(None);
+fn import_fixture_asset()
+-> Result<rintawa::engine::asset_store::AssetRef, rintawa::engine::asset_store::Error> {
+    use rintawa::engine::{asset_store, user_resources};
+    if let Ok(resource) =
+        user_resources::import_resource(include_bytes!("pixel.png"), "image/png", Some("pixel.png"))
+    {
+        let bytes = user_resources::read_resource(&resource, resource.size)
+            .expect("read selected resource");
+        let reference = asset_store::import_asset(&bytes, &resource.media_type);
+        user_resources::release_resource(&resource).expect("release resource");
+        return reference;
+    }
+    let size = 1024 * 1024 + 17;
+    let upload = asset_store::begin_upload("image/png", size)?;
+    let chunk = vec![7u8; 32768];
+    let mut offset = 0;
+    while offset < size {
+        let count = (size - offset).min(chunk.len() as u64) as usize;
+        asset_store::append_upload(upload, &chunk[..count])?;
+        offset += count as u64;
+    }
+    asset_store::finish_upload(upload)
+}
+fn asset_error(error: rintawa::engine::asset_store::Error) -> serde_json::Value {
+    use rintawa::engine::asset_store::Error;
+    serde_json::json!({"error":match error { Error::AccessNotActive=>"access-not-active",Error::PermissionDenied=>"permission-denied",Error::MessageTooLarge=>"message-too-large",Error::InvalidAsset=>"invalid-asset",Error::Rejected=>"rejected",Error::Unavailable=>"unavailable" }})
+}
+
 static LAST_TICKET: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
 
 impl exports::rintawa::engine::transport_handler::Guest for Fixture {
@@ -107,7 +285,11 @@ impl exports::rintawa::engine::transport_handler::Guest for Fixture {
         let result = match request["op"].as_str().expect("operation") {
             "submit" | "submit-lost-reply" => {
                 let schema = request["schema"].as_str().expect("schema");
-                let body = serde_json::json!({"item":request["item"]}).to_string();
+                let body = request
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({"item":request["item"]}))
+                    .to_string();
                 match world_data::submit(schema, &body) {
                     Ok(ticket) => {
                         *LAST_TICKET.lock().unwrap() = Some(ticket);
@@ -139,6 +321,121 @@ impl exports::rintawa::engine::transport_handler::Guest for Fixture {
                 match world_data::load_item(item) {
                     Ok(value) => serde_json::json!({"exists":value.is_some()}),
                     Err(failure) => error(failure),
+                }
+            }
+            "ids" => match world_data::new_item_ids(request["count"].as_u64().unwrap() as u32) {
+                Ok(ids) => serde_json::json!({"ids":ids}),
+                Err(e) => error(e),
+            },
+            "batch" | "batch-summary" => {
+                let items: Vec<String> = serde_json::from_value(request["items"].clone()).unwrap();
+                let keys: Vec<String> = serde_json::from_value(request["keys"].clone()).unwrap();
+                match world_data::read(&items, &keys) {
+                    Ok(value) => {
+                        if request["op"] == "batch-summary" {
+                            serde_json::json!({"encoded_bytes":value.len()})
+                        } else {
+                            serde_json::from_str(&value).unwrap()
+                        }
+                    }
+                    Err(e) => error(e),
+                }
+            }
+            "sized-input" => match world_data::read(
+                &[],
+                &["x".repeat(request["size"].as_u64().unwrap() as usize)],
+            ) {
+                Ok(_) => panic!("oversized input accepted"),
+                Err(e) => error(e),
+            },
+            "relations" => {
+                let direction = match request["direction"].as_str().unwrap() {
+                    "incoming" => rintawa::engine::world_system_snapshot::Direction::Incoming,
+                    "outgoing" => rintawa::engine::world_system_snapshot::Direction::Outgoing,
+                    _ => rintawa::engine::world_system_snapshot::Direction::Either,
+                };
+                let targets: Vec<String> =
+                    serde_json::from_value(request["targets"].clone()).unwrap();
+                let property = request["property"].as_str();
+                let after = request["after"].as_str();
+                match world_data::find_relations(
+                    &targets,
+                    direction,
+                    property,
+                    after,
+                    request["limit"].as_u64().unwrap() as u32,
+                ) {
+                    Ok(values) => serde_json::json!({"records":values}),
+                    Err(e) => error(e),
+                }
+            }
+            "properties" => match world_data::find_properties(
+                request["key"].as_str().unwrap(),
+                request["after"].as_str(),
+                request["limit"].as_u64().unwrap() as u32,
+            ) {
+                Ok(values) => serde_json::json!({"records":values}),
+                Err(e) => error(e),
+            },
+            "property" => match world_data::load_property(
+                request["item"].as_str().unwrap(),
+                request["key"].as_str().unwrap(),
+            ) {
+                Ok(value) => serde_json::json!({"property":value}),
+                Err(e) => error(e),
+            },
+            "entropy" => {
+                let count = request["count"].as_u64().unwrap() as u32;
+                let mut lengths = Vec::new();
+                let mut failed = None;
+                for _ in 0..request["calls"].as_u64().unwrap_or(1) {
+                    match rintawa::engine::host::random_bytes(count) {
+                        Ok(bytes) => lengths.push(bytes.len()),
+                        Err(e) => {
+                            failed = Some(format!("{e:?}"));
+                            break;
+                        }
+                    }
+                }
+                serde_json::json!({"lengths":lengths,"error":failed})
+            }
+            "asset-ref" => {
+                let stored = IMPORTED_ASSET.lock().unwrap();
+                match stored.as_ref() {
+                    Some(r) => {
+                        serde_json::json!({"digest":r.digest,"size":r.size,"media_type":r.media_type})
+                    }
+                    None => serde_json::json!({"error":"not-imported"}),
+                }
+            }
+            "asset-open" => {
+                let r = &request["reference"];
+                let reference = rintawa::engine::asset_store::AssetRef {
+                    digest: r["digest"].as_str().unwrap().into(),
+                    size: r["size"].as_u64().unwrap(),
+                    media_type: r["media_type"].as_str().unwrap().into(),
+                };
+                match rintawa::engine::asset_store::open_asset(&reference) {
+                    Ok(handle) => serde_json::json!({"handle":handle}),
+                    Err(e) => asset_error(e),
+                }
+            }
+            "asset-read" => match rintawa::engine::asset_store::read_asset(
+                request["handle"].as_u64().unwrap(),
+                request["maximum"].as_u64().unwrap() as u32,
+            ) {
+                Ok(bytes) => {
+                    // Summarize a chunk so transport's 64 KiB payload cap does not
+                    // masquerade as the independent 64 KiB asset-read boundary.
+                    serde_json::json!({"length":bytes.len(),"sum":bytes.iter().map(|b|u64::from(*b)).sum::<u64>()})
+                }
+                Err(e) => asset_error(e),
+            },
+            "asset-close" => {
+                match rintawa::engine::asset_store::close_asset(request["handle"].as_u64().unwrap())
+                {
+                    Ok(()) => serde_json::json!({"closed":true}),
+                    Err(e) => asset_error(e),
                 }
             }
             "trap" => panic!("intentional callback trap"),
