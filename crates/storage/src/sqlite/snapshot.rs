@@ -137,6 +137,29 @@ impl SqliteWorldSnapshot {
         query::find_relations(&self.connection, targets, direction, property, after, limit)
     }
 
+    /// Finds a bounded relation page in descending ID order, strictly before a cursor.
+    /// An absent cursor starts at the greatest relation ID in this pinned snapshot.
+    ///
+    /// # Errors
+    /// Returns invalid batch/page limits or a storage error.
+    pub fn find_relations_before(
+        &self,
+        targets: &[ItemId],
+        direction: RelationDirection,
+        property: Option<&SchemaKey>,
+        before: Option<ItemId>,
+        limit: usize,
+    ) -> StorageResult<Vec<ItemRecord>> {
+        query::find_relations_before(
+            &self.connection,
+            targets,
+            direction,
+            property,
+            before,
+            limit,
+        )
+    }
+
     /// Loads every relation whose subject or object is the given item.
     ///
     /// # Errors

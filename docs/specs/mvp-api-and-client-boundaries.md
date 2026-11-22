@@ -357,7 +357,11 @@ find-relations: func(
 find-properties: func(key: string, after: option<string>, limit: u32)
     -> result<list<string>, error>;
 
-// world-data only:
+// world-data only (story MVP adds bounded descending relation pages):
+find-relations-before: func(
+    targets: list<string>, direction: direction, property: option<string>,
+    before: option<string>, limit: u32
+) -> result<list<string>, error>;
 new-item-ids: func(count: u32) -> result<list<string>, error>;
 close: func(ticket: ticket) -> result<_, error>;
 ```
@@ -372,6 +376,11 @@ not all data. Relation targets are ORed and deduplicated. Limits are 1..256;
 `after` is an exclusive item/relation ID, independent of whether that row exists.
 Results use stable ascending ID order; properties additionally use key order.
 Property filters mean exact key presence, not arbitrary JSON predicates.
+The story MVP addition `world-data.find-relations-before` instead returns strict
+descending relation-ID order. Its optional `before` cursor is exclusive; absent
+means the greatest ID, including the maximum UUID. Counts, owner/property checks,
+byte bounds and errors are identical to the forward operation. It is not exposed
+in System imports: the present consumer is an ordinary Chat recent-window read.
 
 `read` returns `{"items":[ItemRecord],"properties":[PropertyRecord]}`. Records use
 the existing serde forms in [state.rs](../../crates/world/src/state.rs): item

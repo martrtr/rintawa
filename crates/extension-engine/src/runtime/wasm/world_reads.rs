@@ -103,6 +103,55 @@ pub(super) fn find_relations(
     limit: u32,
     maximum: usize,
 ) -> Result<Vec<String>, Error> {
+    relation_page(
+        snapshot,
+        targets,
+        direction,
+        property,
+        RelationCursor::After(cursor),
+        limit,
+        maximum,
+    )
+}
+
+pub(super) fn find_relations_before(
+    snapshot: &WorldSnapshot,
+    targets: Vec<String>,
+    direction: WitDirection,
+    property: Option<String>,
+    cursor: Option<String>,
+    limit: u32,
+    maximum: usize,
+) -> Result<Vec<String>, Error> {
+    relation_page(
+        snapshot,
+        targets,
+        direction,
+        property,
+        RelationCursor::Before(cursor),
+        limit,
+        maximum,
+    )
+}
+
+enum RelationCursor {
+    After(Option<String>),
+    Before(Option<String>),
+}
+
+fn relation_page(
+    snapshot: &WorldSnapshot,
+    targets: Vec<String>,
+    direction: WitDirection,
+    property: Option<String>,
+    cursor: RelationCursor,
+    limit: u32,
+    maximum: usize,
+) -> Result<Vec<String>, Error> {
+    let (cursor, descending) = match cursor {
+        RelationCursor::After(value) => (value, false),
+        RelationCursor::Before(value) => (value, true),
+    };
     if targets.len() > 64 {
         return Err(Error::InvalidRequest);
     }
@@ -123,15 +172,14 @@ pub(super) fn find_relations(
         WitDirection::Incoming => RelationDirection::Incoming,
         WitDirection::Either => RelationDirection::Either,
     };
-    let values = snapshot
-        .find_relations(
-            &ids(targets)?,
-            direction,
-            property.as_ref(),
-            after(cursor)?,
-            limit,
-        )
-        .map_err(map_world_system_read_error)?;
+    let targets = ids(targets)?;
+    let cursor = after(cursor)?;
+    let values = if descending {
+        snapshot.find_relations_before(&targets, direction, property.as_ref(), cursor, limit)
+    } else {
+        snapshot.find_relations(&targets, direction, property.as_ref(), cursor, limit)
+    }
+    .map_err(map_world_system_read_error)?;
     pages(values, maximum)
 }
 pub(super) fn find_properties(

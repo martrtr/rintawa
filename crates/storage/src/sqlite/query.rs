@@ -360,6 +360,33 @@ pub(super) fn find_relations(
     after: Option<ItemId>,
     limit: usize,
 ) -> StorageResult<Vec<ItemRecord>> {
+    relation_page(
+        connection, targets, direction, property, after, limit, false,
+    )
+}
+
+pub(super) fn find_relations_before(
+    connection: &Connection,
+    targets: &[ItemId],
+    direction: RelationDirection,
+    property: Option<&SchemaKey>,
+    before: Option<ItemId>,
+    limit: usize,
+) -> StorageResult<Vec<ItemRecord>> {
+    relation_page(
+        connection, targets, direction, property, before, limit, true,
+    )
+}
+
+fn relation_page(
+    connection: &Connection,
+    targets: &[ItemId],
+    direction: RelationDirection,
+    property: Option<&SchemaKey>,
+    cursor: Option<ItemId>,
+    limit: usize,
+    descending: bool,
+) -> StorageResult<Vec<ItemRecord>> {
     let limit = validate_page_size(limit)?;
     validate_batch_size(targets.len())?;
     if targets.is_empty() {
@@ -380,10 +407,17 @@ pub(super) fn find_relations(
               WHERE properties.item = items.id AND properties.name = ? AND properties.version = ?)",
         )
     });
+    let comparison = if descending { "<" } else { ">" };
+    let order = if descending { "DESC" } else { "ASC" };
+    let cursor_predicate = if cursor.is_some() {
+        format!(" AND id {comparison} ?")
+    } else {
+        String::new()
+    };
     let sql = format!(
         "SELECT id, subject, object FROM items
          WHERE type = 2 AND ({endpoint_predicate}){property_predicate}
-         AND id > COALESCE(?, X'') ORDER BY id LIMIT ?"
+         {cursor_predicate} ORDER BY id {order} LIMIT ?"
     );
     let target_copies = match direction {
         RelationDirection::Either => 2,
@@ -401,10 +435,9 @@ pub(super) fn find_relations(
         values.push(Value::Text(property.id().as_str().to_string()));
         values.push(Value::Integer(i64::from(property.version().get())));
     }
-    values.push(match after {
-        Some(cursor) => Value::Blob(cursor.into_bytes().to_vec()),
-        None => Value::Null,
-    });
+    if let Some(cursor) = cursor {
+        values.push(Value::Blob(cursor.into_bytes().to_vec()));
+    }
     values.push(Value::Integer(limit));
 
     let mut statement = connection.prepare(&sql)?;

@@ -434,6 +434,137 @@ fn test_should_read_batched_items_and_properties_and_page_directional_relations(
 }
 
 #[test]
+fn test_reverse_relation_pages_preserve_bounds_filters_and_snapshot() -> anyhow::Result<()> {
+    fn id(value: u128) -> ItemId {
+        ItemId::from_bytes(value.to_be_bytes())
+    }
+    let (_directory, storage) = temp_world();
+    storage.register_definition(&object_schema())?;
+    let key = schema("character.identity@1");
+    let (root, other, unrelated) = (id(100), id(101), id(102));
+    let mut initial = WorldTransaction::new();
+    for item in [root, other, unrelated] {
+        initial.push_change(StateChange::CreateObject { id: item });
+    }
+    for (relation, subject, object, tagged) in [
+        (id(1), root, other, true),
+        (id(2), other, root, true),
+        (id(3), root, other, false),
+        (id(4), unrelated, other, true),
+        (id(u128::MAX), root, other, true),
+    ] {
+        initial.push_change(StateChange::CreateRelation {
+            id: relation,
+            subject,
+            object,
+        });
+        if tagged {
+            initial.push_change(StateChange::SetProperty {
+                item: relation,
+                key: key.clone(),
+                data: serde_json::json!({"name":"edge"}),
+            });
+        }
+    }
+    storage.apply(&initial)?;
+    let snapshot = storage.snapshot()?;
+    let ids = |rows: Vec<rintawa_world::ItemRecord>| {
+        rows.into_iter().map(|row| row.id()).collect::<Vec<_>>()
+    };
+    // No sentinel may accidentally exclude the largest possible identifier.
+    assert_eq!(
+        ids(snapshot.find_relations_before(&[root], RelationDirection::Outgoing, None, None, 2)?),
+        vec![id(u128::MAX), id(3)]
+    );
+    assert_eq!(
+        ids(snapshot.find_relations_before(
+            &[root],
+            RelationDirection::Outgoing,
+            Some(&key),
+            None,
+            8
+        )?),
+        vec![id(u128::MAX), id(1)]
+    );
+    assert_eq!(
+        ids(snapshot.find_relations_before(
+            &[root],
+            RelationDirection::Outgoing,
+            None,
+            Some(id(3)),
+            8
+        )?),
+        vec![id(1)]
+    );
+    assert!(
+        snapshot
+            .find_relations_before(&[root], RelationDirection::Outgoing, None, Some(id(0)), 8)?
+            .is_empty()
+    );
+    assert_eq!(
+        ids(snapshot.find_relations_before(&[root], RelationDirection::Incoming, None, None, 8)?),
+        vec![id(2)]
+    );
+    assert_eq!(
+        ids(snapshot.find_relations_before(
+            &[root, root],
+            RelationDirection::Either,
+            None,
+            None,
+            8
+        )?),
+        vec![id(u128::MAX), id(3), id(2), id(1)]
+    );
+    for limit in [0, 257] {
+        assert!(
+            snapshot
+                .find_relations_before(&[root], RelationDirection::Outgoing, None, None, limit)
+                .is_err()
+        );
+    }
+    assert!(
+        snapshot
+            .find_relations_before(&vec![root; 65], RelationDirection::Outgoing, None, None, 8)
+            .is_err()
+    );
+    let mut append = WorldTransaction::new();
+    append.push_change(StateChange::CreateRelation {
+        id: id(5),
+        subject: root,
+        object: other,
+    });
+    storage.apply(&append)?;
+    assert_eq!(
+        ids(snapshot.find_relations_before(
+            &[root],
+            RelationDirection::Outgoing,
+            None,
+            Some(id(u128::MAX)),
+            8
+        )?),
+        vec![id(3), id(1)]
+    );
+    assert_eq!(
+        ids(storage.snapshot()?.find_relations_before(
+            &[root],
+            RelationDirection::Outgoing,
+            None,
+            Some(id(u128::MAX)),
+            8
+        )?),
+        vec![id(5), id(3), id(1)]
+    );
+    let (_second_directory, second) = temp_world();
+    assert!(
+        second
+            .snapshot()?
+            .find_relations_before(&[root], RelationDirection::Outgoing, None, None, 8)?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
 fn test_should_load_manifest_and_registry_from_one_commit() -> anyhow::Result<()> {
     use std::sync::{Arc, Barrier};
 

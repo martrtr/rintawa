@@ -248,6 +248,7 @@ adapters and Host-generated item IDs without a query language.
 | --- | --- |
 | `world-data.read(items, properties)` | One snapshot per bounded batch; at most 64 IDs and 64 selected keys; missing records omitted; unauthorized keys rejected before reading |
 | `world-data.find-relations(targets, direction, property?, after?, limit)` | Conversation relation page; at most 64 targets/256 rows, exclusive ID cursor and owner-checked optional property filter |
+| `world-data.find-relations-before(targets, direction, property?, before?, limit)` | Story MVP recent-window addition: strict descending relation IDs, exclusive cursor or newest when absent; same row/byte/owner bounds as the forward read |
 | Corresponding read/find operations in `world-system-snapshot`, including property search | Graph/value validation against the command's already pinned snapshot, without a second reader or network calls |
 | `world-data.new-item-ids(count) → ids` | Host-generated UUIDv7 IDs for objects/relations, count 1..64; no row reservation or authorization; unused IDs persist nothing |
 

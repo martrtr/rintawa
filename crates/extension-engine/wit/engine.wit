@@ -154,6 +154,9 @@ interface world-data {
     find-properties: func(key: string, after: option<string>, limit: u32) -> result<list<string>, error>;
     read: func(items: list<string>, properties: list<string>) -> result<string, error>;
     find-relations: func(targets: list<string>, direction: direction, property: option<string>, after: option<string>, limit: u32) -> result<list<string>, error>;
+    /// Descending relation IDs strictly before the cursor; none starts at the newest.
+    /// Same owner-scoped reads and unchanged row/byte limits as find-relations.
+    find-relations-before: func(targets: list<string>, direction: direction, property: option<string>, before: option<string>, limit: u32) -> result<list<string>, error>;
     new-item-ids: func(count: u32) -> result<list<string>, error>;
     submit: func(schema: string, payload-json: string) -> result<ticket, error>;
     poll: func(ticket: ticket) -> result<ticket-status, error>;

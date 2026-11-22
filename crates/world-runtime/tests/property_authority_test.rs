@@ -559,6 +559,29 @@ impl WorldSystem for IndexedReadSystem {
         )?;
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id(), self.expected_relation);
+        let descending = snapshot.find_relations_before(
+            &[self.root],
+            RelationDirection::Outgoing,
+            Some(&self.allowed_property),
+            None,
+            10,
+        )?;
+        assert_eq!(descending, filtered);
+        assert!(
+            snapshot
+                .find_relations_before(
+                    &[self.root],
+                    RelationDirection::Outgoing,
+                    Some(&self.allowed_property),
+                    Some(self.expected_relation),
+                    10,
+                )?
+                .is_empty()
+        );
+        assert!(matches!(
+            snapshot.find_relations_before(&[self.root], RelationDirection::Outgoing, Some(&self.forbidden_property), None, 10),
+            Err(WorldReadError::PropertyAccessDenied(key)) if key == self.forbidden_property
+        ));
         assert!(matches!(
             snapshot.find_relations(
                 &[self.root],

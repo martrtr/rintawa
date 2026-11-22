@@ -1494,6 +1494,26 @@ fn map_world_system_read_error(error: WorldReadError) -> WorldSystemSnapshotErro
 }
 
 impl WorldDataHost for WasmHostState {
+    fn find_relations_before(
+        &mut self,
+        targets: Vec<String>,
+        direction: WitDirection,
+        property: Option<String>,
+        before: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<String>, WorldDataError> {
+        let snapshot = self.guest_world_snapshot()?;
+        world_reads::find_relations_before(
+            &snapshot,
+            targets,
+            direction,
+            property,
+            before,
+            limit,
+            self.max_host_message_bytes,
+        )
+        .map_err(world_reads::ordinary_error)
+    }
     fn read(
         &mut self,
         items: Vec<String>,

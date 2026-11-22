@@ -258,6 +258,29 @@ impl WorldSnapshot {
             .find_relations(targets, direction, property, after, limit)?)
     }
 
+    /// Finds descending relations strictly before a cursor, with the same exact
+    /// property-read authority and bounds as forward relation pagination.
+    ///
+    /// # Errors
+    /// Returns PropertyAccessDenied, invalid batch/page limits, or a storage error.
+    pub fn find_relations_before(
+        &self,
+        targets: &[ItemId],
+        direction: RelationDirection,
+        property: Option<&SchemaKey>,
+        before: Option<ItemId>,
+        limit: usize,
+    ) -> WorldReadResult<Vec<ItemRecord>> {
+        if let Some(property) = property
+            && !self.permits_property(property)
+        {
+            return Err(WorldReadError::PropertyAccessDenied(property.clone()));
+        }
+        Ok(self
+            .storage()?
+            .find_relations_before(targets, direction, property, before, limit)?)
+    }
+
     /// Loads every relation whose subject or object is the given item.
     ///
     /// # Errors
