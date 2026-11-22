@@ -458,6 +458,12 @@ interface user-resources {
     cancel-upload: func(handle: u64) -> result<_, error>;
 
     /// Reads exact bytes for one ref. Requires `user-resource-read`.
+    /// Acquires one completed, unclaimed resource for this exact active activation.
+    /// Invalidates the input ref and returns a private replacement without copying bytes.
+    /// Native activation retirement releases the acquired resource; no onward transfer.
+    take-resource: func(reference: resource-ref) -> result<resource-ref, error>;
+
+    /// Reads exact bytes. Acquired refs require the exact acquiring activation.
     read-resource: func(
         reference: resource-ref,
         maximum-bytes: u64,

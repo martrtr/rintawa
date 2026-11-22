@@ -953,7 +953,8 @@ mod tests {
         state
             .transport
             .contexts
-            .revoke_instance(&principal.instance_id);
+            .revoke_instance_if(&principal.instance_id, None)
+            .dispose();
         test_execute_as(&mut state, principal.clone());
         assert!(matches!(
             HttpRequestHost::poll(&mut state, handle, 32),
@@ -1165,7 +1166,9 @@ mod revocation_tests {
         let handle = state
             .allocate_http_request_handle(owner.clone(), receiver, Arc::clone(&cancellation), None)
             .expect("test allocation should succeed");
-        state.runtime_permissions.revoke_component(&owner);
+        state
+            .runtime_permissions
+            .revoke_component(&owner, &state.transport.contexts);
 
         assert!(matches!(
             HttpRequestHost::poll(&mut state, handle, 32),

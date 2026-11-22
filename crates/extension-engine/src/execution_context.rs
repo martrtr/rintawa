@@ -15,6 +15,7 @@ use rintawa_sdk::{
 
 use crate::{
     composition::{OwnedContractProvider, resolve_contract_providers},
+    host_access::{HostAccessError, HostAccessResult, UserResourceAccess, UserResourceRef},
     secrets::SecretManager,
     transport::TransportError,
 };
@@ -31,6 +32,38 @@ struct Binding {
     context: ExecutionContext,
     active: bool,
     provider: Option<ComponentRef>,
+    resource_access: Option<Arc<dyn UserResourceAccess>>,
+}
+
+/// Detached cleanup runs after execution and transport locks have been released.
+pub(crate) struct ResourceCleanup {
+    principal: ComponentPrincipal,
+    access: Arc<dyn UserResourceAccess>,
+}
+impl ResourceCleanup {
+    pub(crate) fn dispose(self) {
+        self.access.release_owned_resources(&self.principal);
+    }
+}
+impl Binding {
+    fn into_cleanup(self) -> Option<ResourceCleanup> {
+        self.resource_access.map(|access| ResourceCleanup {
+            principal: self.context.principal,
+            access,
+        })
+    }
+}
+#[derive(Default)]
+pub(crate) struct RetiredContexts {
+    pub(crate) owners: Vec<ComponentRef>,
+    resources: Vec<ResourceCleanup>,
+}
+impl RetiredContexts {
+    pub(crate) fn dispose(self) {
+        for cleanup in self.resources {
+            cleanup.dispose();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -68,7 +101,8 @@ impl ExecutionContexts {
                 activation,
             },
         };
-        self.0
+        let displaced = self
+            .0
             .lock()
             .map_err(|_| TransportError::Unavailable)?
             .bindings
@@ -78,8 +112,12 @@ impl ExecutionContexts {
                     context,
                     active: false,
                     provider: None,
+                    resource_access: None,
                 },
             );
+        if let Some(cleanup) = displaced.and_then(Binding::into_cleanup) {
+            cleanup.dispose();
+        }
         Ok(())
     }
 
@@ -155,15 +193,11 @@ impl ExecutionContexts {
         Ok(())
     }
 
-    pub(crate) fn revoke_instance(&self, instance: &ExtensionInstanceId) -> Vec<ComponentRef> {
-        self.revoke_instance_if(instance, None)
-    }
-
     pub(crate) fn revoke_instance_if(
         &self,
         instance: &ExtensionInstanceId,
         expected: Option<&ExecutionContext>,
-    ) -> Vec<ComponentRef> {
+    ) -> RetiredContexts {
         let mut view = self.0.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(expected) = expected
             && !view
@@ -171,21 +205,72 @@ impl ExecutionContexts {
                 .get(&expected.principal.component())
                 .is_some_and(|binding| binding.context == *expected)
         {
-            return Vec::new();
+            return RetiredContexts::default();
         }
-        let mut revoked = Vec::new();
-        view.bindings.retain(|owner, binding| {
-            let keep = &owner.instance_id != instance
-                && binding
-                    .provider
-                    .as_ref()
-                    .is_none_or(|provider| &provider.instance_id != instance);
-            if !keep {
-                revoked.push(owner.clone());
+        let owners: Vec<_> = view
+            .bindings
+            .iter()
+            .filter(|(owner, binding)| {
+                &owner.instance_id == instance
+                    || binding
+                        .provider
+                        .as_ref()
+                        .is_some_and(|provider| &provider.instance_id == instance)
+            })
+            .map(|(owner, _)| owner.clone())
+            .collect();
+        let mut retired = RetiredContexts {
+            owners,
+            resources: Vec::new(),
+        };
+        for owner in &retired.owners {
+            if let Some(cleanup) = view.bindings.remove(owner).and_then(Binding::into_cleanup) {
+                retired.resources.push(cleanup);
             }
-            keep
-        });
-        revoked
+        }
+        retired
+    }
+
+    /// The permission read guard is held by the caller through this transition.
+    /// No guest callbacks, data copies, entropy or I/O may occur while View is held.
+    pub(crate) fn take_resource(
+        &self,
+        context: &ExecutionContext,
+        service: Arc<dyn UserResourceAccess>,
+        reference: &UserResourceRef,
+        replacement_id: &str,
+    ) -> Result<HostAccessResult<UserResourceRef>, TransportError> {
+        let mut view = self.0.try_lock().map_err(|_| TransportError::Unavailable)?;
+        let binding = view
+            .bindings
+            .get_mut(&context.principal.component())
+            .filter(|binding| binding.active && binding.context == *context)
+            .ok_or(TransportError::Inactive)?;
+        if binding
+            .resource_access
+            .as_ref()
+            .is_some_and(|current| !Arc::ptr_eq(current, &service))
+        {
+            return Ok(Err(HostAccessError::Rejected));
+        }
+        let result = service.take_resource(reference, &context.principal, replacement_id);
+        if result.is_ok() {
+            binding.resource_access = Some(service);
+        }
+        Ok(result)
+    }
+
+    /// Effective permission revocation keeps its write guard through disposal.
+    pub(crate) fn detach_resource_access(&self, owner: &ComponentRef) -> Option<ResourceCleanup> {
+        let mut view = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let binding = view.bindings.get_mut(owner)?;
+        binding
+            .resource_access
+            .take()
+            .map(|access| ResourceCleanup {
+                principal: binding.context.principal.clone(),
+                access,
+            })
     }
 
     pub(crate) fn replace_selection(&self, scopes: HashMap<RuntimeScopeId, ScopeSelection>) {
@@ -260,7 +345,9 @@ mod tests {
         assert!(contexts.validate(&first).is_err());
         contexts.activate_instance(&owner.instance_id);
         contexts.validate(&first)?;
-        contexts.revoke_instance(&owner.instance_id);
+        contexts
+            .revoke_instance_if(&owner.instance_id, None)
+            .dispose();
         contexts.begin(owner.clone(), scope.clone())?;
         contexts.activate_instance(&owner.instance_id);
         assert!(contexts.validate(&first).is_err());
@@ -305,3 +392,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod resource_tests;

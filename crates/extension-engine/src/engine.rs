@@ -1492,11 +1492,10 @@ impl ExtensionEngine {
                 ));
             }
             for component in &extension.manifest.components {
-                self.runtime_permissions
-                    .revoke_component(&ComponentRef::new(
-                        instance_id.clone(),
-                        component.id.clone(),
-                    ));
+                self.runtime_permissions.revoke_component(
+                    &ComponentRef::new(instance_id.clone(), component.id.clone()),
+                    &self.transport.contexts,
+                );
             }
             self.transport.revoke_instance(instance_id);
             self.execution_targets.revoke_instance(instance_id);

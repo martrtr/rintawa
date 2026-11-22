@@ -636,6 +636,11 @@ Panel allowlist, with WIT argument names converted to camelCase:
   signatures, channel-owned handles and dependent permissions. This supplies an
   exact user-selected resource ref to the domain importer; the backend reads and
   releases it through existing APIs. Do not put PNG/RTW bytes in a transport payload.
+  The accepted [resource-transfer amendment](user-resource-transfer-amendment.md)
+  adds backend-only `take-resource`: activation-owned acquisition without a copy,
+  a private replacement ref and native stop/trap cleanup. It is not a browser
+  endpoint. The current per-resource bound is 16 MiB, with 32 MiB aggregate and
+  32 retained resources; unclaimed refs remain Host-lifetime bearers.
 - `asset-store.open-asset/read-asset/close-asset`: D7, own permission and
   channel-owned readers; browser requests at most 32 KiB per read. Render raster media via blob URLs;
   revoke them on unmount. Never serve arbitrary imported HTML/SVG as shell documents.

@@ -594,14 +594,12 @@ impl Transport {
                 }
             };
             // Serialize declaration cleanup with publication of replacement resources.
-            let revoked = match expected {
-                Some(expected) => self.contexts.revoke_instance_if(instance, Some(expected)),
-                None => self.contexts.revoke_instance(instance),
-            };
+            let retired = self.contexts.revoke_instance_if(instance, expected);
+            let revoked = &retired.owners;
             if expected.is_some() && revoked.is_empty() {
                 return;
             }
-            let polled = state.polled.revoke(instance, &revoked);
+            let polled = state.polled.revoke(instance, revoked);
             let mut kept = Vec::new();
             let mut removed = Vec::new();
             for declaration in std::mem::take(&mut state.queryables) {
@@ -626,8 +624,9 @@ impl Transport {
                 }
             }
             state.subscriptions = kept_subscriptions;
-            (removed, removed_subscriptions, polled)
+            (removed, removed_subscriptions, polled, retired)
         };
+        removed.3.dispose();
         removed.2.dispose();
         for declaration in removed.0 {
             if let Err(error) = declaration.undeclare().wait() {

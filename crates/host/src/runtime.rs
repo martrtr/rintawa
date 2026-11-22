@@ -20,7 +20,7 @@ use rintawa_extension_engine::{
 };
 use rintawa_sdk::{
     contracts::{
-        ComponentRef, ContractKey, ContractResolutionPolicy, ContractVersion,
+        ComponentPrincipal, ComponentRef, ContractKey, ContractResolutionPolicy, ContractVersion,
         host_shell_contract_key,
     },
     runtime_permissions::RuntimePermission,
@@ -46,11 +46,13 @@ use crate::{
 mod activation_cleanup_tests;
 #[cfg(test)]
 mod command_ticket_tests;
+#[cfg(test)]
+mod resource_transfer_tests;
 
 /// Maximum one-shot user resources retained by one HostRuntime.
 const MAX_USER_RESOURCES: usize = 32;
 /// Maximum bytes accepted for one ephemeral user resource.
-const MAX_USER_RESOURCE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_USER_RESOURCE_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum total bytes retained across all ephemeral user resources.
 const MAX_USER_RESOURCE_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 /// Maximum UTF-8 bytes retained for one resource media type.
@@ -245,7 +247,8 @@ impl WorldSessionRuntimeControl {
 #[derive(Clone)]
 struct StoredUserResource {
     reference: UserResourceRef,
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
+    owner: Option<ComponentPrincipal>,
 }
 
 #[derive(Default)]
@@ -283,19 +286,15 @@ impl UserResourceRuntimeControl {
         }) {
             return Err(HostAccessError::Rejected);
         }
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| HostAccessError::Unavailable)?;
-        let next_total = state.total_bytes.saturating_add(bytes.len());
-        if state.resources.len() >= MAX_USER_RESOURCES || next_total > MAX_USER_RESOURCE_TOTAL_BYTES
         {
-            return Err(HostAccessError::QueueFull);
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| HostAccessError::Unavailable)?;
+            Self::check_capacity(&state, bytes.len())?;
         }
+        let bytes: Arc<[u8]> = Arc::from(bytes);
         let id = Uuid::now_v7().to_string();
-        if state.resources.contains_key(&id) {
-            return Err(HostAccessError::Rejected);
-        }
         let size = u64::try_from(bytes.len()).map_err(|_| HostAccessError::Rejected)?;
         let reference = UserResourceRef {
             id: id.clone(),
@@ -303,36 +302,109 @@ impl UserResourceRuntimeControl {
             media_type: media_type.to_string(),
             name: name.map(str::to_string),
         };
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| HostAccessError::Unavailable)?;
+        Self::check_capacity(&state, bytes.len())?;
+        if state.resources.contains_key(&id) {
+            return Err(HostAccessError::Rejected);
+        }
+        state.total_bytes += bytes.len();
         state.resources.insert(
             id,
             StoredUserResource {
                 reference: reference.clone(),
-                bytes: bytes.to_vec(),
+                bytes,
+                owner: None,
             },
         );
-        state.total_bytes = next_total;
         Ok(reference)
     }
 
-    fn read(&self, reference: &UserResourceRef, maximum_bytes: usize) -> HostAccessResult<Vec<u8>> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| HostAccessError::Unavailable)?;
-        let resource = state
-            .resources
-            .get(&reference.id)
-            .ok_or(HostAccessError::NotFound)?;
-        if resource.reference != *reference {
-            return Err(HostAccessError::Rejected);
+    fn check_capacity(state: &UserResourceRuntimeState, size: usize) -> HostAccessResult<()> {
+        if state.resources.len() >= MAX_USER_RESOURCES
+            || state.total_bytes.saturating_add(size) > MAX_USER_RESOURCE_TOTAL_BYTES
+        {
+            return Err(HostAccessError::QueueFull);
         }
-        if resource.bytes.len() > maximum_bytes {
-            return Err(HostAccessError::Rejected);
-        }
-        Ok(resource.bytes.clone())
+        Ok(())
     }
 
+    #[cfg(test)]
+    fn read(&self, reference: &UserResourceRef, maximum_bytes: usize) -> HostAccessResult<Vec<u8>> {
+        self.read_for(reference, maximum_bytes, None)
+    }
+    fn read_for(
+        &self,
+        reference: &UserResourceRef,
+        maximum_bytes: usize,
+        principal: Option<&ComponentPrincipal>,
+    ) -> HostAccessResult<Vec<u8>> {
+        let bytes = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| HostAccessError::Unavailable)?;
+            let resource = state
+                .resources
+                .get(&reference.id)
+                .ok_or(HostAccessError::NotFound)?;
+            if resource.reference != *reference
+                || resource
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| Some(owner) != principal)
+                || resource.bytes.len() > maximum_bytes
+            {
+                return Err(HostAccessError::Rejected);
+            }
+            Arc::clone(&resource.bytes)
+        };
+        Ok(bytes.to_vec())
+    }
+    #[cfg(test)]
     fn release(&self, reference: &UserResourceRef) -> HostAccessResult<()> {
+        self.release_for(reference, None)
+    }
+    fn release_for(
+        &self,
+        reference: &UserResourceRef,
+        principal: Option<&ComponentPrincipal>,
+    ) -> HostAccessResult<()> {
+        let removed = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| HostAccessError::Unavailable)?;
+            let resource = state
+                .resources
+                .get(&reference.id)
+                .ok_or(HostAccessError::NotFound)?;
+            if resource.reference != *reference
+                || resource
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| Some(owner) != principal)
+            {
+                return Err(HostAccessError::Rejected);
+            }
+            let removed = state
+                .resources
+                .remove(&reference.id)
+                .expect("verified resource");
+            state.total_bytes -= removed.bytes.len();
+            removed
+        };
+        drop(removed);
+        Ok(())
+    }
+    fn take(
+        &self,
+        reference: &UserResourceRef,
+        principal: &ComponentPrincipal,
+        replacement_id: &str,
+    ) -> HostAccessResult<UserResourceRef> {
         let mut state = self
             .state
             .lock()
@@ -341,13 +413,48 @@ impl UserResourceRuntimeControl {
             .resources
             .get(&reference.id)
             .ok_or(HostAccessError::NotFound)?;
-        if resource.reference != *reference {
+        if resource.reference != *reference
+            || resource.owner.is_some()
+            || replacement_id.is_empty()
+            || state.resources.contains_key(replacement_id)
+        {
             return Err(HostAccessError::Rejected);
         }
-        let size = resource.bytes.len();
-        state.resources.remove(&reference.id);
-        state.total_bytes = state.total_bytes.saturating_sub(size);
-        Ok(())
+        let mut resource = state
+            .resources
+            .remove(&reference.id)
+            .expect("verified resource");
+        resource.reference.id = replacement_id.to_string();
+        resource.owner = Some(principal.clone());
+        let result = resource.reference.clone();
+        state.resources.insert(replacement_id.to_string(), resource);
+        Ok(result)
+    }
+    fn release_owned(&self, principal: &ComponentPrincipal) {
+        let removed = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ids: Vec<_> = state
+                .resources
+                .iter()
+                .filter(|(_, resource)| resource.owner.as_ref() == Some(principal))
+                .map(|(id, _)| id.clone())
+                .collect();
+            let removed: Vec<_> = ids
+                .iter()
+                .filter_map(|id| state.resources.remove(id))
+                .collect();
+            state.total_bytes = state
+                .resources
+                .values()
+                .map(|resource| resource.bytes.len())
+                .sum();
+            self.state.clear_poison();
+            removed
+        };
+        drop(removed);
     }
 }
 
@@ -589,12 +696,29 @@ impl UserResourceAccess for LocalHostAccess {
         &self,
         reference: &UserResourceRef,
         maximum_bytes: usize,
+        principal: &ComponentPrincipal,
     ) -> HostAccessResult<Vec<u8>> {
-        self.user_resources.read(reference, maximum_bytes)
+        self.user_resources
+            .read_for(reference, maximum_bytes, Some(principal))
     }
-
-    fn release_resource(&self, reference: &UserResourceRef) -> HostAccessResult<()> {
-        self.user_resources.release(reference)
+    fn release_resource(
+        &self,
+        reference: &UserResourceRef,
+        principal: &ComponentPrincipal,
+    ) -> HostAccessResult<()> {
+        self.user_resources.release_for(reference, Some(principal))
+    }
+    fn take_resource(
+        &self,
+        reference: &UserResourceRef,
+        principal: &ComponentPrincipal,
+        replacement_id: &str,
+    ) -> HostAccessResult<UserResourceRef> {
+        self.user_resources
+            .take(reference, principal, replacement_id)
+    }
+    fn release_owned_resources(&self, principal: &ComponentPrincipal) {
+        self.user_resources.release_owned(principal);
     }
 }
 
@@ -3025,6 +3149,127 @@ mod tests {
         Ok(())
     }
 
+    fn resource_owner(instance: &str, activation: u64) -> ComponentPrincipal {
+        ComponentPrincipal {
+            instance_id: ExtensionInstanceId::new(instance),
+            component_id: ComponentId::new("backend"),
+            activation,
+        }
+    }
+
+    #[test]
+    fn test_user_resource_take_checks_ownership_and_preserves_allocation() {
+        let broker = UserResourceRuntimeControl::default();
+        let owner = resource_owner("a", 1);
+        let other = resource_owner("a", 2);
+        let source = broker.import(b"contents", "text/plain", None).unwrap();
+        let spare = broker.import(b"other", "text/plain", None).unwrap();
+        let original = Arc::clone(&broker.state.lock().unwrap().resources[&source.id].bytes);
+        let mut spoofed = source.clone();
+        spoofed.size += 1;
+        assert_eq!(
+            broker.take(&spoofed, &owner, "fresh"),
+            Err(HostAccessError::Rejected)
+        );
+        assert_eq!(
+            broker.take(&source, &owner, &spare.id),
+            Err(HostAccessError::Rejected)
+        );
+        assert_eq!(
+            broker.take(&source, &owner, ""),
+            Err(HostAccessError::Rejected)
+        );
+        let claimed = broker.take(&source, &owner, "fresh").unwrap();
+        {
+            let state = broker.state.lock().unwrap();
+            assert_eq!(state.resources.len(), 2);
+            assert_eq!(state.total_bytes, 13);
+            assert!(Arc::ptr_eq(&original, &state.resources[&claimed.id].bytes));
+        }
+        assert_eq!(broker.read(&source, 20), Err(HostAccessError::NotFound));
+        assert_eq!(
+            broker.take(&source, &owner, "next"),
+            Err(HostAccessError::NotFound)
+        );
+        assert_eq!(
+            broker.take(&claimed, &owner, "next"),
+            Err(HostAccessError::Rejected)
+        );
+        assert_eq!(broker.read(&claimed, 20), Err(HostAccessError::Rejected));
+        assert_eq!(
+            broker.read_for(&claimed, 20, Some(&other)),
+            Err(HostAccessError::Rejected)
+        );
+        assert_eq!(
+            broker.release_for(&claimed, Some(&other)),
+            Err(HostAccessError::Rejected)
+        );
+        assert_eq!(
+            broker.read_for(&claimed, 20, Some(&owner)).unwrap(),
+            b"contents"
+        );
+        broker.release_for(&claimed, Some(&owner)).unwrap();
+        assert_eq!(broker.read(&spare, 20).unwrap(), b"other");
+    }
+
+    #[test]
+    fn test_user_resource_cleanup_preserves_other_owners_and_recovers_poison_and_quota() {
+        let broker = UserResourceRuntimeControl::default();
+        let a = resource_owner("a", 1);
+        let next_a = resource_owner("a", 2);
+        let b = resource_owner("b", 1);
+        let mut a_refs = Vec::new();
+        for i in 0..MAX_USER_RESOURCES - 2 {
+            let source = broker.import(b"x", "text/plain", None).unwrap();
+            a_refs.push(broker.take(&source, &a, &format!("a-{i}")).unwrap());
+        }
+        let source = broker.import(b"b", "text/plain", None).unwrap();
+        let owned_b = broker.take(&source, &b, "b").unwrap();
+        let unclaimed = broker.import(b"u", "text/plain", None).unwrap();
+        assert_eq!(
+            broker.import(b"x", "text/plain", None),
+            Err(HostAccessError::QueueFull)
+        );
+        broker.release_owned(&next_a);
+        assert!(broker.read_for(&a_refs[0], 1, Some(&a)).is_ok());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut state = broker.state.lock().unwrap();
+            state.total_bytes = usize::MAX;
+            panic!("poison test");
+        }));
+        broker.release_owned(&a);
+        assert_eq!(broker.state.lock().unwrap().total_bytes, 2);
+        assert_eq!(broker.read_for(&owned_b, 1, Some(&b)).unwrap(), b"b");
+        assert_eq!(broker.read(&unclaimed, 1).unwrap(), b"u");
+        let replacement = broker.import(b"new", "text/plain", None).unwrap();
+        let replacement = broker.take(&replacement, &next_a, "replacement").unwrap();
+        broker.release_owned(&a);
+        assert!(broker.read_for(&replacement, 3, Some(&next_a)).is_ok());
+    }
+
+    #[test]
+    fn test_user_resource_cleanup_returns_owned_byte_quota() {
+        let broker = UserResourceRuntimeControl::default();
+        let owner = resource_owner("a", 1);
+        let bytes = vec![0; MAX_USER_RESOURCE_BYTES];
+        let source = broker
+            .import(&bytes, "application/octet-stream", None)
+            .unwrap();
+        broker.take(&source, &owner, "owned").unwrap();
+        let unclaimed = broker
+            .import(&bytes, "application/octet-stream", None)
+            .unwrap();
+        assert_eq!(
+            broker.import(b"x", "text/plain", None),
+            Err(HostAccessError::QueueFull)
+        );
+        broker.release_owned(&owner);
+        broker
+            .import(&bytes, "application/octet-stream", None)
+            .unwrap();
+        assert!(broker.read(&unclaimed, MAX_USER_RESOURCE_BYTES).is_ok());
+    }
+
     #[test]
     fn test_should_bound_verify_and_release_ephemeral_user_resources() -> anyhow::Result<()> {
         let control = UserResourceRuntimeControl::default();
@@ -3071,6 +3316,46 @@ mod tests {
             control.read(&reference, 1024),
             Err(HostAccessError::NotFound)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_enforce_user_resource_byte_limits_and_recover_quota() -> anyhow::Result<()> {
+        const MIB: usize = 1024 * 1024;
+        let control = UserResourceRuntimeControl::default();
+        let bytes = vec![0_u8; 16 * MIB + 1];
+        let medium = control
+            .import(&bytes[..8 * MIB + 1], "application/octet-stream", None)
+            .map_err(|error| anyhow::anyhow!("medium import failed: {error:?}"))?;
+        control
+            .release(&medium)
+            .map_err(|error| anyhow::anyhow!("resource release failed: {error:?}"))?;
+        assert_eq!(
+            control.import(&bytes, "application/octet-stream", None),
+            Err(HostAccessError::Rejected)
+        );
+        let first = control
+            .import(&bytes[..16 * MIB], "application/octet-stream", None)
+            .map_err(|error| anyhow::anyhow!("first import failed: {error:?}"))?;
+        let second = control
+            .import(&bytes[..16 * MIB], "application/octet-stream", None)
+            .map_err(|error| anyhow::anyhow!("second import failed: {error:?}"))?;
+        assert_eq!(
+            control.import(&bytes[..1], "application/octet-stream", None),
+            Err(HostAccessError::QueueFull)
+        );
+        control
+            .release(&first)
+            .map_err(|error| anyhow::anyhow!("resource release failed: {error:?}"))?;
+        let replacement = control
+            .import(&bytes[..16 * MIB], "application/octet-stream", None)
+            .map_err(|error| anyhow::anyhow!("replacement import failed: {error:?}"))?;
+        control
+            .release(&second)
+            .map_err(|error| anyhow::anyhow!("resource release failed: {error:?}"))?;
+        control
+            .release(&replacement)
+            .map_err(|error| anyhow::anyhow!("resource release failed: {error:?}"))?;
         Ok(())
     }
 

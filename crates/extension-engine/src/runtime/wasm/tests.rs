@@ -80,6 +80,7 @@ struct RecordingScopedHostAccess {
     http_origin_policy_reads: Mutex<Vec<String>>,
     http_origin_policy_writes: Mutex<Vec<HttpOriginPolicyWrite>>,
     user_resources: Mutex<Vec<Vec<u8>>>,
+    resource_takes: std::sync::atomic::AtomicUsize,
     world_session_writes: Mutex<Vec<(String, bool)>>,
 }
 
@@ -153,12 +154,30 @@ impl UserResourceAccess for RecordingScopedHostAccess {
         &self,
         _reference: &UserResourceRef,
         _maximum_bytes: usize,
+        _principal: &rintawa_sdk::contracts::ComponentPrincipal,
     ) -> HostAccessResult<Vec<u8>> {
         Err(HostAccessError::NotFound)
     }
 
-    fn release_resource(&self, _reference: &UserResourceRef) -> HostAccessResult<()> {
+    fn release_resource(
+        &self,
+        _reference: &UserResourceRef,
+        _principal: &rintawa_sdk::contracts::ComponentPrincipal,
+    ) -> HostAccessResult<()> {
         Err(HostAccessError::NotFound)
+    }
+    fn take_resource(
+        &self,
+        _: &UserResourceRef,
+        _: &rintawa_sdk::contracts::ComponentPrincipal,
+        _: &str,
+    ) -> HostAccessResult<UserResourceRef> {
+        self.resource_takes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(HostAccessError::Unavailable)
+    }
+    fn release_owned_resources(&self, _: &rintawa_sdk::contracts::ComponentPrincipal) {
+        // This fixture never supports acquisition, so it has no owned rows.
     }
 }
 
@@ -1476,7 +1495,11 @@ fn test_should_reject_task_and_network_handles_retained_from_an_earlier_activati
     state.begin_guest_execution();
     let task = RuntimeTasksHost::spawn_periodic(&mut state, 10).unwrap();
     let listener = NetworkHost::listen_loopback(&mut state, 0).unwrap();
-    state.transport.contexts.revoke_instance(&owner.instance_id);
+    state
+        .transport
+        .contexts
+        .revoke_instance_if(&owner.instance_id, None)
+        .dispose();
     state
         .transport
         .contexts
@@ -2229,7 +2252,8 @@ fn test_monotonic_clock_is_process_relative_and_rejects_inactive_or_stale_execut
     second
         .transport
         .contexts
-        .revoke_instance(&test_instance_id());
+        .revoke_instance_if(&test_instance_id(), None)
+        .dispose();
     assert!(matches!(
         HostOperations::monotonic_millis(&mut second),
         Err(ClockError::AccessNotActive)
@@ -2529,4 +2553,60 @@ fn test_guest_shared_memory_growth_cannot_bypass_aggregate_pair_limit() -> anyho
         ),
     }
     Ok(())
+}
+
+#[test]
+fn test_resource_take_denies_before_entropy_and_has_no_predictable_fallback() {
+    let access = Arc::new(RecordingScopedHostAccess::default());
+    let mut services = WasmHostServices::standalone(SecretManager::default());
+    services.host_access = HostAccessServices::new(
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+        access.clone(),
+    )
+    .with_user_resource_access(access.clone());
+    let mut state = WasmHostState::with_host_services_and_budget(
+        ComponentId::new("runtime"),
+        services,
+        false,
+        &WasmExecutionBudget::default(),
+    );
+    begin_test_registration(&mut state, ExtensionId::new("resource.owner"));
+    state.finish_registration().unwrap();
+    state.begin_guest_execution();
+    let reference = || WitUserResourceRef {
+        id: "upload".into(),
+        size: 1,
+        media_type: "text/plain".into(),
+        name: None,
+    };
+    assert!(matches!(
+        state.take_resource_with(reference(), |_| panic!("denied call reached entropy")),
+        Err(UserResourceError::PermissionDenied)
+    ));
+    state
+        .runtime_permissions
+        .grant(
+            state.registered_owner().unwrap(),
+            RuntimePermission::UserResourceRead,
+        )
+        .unwrap();
+    assert!(matches!(
+        state.take_resource_with(reference(), |_| Err(())),
+        Err(UserResourceError::Unavailable)
+    ));
+    assert_eq!(
+        access
+            .resource_takes
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    state.finish_guest_execution();
+    assert!(matches!(
+        state.take_resource_with(reference(), |_| panic!("inactive call reached entropy")),
+        Err(UserResourceError::AccessNotActive)
+    ));
 }

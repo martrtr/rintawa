@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use crate::execution_context::ExecutionContexts;
 use rintawa_sdk::{contracts::ComponentRef, runtime_permissions::RuntimePermission};
 use url::{Host, Url};
 
@@ -58,6 +59,24 @@ pub(crate) struct RuntimePermissionManager {
 }
 
 impl RuntimePermissionManager {
+    /// Executes bounded resource admission while the effective grant cannot change.
+    pub(crate) fn while_granted<T>(
+        &self,
+        owner: &ComponentRef,
+        permission: RuntimePermission,
+        action: impl FnOnce() -> T,
+    ) -> Result<Option<T>, ()> {
+        let grants = self.grants.try_read().map_err(|_| ())?;
+        if !grants
+            .get(owner)
+            .is_some_and(|values| values.contains(&permission))
+        {
+            return Ok(None);
+        }
+        let result = action();
+        drop(grants);
+        Ok(Some(result))
+    }
     pub(crate) fn grant(
         &self,
         owner: ComponentRef,
@@ -139,12 +158,17 @@ impl RuntimePermissionManager {
         Ok(())
     }
 
-    pub(crate) fn revoke_component(&self, owner: &ComponentRef) {
+    pub(crate) fn revoke_component(&self, owner: &ComponentRef, contexts: &ExecutionContexts) {
         let mut grants = match self.grants.write() {
             Ok(grants) => grants,
             Err(poisoned) => poisoned.into_inner(),
         };
         grants.remove(owner);
+        if let Some(cleanup) = contexts.detach_resource_access(owner) {
+            cleanup.dispose();
+        }
+        // A same-activation regrant cannot race the previous sweep.
+        drop(grants);
         let mut approvals = match self.http_loopback_origins.write() {
             Ok(approvals) => approvals,
             Err(poisoned) => poisoned.into_inner(),
@@ -182,7 +206,7 @@ mod tests {
         })
         .join();
 
-        manager.revoke_component(&owner);
+        manager.revoke_component(&owner, &ExecutionContexts::default());
         let grants = match manager.grants.read() {
             Ok(grants) => grants,
             Err(poisoned) => poisoned.into_inner(),
@@ -311,7 +335,7 @@ mod http_origin_tests {
                 .approve_http_loopback_origin(owner.clone(), origin)
                 .expect("origin approval should work");
         }
-        policy.revoke_component(&owner);
+        policy.revoke_component(&owner, &ExecutionContexts::default());
         for origin in ["http://localhost:11434", "http://127.0.0.1:5000"] {
             assert!(
                 !policy

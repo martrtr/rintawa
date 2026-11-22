@@ -231,6 +231,12 @@ impl WasmHostState {
 }
 
 impl UserResourcesHost for WasmHostState {
+    fn take_resource(
+        &mut self,
+        reference: WitUserResourceRef,
+    ) -> Result<WitUserResourceRef, UserResourceError> {
+        self.take_resource_with(reference, |bytes| getrandom::fill(bytes).map_err(|_| ()))
+    }
     fn import_resource(
         &mut self,
         bytes: Vec<u8>,
@@ -403,7 +409,15 @@ impl UserResourcesHost for WasmHostState {
         let reference = from_wit_user_resource_ref(reference)?;
         self.host_access
             .user_resources
-            .read_resource(&reference, maximum_bytes)
+            .read_resource(
+                &reference,
+                maximum_bytes,
+                &self
+                    .execution_context
+                    .as_ref()
+                    .ok_or(UserResourceError::AccessNotActive)?
+                    .principal,
+            )
             .map_err(map_user_resource_access_error)
     }
 
@@ -419,12 +433,69 @@ impl UserResourcesHost for WasmHostState {
         let reference = from_wit_user_resource_ref(reference)?;
         self.host_access
             .user_resources
-            .release_resource(&reference)
+            .release_resource(
+                &reference,
+                &self
+                    .execution_context
+                    .as_ref()
+                    .ok_or(UserResourceError::AccessNotActive)?
+                    .principal,
+            )
             .map_err(map_user_resource_access_error)
     }
 }
 
 impl WasmHostState {
+    pub(super) fn take_resource_with(
+        &mut self,
+        reference: WitUserResourceRef,
+        fill: impl FnOnce(&mut [u8]) -> Result<(), ()>,
+    ) -> Result<WitUserResourceRef, UserResourceError> {
+        if !self.host_access_active {
+            return Err(UserResourceError::AccessNotActive);
+        }
+        let context = self
+            .active_execution_context()
+            .map_err(|error| match error {
+                crate::runtime::wasm::RuntimeContextError::Unavailable => {
+                    UserResourceError::Unavailable
+                }
+                _ => UserResourceError::AccessNotActive,
+            })?
+            .clone();
+        self.runtime_permission_owner(RuntimePermission::UserResourceRead)
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => UserResourceError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => UserResourceError::Unavailable,
+            })?;
+        let reference = from_wit_user_resource_ref(reference)?;
+        // Entropy is generated before entering any policy/context/broker lock.
+        let mut entropy = [0u8; 32];
+        fill(&mut entropy).map_err(|_| UserResourceError::Unavailable)?;
+        let replacement_id: String = entropy.iter().map(|byte| format!("{byte:02x}")).collect();
+        let access = self.host_access.user_resources.clone();
+        let transition = self.runtime_permissions.while_granted(
+            &context.principal.component(),
+            RuntimePermission::UserResourceRead,
+            || {
+                self.transport
+                    .contexts
+                    .take_resource(&context, access, &reference, &replacement_id)
+            },
+        );
+        match transition {
+            Err(()) => Err(UserResourceError::Unavailable),
+            Ok(None) => Err(UserResourceError::PermissionDenied),
+            Ok(Some(Err(crate::transport::TransportError::Unavailable))) => {
+                Err(UserResourceError::Unavailable)
+            }
+            Ok(Some(Err(_))) => Err(UserResourceError::AccessNotActive),
+            Ok(Some(Ok(result))) => result
+                .map(to_wit_user_resource_ref)
+                .map_err(map_user_resource_access_error),
+        }
+    }
+
     fn require_user_resource_import_access(&self) -> Result<(), UserResourceError> {
         if !self.host_access_active {
             return Err(UserResourceError::AccessNotActive);

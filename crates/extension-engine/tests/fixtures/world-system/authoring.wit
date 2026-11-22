@@ -5,4 +5,5 @@ world command-ticket-fixture {
     include plugin;
     export world-system;
     export transport-handler;
+    export task-handler;
 }

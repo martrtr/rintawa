@@ -3,8 +3,27 @@ wit_bindgen::generate!({ path: "wit", world: "command-ticket-fixture" });
 
 struct Fixture;
 
+fn dummy_resource() -> rintawa::engine::user_resources::ResourceRef {
+    rintawa::engine::user_resources::ResourceRef {
+        id: "missing".into(),
+        size: 1,
+        media_type: "application/octet-stream".into(),
+        name: None,
+    }
+}
+
+#[derive(Default)]
+struct ResourceProbe {
+    pending: Vec<usize>,
+    owned: Vec<rintawa::engine::user_resources::ResourceRef>,
+    originals: Vec<rintawa::engine::user_resources::ResourceRef>,
+    trap: bool,
+}
+static RESOURCE_PROBE: std::sync::Mutex<Option<ResourceProbe>> = std::sync::Mutex::new(None);
+
 impl exports::rintawa::engine::guest::Guest for Fixture {
     fn register() {
+        assert!(rintawa::engine::user_resources::take_resource(&dummy_resource()).is_err());
         use rintawa::engine::world_registration::{self, SchemaKind};
         world_registration::register_world_schema(
             "fixture.value",
@@ -60,6 +79,9 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
     }
 
     fn start() {
+        assert!(rintawa::engine::user_resources::take_resource(&dummy_resource()).is_err());
+        *RESOURCE_PROBE.lock().unwrap() = Some(ResourceProbe::default());
+        let _ = rintawa::engine::runtime_tasks::spawn_periodic(10);
         rintawa::engine::host::monotonic_millis().expect("start clock");
         LIFECYCLE_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(rintawa::engine::host::random_bytes(16).unwrap().len(), 16);
@@ -70,6 +92,14 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
         rintawa::engine::transport::declare("fixture/commands").expect("command point");
     }
     fn stop() {
+        use rintawa::engine::user_resources;
+        assert!(user_resources::take_resource(&dummy_resource()).is_err());
+        if let Some(probe) = RESOURCE_PROBE.lock().unwrap().as_ref() {
+            for resource in &probe.owned {
+                assert!(user_resources::read_resource(resource, resource.size).is_err());
+                assert!(user_resources::release_resource(resource).is_err());
+            }
+        }
         assert!(rintawa::engine::host::monotonic_millis().is_err());
         assert!(rintawa::engine::host::random_bytes(16).is_err());
         if let Some(ticket) = *LAST_TICKET.lock().unwrap() {
@@ -85,6 +115,7 @@ impl exports::rintawa::engine::world_system::Guest for Fixture {
     fn evaluate(
         command_json: String,
     ) -> Result<String, exports::rintawa::engine::world_system::Error> {
+        assert!(rintawa::engine::user_resources::take_resource(&dummy_resource()).is_err());
         let command: serde_json::Value = serde_json::from_str(&command_json).map_err(|error| {
             exports::rintawa::engine::world_system::Error::Failed(error.to_string())
         })?;
@@ -286,6 +317,31 @@ fn asset_error(error: rintawa::engine::asset_store::Error) -> serde_json::Value 
 
 static LAST_TICKET: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
 
+impl exports::rintawa::engine::task_handler::Guest for Fixture {
+    fn on_task(_: u64) {
+        use rintawa::engine::user_resources as resources;
+        let mut guard = RESOURCE_PROBE.lock().unwrap();
+        let Some(probe) = guard.as_mut() else { return };
+        if probe.trap {
+            panic!("intentional resource task trap");
+        }
+        let Some(size) = probe.pending.pop() else {
+            return;
+        };
+        let bytes = vec![0; size];
+        let original =
+            resources::import_resource(&bytes, "application/octet-stream", None).unwrap();
+        let owned = resources::take_resource(&original).unwrap();
+        assert!(matches!(
+            resources::read_resource(&original, 1),
+            Err(resources::Error::NotFound)
+        ));
+        assert!(resources::take_resource(&owned).is_err());
+        probe.originals.push(original);
+        probe.owned.push(owned);
+    }
+}
+
 impl exports::rintawa::engine::transport_handler::Guest for Fixture {
     fn on_query(
         _: String,
@@ -302,6 +358,25 @@ impl exports::rintawa::engine::transport_handler::Guest for Fixture {
             }})
         };
         let result = match request["op"].as_str().expect("operation") {
+            "resource-fill" => {
+                let size = request["bytes"].as_u64().unwrap() as usize;
+                let count = request["count"].as_u64().unwrap() as usize;
+                let mut guard = RESOURCE_PROBE.lock().unwrap();
+                let probe = guard.as_mut().unwrap();
+                assert!(count <= 2 && probe.pending.len() + probe.owned.len() + count <= 2);
+                probe.pending.extend(std::iter::repeat_n(size, count));
+                serde_json::json!({"queued":count})
+            }
+            "resource-state" => {
+                let guard = RESOURCE_PROBE.lock().unwrap();
+                let probe = guard.as_ref().unwrap();
+                let summarize = |v: &rintawa::engine::user_resources::ResourceRef| serde_json::json!({"id":v.id,"size":v.size,"mediaType":v.media_type,"name":v.name});
+                serde_json::json!({"count":probe.owned.len(),"originals":probe.originals.iter().map(summarize).collect::<Vec<_>>(),"owned":probe.owned.iter().map(summarize).collect::<Vec<_>>()})
+            }
+            "resource-trap" => {
+                RESOURCE_PROBE.lock().unwrap().as_mut().unwrap().trap = true;
+                serde_json::json!({"armed":true})
+            }
             "submit" | "submit-lost-reply" => {
                 let schema = request["schema"].as_str().expect("schema");
                 let body = request
