@@ -174,7 +174,9 @@ use bindings::rintawa::engine::{
     scoped_composition::Host as ScopedCompositionHost,
     scoped_runtime_policy::Host as ScopedRuntimePolicyHost,
     secrets::{Error as SecretError, Host as SecretsHost},
-    transport::{Error as TransportApiError, Host as TransportHost},
+    transport::{
+        Error as TransportApiError, Host as TransportHost, InboundQuery as WitInboundQuery,
+    },
     user_resources::{
         Error as UserResourceError, Host as UserResourcesHost, ResourceRef as WitUserResourceRef,
     },
@@ -1686,6 +1688,57 @@ fn map_world_data_error(error: HostAccessError) -> WorldDataError {
 }
 
 impl TransportHost for WasmHostState {
+    fn begin_query(&mut self, point: String, payload: Vec<u8>) -> Result<u64, TransportApiError> {
+        self.transport
+            .begin_query(self.polled_transport_context()?, &point, &payload)
+            .map_err(map_transport_error)
+    }
+    fn poll_query(&mut self, handle: u64) -> Result<Option<Vec<Vec<u8>>>, TransportApiError> {
+        self.transport
+            .poll_query(self.polled_transport_context()?, handle)
+            .map_err(map_transport_error)
+    }
+    fn close_query(&mut self, handle: u64) -> Result<(), TransportApiError> {
+        self.transport
+            .close_query(self.polled_transport_context()?, handle)
+            .map_err(map_transport_error)
+    }
+    fn declare_polled(&mut self, point: String) -> Result<u64, TransportApiError> {
+        self.transport
+            .declare_polled(self.polled_transport_context()?, &point)
+            .map_err(map_transport_error)
+    }
+    fn next_query(&mut self, handle: u64) -> Result<Option<WitInboundQuery>, TransportApiError> {
+        self.transport
+            .next_query(self.polled_transport_context()?, handle)
+            .map(|request| {
+                request.map(|request| WitInboundQuery {
+                    handle: request.handle,
+                    caller: WitPrincipal {
+                        instance_id: request.caller.instance_id.to_string(),
+                        component_id: request.caller.component_id.to_string(),
+                        activation: request.caller.activation,
+                    },
+                    payload: request.payload,
+                })
+            })
+            .map_err(map_transport_error)
+    }
+    fn reply_query(
+        &mut self,
+        handle: u64,
+        payload: Option<Vec<u8>>,
+    ) -> Result<(), TransportApiError> {
+        self.transport
+            .reply_query(self.polled_transport_context()?, handle, payload)
+            .map_err(map_transport_error)
+    }
+    fn close_queryable(&mut self, handle: u64) -> Result<(), TransportApiError> {
+        self.transport
+            .close_queryable(self.polled_transport_context()?, handle)
+            .map_err(map_transport_error)
+    }
+
     fn declare(&mut self, point: String) -> Result<(), TransportApiError> {
         // A provider target executing for a dependent principal must not
         // borrow this provider's World scope to publish a queryable.
@@ -1798,6 +1851,15 @@ impl WasmHostState {
         result
     }
 
+    fn polled_transport_context(&self) -> Result<&ExecutionContext, TransportApiError> {
+        if !self.transport_access_active {
+            return Err(TransportApiError::AccessNotActive);
+        }
+        self.execution_context
+            .as_ref()
+            .ok_or(TransportApiError::AccessNotActive)
+    }
+
     fn transport_execution_context(&self) -> Result<&ExecutionContext, TransportApiError> {
         if !self.transport_access_active {
             return Err(TransportApiError::AccessNotActive);
@@ -1818,6 +1880,7 @@ fn map_transport_error(error: TransportError) -> TransportApiError {
         TransportError::LimitExceeded => TransportApiError::LimitExceeded,
         TransportError::Unavailable => TransportApiError::Unavailable,
         TransportError::UnknownSubscription => TransportApiError::UnknownSubscription,
+        TransportError::InvalidHandle => TransportApiError::InvalidHandle,
         TransportError::NotSelected => TransportApiError::NotSelected,
         TransportError::ActiveConflict => TransportApiError::Unavailable,
     }

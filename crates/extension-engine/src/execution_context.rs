@@ -106,6 +106,18 @@ impl ExecutionContexts {
         Ok(binding.context.clone())
     }
 
+    pub(crate) fn try_validate(&self, context: &ExecutionContext) -> Result<(), TransportError> {
+        let view = self.0.try_lock().map_err(|_| TransportError::Unavailable)?;
+        if !view
+            .bindings
+            .get(&context.principal.component())
+            .is_some_and(|binding| binding.active && binding.context == *context)
+        {
+            return Err(TransportError::Inactive);
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate(&self, context: &ExecutionContext) -> Result<(), TransportError> {
         if self.context(&context.principal.component(), false)? != *context {
             return Err(TransportError::Inactive);

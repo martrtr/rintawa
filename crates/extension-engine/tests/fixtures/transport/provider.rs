@@ -15,6 +15,8 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
         registration::provide_contract("fixture.backend", 1, &[]).expect("backend provider");
         registration::provide_contract("rintawa.host.shell", 1, &[])
             .expect("generic shell binding");
+        assert!(transport::declare_polled("fixture/not-active").is_err());
+        assert!(transport::begin_query("fixture/not-active", b"no").is_err());
         assert!(transport::declare("chat/send-controls/v1").is_err());
         assert!(transport::query("chat/send-controls/v1", b"ping").is_err());
         assert!(transport::subscribe("chat/updates/v1").is_err());
@@ -23,6 +25,8 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
 
     fn start() {
         use rintawa::engine::transport;
+        assert!(transport::declare_polled("fixture/not-yet-active").is_err());
+        assert!(transport::begin_query("fixture/not-yet-active", b"no").is_err());
         assert!(transport::declare("../escape").is_err());
         match transport::declare("chat/send-controls/v1") {
             Ok(()) => {
@@ -56,6 +60,9 @@ impl exports::rintawa::engine::transport_handler::Guest for Fixture {
         caller: rintawa::engine::runtime_context::Principal,
     ) -> Vec<u8> {
         assert!(point == "chat/send-controls/v1" || point == "fixture/caller");
+        if let Some(result) = d8_control(&payload) {
+            return result;
+        }
         if let Some(forward) = payload.strip_prefix(b"forward:") {
             let split = forward
                 .iter()
@@ -150,3 +157,53 @@ impl exports::rintawa::engine::transport_handler::Guest for Fixture {
     }
 }
 export!(Fixture);
+
+fn d8_control(payload: &[u8]) -> Option<Vec<u8>> {
+    use rintawa::engine::transport;
+    let text = std::str::from_utf8(payload).ok()?;
+    let rest = text.strip_prefix("d8:")?;
+    let (operation, input) = rest.split_once(':').unwrap();
+    let parsed = || input.split('\n').next().unwrap().parse::<u64>().unwrap();
+    let bytes = match operation {
+        "declare" => {
+            transport::declare_polled(input).map(|handle| format!("handle:{handle}").into_bytes())
+        }
+        "begin" => {
+            let (point, payload) = input.split_once('\n').unwrap();
+            transport::begin_query(point, payload.as_bytes())
+                .map(|handle| format!("handle:{handle}").into_bytes())
+        }
+        "poll" => transport::poll_query(parsed()).map(|reply| match reply {
+            None => b"pending".to_vec(),
+            Some(mut values) => {
+                assert_eq!(values.len(), 1);
+                let mut bytes = b"reply:".to_vec();
+                bytes.append(&mut values.remove(0));
+                bytes
+            }
+        }),
+        "next" => transport::next_query(parsed()).map(|request| match request {
+            None => b"pending".to_vec(),
+            Some(request) => {
+                let mut bytes = format!(
+                    "{}|{}|{}|{}\n",
+                    request.handle,
+                    request.caller.instance_id,
+                    request.caller.component_id,
+                    request.caller.activation
+                )
+                .into_bytes();
+                bytes.extend(request.payload);
+                bytes
+            }
+        }),
+        "reply" => {
+            let (_, bytes) = input.split_once('\n').unwrap();
+            transport::reply_query(parsed(), Some(bytes.as_bytes())).map(|_| b"ok".to_vec())
+        }
+        "close" => transport::close_query(parsed()).map(|_| b"closed".to_vec()),
+        "undeclare" => transport::close_queryable(parsed()).map(|_| b"closed".to_vec()),
+        _ => panic!("unknown D8 operation"),
+    };
+    Some(bytes.unwrap_or_else(|error| format!("error:{error:?}").into_bytes()))
+}

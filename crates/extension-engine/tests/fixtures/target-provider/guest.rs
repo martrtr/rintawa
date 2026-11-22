@@ -121,6 +121,10 @@ impl exports::rintawa::engine::task_handler::Guest for Fixture {
             if expected == "trap" {
                 panic!("hosted task trap");
             }
+            if expected.starts_with("d8-") {
+                d8_task(&expected, &current);
+                return;
+            }
         }
         let subscriptions = &mut *SUBSCRIPTIONS.lock().unwrap();
         for (owner, foreign) in subscriptions.iter() {
@@ -162,3 +166,146 @@ impl exports::rintawa::engine::task_handler::Guest for Fixture {
 }
 
 export!(Fixture);
+
+struct D8State {
+    incoming: Option<rintawa::engine::transport::InboundQuery>,
+    pending: Option<Vec<u8>>,
+    activation: u64,
+    queryable: Option<u64>,
+    outgoing: Option<u64>,
+    subscription: Option<u64>,
+}
+static D8_STATES: Mutex<BTreeMap<String, D8State>> = Mutex::new(BTreeMap::new());
+fn d8_task(role: &str, current: &rintawa::engine::runtime_context::Context) {
+    use rintawa::engine::transport;
+    let mut states = D8_STATES.lock().unwrap();
+    let id = &current.principal.instance_id;
+    let activation = current.principal.activation;
+    // Same-Store dependents cannot use each other's declarations/results.
+    for (foreign, state) in states.iter() {
+        if foreign == id {
+            continue;
+        }
+        if let Some(handle) = state.queryable {
+            assert!(matches!(
+                transport::next_query(handle),
+                Err(transport::Error::InvalidHandle | transport::Error::Unavailable)
+            ));
+            assert!(matches!(
+                transport::close_queryable(handle),
+                Err(transport::Error::InvalidHandle | transport::Error::Unavailable)
+            ));
+        }
+        if let Some(handle) = state.outgoing {
+            assert!(matches!(
+                transport::poll_query(handle),
+                Err(transport::Error::InvalidHandle) | Ok(None)
+            ));
+            assert!(matches!(
+                transport::close_query(handle),
+                Err(transport::Error::InvalidHandle | transport::Error::Unavailable)
+            ));
+        }
+    }
+    if states
+        .get(id)
+        .is_some_and(|state| state.activation != activation)
+    {
+        let old = states.remove(id).unwrap();
+        if let Some(handle) = old.queryable {
+            assert!(transport::next_query(handle).is_err());
+        }
+        if let Some(handle) = old.outgoing {
+            assert!(matches!(
+                transport::poll_query(handle),
+                Err(transport::Error::InvalidHandle) | Ok(None)
+            ));
+        }
+    }
+    let state = states.entry(id.clone()).or_insert(D8State {
+        incoming: None,
+        pending: None,
+        activation,
+        queryable: None,
+        outgoing: None,
+        subscription: None,
+    });
+    let trace = |kind: &str, value: &str| {
+        transport::publish(
+            "fixture/d8-events",
+            format!("{kind}|{}|{id}|{activation}|{value}", current.scope_id).as_bytes(),
+        )
+        .unwrap();
+    };
+    if role == "d8-provider" {
+        if state.queryable.is_none() {
+            match transport::declare_polled("fixture/d8-echo") {
+                Ok(handle) => {
+                    state.queryable = Some(handle);
+                    trace("ready", "provider");
+                }
+                Err(transport::Error::Unavailable) => return,
+                Err(error) => panic!("declare: {error:?}"),
+            }
+        }
+        if state.incoming.is_none() {
+            state.incoming = match transport::next_query(state.queryable.unwrap()) {
+                Ok(request) => request,
+                Err(transport::Error::Unavailable) => return,
+                Err(error) => panic!("next: {error:?}"),
+            };
+        }
+        let Some(request) = &state.incoming else {
+            return;
+        };
+        match transport::reply_query(request.handle, Some(&request.payload)) {
+            Ok(()) => {
+                trace(
+                    "handled",
+                    &format!(
+                        "{}:{}",
+                        request.caller.instance_id,
+                        std::str::from_utf8(&request.payload).unwrap()
+                    ),
+                );
+                state.incoming = None;
+            }
+            Err(transport::Error::Unavailable | transport::Error::LimitExceeded) => {}
+            Err(error) => panic!("reply: {error:?}"),
+        }
+    } else {
+        if state.subscription.is_none() {
+            state.subscription = Some(transport::subscribe("fixture/d8-start").unwrap());
+            trace("ready", "caller");
+        }
+        if let Some(handle) = state.outgoing {
+            match transport::poll_query(handle) {
+                Ok(Some(values)) => {
+                    assert_eq!(values.len(), 1);
+                    trace("done", std::str::from_utf8(&values[0]).unwrap());
+                    state.outgoing = None;
+                }
+                Ok(None) => {}
+                Err(error) => panic!("poll: {error:?}"),
+            }
+        }
+        if state.outgoing.is_none() {
+            if state.pending.is_none() {
+                state.pending = transport::poll(state.subscription.unwrap())
+                    .unwrap()
+                    .into_iter()
+                    .next();
+            }
+            if let Some(payload) = &state.pending {
+                match transport::begin_query("fixture/d8-echo", payload) {
+                    Ok(handle) => {
+                        state.outgoing = Some(handle);
+                        state.pending = None;
+                    }
+                    Err(transport::Error::Unavailable | transport::Error::LimitExceeded) => {}
+                    Err(error) => panic!("begin: {error:?}"),
+                }
+            }
+        }
+    }
+}

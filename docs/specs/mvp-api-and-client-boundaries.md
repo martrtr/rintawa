@@ -2,12 +2,13 @@
 
 **Status: accepted design, 2026-11-21; implementation in progress.** The owner accepted D1–D7
 on the condition that UI uses general extension interaction and adds no UI-specific
-Core code. A subsequent browser review is recorded below as D8 (proposed amendment;
-not covered by the earlier acceptance). The role flag from the draft is therefore replaced by the generic
+Core code. D8 was subsequently accepted by the owner on 2026-11-22, including nonblocking
+declaration admission semantics. The role flag from the draft is therefore replaced by the generic
 existing-contract lookup below. Architecture work P01–P04 is complete. This document refines
 [D1–D5](core-mvp-contract.md), adds D6–D7 below, and selects the first browser/native
 scope. Where the earlier draft left alternatives open, the choices here supersede
-them. No product code, builds, tests or performance measurements accompany it.
+them. The original design analysis was static; implementation evidence is recorded
+separately below and in the Core contract.
 
 Acceptance covers this design and its stated MVP limits; it is not evidence of
 correctness, minimal implementation or release readiness. New mechanisms still
@@ -16,7 +17,7 @@ need the concrete requirement and acceptance checks specified here.
 P05/D1 and D6 are implemented and verified; see [implementation progress](core-mvp-contract.md#implementation-progress).
 P06/D4, P07/D2 and P08/D3+D7 are implemented. P09 implements the D5
 lifecycle/resource slice; its API removals remain P12 work. The client implementation
-below remains pending. D8 remains proposed.
+below remains pending. D8 is accepted and implemented; browser acceptance remains P10.
 
 Core baseline: `fb1072a2c9169af1b36ea9cdffed31c146ed0341`; rtwKit baseline:
 `77782727020f6066be4d4c205b077dd3f9555775`. Recheck relevant source before coding.
@@ -184,9 +185,9 @@ into a dependent task; a provider task never inherits the last dependent's scope
 Enable existing query/publish/subscribe/poll/unsubscribe for those contexts, with
 quotas and handles charged to the dependent activation. Reject operations during
 registration, teardown, or before activation completes. The accepted D6 baseline
-keeps hosted callback-style `declare` and World-data unavailable. Proposed D8 below
+keeps hosted callback-style `declare` and World-data unavailable. Accepted D8 below
 adds general polled queryables and nonblocking queries, superseding the consumer-only
-Web restriction when accepted. World Systems remain separate backend components.
+Web transport restriction. World Systems remain separate backend components.
 No `query-in-scope`, arbitrary `run-as`, or new delegated handle API is added.
 
 Apply the corrected executing context to existing permission checks and
@@ -203,11 +204,10 @@ Store; their JavaScript runs in isolated frames.
 
 ## D8. Nonblocking transport for hosted and ordinary components
 
-**Status: proposed amendment after browser review; owner acceptance required before
-implementation.** D1–D7 retain their recorded status. This amendment replaces the
-consumer-only restriction for hosted transport and adds the primitives below.
-The browser and DockView sections describe the resulting target design, conditional
-on D8. No product code has changed.
+**Status: accepted by the owner and implemented, 2026-11-22.** D1–D7
+retain their recorded status. D8 replaces the consumer-only restriction for hosted
+transport and adds the primitives below. Browser/DockView implementation remains
+rtwKit P10 work.
 
 A browser contribution must be able to answer an ordinary Zenoh query without an
 extra WASM backend. A synchronous call from a hosted task cannot wait for another
@@ -271,7 +271,7 @@ close-queryable: func(handle: u64) -> result<_, error>;
   has not polled. An idle owner may retain only the bounded stale records until
   the next cleanup; no background delivery/retry service is required.
 
-Additional D8 requirements (proposed, subject to the same owner acceptance):
+Additional accepted D8 requirements:
 
 - Every operation above must return without waiting for another guest, a reply,
   network progress or a Store lock. This includes declaration, reply and close;
@@ -301,7 +301,33 @@ D8 acceptance extends B10 with delayed dispatch, partial success/error/timeout,
 caller/provider stop with checked-out requests, close/reply races, replacement
 activation isolation, quota recovery and a prompt-return check for all seven calls.
 
-The browser SDK uses begin/poll internally to implement a Promise-based query;
+### Accepted execution clarification, 2026-11-22
+
+`declare-polled` returns a handle for an admitted declaration. Publication runs
+outside the guest callback; `next-query` returns none while publication is pending
+and unavailable on publication failure. A `begin-query` admitted after that
+`declare-polled` in the same Host dispatches after its publication attempt. This
+clarification was explicitly accepted by the owner; no readiness import is added.
+
+A concrete bounded transport work queue runs Zenoh declaration/send/drop calls
+outside guest imports. It preserves admission order, while reply callbacks collect
+outgoing results without blocking that queue. The outgoing running permit remains
+owned by actual work until completion, even after close/poll releases its receiver.
+Admission/handle maps use prompt busy errors rather than waiting on guest/Store or
+Zenoh locks. `poll-query` reports pending on temporary metadata contention so
+terminal errors always consume an owned result. Handles are process-unique,
+exact-activation bound. Private attachment
+metadata carries a process-monotonic deadline from admission; neither dispatch nor
+receivers restart it. No routing/discovery layer or persistence is added.
+
+Core acceptance is covered by [native tests](../../crates/extension-engine/src/transport/polled/tests.rs),
+[ordinary WASM tests](../../crates/extension-engine/tests/wasm_transport_test/nonblocking_tests.rs)
+and [hosted shared-Store tests](../../crates/extension-engine/tests/artifact_loader_test/nonblocking_tests.rs).
+The full repository check passed. The paused-worker timing check is a regression
+probe for waiting on dispatch, not an OS scheduling latency guarantee. Actual
+browser/JS-only handlers, channel disconnect and DockView remain P10 work.
+
+The planned browser SDK uses begin/poll internally to implement a Promise-based query;
 it pumps incoming requests to registered JavaScript handlers and sends replies.
 Registration and pending handles belong to the actual hosted activation and mount;
 closing a panel undeclares its handlers. Backends need not know whether the other
@@ -312,7 +338,7 @@ Alternatives: retaining consumer-only Web forces extra backend packages for simp
 contributions; synchronous delegated callbacks deadlock/starve their shared pump;
 running a second native remote-api bridge needs the identity/lifecycle integration
 compared below. The selected amendment adds seven general lifecycle operations,
-not seven UI operations. Implement only after accepting this explicit cost.
+not seven UI operations. The owner accepted this explicit cost with D8.
 
 ## 3. Exact D2/D3 guest interface
 
@@ -781,9 +807,8 @@ condition and B9. All web wire/session/frame/theme behavior remains in rtwKit.
 Core provides only general transport, context, lifecycle, permissions, World and
 CAS primitives. No parallel UI mutation path or service bus may be introduced.
 P05 implements D6 identity/context and its immediate transport/cleanup checks.
-Continue the broader lifecycle/budget checks through P09, D7 and exact guest reads
-with P08; realize the browser protocol in rtwKit P10. D8 requires explicit owner acceptance and is a separate transport
-slice after D6 and before P10; it does not block the already accepted D1 correction.
-P05–P07 are implemented; the next implementation slice is P08. Do not make Sol
+P05–P09 and the separately accepted D8 transport slice are implemented. D5 API
+removals remain P12 work. The next integration slice is the browser protocol in
+rtwKit P10; product B10/B11 acceptance is not established by Core fixtures. Do not make Sol
 choose among the rejected alternatives unless evidence shows this contract is
 inconsistent or impossible; report a narrow amendment instead.

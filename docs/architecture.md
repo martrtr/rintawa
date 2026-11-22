@@ -2,7 +2,7 @@
 
 > This description contains historical API claims and is not an implementation
 > checklist. See [Core specifications](specs/README.md) for the accepted D1–D7
-> target boundaries and proposed D8. Acceptance does not imply implementation.
+> target boundaries and accepted D8. Acceptance does not imply implementation.
 
 Rintawa is a local-first runtime for persistent Worlds composed from immutable RTW
 packages. Core provides generic execution, storage, authority, composition and UI
@@ -297,9 +297,14 @@ Registration, teardown and incomplete activation cannot query or publish.
 Hosted subscriptions/uploads/tasks belong to the dependent activation. Stopping
 one dependent revokes its resources; a failed shared provider invalidates all its
 clients. Components in unrelated Stores/Worlds remain usable. Hosted callback
-queryables and World-data are unavailable. The proposed nonblocking D8 transport
-and browser runtime are separate, unfinished slices; no Core UI formats or widget
-DTOs are introduced. Existing `0.0.1` WASM components must be rebuilt against the
+queryables and World-data are unavailable. D8 adds nonblocking begin/poll/close
+and polled declaration/next/reply/close for ordinary and hosted callbacks. A bounded
+native queue performs Zenoh work outside the guest; exact-activation handles retain
+the original 500 ms admission deadline. Declaration handles confirm admission,
+with publication pending/failure observed through next-query. Stop/trap revokes
+owned routes; close releases buffered results without undoing admitted effects.
+Native and real WASM shared-Store regressions cover this boundary. The browser
+runtime remains rtwKit work; no Core UI formats or widget DTOs are introduced. Existing `0.0.1` WASM components must be rebuilt against the
 new WIT. See [the accepted contract](specs/mvp-api-and-client-boundaries.md).
 
 WASM `host.random-bytes` uses OS cryptographic entropy with no fallback: 1..256 bytes

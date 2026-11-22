@@ -2,7 +2,7 @@
 
 > Historical roadmap: do not restore removed APIs from this list. The
 > [Core specifications](specs/README.md) distinguish current source behavior,
-> accepted D1–D7 target contracts and the separately proposed D8 amendment.
+> accepted D1–D8 target contracts and their implementation status.
 
 Rintawa is working toward the first `0.0.1` end-to-end MVP: import a character,
 create a persistent World, talk through world-scoped Chat, receive an AI-controlled reply,
@@ -27,7 +27,8 @@ World and interaction API cuts. The foundation and old integration code include:
   relation persistence. These do not prove the later Chat/Narrator end-to-end MVP;
 - scoped `Single`/`Multiple` service routing and provider policy;
 - the old Portable UI runtime, UI Layer and World-focus SDK/WIT/Host stack have
-  been retired; no replacement transport is integrated;
+  been retired; general Zenoh transport replaces the interaction boundary, with
+  browser integration pending;
 - historical World Manager and shared Manage workspace packages (not currently
   compatible with the reduced UI ABI);
 - bounded file/resource ingress, streaming asset upload and permission-checked
@@ -51,10 +52,10 @@ do not provide authoritative World-change delivery.
 
 The remaining MVP work is:
 
-1. **Extension transport proof** — compare the proposed Zenoh integration with
-   a simpler direct option if required. Prove native/WASM query/reply, pub/sub,
-   authenticated admission, strict World-scope boundaries, fan-out and lifecycle
-   cleanup before adopting it as Core transport.
+1. **Product integration of extension transport** — Core now has scoped Zenoh,
+   attested callers and D8 nonblocking queries/polled queryables. Native and real
+   WASM tests cover shared-Store exchange, scope isolation, deadlines, overload and
+   cleanup. Validate the browser adapter and JS-only contribution in rtwKit P10.
 2. **Extension-owned UI composition** — rebuild one narrow Chat/Web UI path
    using the proven transport. Portable UI generation, surface budgets and
    the former idle presentation API were removed rather than preserved.
@@ -65,7 +66,8 @@ The remaining MVP work is:
    are implemented and covered by a real two-component WASM service fixture.
    Durable World effect handlers and their deferred continuations were removed with
    the four-table World model. The dedicated World signal bridge was also removed;
-   a replacement interaction transport has not been integrated.
+   scoped Zenoh now supplies general extension interaction, with the browser
+   adapter still pending.
 5. **Provider-neutral inference** — versioned inference contract plus one AI Provider.
 6. **Narrator** — a planned extension-owned request/reply path to inference and an
    authoritative World command, once the replacement interaction transport is proved.

@@ -777,6 +777,8 @@ interface secrets {
 
 /// Host-scoped ephemeral Zenoh queries. Names and payloads belong to features.
 interface transport {
+    use runtime-context.{principal};
+    record inbound-query { handle: u64, caller: principal, payload: list<u8> }
     variant error {
         access-not-active,
         invalid-name,
@@ -784,6 +786,7 @@ interface transport {
         limit-exceeded,
         unavailable,
         unknown-subscription,
+        invalid-handle,
         not-selected,
     }
     /// Stages a queryable during guest.start, activated only after success.
@@ -798,6 +801,16 @@ interface transport {
     poll: func(handle: u64) -> result<list<list<u8>>, error>;
     /// Removes a subscription early; stop automatically revokes remaining ones.
     unsubscribe: func(handle: u64) -> result<_, error>;
+    /// Admits a query without waiting for dispatch or replies.
+    begin-query: func(point: string, payload: list<u8>) -> result<u64, error>;
+    poll-query: func(handle: u64) -> result<option<list<list<u8>>>, error>;
+    close-query: func(handle: u64) -> result<_, error>;
+    /// Admits publication; next-query is empty while publication is pending.
+    declare-polled: func(point: string) -> result<u64, error>;
+    next-query: func(queryable: u64) -> result<option<inbound-query>, error>;
+    reply-query: func(handle: u64, payload: option<list<u8>>) -> result<_, error>;
+    close-queryable: func(handle: u64) -> result<_, error>;
+
 }
 
 /// Optional WASM provider callback, invoked with host-attested identity.

@@ -9,7 +9,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rintawa_sdk::{
@@ -17,6 +17,8 @@ use rintawa_sdk::{
     types::{ExtensionInstanceId, RuntimeScopeId},
 };
 use thiserror::Error;
+
+mod polled;
 
 use crate::execution_context::{ExecutionContext, ExecutionContexts};
 use zenoh::{
@@ -60,6 +62,9 @@ pub enum TransportError {
     /// The subscription handle is not owned by this component.
     #[error("unknown transport subscription")]
     UnknownSubscription,
+    /// Unknown, foreign, expired or already-consumed nonblocking handle.
+    #[error("invalid transport handle")]
+    InvalidHandle,
     /// Host selected a different component for this authoritative point.
     #[error("component is not selected for this authoritative point")]
     NotSelected,
@@ -75,6 +80,7 @@ struct State {
     subscriptions: Vec<OwnedSubscription>,
     next_subscription: u64,
     authoritative: HashMap<(RuntimeScopeId, String), ComponentRef>,
+    polled: polled::PolledState,
 }
 
 struct OwnedQueryable {
@@ -189,6 +195,7 @@ impl Transport {
             .queryables
             .iter()
             .any(|entry| entry.key == key && entry.owner != *owner)
+            || state.polled.conflicting(&key, owner)
         {
             return Err(TransportError::ActiveConflict);
         }
@@ -259,6 +266,7 @@ impl Transport {
             .queryables
             .iter()
             .any(|registered| registered.owner == *owner && registered.key == key)
+            || state.polled.duplicate(&key, owner)
         {
             return Err(TransportError::Duplicate);
         }
@@ -267,6 +275,7 @@ impl Transport {
             .iter()
             .filter(|registered| registered.owner == *owner)
             .count()
+            + state.polled.declarations_for(owner)
             >= MAX_DECLARATIONS_PER_OWNER
         {
             return Err(TransportError::LimitExceeded);
@@ -293,13 +302,7 @@ impl Transport {
                     let _ = query.reply_err(b"provider busy".to_vec()).wait();
                     return;
                 }
-                let caller = query.attachment().and_then(|attachment| {
-                    let bytes = attachment.to_bytes();
-                    if bytes.len() > 1024 * 1024 {
-                        return None;
-                    }
-                    serde_json::from_slice::<ComponentPrincipal>(&bytes).ok()
-                });
+                let caller = polled::request_caller(&query).ok();
                 let Some(caller) = caller else {
                     let _ = query.reply_err(b"missing caller".to_vec()).wait();
                     active_callbacks.fetch_sub(1, Ordering::AcqRel);
@@ -333,7 +336,21 @@ impl Transport {
                                     hook();
                                 }
                             }
-                            callback(query, caller);
+                            let live_caller = contexts
+                                .context(&caller.component(), false)
+                                .is_ok_and(|bound| {
+                                    bound.principal == caller && bound.scope == executing.scope
+                                });
+                            if live_caller
+                                && contexts.validate(&executing).is_ok()
+                                && !polled::expired_metadata(&query)
+                            {
+                                callback(query, caller);
+                            } else {
+                                let _ = query
+                                    .reply_err(b"expired caller or provider".to_vec())
+                                    .wait();
+                            }
                             #[cfg(test)]
                             {
                                 let hook = after_callback.lock().unwrap().take();
@@ -398,13 +415,11 @@ impl Transport {
             }
             session(&mut state)?
         };
+        let metadata = polled::metadata(&executing.principal, Instant::now() + timeout)?;
         let replies = zenoh
             .get(key)
             .payload(payload.to_vec())
-            .attachment(
-                serde_json::to_vec(&executing.principal)
-                    .map_err(|_| TransportError::Unavailable)?,
-            )
+            .attachment(metadata)
             .target(QueryTarget::All)
             .consolidation(ConsolidationMode::None)
             .timeout(timeout)
@@ -586,6 +601,7 @@ impl Transport {
             if expected.is_some() && revoked.is_empty() {
                 return;
             }
+            let polled = state.polled.revoke(instance, &revoked);
             let mut kept = Vec::new();
             let mut removed = Vec::new();
             for declaration in std::mem::take(&mut state.queryables) {
@@ -610,8 +626,9 @@ impl Transport {
                 }
             }
             state.subscriptions = kept_subscriptions;
-            (removed, removed_subscriptions)
+            (removed, removed_subscriptions, polled)
         };
+        removed.2.dispose();
         for declaration in removed.0 {
             if let Err(error) = declaration.undeclare().wait() {
                 tracing::warn!(%error, "failed to undeclare stopped component's Zenoh key");
@@ -724,7 +741,7 @@ mod tests {
                 .map_err(|_| TransportError::Unavailable)?;
             session(&mut state)?
         };
-        for metadata in [None, Some(serde_json::to_vec(&foreign.principal).expect("foreign metadata")), Some(serde_json::to_vec(&stale).expect("stale metadata")), Some(br#"{"instance_id":"caller","component_id":"component","activation":0,"scope":"world-a"}"#.to_vec())] {
+        for metadata in [None, Some(polled::metadata(&foreign.principal,Instant::now()+QUERY_TIMEOUT).expect("foreign metadata")), Some(polled::metadata(&stale,Instant::now()+QUERY_TIMEOUT).expect("stale metadata")), Some(br#"{"instance_id":"caller","component_id":"component","activation":0,"scope":"world-a"}"#.to_vec())] {
             let request = zenoh.get(scoped_key(&scope, point)?).payload(b"claim-caller".to_vec()).timeout(QUERY_TIMEOUT);
             let replies = match metadata { Some(bytes) => request.attachment(bytes).wait(), None => request.wait() }.map_err(|_| TransportError::Unavailable)?;
             let replies: Vec<_> = replies.into_iter().collect();

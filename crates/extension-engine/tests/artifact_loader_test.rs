@@ -1078,3 +1078,6 @@ runtime = ["background-task", "user-resource-import"]
     assert!(engine.active_component_principal(&independent).is_ok());
     Ok(())
 }
+
+#[path = "artifact_loader_test/nonblocking_tests.rs"]
+mod nonblocking_tests;

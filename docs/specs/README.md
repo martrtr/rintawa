@@ -10,10 +10,10 @@ the companion's explicit choices supersede earlier open alternatives.
 **Status: accepted design, implementation in progress.** On 2026-11-21 the owner
 accepted D1–D7 subject to UI using general extension interaction without new
 UI-specific Core code. The companion records this boundary and its acceptance
-checks. The follow-up browser review adds **D8 as a proposed amendment**, not yet accepted:
-nonblocking queries/polled queryables for all execution targets. DockView belongs
-to the rtwKit shell. The comparison with official zenoh-ts/remote-api and B10–B11
-checks are included in the companion; approve D8 before implementing that slice.
+checks. On 2026-11-22 the owner also accepted **D8**, including declaration
+admission semantics: nonblocking queries/polled queryables for ordinary and hosted
+components. DockView belongs to the rtwKit shell. The browser transport comparison
+and B10–B11 checks are included in the companion.
 Only the project owner may accept further architectural changes.
 The baseline is `fb1072a2c9169af1b36ea9cdffed31c146ed0341`, inspected on
 2026-11-21. No builds, tests or benchmarks were run for that investigation.
@@ -25,8 +25,13 @@ P05/D6 is also implemented: ABI `rintawa:engine@0.0.2`, attested immediate calle
 activation-bound hosted execution and generic selected-provider lookup. The full
 repository check passed. P06/D4 corrections are in `27d1899`; P07/D2 now preserves command tickets across
 callbacks, adds close and rejects stale activation handles. Real WASM completion
-checks cover COMMIT/rejection/rollback, quota and reply loss. P08 is next.
-D8 remains proposed.
+checks cover COMMIT/rejection/rollback, quota and reply loss. P08/D3+D7 adds
+graph reads, IDs, entropy and asset readers; P09/D5 adds resource bounds and
+retryable cleanup. D8 is implemented with bounded native dispatch and exact
+activation ownership. Native and real WASM tests cover deadlines, overload,
+stop/restart/trap and two Worlds sharing one provider Store. The repository check
+passed. Browser protocol, JS-only contributions and DockView acceptance remain
+rtwKit P10 work; Core fixtures do not prove those product paths.
 
 This directory contains durable project specifications in English. Revision-specific
 audit notes and the working refactoring checklist are local engineering material

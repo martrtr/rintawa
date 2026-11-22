@@ -10,8 +10,8 @@ D1–D7 subject to general extension interaction and no new UI-specific Core cod
 resolves P01–P04, specifies exact guest/bridge interfaces, adds D6–D7 and narrows
 release promises. Read both before implementation. The companion records the
 acceptance condition and replaces the draft UI flag with general contract lookup.
-The companion also contains proposed D8 following the browser review. It is not
-covered by D1–D7 acceptance: it enables nonblocking, bidirectional hosted transport.
+The owner separately accepted D8 on 2026-11-22, including declaration admission
+semantics. It enables nonblocking, bidirectional ordinary and hosted transport.
 Neither document proves implementation correctness or release readiness.
 
 ## Implementation progress
@@ -30,7 +30,21 @@ context, and stop/trap/drop revoke admission and owned resources. Generic
 re-entering the Engine. Native transport wrappers take `ComponentPrincipal`;
 `active_component_principal` obtains the current admitted activation. Retained
 principals and subscription/upload/task handles do not authorize a new activation.
-Hosted callback declarations and World-data remain unavailable. D8 is not implemented.
+Hosted callback declarations and World-data remain unavailable. Accepted D8 adds
+nonblocking queries and polled queryables in both ordinary and hosted callbacks.
+One bounded native control queue performs Zenoh work outside guest imports;
+activation-owned handles retain attested callers and the original admission
+deadline. Declaration handles confirm admission, with publication errors observable
+through `next-query`. Exact ownership, per-owner/global limits and cleanup cover
+pending, checked-out and completed-but-uncollected requests.
+
+D8 evidence: [native boundary tests](../../crates/extension-engine/src/transport/polled/tests.rs),
+[ordinary WASM imports](../../crates/extension-engine/tests/wasm_transport_test/nonblocking_tests.rs)
+and [two-World shared-Store exchange](../../crates/extension-engine/tests/artifact_loader_test/nonblocking_tests.rs).
+These cover prompt imports with dispatch paused, deadline propagation, partial
+results, overload, foreign/stale handles, stop/restart and shared-provider trap.
+The full repository check passed. Actual browser handlers and channel/unmount
+ownership remain rtwKit P10 acceptance.
 
 Evidence: [property authority regressions](../../crates/world-runtime/tests/property_authority_test.rs),
 [real WASM caller/selection tests](../../crates/extension-engine/tests/wasm_transport_test.rs),
@@ -531,12 +545,12 @@ component callers and binds hosted tasks to their own scope; domain owners enfor
 item-specific operation rules; atomic invariants remain under one owner; the browser
 wire/session/frame contract is specified; external native supervision is excluded
 from this release. D7 adds session entropy and permission-gated asset readers.
-Guest signatures, initial budgets and B1–B11 acceptance checks (including proposed D8) are explicit there.
+Guest signatures, initial budgets and B1–B11 acceptance checks (including accepted D8) are explicit there.
 These accepted design choices do not prove support for all future scenarios.
 
 ### Approval and delivery
 
-D1–D7 are accepted within the companion's stated scope and no-UI-specific-Core
+D1–D8 are accepted within the companion's stated scope and no-UI-specific-Core
 condition. Private structures/algorithms/module layout remain implementation choices. Any new public
 API, schema, permission, mandatory dependency or weaker guarantee outside the
 accepted scope needs a narrow amendment with alternatives and consequences.

@@ -516,3 +516,6 @@ fn test_should_attest_immediate_callers_reject_stale_activations_and_match_selec
     );
     Ok(())
 }
+
+#[path = "wasm_transport_test/nonblocking_tests.rs"]
+mod nonblocking_tests;
