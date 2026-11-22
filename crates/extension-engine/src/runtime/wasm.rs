@@ -1697,6 +1697,19 @@ fn world_command_failure(
     }
     let mut diagnostic = error.to_string();
     diagnostic.truncate(diagnostic.floor_char_boundary(MAX_COMMAND_FAILURE_BYTES));
+    // Display of SystemFailed is intentionally only the outer classification.
+    // Preserve the owner's bounded domain reason in the guest completion result.
+    if let rintawa_world_runtime::WorldRuntimeError::SystemFailed { source, .. } = &error {
+        use rintawa_world_runtime::SystemError;
+        if let SystemError::Rejected(reason) | SystemError::Failed(reason) = source {
+            let remaining = MAX_COMMAND_FAILURE_BYTES.saturating_sub(diagnostic.len());
+            if remaining > 2 {
+                diagnostic.push_str(": ");
+                let end = reason.floor_char_boundary(remaining - 2);
+                diagnostic.push_str(&reason[..end]);
+            }
+        }
+    }
     Ok(WitTicketStatus::Failed(diagnostic))
 }
 

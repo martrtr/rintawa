@@ -2610,3 +2610,23 @@ fn test_resource_take_denies_before_entropy_and_has_no_predictable_fallback() {
         Err(UserResourceError::AccessNotActive)
     ));
 }
+
+#[test]
+fn test_world_failure_preserves_bounded_system_rejection_reason() {
+    use rintawa_world_runtime::{SystemError, WorldRuntimeError};
+    for source in [
+        SystemError::Rejected("stale-entry-id".into()),
+        SystemError::Failed("é".repeat(4096)),
+    ] {
+        let error = WorldRuntimeError::SystemFailed {
+            schema: "chat.append@1".parse().unwrap(),
+            source,
+        };
+        let Ok(WitTicketStatus::Failed(reason)) = world_command_failure(error) else {
+            panic!("expected definite failure");
+        };
+        assert!(reason.len() <= MAX_COMMAND_FAILURE_BYTES);
+        assert!(std::str::from_utf8(reason.as_bytes()).is_ok());
+        assert!(reason.contains("stale-entry-id") || reason.contains('é'));
+    }
+}
