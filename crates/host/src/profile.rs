@@ -31,6 +31,28 @@ const MAX_PREFERENCE_KEY_BYTES: usize = 128;
 const MAX_PREFERENCE_VALUE_BYTES: usize = 64 * 1024;
 const MAX_PREFERENCE_TOTAL_BYTES_PER_COMPONENT: usize = 1024 * 1024;
 
+/// Exact prerequisite for a shared Host execution target, without permission inheritance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct HostExecutionRequirement {
+    /// Exact provider RTW bytes.
+    pub artifact: ArtifactDigest,
+    /// Component in the approved baseline activation.
+    pub component_id: ComponentId,
+    /// Exact versioned target supplied by that component.
+    pub target: String,
+}
+
+/// Optional starting component selected by a World template, without runtime authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct CompositionEntry {
+    /// Concrete World instance containing the starting component.
+    pub instance_id: ExtensionInstanceId,
+    /// Exact component, resolved by its presentation host when available.
+    pub component_id: ComponentId,
+}
+
 /// One exact activation selected for a host-owned composition.
 ///
 /// `subject` is defined by the RTW content handler. For `rintawa.extension@1`
@@ -232,6 +254,12 @@ impl PreferenceRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompositionProfile {
+    /// Exact shared Host prerequisites. Empty retains the existing default-recipe policy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub execution_requirements: Vec<HostExecutionRequirement>,
+    /// Template starting component; does not enable it or grant permissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<CompositionEntry>,
     /// Version of this persistence schema.
     pub schema: u32,
     /// Ordered exact activations. Order remains explicit for future composition policy.
@@ -257,6 +285,8 @@ pub struct CompositionProfile {
 impl Default for CompositionProfile {
     fn default() -> Self {
         Self {
+            execution_requirements: Vec::new(),
+            entry: None,
             schema: PROFILE_SCHEMA,
             activations: Vec::new(),
             preferred_providers: Vec::new(),
@@ -349,6 +379,26 @@ impl CompositionProfile {
     }
 
     fn validate(&self) -> HostResult<()> {
+        let mut targets = HashSet::new();
+        for requirement in &self.execution_requirements {
+            rintawa_sdk::manifest::validate_component_target(&requirement.target)
+                .map_err(|error| HostError::InvalidTemplate(error.to_string()))?;
+            if !targets.insert(&requirement.target) {
+                return Err(HostError::InvalidTemplate(
+                    "duplicate Host execution requirement".into(),
+                ));
+            }
+        }
+        if let Some(entry) = &self.entry
+            && !self
+                .activations
+                .iter()
+                .any(|activation| activation.instance_id == entry.instance_id)
+        {
+            return Err(HostError::InvalidTemplate(
+                "entry instance is absent from composition".into(),
+            ));
+        }
         let mut selections = HashSet::new();
         for selection in &self.preferred_providers {
             let contract = selection.contract();
@@ -780,7 +830,16 @@ impl CompositionProfile {
             })
             .collect();
 
+        let entry = self.entry.as_ref().map(|entry| CompositionEntry {
+            instance_id: instance_map
+                .get(&entry.instance_id)
+                .cloned()
+                .unwrap_or_else(|| entry.instance_id.clone()),
+            component_id: entry.component_id.clone(),
+        });
         Self {
+            execution_requirements: self.execution_requirements.clone(),
+            entry,
             schema: PROFILE_SCHEMA,
             activations,
             preferred_providers,
@@ -831,6 +890,13 @@ impl CompositionProfile {
             .position(|activation| activation.subject == subject)
             .ok_or_else(|| HostError::ActivationNotFound(subject.to_string()))?;
         let removed = self.activations.remove(index);
+        if self
+            .entry
+            .as_ref()
+            .is_some_and(|entry| entry.instance_id == removed.instance_id)
+        {
+            self.entry = None;
+        }
 
         self.runtime_permissions.retain(|grant| {
             grant.scope_id != removed.scope_id || grant.instance_id != removed.instance_id

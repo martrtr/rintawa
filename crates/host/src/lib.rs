@@ -13,6 +13,7 @@
 
 mod profile;
 mod runtime;
+mod templates;
 mod world_metadata;
 
 use std::{
@@ -41,10 +42,12 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub use profile::{
-    ActivationRecord, AuthoritativeProviderSelection, CompositionProfile, HttpLoopbackOriginGrant,
-    PROFILE_SCHEMA, PreferredProviderSelection, RuntimePermissionGrant,
+    ActivationRecord, AuthoritativeProviderSelection, CompositionEntry, CompositionProfile,
+    HostExecutionRequirement, HttpLoopbackOriginGrant, PROFILE_SCHEMA, PreferredProviderSelection,
+    RuntimePermissionGrant,
 };
 pub use runtime::HostRuntime;
+pub use templates::{CreatedTemplateWorld, PackageInstallResult, TemplateSummary};
 use world_metadata::WorldMetadata;
 pub use world_metadata::{MAX_WORLD_DESCRIPTION_BYTES, MAX_WORLD_TITLE_BYTES};
 
@@ -69,7 +72,6 @@ pub const DEFAULT_WORLD_PROFILE_FILE: &str = "default-world.toml";
 const EXTENSION_CONTENT_V1: &str = "rintawa.extension@1";
 const WORLD_DATABASE_FILE: &str = "world.sqlite";
 const WORLD_COMPOSITION_FILE: &str = "composition.toml";
-const WORLD_ID_CREATION_ATTEMPTS: usize = 8;
 /// Maximum single raw asset size accepted by the local host asset store.
 pub const MAX_ASSET_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -250,6 +252,15 @@ impl std::error::Error for HostShutdownFailures {
 /// Errors returned by local host composition operations.
 #[derive(Debug, Error)]
 pub enum HostError {
+    /// A World is activating, active or still cleaning up its components.
+    #[error("World lifecycle is busy: {0}")]
+    WorldLifecycleBusy(WorldId),
+    /// A template or its portable dependency closure is invalid.
+    #[error("invalid World template: {0}")]
+    InvalidTemplate(String),
+    /// Local approval is required before creating a World with requested capabilities.
+    #[error("template runtime permission approval required: {0}")]
+    TemplateApprovalRequired(String),
     /// Trusted interactive session and World command Principal do not match.
     #[error("interactive World command Principal differs from authenticated session")]
     InteractiveWorldCommandPrincipalMismatch,
@@ -669,64 +680,11 @@ impl HostHome {
     /// Returns a filesystem or storage error if the world directory/database
     /// cannot be created safely.
     pub fn create_world(&self) -> HostResult<WorldSummary> {
-        let default_world = self.load_default_world_recipe()?;
-        for _ in 0..WORLD_ID_CREATION_ATTEMPTS {
-            let world_id = WorldId::new();
-            let directory = self.worlds_directory.join(world_id.to_string());
-            match std::fs::create_dir(&directory) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error.into()),
-            }
-
-            let database = directory.join(WORLD_DATABASE_FILE);
-            // Retain this guard through initial publication AND rollback. Waiters
-            // must never successfully mutate a profile that creation later erases.
-            let mut _composition_lock = None;
-            let mut created_storage = None;
-            let creation: HostResult<WorldSummary> = (|| {
-                _composition_lock = Some(CompositionProfile::lock(
-                    &directory.join(WORLD_COMPOSITION_FILE),
-                )?);
-                let metadata = WorldMetadata::new("New World", None, None)?;
-                let manifest = metadata.write_to_manifest(&WorldManifest::default())?;
-                let storage = created_storage.insert(SqliteWorldStorage::create_with_manifest(
-                    &database, world_id, &manifest,
-                )?);
-                let state = storage.load_session()?;
-                #[cfg(test)]
-                BEFORE_INITIAL_COMPOSITION.with(|hook| {
-                    if let Some(hook) = hook.borrow_mut().take() {
-                        hook(world_id);
-                    }
-                });
-                let scope_id = world_runtime_scope_id(world_id);
-                let profile = default_world.materialize_all(scope_id);
-                self.save_world_composition(world_id, &profile)?;
-                world_summary(&state)
-            })();
-            match creation {
-                Ok(summary) => return Ok(summary),
-                Err(error) => {
-                    let cleanup: HostResult<()> = (|| {
-                        if let Some(storage) = created_storage.take() {
-                            storage.delete()?;
-                        }
-                        std::fs::remove_dir_all(&directory)?;
-                        Ok(())
-                    })();
-                    if let Err(cleanup) = cleanup {
-                        return Err(HostError::WorldCreateRollbackFailed {
-                            creation: error.to_string(),
-                            cleanup: cleanup.to_string(),
-                        });
-                    }
-                    return Err(error);
-                }
-            }
-        }
-
-        Err(HostError::WorldIdCollision)
+        let recipe = self.load_default_world_recipe()?;
+        let metadata = WorldMetadata::new("New World", None, None)?;
+        let manifest = metadata.write_to_manifest(&WorldManifest::default())?;
+        self.publish_world(&recipe, None, &manifest)
+            .map(|created| created.world)
     }
 
     /// Lists all persistent worlds in deterministic identifier order.
@@ -812,6 +770,7 @@ impl HostHome {
     /// Returns an error when the World does not exist, its directory identity is unsafe,
     /// or the host cannot remove the validated World directory.
     pub fn delete_world(&self, world_id: WorldId) -> HostResult<()> {
+        let _lifecycle = self.lock_world_lifecycle(world_id)?;
         let _profile_lock = self.lock_composition_scope(&world_runtime_scope_id(world_id))?;
         let directory = self.worlds_directory.join(world_id.to_string());
         let storage = open_world_database(&directory, world_id)?;
@@ -1807,8 +1766,7 @@ mod creation_review_tests {
     use std::{sync::mpsc, time::Duration};
 
     #[test]
-    fn test_should_preserve_mutation_during_initial_composition_publication() -> anyhow::Result<()>
-    {
+    fn test_should_hide_world_until_composition_is_published() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let home = HostHome::open(root.path())?;
         let creator_home = HostHome::open(root.path())?;
@@ -1824,118 +1782,33 @@ mod creation_review_tests {
             creator_home.create_world()
         });
         let world = paused.recv_timeout(Duration::from_secs(5))?;
-        let path = home
-            .worlds_directory
-            .join(world.to_string())
-            .join(WORLD_COMPOSITION_FILE);
-        let probe = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path.with_extension("toml.lock"))?;
+        assert!(home.list_worlds()?.is_empty());
+        assert!(matches!(
+            home.load_world_composition(world),
+            Err(HostError::WorldNotFound(_))
+        ));
+        // Startup recovery must leave a live creator's private stage alone.
+        home.recover_world_staging()?;
+        resume.send(())?;
+        let created = creator.join().unwrap()?;
+        assert_eq!(created.id, world);
         let owner = ComponentRef::new("review-owner", "runtime");
         let scope = world_runtime_scope_id(world);
-        // On the broken implementation no creator lock exists, so complete the
-        // mutation before resuming creation: its confirmed result must survive.
-        match probe.try_lock() {
-            Ok(()) => {
-                drop(probe);
-                home.set_preference(
-                    scope.clone(),
-                    owner.clone(),
-                    "review-key".into(),
-                    "confirmed".into(),
-                )?;
-                resume.send(())?;
-                creator.join().unwrap()?;
-            }
-            Err(std::fs::TryLockError::WouldBlock) => {
-                let mutation_home = HostHome::open(root.path())?;
-                let mutation_owner = owner.clone();
-                let mutation_scope = scope.clone();
-                let mutation = std::thread::spawn(move || {
-                    mutation_home.set_preference(
-                        mutation_scope,
-                        mutation_owner,
-                        "review-key".into(),
-                        "confirmed".into(),
-                    )
-                });
-                resume.send(())?;
-                creator.join().unwrap()?;
-                mutation.join().unwrap()?;
-            }
-            Err(error) => return Err(error.into()),
-        }
+        home.set_preference(
+            scope.clone(),
+            owner.clone(),
+            "review-key".into(),
+            "confirmed".into(),
+        )?;
         assert_eq!(
             home.get_preference(&scope, &owner, "review-key")?,
-            Some("confirmed".into()),
-            "initial composition overwrote a confirmed profile mutation"
+            Some("confirmed".into())
         );
-        Ok(())
-    }
-    #[test]
-    fn test_should_serialize_activate_and_delete_with_initial_composition() -> anyhow::Result<()> {
-        for delete in [false, true] {
-            let root = tempfile::tempdir()?;
-            let home = HostHome::open(root.path())?;
-            let creator_home = HostHome::open(root.path())?;
-            let (ready, paused) = mpsc::channel();
-            let (resume, release) = mpsc::channel();
-            let creator = std::thread::spawn(move || {
-                BEFORE_INITIAL_COMPOSITION.with(|hook| {
-                    *hook.borrow_mut() = Some(Box::new(move |world| {
-                        ready.send(world).unwrap();
-                        release.recv_timeout(Duration::from_secs(10)).unwrap();
-                    }));
-                });
-                creator_home.create_world()
-            });
-            let world = paused.recv_timeout(Duration::from_secs(5))?;
-            let composition = home
-                .worlds_directory
-                .join(world.to_string())
-                .join(WORLD_COMPOSITION_FILE);
-            assert!(!composition.exists());
-            // This is a deterministic observation of the creator's ownership,
-            // independent of whether the lifecycle worker has been scheduled.
-            let probe = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(composition.with_extension("toml.lock"))?;
-            let locked = matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock));
-            drop(probe);
-            let actor_home = HostHome::open(root.path())?;
-            let (attempt, attempted) = mpsc::channel();
-            let actor = std::thread::spawn(move || -> anyhow::Result<()> {
-                let mut runtime = crate::HostRuntime::start(&actor_home)?;
-                attempt.send(())?;
-                if delete {
-                    actor_home.delete_world(world)?;
-                    assert!(!composition.exists());
-                } else {
-                    runtime.activate_world(&actor_home, world)?;
-                    assert!(
-                        composition.is_file(),
-                        "activation observed an unpublished overlay"
-                    );
-                    assert!(runtime.is_world_active(world));
-                }
-                runtime.shutdown()?;
-                Ok(())
-            });
-            attempted.recv_timeout(Duration::from_secs(5))?;
-            resume.send(())?;
-            let creation = creator.join().unwrap();
-            let action = actor.join().unwrap();
-            assert!(locked, "creation failed to retain the composition lock");
-            creation?;
-            action?;
-            if !delete {
-                home.delete_world(world)?;
-            }
-        }
+        let mut runtime = crate::HostRuntime::start(&home)?;
+        runtime.activate_world(&home, world)?;
+        runtime.deactivate_world(world)?;
+        runtime.shutdown()?;
+        home.delete_world(world)?;
         Ok(())
     }
 
@@ -1945,14 +1818,15 @@ mod creation_review_tests {
         let home = HostHome::open(root.path())?;
         // Force atomic profile publication to fail, after the database is ready.
         BEFORE_INITIAL_COMPOSITION.with(|hook| {
-            let directory = home.worlds_directory.clone();
-            *hook.borrow_mut() = Some(Box::new(move |world| {
-                std::fs::create_dir(
-                    directory
-                        .join(world.to_string())
-                        .join(WORLD_COMPOSITION_FILE),
-                )
-                .unwrap();
+            let directory = home.root.join("world-staging");
+            *hook.borrow_mut() = Some(Box::new(move |_world| {
+                let stage = std::fs::read_dir(&directory)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                std::fs::create_dir(stage.join(WORLD_COMPOSITION_FILE)).unwrap();
             }));
         });
         assert!(home.create_world().is_err());

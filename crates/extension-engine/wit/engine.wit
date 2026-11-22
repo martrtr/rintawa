@@ -507,6 +507,16 @@ interface world-sessions {
     /// Lists persistent worlds. Requires `world-session-read`.
     list-worlds: func() -> result<list<summary>, error>;
 
+    /// Installed immutable template catalog as bounded JSON. Requires world-session-read.
+    list-templates: func() -> result<string, error>;
+    /// Exact inert template descriptor JSON. Requires world-session-read.
+    template-info: func(digest: string) -> result<string, error>;
+    /// Atomically creates a new World; does not activate it or approve Host providers.
+    create-from-template: func(digest: string, title: string, approve-runtime-permissions: bool) -> result<summary, error>;
+    record entry-component { instance-id: string, component-id: string }
+    /// Stable template entry in the requested World. Requires world-session-read.
+    entry: func(world-id: string) -> result<option<entry-component>, error>;
+
     /// Creates one empty persistent world. Requires `world-session-write`.
     create: func() -> result<summary, error>;
 

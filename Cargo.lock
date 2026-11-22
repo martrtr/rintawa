@@ -3244,6 +3244,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
+ "rintawa-artifacts",
  "rintawa-host",
  "rintawa-sdk",
  "tempfile",

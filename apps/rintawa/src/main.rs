@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use rintawa_artifacts::ArtifactDigest;
 use rintawa_host::{HOST_SCOPE, HostHome, HostRuntime};
 use rintawa_sdk::{
     contracts::ComponentRef, runtime_permissions::RuntimePermission, types::RuntimeScopeId,
@@ -35,6 +36,14 @@ enum Commands {
         #[arg(long)]
         disabled: bool,
     },
+    /// Store a verified RTW without activation or permission changes.
+    PackageInstall { path: PathBuf },
+    /// List immutable installed World templates.
+    TemplateList,
+    /// Inspect exact template composition and requested capabilities.
+    TemplateInfo { digest: ArtifactDigest },
+    /// Export a stopped supported World, including committed data, as a template.
+    WorldExport { id: WorldId, path: PathBuf },
     /// Show baseline extension activations.
     List,
     /// Enable one baseline activation by extension ID.
@@ -104,7 +113,17 @@ enum Commands {
         scope: String,
     },
     /// Create an empty persistent authoritative world.
-    WorldCreate,
+    WorldCreate {
+        /// Exact installed template; omit to use the trusted default recipe.
+        #[arg(long)]
+        template: Option<ArtifactDigest>,
+        /// Override the template name before publishing the new World.
+        #[arg(long, requires = "template")]
+        title: Option<String>,
+        /// Explicitly approve only the template's requested World capabilities.
+        #[arg(long, requires = "template")]
+        approve_runtime_permissions: bool,
+    },
     /// List persistent worlds in the local Rintawa home.
     WorldList,
     /// Show durable metadata for one persistent world.
@@ -126,6 +145,34 @@ fn main() -> Result<()> {
     let home = HostHome::open(resolve_home(cli.home)?)?;
     match cli.command {
         Commands::Install { path, disabled } => install(&home, path, disabled),
+        Commands::PackageInstall { path } => {
+            let result = home.install_package(path)?;
+            println!("digest = {}", result.digest);
+            println!("content = {}", result.content);
+            Ok(())
+        }
+        Commands::TemplateList => {
+            for template in home.list_templates()? {
+                if let Some(reason) = template.invalid_reason {
+                    println!("{} invalid: {}", template.digest, reason);
+                } else {
+                    println!("{} {}", template.digest, template.name);
+                }
+            }
+            Ok(())
+        }
+        Commands::TemplateInfo { digest } => {
+            println!("{}", home.template_info(&digest)?);
+            Ok(())
+        }
+        Commands::WorldExport { id, path } => {
+            home.export_world_template(id, &path)?;
+            println!("exported = {}", path.display());
+            println!(
+                "Includes all committed World data. Secrets and local approvals are excluded."
+            );
+            Ok(())
+        }
         Commands::List => list(&home),
         Commands::Enable { id } => set_enabled(&home, id, true),
         Commands::Disable { id } => set_enabled(&home, id, false),
@@ -155,7 +202,27 @@ fn main() -> Result<()> {
             origin,
             scope,
         } => revoke_http_origin(&home, instance, component, origin, scope),
-        Commands::WorldCreate => world_create(&home),
+        Commands::WorldCreate {
+            template,
+            title,
+            approve_runtime_permissions,
+        } => {
+            if let Some(template) = template {
+                let result = home.create_world_from_template(
+                    &template,
+                    title.as_deref(),
+                    approve_runtime_permissions,
+                )?;
+                println!("world = {}", result.world.id);
+                println!("title = {}", result.world.title);
+                if let Some(entry) = result.entry {
+                    println!("entry = {}/{}", entry.instance_id, entry.component_id);
+                }
+                Ok(())
+            } else {
+                world_create(&home)
+            }
+        }
         Commands::WorldList => world_list(&home),
         Commands::WorldInfo { id } => world_info(&home, id),
         Commands::Run { once } => run(&home, once),

@@ -250,9 +250,15 @@ by target (`artifact_loader.rs` / `execution_targets.rs`). Omitting a baseline
 provider from A's activation list does not establish an exclusion. Keep this gap
 open until slice 7; stopping the provider globally would violate the accepted model.
 
-Current work: slice 1 completed with local acceptance below. Slices 2–7 remain open.
-The additive Core ABI change must be committed and pinned by rtwKit before releasing
-these new packages; local acceptance used the rebuilt working Core CLI.
+Current work, 2026-11-23: slices 1 and 2 are complete. The installed-template
+portion of slice 3 and Character-first workflow of slice 4 now have real-browser
+acceptance. Disk-backed browser RTW file transfer/export in slice 3, Narrator/AI,
+World-local provider exclusions and final full-MVP acceptance remain open.
+Slice 1 Core is committed as `b997e98`; native templates and the new World-session
+WIT methods are pending owner commit. rtwKit's artifact tooling still pins that
+previous commit; update its Core pin after the companion Core commit exists.
+The live dev installation has been updated to this checkpoint; no MVP completion
+or published release is claimed.
 
 ### Slice 1 bounded recent-read addition
 
@@ -318,3 +324,165 @@ independent Worlds in a clean home. Its source inventory is
 `/tmp/rintawa-template-inventory.md`. No template/AI/exclusion feature is claimed
 implemented by this checkpoint. No Package Manager, separate World Manager,
 exclusive Host mode, paid provider calls or private-card transmission was added.
+
+### Slice 2 checkpoint — Native templates and portable snapshots
+
+Core installs arbitrary verified RTW containers without changing composition.
+The built-in World-template handler validates exact dependencies, declared schema
+owners, seed integrity/graph/payloads and the full asset closure. Both embedded and
+thin dependency payloads are checked, including old generic CAS imports; aggregate
+expansion limits apply. No package handlers or guests run during installation.
+
+Creation selects an immutable installed template before constructing anything.
+It publishes a new DB and freshly materialized composition as one directory rename
+from private staging. The resolved entry is returned from that same materialization.
+Restart recovery skips active stages and reclaims abandoned ones. Requested grants
+require explicit approval, never copy trust from an export. The original default
+recipe uses this publisher too; no template is applied to an existing empty World.
+
+Stopped export captures SQLite WAL state, exact composition/artifacts and supported
+AssetRefs, preserving local graph IDs. It excludes local approvals, credentials and
+Host preferences. The completed private RTW passes the same import validator before
+no-clobber output publication. Unsupported schema owners, resources, unrecorded
+required Host targets and active/unclean lifetimes fail before publication.
+World runtime locks cover activation, drain, failed cleanup retries and implicit
+Native teardown; provider checks match the actually loaded artifact as well as its
+stable instance/component identity. Positive prerequisites are implemented here;
+World-local negative execution-provider exclusions remain slice 7.
+
+rtwKit generates `world-portability.json` from its existing Chat/Character schema
+functions and builds the exact local `ChatRoleplay.rtw`. Both accepted AssetRef
+encodings are explicit per schema; no persisted rows are rewritten. The current
+entry is Chat UI. Welcome/import coordination and Narrator/AI are later slices.
+No Package Manager or separate World Manager was introduced.
+
+Successful checks and durable evidence:
+
+- `/tmp/rintawa-story-slice2-core-final.log`: required Core gate, 483 passing tests;
+  the external RTW test is explicitly ignored by this general gate.
+- `/tmp/rintawa-story-slice2-real-wasm-final.log`: that real RTW test was executed
+  separately and passed. Actual Character/Chat Systems commit, stopped export
+  restores two clean-home forks with new World/instance IDs and preserved graph
+  IDs/source bytes, independent edits, fresh owner bindings and refusal of a running
+  provider A when disk selection changes to B under the same instance ID.
+- `/tmp/rintawa-template-implicit-drop-final.log`: ten cleanup/lifecycle regressions,
+  including an Engine component destructor barrier while the writer is already
+  gone, keep export/delete blocked until teardown finishes.
+- `/tmp/rintawa-template-thin-crc-tests-resumed.log`: template regressions include
+  malformed nested installers, expected digests, warm/thin corrupt dependencies,
+  unavailable catalog entries and refusal to export an unimportable dependency.
+- `/tmp/rintawa-story-slice2-cli-final.log`: CLI template choice/approval/create,
+  independent composition, export, clean-home install and repeated forks.
+- `/tmp/rtwkit-story-slice2-full-check.log`: full rtwKit gate, 70 Rust / 16 JS tests,
+  native/WASM Clippy, typecheck, documentation and package assembly, exit 0.
+
+All commands, revisions, source/RTW hashes and raw final logs are preserved under
+`.vscode/evidence/story-slice2/` and copied to
+`/home/mart/Desktop/rintawa-evidence/2026-11-22-story-mvp/slice2/`.
+The prior independent Sol findings and their subsequent fixes are recorded there;
+source gates and failing-before regressions are distinguished from final checks.
+
+Limitations: Linux/loopback local acceptance; the real-WASM fixture uses trusted
+Native command ingress rather than browser upload. Older experimental RTWs without
+portability declarations are explicitly unsupported for export; no migration or
+compatibility layer was added. CLI transfer is complete; browser template upload,
+chooser/download, welcome/import-to-Chat and AI are not claimed by this checkpoint.
+Next: slice 3, the bounded administrative browser transfer/chooser contract, then
+implementation using this shared Native path.
+
+### Installed-template browser and character-first entry checkpoint
+
+Owner request, 2026-11-23: expose the installed **Text Roleplay** template in the
+creation dialog, create and start its independent World, mount its declared entry,
+import Character and open the linked Chat. This checkpoint connects installed
+packages; disk-backed browser RTW transfer remains a separate unfinished acceptance
+item of slice 3. No Package Manager, AI or exclusion completion is implied.
+
+The existing privileged `world-sessions` boundary gains `list-templates` (bounded
+catalog), `template-info(digest)` (bounded inert descriptor JSON),
+`create-from-template(digest,title,approve-runtime-permissions)` and
+`entry(world-id)` (optional stable instance/component). Read/write permissions,
+browser shell-only enforcement, mutation budgets and message limits remain unchanged.
+Creation uses the existing native atomic publisher and returns only after publication;
+activation is a separate admitted `set-active` followed by read-only reconciliation.
+A lost creation reply must never cause automatic resubmission: refresh the World
+list and let the operator select the published World. Capability approval is an
+explicit unchecked dialog control displaying the template's exact requested grants.
+Missing providers, malformed templates and refused grants leave no published World.
+Entry resolution is exact and World-scoped; unavailable entries stay recoverable.
+
+Within rtwKit, the Character extension owns the workflow in its separate story UI. Its static web-bundle descriptor
+may declare bounded single-provider contracts, registered under its actual delegated
+principal. Text Roleplay explicitly selects Character/story for
+`rintawa.roleplay.workflow@1`. Character and Chat admit only their own UI or the
+exact selected live workflow for allocate/import/create (Chat send remains own-UI).
+Import and create remain separate committed operations with preallocated known IDs;
+unknown outcomes are read back, never replayed. After restart discover existing
+conversations and Characters before offering import. A Character without a linked
+conversation offers explicit Continue; failed Chat creation never deletes Character.
+
+The browser bridge adds owner-scoped `ui.state.get/set`, one fixed preference key
+per exact component, at most 1 KiB of inert flat string state (at most eight keys,
+64 ASCII bytes/key and 256 UTF-8 bytes/value). No caller-selected preference key,
+owner or scope. It stores current conversation and preallocated workflow IDs, never
+credentials or runtime handles. `ui.navigate` is a local shell/MessagePort request
+for an exact same-World instance/component with the same bounded inert state.
+The shell resolves the source from the mounted binding, refreshes the live catalog,
+rejects foreign/missing/ambiguous destinations and mounts under the destination's
+own principal. State is data only, delivered to the target on initialization; it
+cannot override dispatch scope/owner. The destination validates domain IDs and
+rereads the World. Existing layout serialization remains unchanged.
+
+Acceptance: actual Chromium installed template selection and explicit grant review;
+creation auto-start and exact entry; Tavern V2/V3 import -> one linked Chat -> saved
+message -> restart/resume; failure between commits preserves Character and offers
+Continue; forged/cross-World navigation or workflow calls are denied; two Worlds
+remain independent. Preserve raw redacted logs and final RTW hashes.
+
+Wire details for this checkpoint: `list-templates` returns JSON rows
+`{digest,name,description,invalidReason:string|null}`. `template-info` returns the
+existing template descriptor as inert JSON. Both encoded Native results are at
+most 64 KiB and additionally respect the current Host message budget; excess is
+`message-too-large`. Creation requires all three fields (canonical exact digest,
+1..256-byte nonblank title, explicit boolean approval); it returns the ordinary
+World summary. `entry` returns null or `{instanceId,componentId}`, with the World
+coming exclusively from its request. Native errors retain the existing World
+session cases; unapproved/invalid composition is rejected. Read failures may be
+retried; admitted creation and unknown lifecycle requests are never replayed.
+
+Character's ordinary `ui` remains its independent collection interface. The separate
+`story` component provides the workflow contract and reuses the same web bundle.
+Only the story descriptor declares that contract, so ordinary standalone Character
+installation does not accidentally enable onboarding by single-provider resolution.
+The story component requests only background-task and user-resource-import; Chat
+renders assets under its own existing asset-read permission.
+
+
+### Character-first entry acceptance, 2026-11-23
+
+The installed Text Roleplay dialog explicitly reviews World grants, atomically
+creates a new World, requests start and resolves Character/story by its fresh exact
+identity. Character story UI imports the card, waits for COMMIT, creates its linked
+conversation through selected-workflow authority and navigates to Chat's own UI.
+The default conversation drawer is collapsed. Native owner-scoped preferences hold
+current selection and inert recovery IDs, without changes to the layout schema.
+Read-only transient failures are retried/reconciled; create/import/send are not
+replayed after unknown outcomes. Ordinary Character/ui keeps its collection mode.
+
+Actual Chromium acceptance covers Tavern V2/V3 in two independent concurrently
+running Worlds, failure before Chat admission after Character COMMIT and explicit
+Continue, one linked conversation, a saved message, Host restart/resume without
+duplicates, denial of workflow attempts to send Chat messages and of Chat callers
+to import Characters, and a forged MessagePort navigation to another World.
+The standalone Character PNG/portrait/CAS failure/restart browser regression passes
+as well. Native self-contained export/independent forks were rerun on these RTWs.
+
+Required checks: Core 483 tests, rtwKit 71 Rust + 17 JS tests, WASM Clippy, builds,
+typecheck and documentation gates passed. The external real-WASM template test
+passes separately (one test). Important logs, RTWs, source hashes and screenshots
+are preserved at `/home/mart/Desktop/rintawa-evidence/story-entry-2026-11-23/`;
+private working copies also remain in `.vscode/evidence/story-entry-ready/`.
+The normal system launcher was checked against the updated dev home: HTTP 200 and
+clean SIGINT shutdown, exit 0. Existing Worlds were not rewritten or templated.
+The dev setup helper now installs only runtime/shell in baseline and the immutable
+Text Roleplay package, never Character/Chat baseline instances or a default recipe.

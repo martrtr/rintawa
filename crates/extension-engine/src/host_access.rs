@@ -270,6 +270,28 @@ pub trait WorldSessionAccess: Send + Sync {
     /// Lists persistent worlds together with current/pending runtime lifecycle state.
     fn list_worlds(&self) -> HostAccessResult<Vec<WorldSessionSummary>>;
 
+    /// Bounded inert JSON catalog of installed immutable templates.
+    fn list_templates(&self) -> HostAccessResult<String> {
+        Err(HostAccessError::Unavailable)
+    }
+    /// Exact inert template descriptor JSON for permission review.
+    fn template_info(&self, _digest: &str) -> HostAccessResult<String> {
+        Err(HostAccessError::Unavailable)
+    }
+    /// Atomically creates an independent World from an installed exact template.
+    fn create_from_template(
+        &self,
+        _digest: &str,
+        _title: &str,
+        _approve_runtime_permissions: bool,
+    ) -> HostAccessResult<WorldSessionSummary> {
+        Err(HostAccessError::Unavailable)
+    }
+    /// Stable entry component, without implicit activation or permission changes.
+    fn entry(&self, _world_id: &str) -> HostAccessResult<Option<ComponentRef>> {
+        Err(HostAccessError::Unavailable)
+    }
+
     /// Creates one empty persistent authoritative world.
     fn create_world(&self) -> HostAccessResult<WorldSessionSummary>;
 

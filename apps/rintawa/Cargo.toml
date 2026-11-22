@@ -9,6 +9,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+rintawa-artifacts = { path = "../../crates/artifacts" }
 anyhow.workspace = true
 clap.workspace = true
 ctrlc.workspace = true

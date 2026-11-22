@@ -6,10 +6,13 @@
 
 mod apply;
 mod codec;
+mod portable;
 mod query;
 mod schema;
 mod snapshot;
 
+#[cfg(test)]
+mod portable_tests;
 #[cfg(test)]
 mod tests;
 

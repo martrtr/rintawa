@@ -723,6 +723,56 @@ impl UserResourceAccess for LocalHostAccess {
 }
 
 impl WorldSessionAccess for LocalHostAccess {
+    fn list_templates(&self) -> HostAccessResult<String> {
+        let rows = self
+            .home()?
+            .list_templates()
+            .map_err(map_host_access_error)?;
+        let rows: Vec<_> = rows.into_iter().map(|row| serde_json::json!({
+            "digest":row.digest.to_string(),"name":row.name,"description":row.description,"invalidReason":row.invalid_reason
+        })).collect();
+        let text = serde_json::to_string(&rows).map_err(|_| HostAccessError::Unavailable)?;
+        if text.len() > 64 * 1024 {
+            return Err(HostAccessError::MessageTooLarge);
+        }
+        Ok(text)
+    }
+    fn template_info(&self, digest: &str) -> HostAccessResult<String> {
+        let digest = ArtifactDigest::parse(digest).map_err(|_| HostAccessError::InvalidDigest)?;
+        let text = self
+            .home()?
+            .template_info(&digest)
+            .map_err(map_host_access_error)?;
+        if text.len() > 64 * 1024 {
+            return Err(HostAccessError::MessageTooLarge);
+        }
+        Ok(text)
+    }
+    fn create_from_template(
+        &self,
+        digest: &str,
+        title: &str,
+        approve_runtime_permissions: bool,
+    ) -> HostAccessResult<WorldSessionSummary> {
+        let digest = ArtifactDigest::parse(digest).map_err(|_| HostAccessError::InvalidDigest)?;
+        let result = self
+            .home()?
+            .create_world_from_template(&digest, Some(title), approve_runtime_permissions)
+            .map_err(map_host_access_error)?;
+        self.world_sessions.summary(result.world)
+    }
+    fn entry(&self, world_id: &str) -> HostAccessResult<Option<ComponentRef>> {
+        let id = world_id
+            .parse::<WorldId>()
+            .map_err(|_| HostAccessError::InvalidWorldId)?;
+        Ok(self
+            .home()?
+            .load_world_composition(id)
+            .map_err(map_host_access_error)?
+            .entry
+            .map(|entry| ComponentRef::new(entry.instance_id, entry.component_id)))
+    }
+
     fn list_worlds(&self) -> HostAccessResult<Vec<WorldSessionSummary>> {
         self.home()?
             .list_worlds()
@@ -1263,10 +1313,13 @@ struct ActiveWorld {
     runtime: WorldRuntime,
     registered_instances: Vec<ExtensionInstanceId>,
     started_instances: Vec<ExtensionInstanceId>,
+    // Keep lifecycle ownership until the worker itself has been dropped as well.
+    _lifecycle: Option<std::fs::File>,
 }
 
 /// Running host composition containing baseline extensions and active worlds.
 pub struct HostRuntime {
+    baseline_artifacts: BTreeMap<String, ArtifactDigest>,
     // Active worlds are declared before the Engine so implicit field drop also
     // tears down command execution before provider component state disappears.
     active_worlds: BTreeMap<WorldId, ActiveWorld>,
@@ -1279,6 +1332,27 @@ pub struct HostRuntime {
     world_data: WorldDataRuntimeControl,
 }
 
+impl Drop for HostRuntime {
+    fn drop(&mut self) {
+        // A caller may drop without an explicit successful shutdown. Keep leases
+        // until both worker drain and Engine/proxy resource teardown have finished.
+        let guards = self
+            .active_worlds
+            .values_mut()
+            .filter_map(|world| world._lifecycle.take())
+            .chain(
+                self.pending_world_cleanup
+                    .values_mut()
+                    .filter_map(|world| world._lifecycle.take()),
+            )
+            .collect::<Vec<_>>();
+        drop(std::mem::take(&mut self.active_worlds));
+        drop(std::mem::take(&mut self.pending_world_cleanup));
+        drop(std::mem::take(&mut self.engine));
+        drop(guards);
+    }
+}
+
 impl HostRuntime {
     /// Loads and starts every enabled activation in the baseline profile.
     ///
@@ -1289,6 +1363,7 @@ impl HostRuntime {
     /// every artifact is registered, the remaining instances use the ordinary
     /// deterministic full-topology activation plan.
     pub fn start(home: &HostHome) -> HostResult<Self> {
+        home.recover_world_staging()?;
         let profile = home.load_profile()?;
         let user_resources = UserResourceRuntimeControl::default();
         let world_sessions = WorldSessionRuntimeControl::default();
@@ -1366,6 +1441,16 @@ impl HostRuntime {
         }
 
         Ok(Self {
+            baseline_artifacts: profile
+                .activations
+                .iter()
+                .map(|activation| {
+                    (
+                        activation.instance_id.to_string(),
+                        activation.artifact.clone(),
+                    )
+                })
+                .collect(),
             active_worlds: BTreeMap::new(),
             shutting_down: false,
             pending_world_cleanup: BTreeMap::new(),
@@ -1422,9 +1507,32 @@ impl HostRuntime {
         if self.active_worlds.len() + self.pending_world_cleanup.len() >= 8 {
             return Err(HostError::ActiveWorldLimitExceeded);
         }
+        let lifecycle = home.lock_world_lifecycle(world_id)?;
         let profile = home.load_world_composition(world_id)?;
+        for (target, owner) in
+            home.resolve_execution_requirements(&profile.execution_requirements)?
+        {
+            let requirement = profile
+                .execution_requirements
+                .iter()
+                .find(|requirement| requirement.target == target)
+                .ok_or_else(|| {
+                    HostError::InvalidTemplate("missing execution prerequisite".into())
+                })?;
+            if self.baseline_artifacts.get(owner.instance_id.as_str())
+                != Some(&requirement.artifact)
+                || self.engine.execution_target_owner(&target).as_ref() != Some(&owner)
+            {
+                return Err(HostError::InvalidTemplate(format!(
+                    "exact Host provider unavailable for {target}"
+                )));
+            }
+        }
         let scope_id = world_runtime_scope_id(world_id);
-        let mut overlay = ActivatedComposition::default();
+        let mut overlay = ActivatedComposition {
+            _lifecycle: Some(lifecycle),
+            ..ActivatedComposition::default()
+        };
         if let Err(error) =
             activate_composition(&mut self.engine, home, &profile, &scope_id, &mut overlay)
         {
@@ -1461,6 +1569,7 @@ impl HostRuntime {
         self.active_worlds.insert(
             world_id,
             ActiveWorld {
+                _lifecycle: overlay._lifecycle.take(),
                 runtime: runtime_parts.runtime,
                 registered_instances: overlay.registered_instances,
                 started_instances: overlay.started_instances,
@@ -1790,6 +1899,7 @@ fn bounded_world_session_diagnostic(value: &str) -> String {
 
 #[derive(Default)]
 struct ActivatedComposition {
+    _lifecycle: Option<std::fs::File>,
     registered_instances: Vec<ExtensionInstanceId>,
     started_instances: Vec<ExtensionInstanceId>,
 }
@@ -2429,6 +2539,7 @@ mod tests {
         )?;
 
         let mut host = HostRuntime {
+            baseline_artifacts: BTreeMap::new(),
             active_worlds: BTreeMap::new(),
             shutting_down: false,
             pending_world_cleanup: BTreeMap::new(),
@@ -2516,6 +2627,7 @@ mod tests {
         engine.start_extension_instance(&foreign_instance)?;
 
         let mut host = HostRuntime {
+            baseline_artifacts: BTreeMap::new(),
             active_worlds: BTreeMap::new(),
             shutting_down: false,
             pending_world_cleanup: BTreeMap::new(),
@@ -2865,6 +2977,7 @@ mod tests {
             engine.start_extension_instance(instance)?;
         }
         let mut host = HostRuntime {
+            baseline_artifacts: BTreeMap::new(),
             active_worlds: BTreeMap::new(),
             shutting_down: false,
             pending_world_cleanup: BTreeMap::new(),
@@ -3007,6 +3120,7 @@ mod tests {
         }
 
         let mut host = HostRuntime {
+            baseline_artifacts: BTreeMap::new(),
             active_worlds: BTreeMap::new(),
             shutting_down: false,
             pending_world_cleanup: BTreeMap::new(),
@@ -3080,6 +3194,7 @@ mod tests {
         }
 
         let mut host = HostRuntime {
+            baseline_artifacts: BTreeMap::new(),
             active_worlds: BTreeMap::new(),
             shutting_down: false,
             pending_world_cleanup: BTreeMap::new(),
@@ -3130,6 +3245,7 @@ mod tests {
         )?;
 
         let mut host = HostRuntime {
+            baseline_artifacts: BTreeMap::new(),
             active_worlds: BTreeMap::new(),
             shutting_down: false,
             pending_world_cleanup: BTreeMap::new(),
@@ -3674,6 +3790,7 @@ mod tests {
         host.active_worlds.insert(
             world.id,
             ActiveWorld {
+                _lifecycle: None,
                 runtime,
                 registered_instances: Vec::new(),
                 started_instances: Vec::new(),
@@ -3979,9 +4096,7 @@ mod tests {
         ));
         assert!(matches!(
             home.delete_world(world.id),
-            Err(HostError::Storage(
-                rintawa_storage::StorageError::WriterBusy(_)
-            ))
+            Err(HostError::WorldLifecycleBusy(id)) if id == world.id
         ));
         let access = host.host_access.as_ref().unwrap().clone();
         let id = world.id.to_string();

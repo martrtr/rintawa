@@ -1,10 +1,10 @@
 # Installable World templates and portable World state
 
-Status: implementation design under the owner's story-MVP delivery direction,
-updated 2026-11-22. This document extends the existing World/RTW contracts; it does
-not report implemented export or approve guest access to arbitrary databases.
-Exact new wire schemas must be recorded before implementation. No product code is
-changed here.
+Status: native CLI checkpoint implemented under the owner's story-MVP direction,
+updated 2026-11-23. Install/create/stopped export and real-WASM independent forks
+have local acceptance below; the installed-template browser chooser and Character-first workflow are now connected.
+Disk-backed browser package transfer remains a subsequent slice. This does not grant guests arbitrary database access.
+Exact additional wire schemas must be recorded before their implementation.
 
 The end-to-end product sequence and proposed workflow/AI/Host-lifecycle amendments
 are in [mvp-story-delivery.md](mvp-story-delivery.md). That plan includes browser
@@ -17,13 +17,13 @@ A template creates independent Worlds with an initial composition, optional stat
 assets and an extension-owned starting experience. Chat Roleplay, a lore campaign
 and a theme collection are data choices, not Core World types.
 
-Current source has four-table World persistence, atomic transactions, snapshots,
+At the design baseline (before this native template slice), source had four-table World persistence, atomic transactions, snapshots,
 asset/artifact CAS, and composition materialization with fresh instance IDs.
 `HostHome::create_world` uses one default recipe. `CompositionProfile::materialize_all`
 remaps composition-owned references. `SqliteWorldStorage::open` validates current DDL.
 The storage test `test_should_accept_current_schema_after_vacuum_backup` covers a
-SQLite copy, not a complete portable World. There is no complete World export/import
-path in the inspected Host/CLI. Arbitrary JSON properties can refer to external
+SQLite copy, not a complete portable World. The baseline lacked a complete World export/import
+path in Host/CLI; the native implementation below adds it. Arbitrary JSON properties can refer to external
 resources; Core currently has no authoritative reference inventory.
 
 World persistence is current committed state, not a transcript or automatic history.
@@ -267,3 +267,154 @@ exports require stop, first portability requires owner opt-in, existing arbitrar
 plugin state cannot be promised portable, and selected native/schema handling needs
 implementation and acceptance. This is a complete initial design boundary, not a
 claim to anticipate every future extension format.
+
+## Slice 2 implementation contracts — 2026-11-22
+
+The first CLI checkpoint uses the existing artifact CAS as installed-package source,
+with no second template index: enumerate verified stored RTWs and read template
+metadata without activating them. A generic `package-install FILE` validates the
+container and stores it without changing any composition. Template content also
+undergoes descriptor/dependency/seed/resource checks. Missing installed dependencies
+are reported by exact digest; no fetch or implicit activation occurs. Existing
+`install` remains the explicit extension baseline-selection command.
+
+The archive boundary adds `RtwArchive::copy_to(path, writer, maximum_bytes)`.
+It streams one regular entry, rejects declared size before writing, never writes
+beyond the lesser of caller and existing per-entry limits, verifies decompression
+and final size/CRC and propagates writer failure. The caller owns temporary-file
+cleanup; it must not publish a failed partial copy. No archive limit increases.
+
+Storage adds native-only seed validation/creation and consistent file export.
+Untrusted seed reads are read-only and use one pinned transaction. Validate exact
+current DDL first, SQLite integrity/FKs, object-only relation endpoints, canonical
+stored IDs/keys and every property against its registered JSON Schema. Copy into
+fresh trusted DDL with a new WorldId while preserving local graph IDs, exact
+properties and nontechnical manifest fields. The caller supplies the resulting
+manifest. Failure must leave no destination database; an existing file is never
+replaced. Source bytes are unchanged and no source triggers/install hooks execute.
+Export holds existing exclusive writable ownership and creates a consistent SQLite
+copy including committed WAL data. An existing destination is an error. Host owns
+private staging and publishes only after validating schema ownership/composition.
+
+Host creates in a private staging directory outside `worlds/`, retains ownership
+through DB/composition completion and atomically renames the complete directory to
+its fresh WorldId. Lists never see staged content. Creation and cleanup coordinate
+on an existing-style stable filesystem lock; a new Host may reclaim abandoned
+staging only after obtaining that lock. Stop/export retain composition-before-DB
+lock order. No restore/merge operation or approval inheritance is introduced.
+
+### Existing Character AssetRef encoding — proposed clarification
+
+The native AssetRef JSON uses `{digest,size,media_type}` with numeric size. The
+accepted Character/bridge records already use `{digest,size,mediaType}` with a
+canonical decimal size string. Rewriting those records would change a currently
+working schema. Proposed clarification: a static portability declaration selects
+one of these two exact encodings per property schema (`native` or `browser-v1`).
+The walker recognizes only the selected encoding, validates it through the same
+AssetRef/CAS rules and collects bytes without rewriting stored data. World manifest
+uses `native`. Neither arbitrary digest strings nor loose mixed shapes qualify.
+The owner accepted this clarification on 2026-11-22; archive/storage semantics
+remain unchanged.
+
+The owner accepted both explicitly declared AssetRef encodings on 2026-11-22.
+The encoding clarification above is therefore accepted; no Character rows are migrated.
+
+### Exact first template JSON and offline declarations
+
+All descriptor field names are camelCase, unknown/duplicate fields are errors at
+any depth; nesting is at most 32 and the descriptor at most 1 MiB. `format` is 1.
+`components` contains `{slot,artifact,enabled,packageId?,version?}`. Slot labels use
+1..64 ASCII letters/digits/`_-`; at most 128 slots, all unique. `artifact` is a
+canonical exact ArtifactDigest. Package/version fields are display metadata.
+`composition` is `{preferredProviders,authoritativeProviders,requestedGrants}`:
+provider selections are `{contractId,contractVersion,provider:{slot,componentId}}`
+or `{point,provider:{slot,componentId}}`; a grant is `{slot,componentId,permission}`.
+Use existing contract/point/runtime-permission validators and composition bounds.
+`entry` is null or `{slot,componentId}`. `hostRequirements` contains exact
+`{artifact,componentId,target}` requirements for the local baseline. `seed` is null
+or `seed.sqlite`. `assets` contains `{reference: native AssetRef,path}`; distinct
+media-type references may share one digest/file. `artifacts` contains `{digest,path}`
+for embedded extension RTWs. Arrays omitted from composition/resources default empty.
+Canonical RTW relative paths cannot alias descriptors, seed or distinct content.
+
+Offline seed ownership cannot be inferred from JSON Schema equality. An extension
+that supports portable World state supplies `world-portability.json` at its RTW
+root, bounded to 1 MiB/depth 32, with
+`{format:1,properties:[{key,componentId,schema,assetRefs,portable:true}]}`.
+`key` is the exact property key, `componentId` its actual declaring component,
+`schema` the exact JSON Schema document, `assetRefs` is `native` or `browser-v1`.
+The exact selected artifact binds this declaration; duplicate property-name owners
+and missing/mismatching definitions reject a seed/export. Carrying schema bodies
+is necessary for offline validation without executing guest registration. Packages
+must generate this metadata from their existing schema definitions to avoid a
+second author-maintained schema. This does not grant runtime authority, override
+actual registered schemas or make a dishonest package's dependency claims true.
+A package may omit this file when no stored schema is being exported/imported.
+
+Persist the resolved optional entry as generic `{instance-id,component-id}` in its
+World composition; materialization remaps it with other composition references.
+It grants no permission and does not force an entry's activation. An absent web
+view still yields the accepted headless administrative state. Export includes no
+Host preferences by default: portable domain settings belong to opted-in World
+schemas; credentials and shell layout remain local.
+
+CLI adds `package-install FILE`, `template-list`, `template-info DIGEST`,
+`world-create --template DIGEST [--title TITLE] [--approve-runtime-permissions]` and
+`world-export WORLD FILE`. The approval flag explicitly approves only this template's
+listed World runtime requests, after checking each against its exact manifest.
+It never grants baseline permissions. Without it, nonempty requests return a named
+approval-required error and create nothing. Exact Host prerequisites must already
+be selected and approved locally. Neither install/create nor export starts a World.
+Existing `world-create` uses the same staged publisher with the trusted default
+recipe; it does not change global defaults around a request.
+
+Exact Host execution prerequisites are persisted as `execution_requirements` in
+World composition (`artifact`, `component-id`, `target`). Materialization preserves
+these immutable identities. Activation checks both the approved baseline selection
+and the actual registered target owner before admitting World components; a changed
+Host provider fails instead of falling back. This is the positive binding required
+for offline export, not the later World-local negative exclusion mechanism. Worlds
+from the previous trusted default recipe have no such recorded prerequisites;
+portable export refuses an unrecorded required external target rather than guessing
+its provider from a name. Operator composition may supply the explicit requirement.
+
+Lifecycle correction required by stopped export: a native per-World `runtime.lock`
+is acquired before activation registers any guest and retained through writer drain
+AND all guest/resource cleanup, including failed activation/stop retries. Export and
+delete require this same nonblocking lock, then composition, then SQLite ownership.
+This closes the interval where a stopped writer alone did not attest completed
+component cleanup. Existing stable files are never unlinked while waiters exist.
+An execution prerequisite must match the artifact actually loaded by this Host,
+not only the current on-disk selection with a stable instance ID.
+
+Generic native CAS imports can precede content-specific validation. Catalog rows
+therefore carry an optional bounded `invalid_reason`: malformed template metadata
+is shown as unavailable with its exact digest and reason; it does not hide other
+valid templates or become selectable. Normal package-install rejects malformed
+content before root publication. Embedded dependencies must be declared component/
+Host digests, be extension RTWs, pass every payload CRC and match the expected
+identity before entering shared CAS; nested templates are not dependency installers.
+
+Template plus embedded dependency expansion shares the existing aggregate RTW
+uncompressed-byte/entry ceilings; independent nested archive limits must not
+multiply into an unbounded validation pass. Host prerequisite resolution does not
+force approval of unused optional manifest capabilities. Actual target publication
+and sandboxed callback permissions are checked during activation; a stopped World
+can be constructed before that live readiness is known. No callback is invoked
+or permission granted merely to inspect/install a package.
+
+Dependency verification is identical for embedded and thin references, including
+artifacts already present through an older/generic CAS import. Each distinct digest
+is checked once per preparation and consumes the same expansion budget. Implicit
+Native Host destruction also retains World lifecycle leases until worker drain and
+Engine/proxy teardown finish; dropping the library owner cannot expose the earlier
+cleanup/export interval.
+
+## Native acceptance checkpoint
+
+Implemented CLI commands and all Native contracts above are covered by the current
+[delivery evidence](mvp-story-delivery.md#slice-2-checkpoint--native-templates-and-portable-snapshots).
+The real-WASM integration is `crates/host/tests/template_runtime_test.rs`; invoke it
+explicitly with built RTW fixtures as documented in the repository README. The
+CLI smoke is `scripts/template-cli-smoke.py`. Browser transfer/onboarding/AI are
+subsequent steps; Native acceptance is not a claim that those flows already exist.

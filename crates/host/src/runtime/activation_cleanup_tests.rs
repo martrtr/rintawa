@@ -24,6 +24,10 @@ struct Callback {
     release: mpsc::Sender<()>,
     worker: std::thread::JoinHandle<()>,
 }
+struct DropBarrier {
+    ready: mpsc::Sender<String>,
+    release: mpsc::Receiver<()>,
+}
 #[derive(Default)]
 struct Probe {
     hold: AtomicBool,
@@ -31,6 +35,7 @@ struct Probe {
     callback: Mutex<Option<Callback>>,
     wasm: Mutex<Vec<Weak<Mutex<WasmComponent>>>>,
     stops: Mutex<BTreeMap<String, usize>>,
+    drop_barrier: Mutex<Option<DropBarrier>>,
 }
 impl Probe {
     fn release(&self) {
@@ -60,6 +65,14 @@ struct TestComponent {
     id: ComponentId,
     wasm: Option<HeldWasm>,
     probe: Arc<Probe>,
+}
+impl Drop for TestComponent {
+    fn drop(&mut self) {
+        if let Some(barrier) = self.probe.drop_barrier.lock().unwrap().take() {
+            let _ = barrier.ready.send(self.id.to_string());
+            let _ = barrier.release.recv_timeout(Duration::from_secs(5));
+        }
+    }
 }
 impl Component for TestComponent {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -481,5 +494,101 @@ fn test_failed_activation_cleanup_counts_toward_world_admission_until_released()
     fixture.host.activate_world(&fixture.home, next)?;
     fixture.host.shutdown()?;
     assert!(!fixture.probe.wasm_alive());
+    Ok(())
+}
+
+#[test]
+fn test_failed_activation_keeps_world_unexportable_until_cleanup_finishes() -> anyhow::Result<()> {
+    let mut fixture = Harness::new(true)?;
+    assert!(
+        fixture
+            .host
+            .activate_world(&fixture.home, fixture.world)
+            .is_err()
+    );
+    // The failed composition activation has not acquired the SQLite writer.
+    drop(fixture.home.open_world_storage(fixture.world)?);
+    let export = fixture._root.path().join("pending-cleanup.rtw");
+    assert!(matches!(
+        fixture.home.export_world_template(fixture.world, &export),
+        Err(HostError::WorldLifecycleBusy(id)) if id == fixture.world
+    ));
+    assert!(matches!(
+        fixture.home.delete_world(fixture.world),
+        Err(HostError::WorldLifecycleBusy(id)) if id == fixture.world
+    ));
+    assert!(!export.exists());
+    fixture.home.load_world_state(fixture.world)?;
+
+    fixture.probe.release();
+    fixture.host.deactivate_world(fixture.world)?;
+    drop(fixture.home.lock_world_lifecycle(fixture.world)?);
+    fixture.home.delete_world(fixture.world)?;
+    fixture.host.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn test_failed_guest_stop_keeps_world_unexportable_after_worker_drain() -> anyhow::Result<()> {
+    let mut fixture = Harness::new(false)?;
+    fixture.host.activate_world(&fixture.home, fixture.world)?;
+    assert!(matches!(
+        fixture.host.deactivate_world(fixture.world),
+        Err(HostError::ShutdownFailed(_))
+    ));
+    // The worker has drained, but guest cleanup is still pending.
+    let export = fixture._root.path().join("failed-stop.rtw");
+    assert!(matches!(
+        fixture.home.export_world_template(fixture.world, &export),
+        Err(HostError::WorldLifecycleBusy(id)) if id == fixture.world
+    ));
+    assert!(matches!(
+        fixture.home.delete_world(fixture.world),
+        Err(HostError::WorldLifecycleBusy(id)) if id == fixture.world
+    ));
+    assert!(!export.exists());
+    fixture.home.load_world_state(fixture.world)?;
+
+    fixture.probe.release();
+    fixture.host.deactivate_world(fixture.world)?;
+    drop(fixture.home.lock_world_lifecycle(fixture.world)?);
+    fixture.host.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn test_implicit_host_drop_keeps_world_locked_through_component_teardown() -> anyhow::Result<()> {
+    let mut fixture = Harness::new(false)?;
+    fixture.host.activate_world(&fixture.home, fixture.world)?;
+    fixture.probe.release();
+    let replacement = HostRuntime::start(&fixture.home)?;
+    let active = std::mem::replace(&mut fixture.host, replacement);
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *fixture.probe.drop_barrier.lock().unwrap() = Some(DropBarrier {
+        ready: ready_tx,
+        release: release_rx,
+    });
+    let worker = std::thread::spawn(move || drop(active));
+    let dropped_component = ready_rx.recv_timeout(Duration::from_secs(5))?;
+    assert!(!dropped_component.is_empty());
+    // HostRuntime::drop has already released WorldRuntime's writer before
+    // entering the Engine component destructor barrier.
+    drop(fixture.home.open_world_storage(fixture.world)?);
+    let export = fixture._root.path().join("implicit-drop.rtw");
+    assert!(matches!(
+        fixture.home.export_world_template(fixture.world, &export),
+        Err(HostError::WorldLifecycleBusy(id)) if id == fixture.world
+    ));
+    assert!(matches!(
+        fixture.home.delete_world(fixture.world),
+        Err(HostError::WorldLifecycleBusy(id)) if id == fixture.world
+    ));
+    assert!(!export.exists());
+    fixture.home.load_world_state(fixture.world)?;
+    release_tx.send(())?;
+    worker.join().unwrap();
+    drop(fixture.home.lock_world_lifecycle(fixture.world)?);
+    fixture.host.shutdown()?;
     Ok(())
 }

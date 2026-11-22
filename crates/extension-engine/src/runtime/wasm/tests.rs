@@ -1047,7 +1047,32 @@ fn test_should_gate_world_session_catalog_and_lifecycle_requests() {
         WorldSessionsHost::list_worlds(&mut state),
         Err(WorldSessionError::AccessNotActive)
     ));
+    for result in [
+        WorldSessionsHost::list_templates(&mut state),
+        WorldSessionsHost::template_info(&mut state, "sha256:missing".into()),
+    ] {
+        assert!(matches!(result, Err(WorldSessionError::AccessNotActive)));
+    }
     state.begin_guest_execution();
+    for result in [
+        WorldSessionsHost::list_templates(&mut state),
+        WorldSessionsHost::template_info(&mut state, "sha256:missing".into()),
+    ] {
+        assert!(matches!(result, Err(WorldSessionError::PermissionDenied)));
+    }
+    assert!(matches!(
+        WorldSessionsHost::entry(&mut state, "world".into()),
+        Err(WorldSessionError::PermissionDenied)
+    ));
+    assert!(matches!(
+        WorldSessionsHost::create_from_template(
+            &mut state,
+            "sha256:missing".into(),
+            "story".into(),
+            true
+        ),
+        Err(WorldSessionError::PermissionDenied)
+    ));
     assert!(matches!(
         WorldSessionsHost::list_worlds(&mut state),
         Err(WorldSessionError::PermissionDenied)

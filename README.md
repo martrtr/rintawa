@@ -1,15 +1,15 @@
 # Rintawa
 
-> Architecture review (2026-11-21): start with [Core specifications](docs/specs/README.md).
-> Some descriptions below and in the older architecture/roadmap lag behind the
-> current code. D1–D7 are accepted target contracts, not implemented features;
-> the browser review proposes D8 separately. Evidence so far is static inspection.
-
 Rintawa is a local-first runtime for persistent Worlds composed from immutable RTW
-packages. Core provides generic package execution, scoped composition, authoritative World
-state and scoped extension execution. Product features and presentation are
-extension-owned. Core's experimental Portable UI runtime and World-focus
-bridge have been retired; a replacement interaction transport is not yet integrated.
+packages. Core provides sandboxed execution, exact scoped identities, permissions,
+nonblocking extension transport and atomic World storage. Product features and
+presentation belong to extensions in rtwKit.
+
+The native template CLI can install immutable recipes, create independent Worlds
+and export stopped Worlds with their supported schemas/assets. Browser template
+transfer/selection, roleplay onboarding and AI integration are subsequent MVP slices.
+See [current delivery and evidence](docs/specs/mvp-story-delivery.md) and
+[template contract](docs/specs/world-template-packages.md).
 
 Standard packages and the Web experience live in
 [rtwKit](https://github.com/martrtr/rtwKit).
@@ -27,6 +27,39 @@ rintawa run
 RTW artifacts are validated and stored immutably by SHA-256. Global tools run in the
 baseline composition; new Worlds are materialized from an independent default-world recipe
 and then keep their own exact composition.
+
+Install a template without activating its dependencies, inspect its exact requests,
+then explicitly create a new World:
+
+```bash
+rintawa package-install ./TextRoleplay.rtw
+rintawa template-list
+rintawa template-info sha256:<digest>
+rintawa world-create --template sha256:<digest> --title "My story" --approve-runtime-permissions
+rintawa world-export <world-id> ./saved-story.rtw
+```
+
+The separate baseline web-runtime provider must already be selected and locally
+permitted. The creation flag approves only the displayed template's World requests;
+installation grants nothing and does not start a World. Export requires completed
+stop/cleanup, includes all committed World data, and excludes local approvals,
+credentials and shell preferences. Installing the resulting RTW and creating from
+it makes a new independent World with preserved local graph IDs. No state is merged
+into an existing World.
+
+With the matching rtwKit web-runtime/web-ui and installed Text Roleplay package,
+the browser's New World dialog selects the template before creation, reviews World
+permissions and starts its declared entry. Character/story handles welcome/import
+and opens the linked Chat. Core and shell contain no Character-specific dispatch.
+AI replies and browser RTW file transfer remain separate unfinished MVP work.
+
+Local acceptance: `scripts/template-cli-smoke.py` uses `RINTAWA_BINARY` and
+`RINTAWA_TEMPLATE_ARTIFACTS`. The real-WASM regression requires built rtwKit files:
+
+```bash
+RINTAWA_TEMPLATE_ARTIFACTS=/path/to/rtwkit-artifacts \
+  cargo test --locked -p rintawa-host --test template_runtime_test -- --ignored
+```
 
 ## World state
 
@@ -50,8 +83,8 @@ The World model deliberately keeps a reduced set of guarantees:
   checks, while native Host snapshots remain trusted and unrestricted. Property
   ownership is re-established from approved artifacts on each activation, not
   persisted in the transferable four-table World;
-- indexed, paginated searches by versioned property key and bounded relation batch
-  reads are native World primitives; no new guest query transport is implied.
+- owner-scoped indexed property searches, bounded graph/batch reads and forward/
+  reverse relation pagination are exposed to guests without a query language.
 
 ## Documentation
 

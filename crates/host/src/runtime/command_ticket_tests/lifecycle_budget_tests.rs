@@ -89,6 +89,7 @@ fn test_busy_world_shutdown_retains_writer_drains_guest_commits_and_preserves_ot
     host.active_worlds.insert(
         fixture.world,
         ActiveWorld {
+            _lifecycle: None,
             runtime: fixture.runtime.take().unwrap(),
             started_instances: instances.clone(),
             registered_instances: instances,

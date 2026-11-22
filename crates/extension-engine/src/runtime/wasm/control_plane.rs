@@ -566,6 +566,75 @@ fn map_user_resource_access_error(error: HostAccessError) -> UserResourceError {
 }
 
 impl WorldSessionsHost for WasmHostState {
+    fn list_templates(&mut self) -> Result<String, WorldSessionError> {
+        self.require_world_session_permission(RuntimePermission::WorldSessionRead)?;
+        let value = self
+            .host_access
+            .world_sessions
+            .list_templates()
+            .map_err(map_world_session_access_error)?;
+        if value.len() > self.max_host_message_bytes {
+            return Err(WorldSessionError::MessageTooLarge);
+        }
+        Ok(value)
+    }
+    fn template_info(&mut self, digest: String) -> Result<String, WorldSessionError> {
+        self.require_world_session_permission(RuntimePermission::WorldSessionRead)?;
+        if digest.len() > 128 {
+            return Err(WorldSessionError::Rejected);
+        }
+        let value = self
+            .host_access
+            .world_sessions
+            .template_info(&digest)
+            .map_err(map_world_session_access_error)?;
+        if value.len() > self.max_host_message_bytes {
+            return Err(WorldSessionError::MessageTooLarge);
+        }
+        Ok(value)
+    }
+    fn create_from_template(
+        &mut self,
+        digest: String,
+        title: String,
+        approve_runtime_permissions: bool,
+    ) -> Result<WitWorldSummary, WorldSessionError> {
+        self.require_world_session_permission(RuntimePermission::WorldSessionWrite)?;
+        self.consume_world_session_mutation_budget()?;
+        if digest.len() > 128 || title.len() > 256 {
+            return Err(WorldSessionError::Rejected);
+        }
+        let value = self
+            .host_access
+            .world_sessions
+            .create_from_template(&digest, &title, approve_runtime_permissions)
+            .map_err(map_world_session_access_error)?;
+        self.bound_world_session_summary(value)
+    }
+    fn entry(
+        &mut self,
+        world_id: String,
+    ) -> Result<
+        Option<super::bindings::rintawa::engine::world_sessions::EntryComponent>,
+        WorldSessionError,
+    > {
+        self.require_world_session_permission(RuntimePermission::WorldSessionRead)?;
+        if world_id.len() > 64 {
+            return Err(WorldSessionError::InvalidWorldId);
+        }
+        let entry = self
+            .host_access
+            .world_sessions
+            .entry(&world_id)
+            .map_err(map_world_session_access_error)?;
+        Ok(entry.map(
+            |entry| super::bindings::rintawa::engine::world_sessions::EntryComponent {
+                instance_id: entry.instance_id.to_string(),
+                component_id: entry.component_id.to_string(),
+            },
+        ))
+    }
+
     fn list_worlds(&mut self) -> Result<Vec<WitWorldSummary>, WorldSessionError> {
         self.require_world_session_permission(RuntimePermission::WorldSessionRead)?;
         let worlds = self
@@ -1338,6 +1407,7 @@ fn map_world_session_access_error(error: HostAccessError) -> WorldSessionError {
         HostAccessError::InvalidWorldId => WorldSessionError::InvalidWorldId,
         HostAccessError::NotFound => WorldSessionError::NotFound,
         HostAccessError::QueueFull => WorldSessionError::QueueFull,
+        HostAccessError::MessageTooLarge => WorldSessionError::MessageTooLarge,
         HostAccessError::Unavailable => WorldSessionError::Unavailable,
         HostAccessError::InvalidArtifact
         | HostAccessError::InvalidAsset
@@ -1347,7 +1417,6 @@ fn map_world_session_access_error(error: HostAccessError) -> WorldSessionError {
         | HostAccessError::InvalidPreference
         | HostAccessError::PreferenceQuotaExceeded
         | HostAccessError::InvalidRequest
-        | HostAccessError::MessageTooLarge
         | HostAccessError::Rejected => WorldSessionError::Rejected,
     }
 }
