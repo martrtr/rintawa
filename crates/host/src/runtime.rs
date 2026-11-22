@@ -723,6 +723,30 @@ impl UserResourceAccess for LocalHostAccess {
 }
 
 impl WorldSessionAccess for LocalHostAccess {
+    fn package_staging(&self) -> Result<(tempfile::TempDir, std::fs::File), String> {
+        self.home()
+            .map_err(|e| format!("{e:?}"))?
+            .package_transfer_staging()
+            .map_err(|e| e.to_string())
+    }
+
+    fn install_package_file(&self, path: &Path) -> Result<String, String> {
+        self.home()
+            .map_err(|e| format!("{e:?}"))?
+            .install_package(path)
+            .map(|result| result.digest.to_string())
+            .map_err(|e| e.to_string())
+    }
+    fn export_world_file(&self, world_id: &str, path: &Path) -> Result<(), String> {
+        let world = world_id
+            .parse::<WorldId>()
+            .map_err(|_| "invalid World ID".to_string())?;
+        self.home()
+            .map_err(|e| format!("{e:?}"))?
+            .export_world_template(world, path)
+            .map_err(|e| e.to_string())
+    }
+
     fn list_templates(&self) -> HostAccessResult<String> {
         let rows = self
             .home()?

@@ -292,6 +292,19 @@ pub trait WorldSessionAccess: Send + Sync {
         Err(HostAccessError::Unavailable)
     }
 
+    /// Private staging plus its live ownership lock, reclaimed on next Host startup after a crash.
+    fn package_staging(&self) -> Result<(tempfile::TempDir, std::fs::File), String> {
+        Err("package staging unavailable".into())
+    }
+    /// Validates/stores an Engine-generated private package file, outside guest execution.
+    fn install_package_file(&self, _path: &std::path::Path) -> Result<String, String> {
+        Err("package installation unavailable".into())
+    }
+    /// Exports a stopped World to an Engine-generated private destination.
+    fn export_world_file(&self, _world_id: &str, _path: &std::path::Path) -> Result<(), String> {
+        Err("World export unavailable".into())
+    }
+
     /// Creates one empty persistent authoritative world.
     fn create_world(&self) -> HostAccessResult<WorldSessionSummary>;
 

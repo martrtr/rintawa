@@ -566,6 +566,42 @@ fn map_user_resource_access_error(error: HostAccessError) -> UserResourceError {
 }
 
 impl WorldSessionsHost for WasmHostState {
+    fn begin_package_upload(&mut self, size: u64) -> Result<u64, WorldSessionError> {
+        self.transfer_upload(size)
+    }
+    fn append_package_upload(
+        &mut self,
+        handle: u64,
+        offset: u64,
+        bytes: Vec<u8>,
+    ) -> Result<u64, WorldSessionError> {
+        self.transfer_append(handle, offset, &bytes)
+    }
+    fn finish_package_upload(&mut self, handle: u64) -> Result<(), WorldSessionError> {
+        self.transfer_finish(handle)
+    }
+    fn begin_world_export(&mut self, world_id: String) -> Result<u64, WorldSessionError> {
+        self.transfer_export(world_id)
+    }
+    fn poll_package_transfer(
+        &mut self,
+        handle: u64,
+    ) -> Result<super::bindings::rintawa::engine::world_sessions::TransferStatus, WorldSessionError>
+    {
+        self.transfer_poll(handle)
+    }
+    fn read_package_transfer(
+        &mut self,
+        handle: u64,
+        offset: u64,
+        maximum_bytes: u32,
+    ) -> Result<Vec<u8>, WorldSessionError> {
+        self.transfer_read(handle, offset, maximum_bytes)
+    }
+    fn close_package_transfer(&mut self, handle: u64) -> Result<(), WorldSessionError> {
+        self.transfer_close(handle)
+    }
+
     fn list_templates(&mut self) -> Result<String, WorldSessionError> {
         self.require_world_session_permission(RuntimePermission::WorldSessionRead)?;
         let value = self
@@ -1261,7 +1297,9 @@ impl WasmHostState {
             })
     }
 
-    fn consume_world_session_mutation_budget(&mut self) -> Result<(), WorldSessionError> {
+    pub(super) fn consume_world_session_mutation_budget(
+        &mut self,
+    ) -> Result<(), WorldSessionError> {
         if self.world_session_mutations_this_execution
             >= self.max_world_session_mutations_per_execution
         {

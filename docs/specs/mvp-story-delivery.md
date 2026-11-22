@@ -486,3 +486,80 @@ The normal system launcher was checked against the updated dev home: HTTP 200 an
 clean SIGINT shutdown, exit 0. Existing Worlds were not rewritten or templated.
 The dev setup helper now installs only runtime/shell in baseline and the immutable
 Text Roleplay package, never Character/Chat baseline instances or a default recipe.
+
+### Browser package transfer and World menu (owner request, 2026-11-23)
+
+The shell's workspace button opens a native auto popover in the top layer, beside
+its trigger. It works over both empty-World overlays and extension iframes, dismisses
+on outside click/Escape and closes on World switch. Preserve workspace actions;
+add explicit export and delete dialogs bound to a captured World ID. Delete requires
+confirmation. Both operations first request orderly World stop and reconcile the
+known World ID; busy/failed drain refuses further work. Never replay unknown delete
+or creation outcomes. Export preview says that committed chats/Characters are included.
+
+The create selector adds `From file (.rtw)…`, opening a native file input directly
+from the selection gesture. Cancellation retains the previous template. Uploading
+installs validated bytes without executing packages or granting permissions; the
+installed digest is selected for the ordinary preview/approval/create flow.
+
+The existing Host World-session capability gains an ephemeral disk-backed transfer:
+`begin-package-upload(size:u64)->u64`,
+`append-package-upload(handle,offset:u64,bytes:list<u8>)->u64` (new written length),
+`finish-package-upload(handle)->()`, `begin-world-export(worldId)->u64`,
+`poll-package-transfer(handle)->status`,
+`read-package-transfer(handle,offset:u64,maximumBytes:u32)->list<u8>`,
+`close-package-transfer(handle)->()`. Browser namespaces are packages.begin-upload,
+append-upload, finish-upload, status, read, close and world-sessions.begin-export;
+u64 values remain canonical decimal strings, byte chunks are base64.
+Status is uploading(written), pending, installed(digest), download(size), failed(reason).
+Failures reuse World-session error cases; terminal reasons are bounded to 2048 UTF-8
+bytes. No browser-supplied filesystem path, owner, scope, or Native import dispatcher.
+
+All transfer operations require Host scope and world-session-write, except exact-owner
+close which remains allowed for cleanup after permission revocation. Runtime exposes
+these methods only to the selected root shell and tracks handles per channel. Native
+handles additionally bind exact live activation/context. Stop/trap/provider teardown
+releases them through existing owner-resource retirement. An idle transfer expires
+after 120 seconds of Host monotonic inactivity (OS sleep may suspend this timer);
+expiry is checked before every use and during guest callback cleanup. Close cancels
+unfinished upload or abandons an admitted Native job; an accepted installation may
+complete, discoverable by rereading the catalog. It never creates a World. Export
+results remain private and are discarded if their observer is gone.
+
+At most two transfers exist per process, including unreleased terminal results and
+abandoned workers until completion. One uploaded/archive result is bounded by the
+existing 1 GiB RtwLimits; chunks remain at most 32 KiB. Uploads and export results live
+in private Native temp directories; no whole-archive WASM buffer. Existing RTW limits,
+validation, snapshot/lifecycle locks and atomic World publication remain authoritative.
+Native validation/export runs in at most two workers outside guest callbacks. No
+persistent operation/job table, download server, package manager or new permission.
+
+Browser saves directly through File System Access when available. Its fallback
+uses a Blob only for results up to 64 MiB, bounding browser RAM; larger downloads
+require a browser with a streaming file writer or the CLI. This does not reduce the
+Native RTW limit or the separate Character upload limit. Cancel/close/disconnect
+release known handles; unknown admissions are not resubmitted. Tests cover menu
+interaction over empty/live Worlds; file picker cancellation/corrupt upload; Native
+chunk bounds, >16 MiB staging, offsets, quotas, abandoned worker slots, stale owners,
+TTL and stop cleanup; real browser export -> file-based independent clone -> delete
+with another World still usable.
+
+
+#### World-file acceptance checkpoint (2026-11-23)
+
+Implemented and verified against Core `60a1597` plus this working change and rtwKit
+`9344569` plus its companion working change. Core workspace gate and rtwKit gate
+both exit 0; real Chromium onboarding/export/file import/delete round trip exits 0.
+Raw commands, logs, synthetic exported RTW and source/artifact hashes are preserved
+at `/home/mart/Desktop/rintawa-evidence/world-files-2026-11-23/`. The browser check
+covers picker cancellation, corrupt input without World publication, explicit
+permissions, saved Character/messages in an independent clone, and continued writes
+in the other running World. Native transfer tests cover resource bounds and cleanup.
+A pre-existing polled transport quota test now retries its permitted transient
+`Unavailable` result before checking `LimitExceeded`; product transport is unchanged.
+
+The runtime and shell packages must be installed together with the companion Core
+binary: new package-transfer WIT imports require it. The old artifact-tooling Git pin
+alone is insufficient; publishing must pin the eventual committed Core/WIT revision.
+This completes the requested menu and World file workflow, not AI/Narrator or the
+remaining clean-install MVP acceptance. No Package Manager or new World Manager.

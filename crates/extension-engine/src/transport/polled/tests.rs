@@ -370,10 +370,13 @@ fn test_callback_and_polled_declarations_share_quota_and_authoritative_selection
             |_, _| {},
         )?;
     }
-    assert!(matches!(
-        transport.declare_polled(&a, "fixture/17"),
-        Err(Error::LimitExceeded)
-    ));
+    // Publication runs concurrently; an unavailable metadata lock is a permitted
+    // transient result, not evidence that the shared declaration quota changed.
+    let over_quota = retry(|| transport.declare_polled(&a, "fixture/17"));
+    assert!(
+        matches!(over_quota, Err(Error::LimitExceeded)),
+        "{over_quota:?}"
+    );
     assert!(matches!(
         transport.declare(
             &a.principal.component(),

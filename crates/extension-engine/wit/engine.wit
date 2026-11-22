@@ -517,6 +517,16 @@ interface world-sessions {
     /// Stable template entry in the requested World. Requires world-session-read.
     entry: func(world-id: string) -> result<option<entry-component>, error>;
 
+    /// Host-scope, disk-backed administrative RTW transfer; never a guest path.
+    variant transfer-status { uploading(u64), pending, installed(string), download(u64), failed(string) }
+    begin-package-upload: func(size: u64) -> result<u64, error>;
+    append-package-upload: func(handle: u64, offset: u64, bytes: list<u8>) -> result<u64, error>;
+    finish-package-upload: func(handle: u64) -> result<_, error>;
+    begin-world-export: func(world-id: string) -> result<u64, error>;
+    poll-package-transfer: func(handle: u64) -> result<transfer-status, error>;
+    read-package-transfer: func(handle: u64, offset: u64, maximum-bytes: u32) -> result<list<u8>, error>;
+    close-package-transfer: func(handle: u64) -> result<_, error>;
+
     /// Creates one empty persistent world. Requires `world-session-write`.
     create: func() -> result<summary, error>;
 

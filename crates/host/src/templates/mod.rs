@@ -85,6 +85,11 @@ fn descriptor(archive: &mut RtwArchive) -> HostResult<Descriptor> {
     Ok(data)
 }
 impl HostHome {
+    pub(crate) fn package_transfer_staging(&self) -> HostResult<(tempfile::TempDir, File)> {
+        let stage = Stage::new(self)?;
+        Ok((stage.directory, stage._ownership))
+    }
+
     /// Validates/stores a local RTW without selecting or starting any activation.
     pub fn install_package(&self, source: impl AsRef<Path>) -> HostResult<PackageInstallResult> {
         let stage = Stage::new(self)?;

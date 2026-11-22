@@ -52,6 +52,7 @@ pub(crate) mod budget;
 mod control_plane;
 mod http_request;
 mod network;
+mod package_transfer;
 mod target_provider;
 mod world_reads;
 
@@ -226,6 +227,8 @@ pub struct WasmHostState {
     random_bytes_this_execution: usize,
     blocking_import_remaining: Duration,
     asset_readers: HashMap<u64, asset_read::AssetReader>,
+    package_transfers: HashMap<u64, package_transfer::Transfer>,
+    next_package_transfer: u64,
     extension_id: Option<ExtensionId>,
     instance_id: Option<ExtensionInstanceId>,
     scope_id: Option<RuntimeScopeId>,
@@ -399,6 +402,8 @@ impl WasmHostState {
             random_bytes_this_execution: 0,
             blocking_import_remaining: Duration::from_secs(1),
             asset_readers: HashMap::new(),
+            package_transfers: HashMap::new(),
+            next_package_transfer: 0,
             extension_id: None,
             instance_id: None,
             scope_id: None,
@@ -593,6 +598,8 @@ impl WasmHostState {
     }
 
     fn discard_guest_execution(&mut self) {
+        self.package_transfers
+            .retain(|_, transfer| !transfer.expired());
         self.random_bytes_this_execution = 0;
         self.blocking_import_remaining = Duration::from_secs(1);
         self.registration_scope = None;
@@ -910,6 +917,8 @@ impl WasmHostState {
     }
 
     fn revoke_runtime_resources_for_owner(&mut self, owner: &rintawa_sdk::contracts::ComponentRef) {
+        self.package_transfers
+            .retain(|_, transfer| transfer.context.principal.component() != *owner);
         self.asset_readers
             .retain(|_, reader| reader.context.principal.component() != *owner);
         self.asset_uploads
