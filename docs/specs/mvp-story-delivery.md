@@ -563,3 +563,103 @@ binary: new package-transfer WIT imports require it. The old artifact-tooling Gi
 alone is insufficient; publishing must pin the eventual committed Core/WIT revision.
 This completes the requested menu and World file workflow, not AI/Narrator or the
 remaining clean-install MVP acceptance. No Package Manager or new World Manager.
+
+
+### Narrator / AI acceptance checkpoint — 2026-11-23
+
+Implemented against Core `1948004` plus the accepted native secret-configuration
+change, and rtwKit `4c0fb23` plus its companion working change. Exact domain wire,
+limits, prompt mapping and errors are in rtwKit `docs/specs/p10-narrator-ai.md`;
+Native credential policy is in [host-secret-configuration.md](host-secret-configuration.md).
+
+Text Roleplay now includes separate World-scoped Narrator and AI Provider RTWs.
+Chat commits the user message first, then invokes Narrator with known assistant IDs.
+Narrator reads a bounded recent suffix and the Character's original Tavern source,
+builds a <=24 KiB prompt, calls the selected Provider using polled transport, and
+requests a separate assistant append. Chat System checks the initiating user role,
+conversation relation, expected lastEntryId and monotonic new ID before one atomic
+commit. A concurrent append rejects the stale answer. User append/property schemas
+retain their existing meaning. No durable generation jobs or added World tables.
+
+Provider stores only safe non-secret endpoint/model/sampling settings as its own
+portable World property. Readiness is provider-neutral; OpenAI-compatible settings
+are explicitly advertised. HTTP/SSE runs through the existing async Host imports;
+partial, failed, oversized, timed-out and incomplete replies are never committed.
+Pending release keeps work/slots until terminal; World teardown cancels/abandons
+unfinished work. Unknown admissions never replay generation or append. Limits remain
+16 operations/backend, one pending generation/conversation, 16 KiB answer and 64 KiB
+transport. The labelled card and mandatory user message share the 24 KiB content
+budget; only an oldest whole-message prefix may be dropped from recent history.
+
+Owner accepted native CLI stdin/system-credentials storage and exact local scoped
+secret-read approvals. No secret-write WIT or browser method was added. Approvals
+are manifest-limited, persisted under existing composition locks, reapplied before
+start, revoked by World stop/unregister, and never inherited or exported. The AI
+binding derives from the actual World ID, so copied Worlds need their own local key.
+CLI refuses terminal stdin, invalid UTF-8, empty or >64 KiB input without printing
+values. Missing credentials/read permission and unavailable vault are actionable.
+
+Acceptance evidence, commands, source/RTW/binary hashes and redacted logs are at
+`/home/mart/Desktop/rintawa-evidence/narrator-ai-2026-11-23/`. Core and rtwKit required
+gates exit 0. Actual Chromium uses synthetic PNG V3 (~3.6 MB, description >8 KiB),
+JSON V2 and a loopback-only SSE fixture: automatic saved reply, HTTP 500, incomplete
+SSE, oversized answer, real HTTP deadline, concurrent append, released pending work,
+stop/restart without replay, independent B, file export/clone/delete, and clean-home
+installation/start with original graph/PNG/assistant/settings and fresh identities.
+The clean home receives neither local origin nor secret-read approvals. Native
+scope/bootstrap/revocation/quota and CLI stdin/TTY tests pass; credential-value tests
+use the existing in-memory vault. No real keyring values or paid provider were used.
+
+Local offline parsing/prompt checks of the owner's 19 examples print no names or
+content: 17 sources parse and fit context; two exceed the previously accepted
+portrait bounds. These are explicit import policy refusals, not prompt truncation.
+The installed dev template is updated; existing Worlds remain independent snapshots
+and are not silently updated with new extensions.
+
+Final browser acceptance also injects transient backend unavailability during Chat
+mount and verifies bounded startup reads restore the selected conversation. Mutation
+admission and generation remain single-shot.
+
+Next: slice 7's explicit World-local exclusion/headless acceptance matrix. The
+external real-provider/cost check still requires explicit opt-in. No Package Manager
+or separate World Manager has been implemented or claimed complete.
+
+
+### Shared settings / greeting checkpoint — 2026-11-23
+
+The owner requested a usable extension Settings menu and shared AI connections,
+conditioned on a universal extension primitive. Core now implements generic one-key
+published preferences: manifest opt-in, local read permission, same verified live
+RTW/component in baseline and World, no arbitrary foreign scope/key or write API.
+Loader attestation is carried into existing live bindings; reads release the view
+lock for preference I/O and revalidate source/consumer activations and permission.
+No new profile/World tables, sidecar, transport or Core AI semantics.
+
+rtwKit supplies scoped Settings sections, baseline catalog editing from Ollama and
+OpenAI-compatible templates, per-World Use/Disconnect, and selected-shell explicit
+local-origin approval/restart. HTTP/key reads and generation stay World-owned.
+This new exact RTW revision stores connection data/bindings in local preferences;
+exports/imports preserve story data and start disconnected. This supersedes the
+previous endpoint/model portability result only for the new revision. Immutable
+old RTWs and existing Worlds are not migrated. See
+[extension-settings-and-ai-connections.md](extension-settings-and-ai-connections.md).
+
+Character import derives its greeting alongside its unchanged source/card record.
+Chat atomically creates the linked conversation and optional initial assistant
+message. Empty greeting is omitted; oversized greeting preserves Character and
+requires an explicit skip before Chat creation. Card markers expand once and saved
+history enters Narrator context. Original Tavern source remains byte-exact.
+
+Core required gate exits0. rtwKit Rust/Native/WASM/doc/SDK/build gate exits0, followed
+by targeted checks/build and real Chromium on final UI artifacts. Synthetic browser
+acceptance covers two templates, scoped settings, exact sibling/caller denial,
+explicit origin restart, greeted Chat, oversize recovery, no requests on settings,
+errors/timeouts/stale writes, shared catalog edit and independent A/B generation,
+stop/cleanup/restart without replay, disconnected export and clean-home import.
+Real vault values, private cards and paid/external providers were not used.
+
+A separate persistent preview home is prepared at
+/home/mart/Desktop/rintawa-settings-preview-2026-11-23. The existing dev home has
+two Worlds pinned to the previous web-runtime digest and is left unchanged.
+Evidence: /home/mart/Desktop/rintawa-evidence/shared-settings-2026-11-23/.
+The remaining exclusion/headless MVP matrix is still a separate slice.

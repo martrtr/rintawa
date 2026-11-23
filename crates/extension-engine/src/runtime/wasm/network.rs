@@ -6,6 +6,7 @@ use std::{
         IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream,
         ToSocketAddrs, UdpSocket,
     },
+    sync::{Arc, Mutex, atomic::Ordering},
     time::Duration,
 };
 
@@ -32,7 +33,9 @@ pub(super) enum NetworkHandleKind {
 pub(super) struct OwnedNetworkHandle {
     pub(super) owner: ComponentRef,
     activation: u64,
-    pub(super) kind: NetworkHandleKind,
+    kind: Arc<Mutex<Option<NetworkHandleKind>>>,
+    policy: Arc<crate::runtime_permissions::RuntimeCancellation>,
+    permission: RuntimePermission,
 }
 
 impl WasmHostState {
@@ -40,6 +43,7 @@ impl WasmHostState {
         &mut self,
         owner: ComponentRef,
         kind: NetworkHandleKind,
+        permission: RuntimePermission,
     ) -> Result<u64, NetworkError> {
         let owned_count = self
             .network_handles
@@ -61,12 +65,27 @@ impl WasmHostState {
             .ok_or(NetworkError::PermissionDenied)?
             .principal
             .activation;
+        let kind = Arc::new(Mutex::new(Some(kind)));
+        let cleanup = kind.clone();
+        let policy = self
+            .runtime_permissions
+            .register_resource(
+                &owner,
+                activation,
+                permission,
+                Some(Box::new(move || {
+                    cleanup.lock().unwrap_or_else(|e| e.into_inner()).take();
+                })),
+            )
+            .map_err(|_| NetworkError::PermissionDenied)?;
         self.network_handles.insert(
             handle,
             OwnedNetworkHandle {
                 owner,
                 activation,
                 kind,
+                policy,
+                permission,
             },
         );
         Ok(handle)
@@ -100,7 +119,11 @@ impl NetworkHost for WasmHostState {
                 NetworkError::Unavailable
             })?
             .port();
-        let handle = self.allocate_network_handle(owner, NetworkHandleKind::Listener(listener))?;
+        let handle = self.allocate_network_handle(
+            owner,
+            NetworkHandleKind::Listener(listener),
+            RuntimePermission::LoopbackListen,
+        )?;
         Ok(WitNetworkListener {
             handle,
             port: bound_port,
@@ -132,7 +155,11 @@ impl NetworkHost for WasmHostState {
         stream
             .set_nonblocking(true)
             .map_err(|_| NetworkError::Unavailable)?;
-        self.allocate_network_handle(owner, NetworkHandleKind::Stream(stream))
+        self.allocate_network_handle(
+            owner,
+            NetworkHandleKind::Stream(stream),
+            RuntimePermission::LoopbackConnect,
+        )
     }
 
     fn accept(&mut self, listener: u64) -> Result<Option<u64>, NetworkError> {
@@ -165,7 +192,14 @@ impl NetworkHost for WasmHostState {
             {
                 return Err(NetworkError::UnknownHandle);
             }
-            let NetworkHandleKind::Listener(listener) = &resource.kind else {
+            let kind = resource
+                .kind
+                .lock()
+                .map_err(|_| NetworkError::Unavailable)?;
+            if resource.policy.revoked.load(Ordering::Acquire) {
+                return Err(NetworkError::PermissionDenied);
+            }
+            let Some(NetworkHandleKind::Listener(listener)) = kind.as_ref() else {
                 return Err(NetworkError::WrongKind);
             };
             match listener.accept() {
@@ -180,8 +214,17 @@ impl NetworkHost for WasmHostState {
         stream
             .set_nonblocking(true)
             .map_err(|_| NetworkError::Unavailable)?;
-        self.allocate_network_handle(owner, NetworkHandleKind::Stream(stream))
-            .map(Some)
+        let permission = self.network_handles[&listener].permission;
+        let parent = self.network_handles[&listener].policy.clone();
+        let handle =
+            self.allocate_network_handle(owner, NetworkHandleKind::Stream(stream), permission)?;
+        // Revoke followed by regrant between accept and admission must not adopt
+        // a stream accepted by the retired listener authorization.
+        if parent.revoked.load(Ordering::Acquire) {
+            self.network_handles.remove(&handle);
+            return Err(NetworkError::PermissionDenied);
+        }
+        Ok(Some(handle))
     }
 
     fn read(&mut self, socket: u64, max_bytes: u32) -> Result<WitNetworkReadResult, NetworkError> {
@@ -208,7 +251,14 @@ impl NetworkHost for WasmHostState {
         {
             return Err(NetworkError::UnknownHandle);
         }
-        let NetworkHandleKind::Stream(stream) = &mut resource.kind else {
+        let mut kind = resource
+            .kind
+            .lock()
+            .map_err(|_| NetworkError::Unavailable)?;
+        if resource.policy.revoked.load(Ordering::Acquire) {
+            return Err(NetworkError::PermissionDenied);
+        }
+        let Some(NetworkHandleKind::Stream(stream)) = kind.as_mut() else {
             return Err(NetworkError::WrongKind);
         };
         if requested == 0 {
@@ -255,7 +305,14 @@ impl NetworkHost for WasmHostState {
         {
             return Err(NetworkError::UnknownHandle);
         }
-        let NetworkHandleKind::Stream(stream) = &mut resource.kind else {
+        let mut kind = resource
+            .kind
+            .lock()
+            .map_err(|_| NetworkError::Unavailable)?;
+        if resource.policy.revoked.load(Ordering::Acquire) {
+            return Err(NetworkError::PermissionDenied);
+        }
+        let Some(NetworkHandleKind::Stream(stream)) = kind.as_mut() else {
             return Err(NetworkError::WrongKind);
         };
         match stream.write(&data) {
@@ -295,19 +352,34 @@ impl HttpFetchHost for WasmHostState {
         if !self.host_access_active {
             return Err(HttpFetchError::AccessNotActive);
         }
-        self.runtime_permission_owner(RuntimePermission::HttpFetch)
+        let owner = self
+            .runtime_permission_owner(RuntimePermission::HttpFetch)
             .map_err(|error| match error {
                 RuntimePermissionCheck::Denied => HttpFetchError::PermissionDenied,
                 RuntimePermissionCheck::Unavailable => HttpFetchError::Unavailable,
             })?;
 
+        let activation = self
+            .execution_context
+            .as_ref()
+            .ok_or(HttpFetchError::AccessNotActive)?
+            .principal
+            .activation;
+        let policy = self
+            .runtime_permissions
+            .register_resource(&owner, activation, RuntimePermission::HttpFetch, None)
+            .map_err(|_| HttpFetchError::PermissionDenied)?;
         let limit = (max_bytes as usize).min(self.max_http_fetch_bytes);
         let redirects = self.max_http_redirects;
-        self.blocking_import(
+        let result = self.blocking_import(
             Duration::from_millis(self.http_fetch_timeout_ms),
             HttpFetchError::Unavailable,
             |timeout| bounded_http_get(&url, limit, redirects, timeout),
-        )
+        );
+        if policy.revoked.load(Ordering::Acquire) {
+            return Err(HttpFetchError::PermissionDenied);
+        }
+        result
     }
 }
 fn bounded_http_get(

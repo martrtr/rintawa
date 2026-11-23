@@ -110,6 +110,7 @@ fn test_should_execute_granted_background_task_through_engine_runtime_pump() -> 
             target: ComponentTarget::new(WASM_COMPONENT_TARGET_V1),
             entry: None,
             required: true,
+            published_preference: None,
             permissions: ComponentPermissions {
                 secret_read: Vec::new(),
                 runtime: vec![RuntimePermission::BackgroundTask],

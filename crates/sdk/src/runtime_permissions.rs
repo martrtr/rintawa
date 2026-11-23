@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 pub enum RuntimePermission {
     /// Allows owner-scoped cooperative background task scheduling.
     BackgroundTask,
+    /// Allows a World backend to read its exact baseline counterpart's published configuration.
+    PublishedPreferenceRead,
+    /// Allows a World backend to exchange its exact baseline counterpart's published configuration.
+    PublishedPreferenceWrite,
     /// Allows binding a TCP listener only on the local loopback interface.
     LoopbackListen,
     /// Allows opening a TCP connection only to the local loopback interface.
@@ -48,6 +52,8 @@ pub enum RuntimePermission {
 impl fmt::Display for RuntimePermission {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PublishedPreferenceRead => formatter.write_str("published-preference-read"),
+            Self::PublishedPreferenceWrite => formatter.write_str("published-preference-write"),
             Self::BackgroundTask => formatter.write_str("background-task"),
             Self::LoopbackListen => formatter.write_str("loopback-listen"),
             Self::LoopbackConnect => formatter.write_str("loopback-connect"),
@@ -85,6 +91,8 @@ impl FromStr for RuntimePermission {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
+            "published-preference-read" => Ok(Self::PublishedPreferenceRead),
+            "published-preference-write" => Ok(Self::PublishedPreferenceWrite),
             "background-task" => Ok(Self::BackgroundTask),
             "loopback-listen" => Ok(Self::LoopbackListen),
             "loopback-connect" => Ok(Self::LoopbackConnect),

@@ -10,6 +10,7 @@ use std::{
 
 use rintawa_sdk::{
     contracts::{ComponentPrincipal, ComponentRef, ContractDefinition, ContractKey},
+    runtime_permissions::RuntimePermission,
     types::{ExtensionInstanceId, RuntimeScopeId},
 };
 
@@ -28,7 +29,24 @@ pub(crate) struct ExecutionContext {
     pub(crate) principal: ComponentPrincipal,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VerifiedComponent {
+    pub(crate) digest: rintawa_artifacts::ArtifactDigest,
+    pub(crate) published_key: Option<String>,
+    pub(crate) permissions: rintawa_sdk::manifest::ComponentPermissions,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PublishedPreferenceSource {
+    pub(crate) consumer: ExecutionContext,
+    pub(crate) source: ExecutionContext,
+    pub(crate) digest: rintawa_artifacts::ArtifactDigest,
+    pub(crate) key: String,
+    pub(crate) write_requested: bool,
+}
+
 struct Binding {
+    verified: Option<VerifiedComponent>,
     context: ExecutionContext,
     active: bool,
     provider: Option<ComponentRef>,
@@ -80,14 +98,25 @@ struct View {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct ExecutionContexts(Arc<Mutex<View>>);
+pub(crate) struct ExecutionContexts(Arc<Mutex<View>>, pub(crate) Arc<Mutex<()>>);
 
 impl ExecutionContexts {
+    #[cfg(test)]
     pub(crate) fn begin(
         &self,
         owner: ComponentRef,
         scope: RuntimeScopeId,
     ) -> Result<(), TransportError> {
+        self.begin_verified(owner, scope, None)
+    }
+
+    pub(crate) fn begin_verified(
+        &self,
+        owner: ComponentRef,
+        scope: RuntimeScopeId,
+        verified: Option<VerifiedComponent>,
+    ) -> Result<(), TransportError> {
+        let lifecycle = self.1.lock().map_err(|_| TransportError::Unavailable)?;
         let activation = NEXT_ACTIVATION
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
@@ -109,12 +138,14 @@ impl ExecutionContexts {
             .insert(
                 owner,
                 Binding {
+                    verified,
                     context,
                     active: false,
                     provider: None,
                     resource_access: None,
                 },
             );
+        drop(lifecycle);
         if let Some(cleanup) = displaced.and_then(Binding::into_cleanup) {
             cleanup.dispose();
         }
@@ -122,6 +153,7 @@ impl ExecutionContexts {
     }
 
     pub(crate) fn activate_instance(&self, instance: &ExtensionInstanceId) {
+        let _lifecycle = self.1.lock().unwrap_or_else(|e| e.into_inner());
         let mut view = self.0.lock().unwrap_or_else(|error| error.into_inner());
         for (owner, binding) in &mut view.bindings {
             if &owner.instance_id == instance {
@@ -171,6 +203,79 @@ impl ExecutionContexts {
         Ok(())
     }
 
+    pub(crate) fn policy_identity(
+        &self,
+        owner: &ComponentRef,
+    ) -> Result<(ExecutionContext, VerifiedComponent), TransportError> {
+        let view = self.0.try_lock().map_err(|_| TransportError::Unavailable)?;
+        let b = view
+            .bindings
+            .get(owner)
+            .filter(|b| b.active)
+            .ok_or(TransportError::Inactive)?;
+        Ok((
+            b.context.clone(),
+            b.verified.clone().ok_or(TransportError::Unavailable)?,
+        ))
+    }
+
+    /// Resolve only Host-attested live artifacts. Preference I/O holds no view lock.
+    pub(crate) fn published_preference_source(
+        &self,
+        consumer: &ExecutionContext,
+    ) -> Result<PublishedPreferenceSource, TransportError> {
+        let view = self.0.try_lock().map_err(|_| TransportError::Unavailable)?;
+        let reader = view
+            .bindings
+            .get(&consumer.principal.component())
+            .filter(|b| b.active && b.provider.is_none() && b.context == *consumer)
+            .ok_or(TransportError::Inactive)?;
+        let identity = reader
+            .verified
+            .as_ref()
+            .ok_or(TransportError::Unavailable)?;
+        let mut candidates = view.bindings.values().filter(|b| {
+            b.active
+                && b.provider.is_none()
+                && b.context.scope.as_str() == "host"
+                && b.context.principal.component_id == consumer.principal.component_id
+                && b.verified
+                    .as_ref()
+                    .is_some_and(|v| v.digest == identity.digest && v.published_key.is_some())
+        });
+        let source = candidates.next().ok_or(TransportError::Unavailable)?;
+        if candidates.next().is_some() {
+            return Err(TransportError::Unavailable);
+        }
+        Ok(PublishedPreferenceSource {
+            consumer: consumer.clone(),
+            source: source.context.clone(),
+            digest: identity.digest.clone(),
+            key: source
+                .verified
+                .as_ref()
+                .unwrap()
+                .published_key
+                .as_ref()
+                .unwrap()
+                .clone(),
+            write_requested: identity
+                .permissions
+                .runtime
+                .contains(&RuntimePermission::PublishedPreferenceWrite),
+        })
+    }
+
+    pub(crate) fn validate_published_read(
+        &self,
+        read: &PublishedPreferenceSource,
+    ) -> Result<(), TransportError> {
+        if self.published_preference_source(&read.consumer)? != *read {
+            return Err(TransportError::Unavailable);
+        }
+        Ok(())
+    }
+
     pub(crate) fn bind_provider(
         &self,
         context: &ExecutionContext,
@@ -198,6 +303,7 @@ impl ExecutionContexts {
         instance: &ExtensionInstanceId,
         expected: Option<&ExecutionContext>,
     ) -> RetiredContexts {
+        let _lifecycle = self.1.lock().unwrap_or_else(|e| e.into_inner());
         let mut view = self.0.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(expected) = expected
             && !view
@@ -395,3 +501,80 @@ mod tests {
 
 #[cfg(test)]
 mod resource_tests;
+
+#[cfg(test)]
+mod published_tests {
+    use super::*;
+    fn bind(
+        contexts: &ExecutionContexts,
+        name: &str,
+        scope: &str,
+        component: &str,
+        digest: &[u8],
+        published: bool,
+    ) -> ExecutionContext {
+        let owner = ComponentRef::new(name, component);
+        contexts
+            .begin_verified(
+                owner.clone(),
+                RuntimeScopeId::new(scope),
+                Some(VerifiedComponent {
+                    digest: rintawa_artifacts::ArtifactDigest::sha256(digest),
+                    published_key: published.then(|| "fixture.shared.v1".into()),
+                    permissions: Default::default(),
+                }),
+            )
+            .unwrap();
+        contexts.activate_instance(&owner.instance_id);
+        contexts.context(&owner, false).unwrap()
+    }
+    #[test]
+    fn test_published_preference_requires_live_exact_unambiguous_ordinary_source() {
+        let c = ExecutionContexts::default();
+        let a = bind(&c, "A", "world:a", "backend", b"exact", true);
+        let b = bind(&c, "B", "world:b", "backend", b"exact", true);
+        assert!(c.published_preference_source(&a).is_err());
+        let source = bind(&c, "root", "host", "backend", b"exact", true);
+        let read = c.published_preference_source(&a).unwrap();
+        assert_eq!(read.source, source);
+        assert_eq!(read.key, "fixture.shared.v1");
+        let foreign = bind(&c, "foreign", "world:c", "backend", b"different", true);
+        assert!(c.published_preference_source(&foreign).is_err());
+        let wrong_component = bind(&c, "other-component", "world:d", "other", b"exact", true);
+        assert!(c.published_preference_source(&wrong_component).is_err());
+        let duplicate = bind(&c, "duplicate", "host", "backend", b"exact", true);
+        assert!(c.published_preference_source(&a).is_err());
+        c.revoke_instance_if(&duplicate.principal.instance_id, None)
+            .dispose();
+        c.validate_published_read(&read).unwrap();
+        c.bind_provider(&a, source.principal.component()).unwrap();
+        assert!(c.published_preference_source(&a).is_err());
+        assert!(c.published_preference_source(&b).is_ok());
+        c.revoke_instance_if(&source.principal.instance_id, None)
+            .dispose();
+        assert!(c.validate_published_read(&read).is_err());
+        assert!(c.published_preference_source(&b).is_err());
+        let replacement = bind(&c, "root", "host", "backend", b"exact", true);
+        assert_ne!(
+            replacement.principal.activation,
+            source.principal.activation
+        );
+        assert!(c.validate_published_read(&read).is_err());
+        assert_eq!(
+            c.published_preference_source(&b).unwrap().source,
+            replacement
+        );
+        c.revoke_instance_if(&replacement.principal.instance_id, None)
+            .dispose();
+        bind(&c, "unpublished", "host", "backend", b"exact", false);
+        assert!(c.published_preference_source(&b).is_err());
+        let unverified = ComponentRef::new("unverified", "backend");
+        c.begin(unverified.clone(), RuntimeScopeId::new("world:u"))
+            .unwrap();
+        c.activate_instance(&unverified.instance_id);
+        assert!(
+            c.published_preference_source(&c.context(&unverified, false).unwrap())
+                .is_err()
+        );
+    }
+}

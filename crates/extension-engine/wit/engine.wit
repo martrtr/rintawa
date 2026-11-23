@@ -312,6 +312,8 @@ interface http-request {
 
     /// Starts one request without blocking on DNS, TLS, upload or response.
     start: func(request: request) -> result<u64, error>;
+    /// Starts one request with a bounded deadline in milliseconds.
+    start-with-timeout: func(request: request, timeout-ms: u32) -> result<u64, error>;
 
     /// Reads at most the requested number of response bytes without blocking.
     poll: func(handle: u64, max-bytes: u32) -> result<event, error>;
@@ -513,6 +515,8 @@ interface world-sessions {
     template-info: func(digest: string) -> result<string, error>;
     /// Atomically creates a new World; does not activate it or approve Host providers.
     create-from-template: func(digest: string, title: string, approve-runtime-permissions: bool) -> result<summary, error>;
+    /// Atomically creates a World from bounded JSON with reviewed per-component permissions.
+    create-from-template-with-permissions: func(request: string) -> result<summary, error>;
     record entry-component { instance-id: string, component-id: string }
     /// Stable template entry in the requested World. Requires world-session-read.
     entry: func(world-id: string) -> result<option<entry-component>, error>;
@@ -562,6 +566,34 @@ interface preferences {
 
     /// Deletes one preference owned by the current component principal.
     delete: func(key: string) -> result<_, error>;
+
+    /// Failure while reading the explicitly published value.
+    variant published-error {
+        access-not-active,
+        permission-denied,
+        message-too-large,
+        unavailable,
+    }
+
+    /// Reads one explicitly published non-secret preference from the exact active
+    /// baseline counterpart. World ordinary backends only; separately granted.
+    read-published-preference: func() -> result<option<string>, published-error>;
+
+    /// Failure while comparing and exchanging the explicitly published value.
+    variant published-write-error {
+        access-not-active,
+        permission-denied,
+        message-too-large,
+        conflict,
+        quota-exceeded,
+        unavailable,
+    }
+
+    /// Exchanges the exact raw published value if it matches `expected`.
+    /// An absent value means no entry. Each string is bounded to 64 KiB.
+    /// Baseline owners write their own published key. World counterparts require
+    /// an explicit published-preference-write grant for the exact active publisher.
+    compare-exchange-published-preference: func(expected: option<string>, value: option<string>) -> result<_, published-write-error>;
 }
 
 /// Generic mutation/read boundary for the host baseline composition.
@@ -695,6 +727,14 @@ interface runtime-policy {
         unavailable,
     }
 
+    /// Captures active identity and effective policy as strict bounded JSON.
+    /// Requires runtime-policy-write; contains no secret values.
+    live-component-policy: func(scope-id: string, instance-id: string, component-id: string) -> result<string, error>;
+
+    /// Applies one captured LivePolicyChange; success means durable and effective.
+    /// Requires runtime-policy-write. Unknown/stale targets fail closed.
+    apply-live-change: func(change: string) -> result<_, error>;
+
     /// Inspects one imported exact artifact before composition mutation.
     /// Requires runtime-policy-read.
     inspect-artifact: func(digest: string) -> result<artifact-policy, error>;
@@ -724,7 +764,7 @@ interface runtime-policy {
 
     /// Approves one exact HTTP loopback origin, never a path or wildcard.
     /// The component must have separately received http-request permission.
-    /// Requires runtime-policy-write. Takes effect at next activation.
+    /// Requires runtime-policy-write. Applies to the exact active target.
     grant-http-origin: func(
         scope-id: string,
         instance-id: string,
@@ -733,7 +773,7 @@ interface runtime-policy {
     ) -> result<_, error>;
 
     /// Removes one exact HTTP origin approval without affecting adjacent ports.
-    /// Requires runtime-policy-write. Takes effect at next activation.
+    /// Requires runtime-policy-write. Applies to the exact active target.
     revoke-http-origin: func(
         scope-id: string,
         instance-id: string,
@@ -811,6 +851,7 @@ interface secrets {
 interface transport {
     use runtime-context.{principal};
     record inbound-query { handle: u64, caller: principal, payload: list<u8> }
+    record sourced-reply { provider: principal, payload: list<u8> }
     variant error {
         access-not-active,
         invalid-name,
@@ -836,6 +877,9 @@ interface transport {
     /// Admits a query without waiting for dispatch or replies.
     begin-query: func(point: string, payload: list<u8>) -> result<u64, error>;
     poll-query: func(handle: u64) -> result<option<list<list<u8>>>, error>;
+    /// Consumes the same result as poll-query and verifies each live responder.
+    /// Fails with unavailable if any successful reply lacks a live same-scope source.
+    poll-query-sourced: func(handle: u64) -> result<option<list<sourced-reply>>, error>;
     close-query: func(handle: u64) -> result<_, error>;
     /// Admits publication; next-query is empty while publication is pending.
     declare-polled: func(point: string) -> result<u64, error>;

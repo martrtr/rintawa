@@ -6,8 +6,9 @@ mod resources;
 
 use crate::{
     ActivationRecord, AuthoritativeProviderSelection, CompositionEntry, CompositionProfile,
-    DEFAULT_WORLD_SCOPE, HostError, HostHome, HostResult, PreferredProviderSelection,
-    RuntimePermissionGrant, WorldMetadata, WorldSummary,
+    DEFAULT_WORLD_SCOPE, HostError, HostHome, HostResult, HttpLoopbackOriginGrant,
+    PreferredProviderSelection, RuntimePermissionGrant, SecretReadGrant, WorldMetadata,
+    WorldSummary,
 };
 use format::*;
 use publication::Stage;
@@ -18,6 +19,7 @@ use rintawa_extension_engine::{ExtensionEngine, RtwExtensionLoader};
 use rintawa_sdk::{
     contracts::{ComponentRef, ContractKey, ContractVersion},
     manifest::ExtensionManifest,
+    secrets::SecretPath,
     types::{ComponentId, ExtensionInstanceId, RuntimeScopeId},
 };
 use rintawa_storage::SqliteWorldStorage;
@@ -73,6 +75,26 @@ struct Prepared {
     manifests: BTreeMap<String, ExtensionManifest>,
     seed: Option<std::path::PathBuf>,
 }
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreationRequest {
+    digest: ArtifactDigest,
+    title: String,
+    approve_runtime_permissions: bool,
+    permissions: Vec<CreationPermissions>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreationPermissions {
+    slot: String,
+    component_id: String,
+    artifact: ArtifactDigest,
+    http_origins: Vec<String>,
+    secret_read: Vec<SecretPath>,
+}
+
 fn descriptor(archive: &mut RtwArchive) -> HostResult<Descriptor> {
     if archive.manifest().content.to_string() != CONTENT
         || archive.manifest().entry.as_str() != "template.json"
@@ -170,6 +192,52 @@ impl HostHome {
         title: Option<&str>,
         approve_runtime_permissions: bool,
     ) -> HostResult<CreatedTemplateWorld> {
+        self.create_template_world(digest, title, approve_runtime_permissions, &[])
+    }
+
+    pub(crate) fn create_world_from_template_with_permissions(
+        &self,
+        request: &str,
+    ) -> HostResult<CreatedTemplateWorld> {
+        if request.len() > 64 * 1024 {
+            return Err(invalid("World creation permission request exceeds 64 KiB"));
+        }
+        let request: CreationRequest = serde_json::from_str(request)
+            .map_err(|_| invalid("invalid World creation permission request"))?;
+        let count = request
+            .permissions
+            .iter()
+            .map(|permission| permission.http_origins.len() + permission.secret_read.len())
+            .sum::<usize>();
+        if count > 64
+            || request.permissions.iter().any(|permission| {
+                permission.http_origins.is_empty() && permission.secret_read.is_empty()
+            })
+        {
+            return Err(invalid(
+                "each target requires at least one approval, up to 64 total",
+            ));
+        }
+        if !request.approve_runtime_permissions && !request.permissions.is_empty() {
+            return Err(invalid(
+                "local permissions require explicit creation approval",
+            ));
+        }
+        self.create_template_world(
+            &request.digest,
+            Some(&request.title),
+            request.approve_runtime_permissions,
+            &request.permissions,
+        )
+    }
+
+    fn create_template_world(
+        &self,
+        digest: &ArtifactDigest,
+        title: Option<&str>,
+        approve_runtime_permissions: bool,
+        permissions: &[CreationPermissions],
+    ) -> HostResult<CreatedTemplateWorld> {
         let stage = Stage::new(self)?;
         let mut archive = self.store.open_artifact(digest)?;
         let prepared = self.prepare(&mut archive, &stage)?;
@@ -181,6 +249,7 @@ impl HostHome {
             ));
         }
         let recipe = recipe(&prepared.data, &prepared.manifests)?;
+        let targets = creation_permission_targets(permissions, &prepared.manifests, &recipe)?;
         let source_manifest = match &prepared.seed {
             Some(seed) => SqliteWorldStorage::validate_seed(seed)?.manifest().clone(),
             None => WorldManifest::default(),
@@ -203,10 +272,40 @@ impl HostHome {
             metadata
         };
         let manifest = metadata.write_to_manifest(&source_manifest)?;
-        self.publish_world(&recipe, prepared.seed.as_deref(), &manifest)
+        self.publish_world_with_profile(&recipe, prepared.seed.as_deref(), &manifest, |profile| {
+            for (index, permission) in targets.into_iter().zip(permissions) {
+                // materialize_all preserves recipe order, including repeated artifacts.
+                let activation = &profile.activations[index];
+                let component_id = ComponentId::new(&permission.component_id);
+                profile
+                    .http_loopback_origins
+                    .extend(
+                        permission
+                            .http_origins
+                            .iter()
+                            .map(|origin| HttpLoopbackOriginGrant {
+                                scope_id: activation.scope_id.clone(),
+                                instance_id: activation.instance_id.clone(),
+                                component_id: component_id.clone(),
+                                origin: origin.clone(),
+                            }),
+                    );
+                profile
+                    .secret_read_grants
+                    .extend(permission.secret_read.iter().map(|path| SecretReadGrant {
+                        scope_id: activation.scope_id.clone(),
+                        instance_id: activation.instance_id.clone(),
+                        component_id: component_id.clone(),
+                        path: path.clone(),
+                    }));
+            }
+        })
     }
 
-    fn extension_manifest(&self, digest: &ArtifactDigest) -> HostResult<ExtensionManifest> {
+    pub(crate) fn extension_manifest(
+        &self,
+        digest: &ArtifactDigest,
+    ) -> HostResult<ExtensionManifest> {
         Ok(RtwExtensionLoader::new().read_stored_manifest(
             &ExtensionEngine::new(),
             &self.store,
@@ -357,6 +456,55 @@ impl HostHome {
         Ok(result)
     }
 }
+
+fn creation_permission_targets(
+    permissions: &[CreationPermissions],
+    manifests: &BTreeMap<String, ExtensionManifest>,
+    recipe: &CompositionProfile,
+) -> HostResult<Vec<usize>> {
+    let mut targets = BTreeSet::new();
+    permissions
+        .iter()
+        .map(|permission| {
+            let (index, _) = recipe
+                .activations
+                .iter()
+                .enumerate()
+                .find(|(_, activation)| {
+                    activation.instance_id.as_str() == permission.slot
+                        && activation.artifact == permission.artifact
+                })
+                .ok_or_else(|| {
+                    invalid("local permission target does not match the template slot and artifact")
+                })?;
+            let descriptor = component(
+                &Ref {
+                    slot: permission.slot.clone(),
+                    component_id: permission.component_id.clone(),
+                },
+                manifests,
+            )?;
+            if !targets.insert((index, &permission.component_id)) {
+                return Err(invalid("duplicate local permission target"));
+            }
+            if permission.secret_read.iter().any(|path| {
+                !descriptor
+                    .permissions
+                    .secret_read
+                    .iter()
+                    .any(|pattern| pattern.matches(path))
+            }) {
+                return Err(invalid(
+                    "local secret approval exceeds exact component manifest ceiling",
+                ));
+            }
+            // The staged profile's validation enforces canonical unique origins, a
+            // matching HttpRequest grant, and unique exact secret approvals.
+            Ok(index)
+        })
+        .collect()
+}
+
 fn component<'a>(
     reference: &Ref,
     manifests: &'a BTreeMap<String, ExtensionManifest>,
@@ -487,6 +635,8 @@ fn asset_key(reference: &AssetRef) -> (String, u64, String) {
     )
 }
 
+#[cfg(test)]
+mod creation_permission_tests;
 #[cfg(test)]
 mod tests;
 

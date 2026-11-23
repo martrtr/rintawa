@@ -287,6 +287,13 @@ pub trait WorldSessionAccess: Send + Sync {
     ) -> HostAccessResult<WorldSessionSummary> {
         Err(HostAccessError::Unavailable)
     }
+    /// Atomically creates a World with local approvals for exact template components.
+    fn create_from_template_with_permissions(
+        &self,
+        _request: &str,
+    ) -> HostAccessResult<WorldSessionSummary> {
+        Err(HostAccessError::Rejected)
+    }
     /// Stable entry component, without implicit activation or permission changes.
     fn entry(&self, _world_id: &str) -> HostAccessResult<Option<ComponentRef>> {
         Err(HostAccessError::Unavailable)
@@ -356,6 +363,19 @@ pub trait PreferenceAccess: Send + Sync {
         component_id: &str,
         key: &str,
     ) -> HostAccessResult<()>;
+
+    /// Exchanges the exact baseline publisher's raw preference value atomically.
+    /// The persisted owner must still select `digest`. Returns `false` for a value mismatch.
+    fn compare_exchange_published(
+        &self,
+        _owner: &ComponentRef,
+        _digest: &rintawa_artifacts::ArtifactDigest,
+        _key: &str,
+        _expected: Option<&str>,
+        _value: Option<&str>,
+    ) -> HostAccessResult<bool> {
+        Err(HostAccessError::Unavailable)
+    }
 }
 
 /// Requested runtime permissions for one component in an exact artifact.
@@ -410,6 +430,20 @@ pub struct RuntimeHttpOriginGrant {
 
 /// Generic administrative access to runtime permission policy.
 pub trait RuntimePolicyAccess: Send + Sync {
+    /// Inspect an exact active target before displaying an administrative decision.
+    fn live_component_policy(
+        &self,
+        _scope: &str,
+        _instance: &str,
+        _component: &str,
+    ) -> HostAccessResult<String> {
+        Err(HostAccessError::Rejected)
+    }
+    /// Persist and publish one strict, bounded JSON LivePolicyChange for that target.
+    fn apply_live_change(&self, _change: &str) -> HostAccessResult<()> {
+        Err(HostAccessError::Rejected)
+    }
+
     /// Inspects requested runtime permissions in one exact imported artifact.
     fn inspect_artifact(&self, digest: &str) -> HostAccessResult<RuntimeArtifactPolicy>;
 

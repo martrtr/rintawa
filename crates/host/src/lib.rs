@@ -12,7 +12,10 @@
 #![allow(clippy::result_large_err)]
 
 mod profile;
+#[cfg(test)]
+mod published_preference_tests;
 mod runtime;
+mod secret_config;
 mod templates;
 mod world_metadata;
 
@@ -44,7 +47,7 @@ use uuid::Uuid;
 pub use profile::{
     ActivationRecord, AuthoritativeProviderSelection, CompositionEntry, CompositionProfile,
     HostExecutionRequirement, HttpLoopbackOriginGrant, PROFILE_SCHEMA, PreferredProviderSelection,
-    RuntimePermissionGrant,
+    RuntimePermissionGrant, SecretReadGrant,
 };
 pub use runtime::HostRuntime;
 pub use templates::{CreatedTemplateWorld, PackageInstallResult, TemplateSummary};
@@ -252,6 +255,12 @@ impl std::error::Error for HostShutdownFailures {
 /// Errors returned by local host composition operations.
 #[derive(Debug, Error)]
 pub enum HostError {
+    /// A local exact secret-read approval is invalid or exceeds its quota.
+    #[error("invalid local secret policy: {0}")]
+    InvalidSecretPolicy(String),
+    /// The platform credential store rejected an operation without exposing values.
+    #[error(transparent)]
+    Secret(#[from] rintawa_sdk::secrets::SecretAccessError),
     /// A World is activating, active or still cleaning up its components.
     #[error("World lifecycle is busy: {0}")]
     WorldLifecycleBusy(WorldId),
@@ -1064,6 +1073,18 @@ impl HostHome {
                     && permission.permission == RuntimePermission::HttpRequest
             })
         });
+        profile.secret_read_grants.retain(|grant| {
+            grant.scope_id != scope_id
+                || grant.instance_id != instance_id
+                || manifest.components.iter().any(|component| {
+                    component.id == grant.component_id
+                        && component
+                            .permissions
+                            .secret_read
+                            .iter()
+                            .any(|pattern| pattern.matches(&grant.path))
+                })
+        });
         self.save_composition_for_scope(&scope_id, &profile)?;
         let world_default = matches!(composition_scope, PersistedCompositionScope::Baseline)
             && self.is_exact_default_world_activation(&subject, digest)?;
@@ -1292,6 +1313,47 @@ impl HostHome {
         let mut profile = self.load_composition_for_scope_locked(scope_id)?;
         profile.delete_preference(scope_id, owner, key)?;
         self.save_composition_for_scope(scope_id, &profile)
+    }
+
+    fn compare_exchange_published_preference(
+        &self,
+        owner: &ComponentRef,
+        digest: &ArtifactDigest,
+        key: &str,
+        expected: Option<&str>,
+        value: Option<&str>,
+    ) -> HostResult<bool> {
+        let scope_id = RuntimeScopeId::new(HOST_SCOPE);
+        let _profile_lock = CompositionProfile::try_lock(&self.profile_path)?;
+        let mut profile = self.load_profile()?;
+        let mut selections = profile
+            .activations
+            .iter()
+            .filter(|activation| activation.instance_id == owner.instance_id);
+        if !selections
+            .next()
+            .is_some_and(|activation| activation.artifact == *digest && activation.enabled)
+            || selections.next().is_some()
+        {
+            return Err(HostError::ActivationNotFound(owner.instance_id.to_string()));
+        }
+
+        if profile.get_preference(&scope_id, owner, key)?.as_deref() != expected {
+            return Ok(false);
+        }
+        if expected != value {
+            match value {
+                Some(value) => profile.set_preference(
+                    scope_id.clone(),
+                    owner.clone(),
+                    key.to_string(),
+                    value.to_string(),
+                )?,
+                None => profile.delete_preference(&scope_id, owner, key)?,
+            }
+            self.save_composition_for_scope(&scope_id, &profile)?;
+        }
+        Ok(true)
     }
 
     /// Lists requested and granted runtime permissions for the baseline composition.

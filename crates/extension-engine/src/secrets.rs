@@ -124,11 +124,18 @@ impl SecretVault for InMemorySecretVault {
 ///
 /// Clones share both the policy and vault. This lets a WASM runtime retain a
 /// host handle while policy changes immediately affect future reads.
+#[derive(Clone, Default)]
+pub(crate) struct SecretGrants {
+    pub(crate) patterns: Vec<SecretPathPattern>,
+    pub(crate) revision: u64,
+}
+
+/// Shared system vault and owner-scoped live read policy.
 #[derive(Clone)]
 pub struct SecretManager {
     vault: Arc<dyn SecretVault>,
-    read_grants: Arc<RwLock<HashMap<ComponentRef, Vec<SecretPathPattern>>>>,
-    policy_revision: Arc<AtomicU64>,
+    pub(crate) read_grants: Arc<RwLock<HashMap<ComponentRef, SecretGrants>>>,
+    pub(crate) policy_revision: Arc<AtomicU64>,
 }
 
 impl Default for SecretManager {
@@ -180,9 +187,9 @@ impl SecretManager {
             .write()
             .map_err(|_| SecretAccessError::Unavailable)?;
         let principal_grants = grants.entry(principal).or_default();
-        if !principal_grants.contains(&pattern) {
-            principal_grants.push(pattern);
-            self.policy_revision.fetch_add(1, Ordering::Relaxed);
+        if !principal_grants.patterns.contains(&pattern) {
+            principal_grants.patterns.push(pattern);
+            principal_grants.revision = self.policy_revision.fetch_add(1, Ordering::Relaxed) + 1;
         }
         Ok(())
     }
@@ -196,6 +203,7 @@ impl SecretManager {
             .and_then(|grants| {
                 grants.get(&principal).map(|patterns| {
                     patterns
+                        .patterns
                         .iter()
                         .any(|granted| granted.allows_pattern(pattern))
                 })
@@ -224,16 +232,24 @@ impl SecretManager {
             .read_grants
             .read()
             .map_err(|_| SecretAccessError::Unavailable)?;
-        let allowed = grants
+        let revision = grants
             .get(&principal)
-            .is_some_and(|patterns| patterns.iter().any(|pattern| pattern.matches(path)));
+            .filter(|g| g.patterns.iter().any(|p| p.matches(path)))
+            .map(|g| g.revision)
+            .ok_or(SecretAccessError::AccessDenied)?;
         drop(grants);
-
-        if !allowed {
+        let value = self.vault.load(path)?;
+        let grants = self
+            .read_grants
+            .read()
+            .map_err(|_| SecretAccessError::Unavailable)?;
+        if !grants
+            .get(&principal)
+            .is_some_and(|g| g.revision == revision && g.patterns.iter().any(|p| p.matches(path)))
+        {
             return Err(SecretAccessError::AccessDenied);
         }
-
-        self.vault.load(path)?.ok_or(SecretAccessError::NotFound)
+        value.ok_or(SecretAccessError::NotFound)
     }
 }
 

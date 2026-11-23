@@ -12,11 +12,12 @@ use rintawa_artifacts::{ArtifactDigest, AssetDigest, AssetMediaType, AssetRef};
 use rintawa_extension_engine::{
     ActivationPlanError, ArtifactStoreAccess, AssetStoreAccess, CompositionAccess,
     CompositionActivation, EngineError, ExtensionEngine, HostAccessError, HostAccessResult,
-    ImportedArtifact, ImportedAsset, PreferenceAccess, RtwExtensionLoadOutcome, RtwExtensionLoader,
-    RuntimeArtifactPolicy, RuntimeContextAccess, RuntimeHttpOriginGrant, RuntimePolicyAccess,
-    RuntimePolicyComponent, RuntimePolicyRequest, UnresolvedContractReason, UserResourceAccess,
-    UserResourceRef, WasmWorldSystemEndpoint, WorldDataAccess, WorldSessionAccess,
-    WorldSessionAssetRef, WorldSessionSummary,
+    ImportedArtifact, ImportedAsset, LivePolicyChange, LivePolicyControl, LivePolicyDelta,
+    PreferenceAccess, RtwExtensionLoadOutcome, RtwExtensionLoader, RuntimeArtifactPolicy,
+    RuntimeContextAccess, RuntimeHttpOriginGrant, RuntimePolicyAccess, RuntimePolicyComponent,
+    RuntimePolicyRequest, UnresolvedContractReason, UserResourceAccess, UserResourceRef,
+    WasmWorldSystemEndpoint, WorldDataAccess, WorldSessionAccess, WorldSessionAssetRef,
+    WorldSessionSummary,
 };
 use rintawa_sdk::{
     contracts::{
@@ -459,6 +460,7 @@ impl UserResourceRuntimeControl {
 }
 
 struct LocalHostAccess {
+    live_policy: Mutex<Option<LivePolicyControl>>,
     home_root: PathBuf,
     user_resources: UserResourceRuntimeControl,
     world_sessions: WorldSessionRuntimeControl,
@@ -473,11 +475,96 @@ impl LocalHostAccess {
         world_data: WorldDataRuntimeControl,
     ) -> Self {
         Self {
+            live_policy: Mutex::new(None),
             home_root: home_root.to_path_buf(),
             user_resources,
             world_sessions,
             world_data,
         }
+    }
+
+    fn policy_control(&self) -> HostAccessResult<LivePolicyControl> {
+        self.live_policy
+            .lock()
+            .map_err(|_| HostAccessError::Unavailable)?
+            .clone()
+            .ok_or(HostAccessError::Unavailable)
+    }
+
+    fn apply_policy(&self, change: &LivePolicyChange) -> HostAccessResult<()> {
+        let home = self.home()?;
+        let t = &change.target;
+        let d = &change.delta;
+        let scope = RuntimeScopeId::new(t.scope_id.as_str());
+        let owner = ComponentRef::new(t.instance_id.as_str(), t.component_id.as_str());
+        // Keep the existing composition lock through live publication. The live
+        // control fences activation changes; neither path reenters Engine.
+        let _scope_lock = home
+            .lock_composition_scope(&scope)
+            .map_err(map_host_access_error)?;
+        let mut profile = home
+            .load_composition_for_scope_locked(&scope)
+            .map_err(map_host_access_error)?;
+        if !profile.activations.iter().any(|a| {
+            a.enabled
+                && a.scope_id == scope
+                && a.instance_id == owner.instance_id
+                && a.artifact.to_string() == t.artifact
+        }) {
+            return Err(HostAccessError::Rejected);
+        }
+        for p in &d.grant_runtime {
+            profile.grant_runtime_permission(crate::RuntimePermissionGrant::new(
+                scope.clone(),
+                owner.clone(),
+                *p,
+            ));
+        }
+        for p in &d.revoke_runtime {
+            profile.revoke_runtime_permission(&scope, &owner, *p);
+        }
+        for origin in &d.allow_http_origins {
+            profile
+                .grant_http_loopback_origin(crate::HttpLoopbackOriginGrant::new(
+                    scope.clone(),
+                    owner.clone(),
+                    origin.clone(),
+                ))
+                .map_err(map_host_access_error)?;
+        }
+        for origin in &d.deny_http_origins {
+            profile.revoke_http_loopback_origin(&scope, &owner, origin);
+        }
+        for path in &d.allow_secret_read {
+            profile
+                .grant_secret_read(crate::SecretReadGrant {
+                    scope_id: scope.clone(),
+                    instance_id: owner.instance_id.clone(),
+                    component_id: owner.component_id.clone(),
+                    path: path.clone(),
+                })
+                .map_err(map_host_access_error)?;
+        }
+        for path in &d.deny_secret_read {
+            profile.revoke_secret_read(&scope, &owner, path);
+        }
+        self.policy_control()?.apply(change, || {
+            home.save_composition_for_scope(&scope, &profile)
+                .map_err(map_host_access_error)
+        })
+    }
+    fn apply_current_policy(
+        &self,
+        scope: &str,
+        instance: &str,
+        component: &str,
+        delta: LivePolicyDelta,
+    ) -> HostAccessResult<()> {
+        let target = self
+            .policy_control()?
+            .snapshot(scope, instance, component)?
+            .target;
+        self.apply_policy(&LivePolicyChange { target, delta })
     }
 
     fn home(&self) -> HostAccessResult<HostHome> {
@@ -785,6 +872,19 @@ impl WorldSessionAccess for LocalHostAccess {
             .map_err(map_host_access_error)?;
         self.world_sessions.summary(result.world)
     }
+    fn create_from_template_with_permissions(
+        &self,
+        request: &str,
+    ) -> HostAccessResult<WorldSessionSummary> {
+        if request.len() > 64 * 1024 {
+            return Err(HostAccessError::MessageTooLarge);
+        }
+        let result = self
+            .home()?
+            .create_world_from_template_with_permissions(request)
+            .map_err(map_host_access_error)?;
+        self.world_sessions.summary(result.world)
+    }
     fn entry(&self, world_id: &str) -> HostAccessResult<Option<ComponentRef>> {
         let id = world_id
             .parse::<WorldId>()
@@ -937,6 +1037,22 @@ impl PreferenceAccess for LocalHostAccess {
             )
             .map_err(map_host_access_error)
     }
+
+    fn compare_exchange_published(
+        &self,
+        owner: &ComponentRef,
+        digest: &ArtifactDigest,
+        key: &str,
+        expected: Option<&str>,
+        value: Option<&str>,
+    ) -> HostAccessResult<bool> {
+        self.home()?
+            .compare_exchange_published_preference(owner, digest, key, expected, value)
+            .map_err(|error| match error {
+                HostError::PreferenceQuotaExceeded => HostAccessError::PreferenceQuotaExceeded,
+                _ => HostAccessError::Unavailable,
+            })
+    }
 }
 
 fn inspect_runtime_artifact(
@@ -971,6 +1087,49 @@ fn inspect_runtime_artifact(
 }
 
 impl RuntimePolicyAccess for LocalHostAccess {
+    fn live_component_policy(
+        &self,
+        scope: &str,
+        instance: &str,
+        component: &str,
+    ) -> HostAccessResult<String> {
+        let home = self.home()?;
+        let scope_id = RuntimeScopeId::new(scope);
+        let _lock = home
+            .lock_composition_scope(&scope_id)
+            .map_err(map_host_access_error)?;
+        let profile = home
+            .load_composition_for_scope_locked(&scope_id)
+            .map_err(map_host_access_error)?;
+        let snapshot = self
+            .policy_control()?
+            .snapshot(scope, instance, component)?;
+        if !profile.activations.iter().any(|a| {
+            a.enabled
+                && a.scope_id == scope_id
+                && a.instance_id.as_str() == instance
+                && a.artifact.to_string() == snapshot.target.artifact
+        }) {
+            return Err(HostAccessError::Rejected);
+        }
+        let mut value =
+            serde_json::to_value(&snapshot).map_err(|_| HostAccessError::Unavailable)?;
+        value["persisted"] = serde_json::json!({
+            "granted":profile.runtime_permissions.iter().filter(|g|g.scope_id==scope_id && g.instance_id.as_str()==instance && g.component_id.as_str()==component).map(|g|g.permission.to_string()).collect::<Vec<_>>(),
+            "httpOrigins":profile.http_loopback_origins.iter().filter(|g|g.scope_id==scope_id && g.instance_id.as_str()==instance && g.component_id.as_str()==component).map(|g|g.origin.clone()).collect::<Vec<_>>(),
+            "secretRead":profile.secret_read_grants.iter().filter(|g|g.scope_id==scope_id && g.instance_id.as_str()==instance && g.component_id.as_str()==component).map(|g|g.path.to_string()).collect::<Vec<_>>()
+        });
+        serde_json::to_string(&value).map_err(|_| HostAccessError::Unavailable)
+    }
+    fn apply_live_change(&self, raw: &str) -> HostAccessResult<()> {
+        if raw.len() > 64 * 1024 {
+            return Err(HostAccessError::Rejected);
+        }
+        let change: LivePolicyChange =
+            serde_json::from_str(raw).map_err(|_| HostAccessError::Rejected)?;
+        self.apply_policy(&change)
+    }
+
     fn list_http_origins(&self, scope_id: &str) -> HostAccessResult<Vec<RuntimeHttpOriginGrant>> {
         self.home()?
             .list_http_loopback_origins(&RuntimeScopeId::new(scope_id))
@@ -995,13 +1154,15 @@ impl RuntimePolicyAccess for LocalHostAccess {
         component_id: &str,
         origin: &str,
     ) -> HostAccessResult<()> {
-        self.home()?
-            .grant_http_loopback_origin(
-                RuntimeScopeId::new(scope_id),
-                ComponentRef::new(instance_id, component_id),
-                origin,
-            )
-            .map_err(map_host_access_error)
+        self.apply_current_policy(
+            scope_id,
+            instance_id,
+            component_id,
+            LivePolicyDelta {
+                allow_http_origins: vec![origin.into()],
+                ..Default::default()
+            },
+        )
     }
 
     fn revoke_http_origin(
@@ -1011,13 +1172,15 @@ impl RuntimePolicyAccess for LocalHostAccess {
         component_id: &str,
         origin: &str,
     ) -> HostAccessResult<()> {
-        self.home()?
-            .revoke_http_loopback_origin(
-                &RuntimeScopeId::new(scope_id),
-                &ComponentRef::new(instance_id, component_id),
-                origin,
-            )
-            .map_err(map_host_access_error)
+        self.apply_current_policy(
+            scope_id,
+            instance_id,
+            component_id,
+            LivePolicyDelta {
+                deny_http_origins: vec![origin.into()],
+                ..Default::default()
+            },
+        )
     }
 
     fn inspect_artifact(&self, digest: &str) -> HostAccessResult<RuntimeArtifactPolicy> {
@@ -1051,13 +1214,15 @@ impl RuntimePolicyAccess for LocalHostAccess {
         let permission: RuntimePermission = permission
             .parse()
             .map_err(|_| HostAccessError::InvalidPermission)?;
-        self.home()?
-            .grant_runtime_permission(
-                RuntimeScopeId::new(scope_id),
-                ComponentRef::new(instance_id, component_id),
-                permission,
-            )
-            .map_err(map_host_access_error)
+        self.apply_current_policy(
+            scope_id,
+            instance_id,
+            component_id,
+            LivePolicyDelta {
+                grant_runtime: vec![permission],
+                ..Default::default()
+            },
+        )
     }
 
     fn revoke(
@@ -1070,13 +1235,15 @@ impl RuntimePolicyAccess for LocalHostAccess {
         let permission: RuntimePermission = permission
             .parse()
             .map_err(|_| HostAccessError::InvalidPermission)?;
-        self.home()?
-            .revoke_runtime_permission(
-                &RuntimeScopeId::new(scope_id),
-                &ComponentRef::new(instance_id, component_id),
-                permission,
-            )
-            .map_err(map_host_access_error)
+        self.apply_current_policy(
+            scope_id,
+            instance_id,
+            component_id,
+            LivePolicyDelta {
+                revoke_runtime: vec![permission],
+                ..Default::default()
+            },
+        )
     }
 }
 
@@ -1413,6 +1580,11 @@ impl HostRuntime {
             preference_access,
             runtime_policy_access,
         );
+        *access
+            .live_policy
+            .lock()
+            .map_err(|_| HostError::WorldSessionControlUnavailable)? =
+            Some(engine.live_policy_control());
         let runtime_context_access: Arc<dyn RuntimeContextAccess> = access.clone();
         engine.attach_runtime_context_access(runtime_context_access);
         engine.attach_user_resource_access(user_resource_access);
@@ -2028,6 +2200,11 @@ fn activate_composition(
                                 &grant.origin,
                             )?;
                         }
+                        crate::secret_config::apply_secret_read_grants(
+                            engine,
+                            profile,
+                            &activation,
+                        )?;
                         made_progress = true;
                     }
                     RtwExtensionLoadOutcome::Deferred(waiting) => {

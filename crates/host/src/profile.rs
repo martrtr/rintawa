@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    fs::{File, OpenOptions},
+    fs::{File, OpenOptions, TryLockError},
     io::Write,
     path::Path,
 };
@@ -12,6 +12,7 @@ use rintawa_extension_engine::{canonical_http_loopback_origin, validate_transpor
 use rintawa_sdk::{
     contracts::{ComponentRef, ContractKey, ContractVersion},
     runtime_permissions::RuntimePermission,
+    secrets::SecretPath,
     types::{ComponentId, ContractId, ExtensionInstanceId, RuntimeScopeId},
 };
 use serde::{Deserialize, Serialize};
@@ -250,6 +251,20 @@ impl PreferenceRecord {
     }
 }
 
+/// One local exact secret-path approval, never inherited by copied Worlds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct SecretReadGrant {
+    /// Scope containing the selected activation.
+    pub scope_id: RuntimeScopeId,
+    /// Exact installed instance, not a package ID or template slot.
+    pub instance_id: ExtensionInstanceId,
+    /// Manifest-authorized consuming component.
+    pub component_id: ComponentId,
+    /// One canonical secret path. Wildcards cannot be persisted here.
+    pub path: SecretPath,
+}
+
 /// Persistent exact-artifact composition for one host-owned runtime scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -277,6 +292,9 @@ pub struct CompositionProfile {
     /// Individually approved local HTTP origins for exact component principals.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub http_loopback_origins: Vec<HttpLoopbackOriginGrant>,
+    /// Local exact secret approvals, excluded from templates and fresh materializations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_read_grants: Vec<SecretReadGrant>,
     /// Owner-scoped non-authoritative extension preferences.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub preferences: Vec<PreferenceRecord>,
@@ -293,6 +311,7 @@ impl Default for CompositionProfile {
             authoritative_providers: Vec::new(),
             runtime_permissions: Vec::new(),
             http_loopback_origins: Vec::new(),
+            secret_read_grants: Vec::new(),
             preferences: Vec::new(),
         }
     }
@@ -302,6 +321,23 @@ impl CompositionProfile {
     // Atomic rename changes the profile inode. Lock a stable adjacent file instead;
     // never unlink it while other handles/processes might be waiting on it.
     pub(crate) fn lock(path: &Path) -> HostResult<File> {
+        let file = Self::open_lock(path)?;
+        file.lock()?;
+        Ok(file)
+    }
+
+    pub(crate) fn try_lock(path: &Path) -> HostResult<File> {
+        let file = Self::open_lock(path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(TryLockError::WouldBlock) => {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into())
+            }
+            Err(TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+
+    fn open_lock(path: &Path) -> HostResult<File> {
         let lock_path = path.with_extension("toml.lock");
         if let Ok(metadata) = std::fs::symlink_metadata(&lock_path)
             && (metadata.file_type().is_symlink() || !metadata.is_file())
@@ -312,14 +348,12 @@ impl CompositionProfile {
             )
             .into());
         }
-        let file = OpenOptions::new()
+        Ok(OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(lock_path)?;
-        file.lock()?;
-        Ok(file)
+            .open(lock_path)?)
     }
 
     pub(crate) fn load(path: &Path) -> HostResult<Self> {
@@ -348,6 +382,7 @@ impl CompositionProfile {
             )
             .chain(self.runtime_permissions.iter().map(|item| &item.scope_id))
             .chain(self.http_loopback_origins.iter().map(|item| &item.scope_id))
+            .chain(self.secret_read_grants.iter().map(|item| &item.scope_id))
             .chain(self.preferences.iter().map(|item| &item.scope_id))
             .find(|scope| *scope != expected);
         if let Some(actual) = actual {
@@ -474,6 +509,35 @@ impl CompositionProfile {
             }
             if !origin_grants.insert((key, grant.origin.clone())) {
                 return Err(HostError::DuplicateHttpLoopbackOriginGrant);
+            }
+        }
+
+        if self.secret_read_grants.len() > 256 {
+            return Err(HostError::InvalidSecretPolicy(
+                "at most 256 exact approvals per profile".into(),
+            ));
+        }
+        let mut secrets = HashSet::new();
+        for grant in &self.secret_read_grants {
+            if grant.scope_id.as_str() == crate::DEFAULT_WORLD_SCOPE
+                || !self
+                    .activations
+                    .iter()
+                    .any(|a| a.scope_id == grant.scope_id && a.instance_id == grant.instance_id)
+            {
+                return Err(HostError::InvalidSecretPolicy(
+                    "secret approval must name a concrete local activation".into(),
+                ));
+            }
+            if !secrets.insert((
+                &grant.scope_id,
+                &grant.instance_id,
+                &grant.component_id,
+                &grant.path,
+            )) {
+                return Err(HostError::InvalidSecretPolicy(
+                    "duplicate exact secret approval".into(),
+                ));
             }
         }
 
@@ -677,6 +741,27 @@ impl CompositionProfile {
             .retain(|entry| &entry.scope_id != scope || entry.point != point);
     }
 
+    pub(crate) fn grant_secret_read(&mut self, grant: SecretReadGrant) -> HostResult<()> {
+        if !self.secret_read_grants.contains(&grant) {
+            self.secret_read_grants.push(grant);
+        }
+        self.validate()
+    }
+
+    pub(crate) fn revoke_secret_read(
+        &mut self,
+        scope: &RuntimeScopeId,
+        owner: &ComponentRef,
+        path: &SecretPath,
+    ) {
+        self.secret_read_grants.retain(|g| {
+            &g.scope_id != scope
+                || g.instance_id != owner.instance_id
+                || g.component_id != owner.component_id
+                || &g.path != path
+        });
+    }
+
     pub(crate) fn grant_runtime_permission(&mut self, grant: RuntimePermissionGrant) {
         if !self.runtime_permissions.contains(&grant) {
             self.runtime_permissions.push(grant);
@@ -846,6 +931,8 @@ impl CompositionProfile {
             authoritative_providers,
             runtime_permissions,
             http_loopback_origins,
+            // Secret approvals refer to exact local identities and never seed a copy.
+            secret_read_grants: Vec::new(),
             preferences,
         }
     }
@@ -902,6 +989,9 @@ impl CompositionProfile {
             grant.scope_id != removed.scope_id || grant.instance_id != removed.instance_id
         });
         self.http_loopback_origins.retain(|grant| {
+            grant.scope_id != removed.scope_id || grant.instance_id != removed.instance_id
+        });
+        self.secret_read_grants.retain(|grant| {
             grant.scope_id != removed.scope_id || grant.instance_id != removed.instance_id
         });
         self.preferred_providers.retain(|selection| {

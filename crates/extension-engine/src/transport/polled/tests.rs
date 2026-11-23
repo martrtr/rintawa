@@ -36,12 +36,13 @@ fn result(
     owner: &ExecutionContext,
     handle: u64,
 ) -> Result<Vec<Vec<u8>>, Error> {
+    wait_result(|| transport.poll_query(owner, handle))
+}
+fn wait_result<T>(mut poll: impl FnMut() -> Result<Option<T>, Error>) -> Result<T, Error> {
     let until = Instant::now() + Duration::from_secs(2);
     loop {
-        match transport.poll_query(owner, handle) {
-            Ok(None) => {}
-            Ok(Some(result)) => return Ok(result),
-            Err(error) => return Err(error),
+        if let Some(result) = poll()? {
+            return Ok(result);
         }
         assert!(Instant::now() < until, "query never completed");
         std::thread::sleep(Duration::from_millis(1));
@@ -397,7 +398,143 @@ fn test_callback_and_polled_declarations_share_quota_and_authoritative_selection
     Ok(())
 }
 #[test]
-fn test_all_seven_imports_return_promptly_while_transport_work_is_paused() -> Result<(), Error> {
+fn test_sourced_poll_attests_two_responders_and_shares_raw_handle_ownership() -> Result<(), Error> {
+    let transport = Transport::default();
+    let caller = context(&transport, "caller", "world");
+    let a = context(&transport, "a", "world");
+    let b = context(&transport, "b", "world");
+    let foreign = context(&transport, "foreign", "other");
+    let point = "fixture/sourced";
+    let da = transport.declare_polled(&a, point)?;
+    let db = retry(|| transport.declare_polled(&b, point))?;
+    let handle = retry(|| transport.begin_query(&caller, point, b"go"))?;
+    let qa = next(&transport, &a, da);
+    let qb = next(&transport, &b, db);
+    for other in [&a, &foreign] {
+        assert!(matches!(
+            retry(|| transport.poll_query_sourced(other, handle)),
+            Err(Error::InvalidHandle)
+        ));
+    }
+    assert!(transport.poll_query(&caller, handle)?.is_none());
+    let claimed_provider = serde_json::to_vec(&b.principal).unwrap();
+    retry(|| transport.reply_query(&a, qa.handle, Some(claimed_provider.clone())))?;
+    retry(|| transport.reply_query(&b, qb.handle, Some(b"legitimate".to_vec())))?;
+    let replies = wait_result(|| transport.poll_query_sourced(&caller, handle))?;
+    assert_eq!(replies.len(), 2);
+    assert!(
+        replies
+            .iter()
+            .any(|reply| { reply.provider == a.principal && reply.payload == claimed_provider })
+    );
+    assert!(
+        replies
+            .iter()
+            .any(|reply| { reply.provider == b.principal && reply.payload == b"legitimate" })
+    );
+    assert!(matches!(
+        transport.poll_query(&caller, handle),
+        Err(Error::InvalidHandle)
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_sourced_poll_rejects_missing_malformed_oversized_and_foreign_sources() -> Result<(), Error>
+{
+    use crate::transport::{MAX_REPLY_SOURCE_BYTES, REPLY_SOURCE_PREFIX};
+
+    let transport = Transport::default();
+    let caller = context(&transport, "caller", "world");
+    let native = context(&transport, "native-provider", "world");
+    let foreign = context(&transport, "foreign-provider", "other");
+    let point = "fixture/invalid-source";
+    let payload = serde_json::to_vec(&native.principal).unwrap();
+    let callback_payload = payload.clone();
+    transport.declare(
+        &native.principal.component(),
+        &native.scope,
+        point,
+        move |query, _| {
+            let reply = query.reply(query.key_expr().as_str(), callback_payload.clone());
+            match query.payload().unwrap().to_bytes().as_ref() {
+                b"missing" => reply.wait(),
+                b"malformed" => reply
+                    .attachment([REPLY_SOURCE_PREFIX, b"{}"].concat())
+                    .wait(),
+                b"oversized" => {
+                    let mut source = [REPLY_SOURCE_PREFIX, &callback_payload].concat();
+                    source.resize(MAX_REPLY_SOURCE_BYTES + 1, b' ');
+                    reply.attachment(source).wait()
+                }
+                _ => reply_with_source(&query, &foreign.principal, callback_payload.clone()),
+            }
+            .unwrap();
+        },
+    )?;
+    for request in [
+        b"missing".as_slice(),
+        b"malformed",
+        b"oversized",
+        b"foreign",
+    ] {
+        let handle = retry(|| transport.begin_query(&caller, point, request))?;
+        assert!(matches!(
+            wait_result(|| transport.poll_query_sourced(&caller, handle)),
+            Err(Error::Unavailable)
+        ));
+        assert!(matches!(
+            transport.poll_query(&caller, handle),
+            Err(Error::InvalidHandle)
+        ));
+        let raw = retry(|| transport.begin_query(&caller, point, request))?;
+        assert_eq!(result(&transport, &caller, raw)?, vec![payload.clone()]);
+        assert!(matches!(
+            transport.poll_query_sourced(&caller, raw),
+            Err(Error::InvalidHandle)
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn test_sourced_poll_checks_activation_after_reply_collection() -> Result<(), Error> {
+    for replace in [false, true] {
+        let transport = Transport::default();
+        let caller = context(&transport, "caller", "world");
+        let provider = context(&transport, "provider", "world");
+        let point = "fixture/retired-source";
+        let declaration = transport.declare_polled(&provider, point)?;
+        let handle = retry(|| transport.begin_query(&caller, point, b"go"))?;
+        let request = next(&transport, &provider, declaration);
+        retry(|| transport.reply_query(&provider, request.handle, Some(b"old".to_vec())))?;
+        wait_for(|| {
+            let state = transport.state.lock().unwrap();
+            let query = &state.polled.outgoing[&handle];
+            query.done && query.values.len() == 1
+        });
+        transport.revoke_activation(&provider);
+        if replace {
+            let replacement = context(&transport, "provider", "world");
+            assert_ne!(
+                provider.principal.activation,
+                replacement.principal.activation
+            );
+        }
+        assert!(matches!(
+            wait_result(|| transport.poll_query_sourced(&caller, handle)),
+            Err(Error::Unavailable)
+        ));
+        assert!(matches!(
+            transport.poll_query(&caller, handle),
+            Err(Error::InvalidHandle)
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn test_all_eight_imports_return_promptly_while_transport_work_is_paused() -> Result<(), Error> {
     let transport = Transport::default();
     let caller = context(&transport, "caller", "world");
     let provider = context(&transport, "provider", "world");
@@ -410,6 +547,7 @@ fn test_all_seven_imports_return_promptly_while_transport_work_is_paused() -> Re
     let before = Instant::now();
     let handle = transport.begin_query(&caller, "fixture/prompt", b"begin")?;
     assert!(transport.poll_query(&caller, handle)?.is_none());
+    assert!(transport.poll_query_sourced(&caller, handle)?.is_none());
     transport.close_query(&caller, handle)?;
     let pending = transport.declare_polled(&provider, "fixture/pending")?;
     assert!(transport.next_query(&provider, pending)?.is_none());
@@ -545,10 +683,12 @@ fn test_publication_failure_is_observable_and_its_handle_can_be_closed() -> Resu
     session.close().wait().map_err(|_| Error::Unavailable)?;
     let declaration = transport.declare_polled(&provider, "fixture/failure")?;
     wait_for(|| transport.state.lock().unwrap().polled.declarations[&declaration].failed);
-    assert!(matches!(
-        transport.next_query(&provider, declaration),
-        Err(Error::Unavailable)
-    ));
+    wait_for(|| {
+        matches!(
+            transport.next_query(&provider, declaration),
+            Err(Error::Unavailable)
+        )
+    });
     retry(|| transport.close_queryable(&provider, declaration))?;
     assert_eq!(
         transport
@@ -586,4 +726,22 @@ fn test_successful_replies_are_returned_at_deadline_despite_silent_provider() ->
     );
     retry(|| transport.close_queryable(&silent, declaration))?;
     Ok(())
+}
+
+#[test]
+fn next_query_reports_pending_during_native_control_contention() {
+    let transport = Transport::default();
+    let provider = context(&transport, "busy-provider", "world");
+    let declaration = retry(|| transport.declare_polled(&provider, "fixture/busy")).unwrap();
+    let guard = transport.state.lock().unwrap();
+    assert!(matches!(
+        transport.next_query(&provider, declaration),
+        Ok(None)
+    ));
+    drop(guard);
+    assert!(matches!(
+        retry(|| transport.next_query(&provider, declaration)),
+        Ok(None)
+    ));
+    retry(|| transport.close_queryable(&provider, declaration)).unwrap();
 }

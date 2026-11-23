@@ -7,7 +7,7 @@
 use std::{
     io::Read,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     },
@@ -82,14 +82,19 @@ enum WorkerEvent {
     Failed(HttpRequestError),
 }
 
+struct HttpBuffer {
+    receiver: Option<Receiver<WorkerEvent>>,
+    pending_chunk: Vec<u8>,
+}
+
 /// Each handle is bound to its initiating component principal.
 pub(super) struct OwnedHttpRequest {
     pub(super) owner: ComponentRef,
     activation: u64,
-    receiver: Receiver<WorkerEvent>,
+    buffer: Arc<Mutex<HttpBuffer>>,
     cancelled: Arc<AtomicBool>,
+    policy: Option<Arc<crate::runtime_permissions::RuntimeCancellation>>,
     local_origin: Option<Url>,
-    pending_chunk: Vec<u8>,
     deadline: Instant,
     completed: bool,
     failure: Option<HttpRequestError>,
@@ -180,10 +185,13 @@ impl WasmHostState {
                     .principal
                     .activation,
                 owner,
-                receiver,
+                buffer: Arc::new(Mutex::new(HttpBuffer {
+                    receiver: Some(receiver),
+                    pending_chunk: Vec::new(),
+                })),
                 cancelled,
+                policy: None,
                 local_origin,
-                pending_chunk: Vec::new(),
                 deadline: Instant::now() + Duration::from_millis(self.http_fetch_timeout_ms),
                 completed: false,
                 failure: None,
@@ -193,8 +201,12 @@ impl WasmHostState {
     }
 }
 
-impl HttpRequestHost for WasmHostState {
-    fn start(&mut self, request: WitHttpRequest) -> Result<u64, HttpRequestError> {
+impl WasmHostState {
+    fn start_http_request(
+        &mut self,
+        request: WitHttpRequest,
+        timeout_ms: u64,
+    ) -> Result<u64, HttpRequestError> {
         let owner = self.current_http_owner()?;
         if self
             .http_requests
@@ -218,21 +230,72 @@ impl HttpRequestHost for WasmHostState {
         }
         let (sender, receiver) = mpsc::sync_channel(HTTP_WORKER_CHANNEL_CAPACITY);
         let cancelled = Arc::new(AtomicBool::new(false));
-        let worker_cancelled = Arc::clone(&cancelled);
-        let timeout = Duration::from_millis(self.http_fetch_timeout_ms);
-        let permit = HttpWorkerPermit::acquire()?;
-
+        let worker_cancelled = cancelled.clone();
+        let activation = self
+            .execution_context
+            .as_ref()
+            .ok_or(HttpRequestError::AccessNotActive)?
+            .principal
+            .activation;
+        let timeout = Duration::from_millis(timeout_ms);
         let local_origin = (validated.url.scheme() == "http").then(|| validated.url.clone());
+        let handle = self.allocate_http_request_handle(
+            owner.clone(),
+            receiver,
+            cancelled.clone(),
+            local_origin,
+        )?;
+        let deadline = Instant::now() + timeout;
+        self.http_requests.get_mut(&handle).unwrap().deadline = deadline;
+        let buffer = self.http_requests[&handle].buffer.clone();
+        let result = (|| {
+            let policy = self
+                .runtime_permissions
+                .register_http(
+                    &owner,
+                    activation,
+                    &validated.url,
+                    cancelled.clone(),
+                    Some(Box::new(move || {
+                        let mut buffer = buffer.lock().unwrap_or_else(|e| e.into_inner());
+                        buffer.receiver.take();
+                        buffer.pending_chunk.clear();
+                    })),
+                )
+                .map_err(|_| HttpRequestError::PermissionDenied)?;
+            self.http_requests.get_mut(&handle).unwrap().policy = Some(policy);
+            let permit = HttpWorkerPermit::acquire()?;
+            thread::Builder::new()
+                .name("rintawa-http-request".into())
+                .spawn(move || {
+                    let _permit = permit;
+                    run_http_worker(validated, deadline, sender, worker_cancelled);
+                })
+                .map_err(|_| HttpRequestError::Unavailable)?;
+            Ok(handle)
+        })();
+        if result.is_err() {
+            self.http_requests.remove(&handle);
+        }
+        result
+    }
+}
 
-        thread::Builder::new()
-            .name(String::from("rintawa-http-request"))
-            .spawn(move || {
-                let _permit = permit;
-                run_http_worker(validated, timeout, sender, worker_cancelled);
-            })
-            .map_err(|_| HttpRequestError::Unavailable)?;
-
-        self.allocate_http_request_handle(owner, receiver, cancelled, local_origin)
+impl HttpRequestHost for WasmHostState {
+    fn start(&mut self, request: WitHttpRequest) -> Result<u64, HttpRequestError> {
+        self.start_http_request(request, self.http_fetch_timeout_ms)
+    }
+    fn start_with_timeout(
+        &mut self,
+        request: WitHttpRequest,
+        timeout_ms: u32,
+    ) -> Result<u64, HttpRequestError> {
+        // The caller chooses its deadline; the shared Host still bounds retained
+        // resources. Discovery and existing callers retain the short default.
+        if timeout_ms == 0 || timeout_ms > 300_000 {
+            return Err(HttpRequestError::LimitExceeded);
+        }
+        self.start_http_request(request, u64::from(timeout_ms))
     }
 
     fn poll(&mut self, handle: u64, max_bytes: u32) -> Result<WitHttpEvent, HttpRequestError> {
@@ -255,6 +318,17 @@ impl HttpRequestHost for WasmHostState {
         {
             return Err(HttpRequestError::UnknownHandle);
         }
+        if request.policy.as_ref().is_some_and(|p| {
+            p.activation != request.activation || p.revoked.load(Ordering::Acquire)
+        }) {
+            request
+                .buffer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pending_chunk
+                .clear();
+            request.failure = Some(HttpRequestError::PermissionDenied);
+        }
         // A revoked origin cannot be used to drain response bytes previously
         // queued by an in-flight HTTP worker.
         if let Some(origin) = &request.local_origin {
@@ -264,49 +338,90 @@ impl HttpRequestHost for WasmHostState {
                 .map_err(|()| HttpRequestError::Unavailable)?;
             if !is_authorized {
                 request.cancelled.store(true, Ordering::Release);
-                request.pending_chunk.clear();
+                request
+                    .buffer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pending_chunk
+                    .clear();
                 request.failure = Some(HttpRequestError::PermissionDenied);
             }
         }
         if !request.completed && request.failure.is_none() && Instant::now() >= request.deadline {
             request.cancelled.store(true, Ordering::Release);
-            request.pending_chunk.clear();
+            request
+                .buffer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pending_chunk
+                .clear();
             request.failure = Some(HttpRequestError::Timeout);
         }
 
-        if !request.pending_chunk.is_empty() {
-            return Ok(read_chunk(request, read_limit));
-        }
-        if let Some(failure) = request.failure {
-            return Ok(WitHttpEvent::Failed(failure));
-        }
-        if request.completed {
-            return Ok(WitHttpEvent::Completed);
-        }
-        match request.receiver.try_recv() {
-            Ok(WorkerEvent::Head(head)) => Ok(WitHttpEvent::Response(head)),
-            Ok(WorkerEvent::Chunk(chunk)) => {
-                request.pending_chunk = chunk;
-                Ok(read_chunk(request, read_limit))
+        let policy = self.runtime_permissions.clone();
+        let origin = request.local_origin.clone();
+        match policy.while_http_authorized(&owner, origin.as_ref(), || {
+            let mut buffer = request
+                .buffer
+                .try_lock()
+                .map_err(|_| HttpRequestError::Unavailable)?;
+            if !buffer.pending_chunk.is_empty() {
+                return Ok(read_chunk(&mut buffer, read_limit));
             }
-            Ok(WorkerEvent::Completed) => {
-                request.completed = true;
-                Ok(WitHttpEvent::Completed)
+            if let Some(failure) = request.failure {
+                return Ok(WitHttpEvent::Failed(failure));
             }
-            Ok(WorkerEvent::Failed(error)) => {
-                request.failure = Some(error);
-                Ok(WitHttpEvent::Failed(error))
+            if request.completed {
+                return Ok(WitHttpEvent::Completed);
             }
-            Err(TryRecvError::Empty) => Ok(WitHttpEvent::Pending),
-            Err(TryRecvError::Disconnected) => {
-                request.failure = Some(HttpRequestError::Unavailable);
-                Ok(WitHttpEvent::Failed(HttpRequestError::Unavailable))
+            let Some(receiver) = buffer.receiver.as_ref() else {
+                return Ok(WitHttpEvent::Failed(HttpRequestError::PermissionDenied));
+            };
+            match receiver.try_recv() {
+                Ok(WorkerEvent::Head(head)) => Ok(WitHttpEvent::Response(head)),
+                Ok(WorkerEvent::Chunk(chunk)) => {
+                    buffer.pending_chunk = chunk;
+                    Ok(read_chunk(&mut buffer, read_limit))
+                }
+                Ok(WorkerEvent::Completed) => {
+                    request.completed = true;
+                    Ok(WitHttpEvent::Completed)
+                }
+                Ok(WorkerEvent::Failed(error)) => {
+                    request.failure = Some(error);
+                    Ok(WitHttpEvent::Failed(error))
+                }
+                Err(TryRecvError::Empty) => Ok(WitHttpEvent::Pending),
+                Err(TryRecvError::Disconnected) => {
+                    request.failure = Some(HttpRequestError::Unavailable);
+                    Ok(WitHttpEvent::Failed(HttpRequestError::Unavailable))
+                }
             }
+        }) {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                request.cancelled.store(true, Ordering::Release);
+                request
+                    .buffer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pending_chunk
+                    .clear();
+                request.failure = Some(HttpRequestError::PermissionDenied);
+                Ok(WitHttpEvent::Failed(HttpRequestError::PermissionDenied))
+            }
+            Err(()) => Err(HttpRequestError::Unavailable),
         }
     }
 
     fn close(&mut self, handle: u64) -> Result<(), HttpRequestError> {
-        let owner = self.current_http_owner()?;
+        if !self.http_request_access_active {
+            return Err(HttpRequestError::AccessNotActive);
+        }
+        let owner = self
+            .current_execution_owner()
+            .cloned()
+            .ok_or(HttpRequestError::AccessNotActive)?;
         let Some(request) = self.http_requests.get(&handle) else {
             return Err(HttpRequestError::UnknownHandle);
         };
@@ -324,7 +439,7 @@ impl HttpRequestHost for WasmHostState {
     }
 }
 
-fn read_chunk(request: &mut OwnedHttpRequest, max_bytes: usize) -> WitHttpEvent {
+fn read_chunk(request: &mut HttpBuffer, max_bytes: usize) -> WitHttpEvent {
     let read_bytes = max_bytes.min(request.pending_chunk.len());
     let bytes: Vec<_> = request.pending_chunk.drain(..read_bytes).collect();
     WitHttpEvent::Data(bytes)
@@ -415,11 +530,11 @@ fn is_forbidden_header(name: &HeaderName) -> bool {
 
 fn run_http_worker(
     request: ValidatedRequest,
-    timeout: Duration,
+    deadline: Instant,
     sender: SyncSender<WorkerEvent>,
     cancelled: Arc<AtomicBool>,
 ) {
-    let deadline = Instant::now() + timeout;
+    let timeout = deadline.saturating_duration_since(Instant::now());
     let outcome = perform_http_request(&request, timeout, deadline, &sender, &cancelled);
     if !cancelled.load(Ordering::Acquire) {
         let terminal = match outcome {
@@ -440,6 +555,9 @@ fn perform_http_request(
     if cancelled.load(Ordering::Acquire) {
         return Err(HttpRequestError::Unavailable);
     }
+    if Instant::now() >= deadline {
+        return Err(HttpRequestError::Timeout);
+    }
     let is_loopback_http = request.url.scheme() == "http";
     if is_loopback_http && !has_active_local_grant(request)? {
         return Err(HttpRequestError::ForbiddenDestination);
@@ -452,10 +570,15 @@ fn perform_http_request(
     if is_loopback_http && !has_active_local_grant(request)? {
         return Err(HttpRequestError::PermissionDenied);
     }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(HttpRequestError::Timeout);
+    }
     let mut response = client
         .request(request.method.clone(), request.url.clone())
         .headers(request.headers.clone())
         .body(request.body.clone())
+        .timeout(remaining)
         .send()
         .map_err(map_transport_error)?;
 
@@ -1093,7 +1216,7 @@ mod tests {
             move || {
                 run_http_worker(
                     validated,
-                    Duration::from_millis(50),
+                    Instant::now() + Duration::from_millis(50),
                     sender,
                     worker_cancelled,
                 )
@@ -1208,6 +1331,59 @@ mod loopback_http_integration_tests {
         test_execute_as(&mut state, principal);
         state.http_request_access_active = true;
         state
+    }
+
+    #[test]
+    fn explicit_timeout_outlives_short_default_without_changing_discovery_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_http_request(&mut stream);
+            thread::sleep(Duration::from_millis(150));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let mut state = state("timeout");
+        state.http_fetch_timeout_ms = 30;
+        state
+            .runtime_permissions
+            .approve_http_loopback_origin(owner("timeout"), &origin)
+            .unwrap();
+        for timeout in [0, 300_001] {
+            assert!(matches!(
+                HttpRequestHost::start_with_timeout(
+                    &mut state,
+                    make_request(&format!("{origin}/v1/test"), "POST", b"{}"),
+                    timeout
+                ),
+                Err(HttpRequestError::LimitExceeded)
+            ));
+        }
+        assert!(state.http_requests.is_empty());
+        let handle = HttpRequestHost::start_with_timeout(
+            &mut state,
+            make_request(&format!("{origin}/v1/test"), "POST", b"{}"),
+            1000,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut bytes = Vec::new();
+        loop {
+            assert!(Instant::now() < deadline);
+            match HttpRequestHost::poll(&mut state, handle, 1024).unwrap() {
+                WitHttpEvent::Pending => thread::sleep(Duration::from_millis(5)),
+                WitHttpEvent::Response(_) => {}
+                WitHttpEvent::Data(data) => bytes.extend(data),
+                WitHttpEvent::Completed => break,
+                WitHttpEvent::Failed(error) => panic!("explicit deadline failed: {error:?}"),
+            }
+        }
+        assert_eq!(bytes, b"ok");
+        assert_eq!(state.http_fetch_timeout_ms, 30);
+        HttpRequestHost::close(&mut state, handle).unwrap();
+        server.join().unwrap();
     }
 
     fn make_request(url: &str, method: &str, body: &[u8]) -> WitHttpRequest {
@@ -1334,6 +1510,66 @@ mod loopback_http_integration_tests {
         assert_eq!(collect(&mut state, handle), (200, b"hello world".to_vec()));
         HttpRequestHost::close(&mut state, handle).expect("close should succeed");
         server.join().expect("test server should finish");
+    }
+
+    #[test]
+    fn live_origin_revoke_discards_queued_bytes_and_regrant_does_not_revive_old_request() {
+        let (origin, server) = respond("200 OK", b"queued private bytes", false);
+        let mut state = state("first");
+        let who = owner("first");
+        state
+            .runtime_permissions
+            .approve_http_loopback_origin(who.clone(), &origin)
+            .unwrap();
+        let handle = HttpRequestHost::start(
+            &mut state,
+            make_request(&format!("{origin}/v1/test"), "POST", b"{\"hello\":true}"),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            assert!(Instant::now() < deadline);
+            match HttpRequestHost::poll(&mut state, handle, 1).unwrap() {
+                WitHttpEvent::Pending => thread::sleep(Duration::from_millis(1)),
+                WitHttpEvent::Response(_) => break,
+                _ => panic!("headers first"),
+            }
+        }
+        server.join().unwrap();
+        let token = state.http_requests[&handle].policy.clone().unwrap();
+        state
+            .runtime_permissions
+            .revoke_http_loopback_origin(&who, &origin)
+            .unwrap();
+        assert!(
+            token.cancelled.load(Ordering::Acquire),
+            "revocation must cancel without another guest poll"
+        );
+        assert!(
+            state.http_requests[&handle]
+                .buffer
+                .lock()
+                .unwrap()
+                .receiver
+                .is_none(),
+            "revoke must drop queued response bytes without polling"
+        );
+        state
+            .runtime_permissions
+            .approve_http_loopback_origin(who.clone(), &origin)
+            .unwrap();
+        assert!(matches!(
+            HttpRequestHost::poll(&mut state, handle, 32),
+            Ok(WitHttpEvent::Failed(HttpRequestError::PermissionDenied))
+        ));
+        state
+            .runtime_permissions
+            .revoke_component(&who, &state.transport.contexts);
+        assert!(
+            HttpRequestHost::close(&mut state, handle).is_ok(),
+            "cleanup remains allowed after HTTP revoke"
+        );
+        assert!(state.http_requests.is_empty());
     }
 
     #[test]

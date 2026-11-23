@@ -32,6 +32,9 @@ use zenoh::{
 pub(crate) const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_REPLIES: usize = 32;
 const MAX_TOTAL_REPLY_BYTES: usize = 512 * 1024;
+// Source overhead is bounded separately so the raw payload limit stays unchanged.
+const MAX_REPLY_SOURCE_BYTES: usize = 4096;
+const REPLY_SOURCE_PREFIX: &[u8] = b"rintawa-source/1\0";
 const MAX_DECLARATIONS_PER_OWNER: usize = 16;
 const MAX_CONCURRENT_PROVIDER_CALLBACKS: usize = 64;
 const MAX_SUBSCRIPTIONS_PER_OWNER: usize = 16;
@@ -143,6 +146,36 @@ fn session(state: &mut State) -> Result<Session, TransportError> {
         );
     }
     state.session.clone().ok_or(TransportError::Unavailable)
+}
+
+/// The private Zenoh session carries Host-authored reply identity outside guest bytes.
+pub(crate) fn reply_with_source(
+    query: &Query,
+    provider: &ComponentPrincipal,
+    payload: Vec<u8>,
+) -> zenoh::Result<()> {
+    let reply = query.reply(query.key_expr().as_str(), payload);
+    // Keep raw replies usable even when a trusted native owner has oversized IDs.
+    if provider.instance_id.as_str().len() + provider.component_id.as_str().len()
+        <= MAX_REPLY_SOURCE_BYTES
+    {
+        let mut source = REPLY_SOURCE_PREFIX.to_vec();
+        if serde_json::to_writer(&mut source, provider).is_ok()
+            && source.len() <= MAX_REPLY_SOURCE_BYTES
+        {
+            return reply.attachment(source).wait();
+        }
+    }
+    reply.wait()
+}
+
+fn reply_source(sample: &Sample) -> Option<ComponentPrincipal> {
+    let attachment = sample.attachment()?;
+    if attachment.len() > MAX_REPLY_SOURCE_BYTES {
+        return None;
+    }
+    let bytes = attachment.to_bytes();
+    serde_json::from_slice(bytes.strip_prefix(REPLY_SOURCE_PREFIX)?).ok()
 }
 
 /// Checks the syntax of an untrusted extension point name.

@@ -44,7 +44,9 @@ use crate::{
     host_access::{HostAccessError, HostAccessServices},
     runtime_permissions::RuntimePermissionManager,
     secrets::SecretManager,
-    transport::{MAX_PAYLOAD_BYTES, Transport, TransportError, validate_transport_point},
+    transport::{
+        MAX_PAYLOAD_BYTES, Transport, TransportError, reply_with_source, validate_transport_point,
+    },
 };
 
 mod asset_read;
@@ -157,7 +159,11 @@ use bindings::rintawa::engine::{
         Error as NetworkError, Host as NetworkHost, Listener as WitNetworkListener,
         ReadResult as WitNetworkReadResult,
     },
-    preferences::{Error as PreferenceError, Host as PreferencesHost},
+    preferences::{
+        Error as PreferenceError, Host as PreferencesHost,
+        PublishedError as PublishedPreferenceError,
+        PublishedWriteError as PublishedPreferenceWriteError,
+    },
     registration::{
         Error as RegistrationError, Host as RegistrationHost,
         ResolutionPolicy as WitResolutionPolicy,
@@ -177,6 +183,7 @@ use bindings::rintawa::engine::{
     secrets::{Error as SecretError, Host as SecretsHost},
     transport::{
         Error as TransportApiError, Host as TransportHost, InboundQuery as WitInboundQuery,
+        SourcedReply as WitSourcedReply,
     },
     user_resources::{
         Error as UserResourceError, Host as UserResourcesHost, ResourceRef as WitUserResourceRef,
@@ -313,6 +320,7 @@ struct WasmRegistrations {
 }
 
 struct ActiveWasmTask {
+    policy: Arc<crate::runtime_permissions::RuntimeCancellation>,
     context: ExecutionContext,
     owner: rintawa_sdk::contracts::ComponentRef,
     interval: Duration,
@@ -937,6 +945,12 @@ impl WasmHostState {
     fn next_task_due_in(&self, now: Instant) -> Option<Duration> {
         self.active_tasks
             .values()
+            .filter(|task| {
+                !task
+                    .policy
+                    .revoked
+                    .load(std::sync::atomic::Ordering::Acquire)
+            })
             .map(|task| task.next_due.saturating_duration_since(now))
             .min()
     }
@@ -945,7 +959,13 @@ impl WasmHostState {
         let mut tasks: Vec<_> = self
             .active_tasks
             .iter()
-            .filter(|(_, task)| task.next_due <= now)
+            .filter(|(_, task)| {
+                task.next_due <= now
+                    && !task
+                        .policy
+                        .revoked
+                        .load(std::sync::atomic::Ordering::Acquire)
+            })
             .map(|(handle, task)| (task.owner.clone(), *handle))
             .collect();
         tasks.sort_by(|left, right| {
@@ -980,15 +1000,24 @@ impl WasmHostState {
             .ok_or(SecretError::AccessNotActive)?;
         let path = SecretPath::parse(path).map_err(|_| SecretError::InvalidPath)?;
 
-        self.secrets
+        let value = self
+            .secrets
             .read_for_component(owner, &path)
-            .map(|value| value.expose_secret().to_string())
             .map_err(|error| match error {
                 SecretAccessError::InvalidPath => SecretError::InvalidPath,
                 SecretAccessError::AccessDenied => SecretError::AccessDenied,
                 SecretAccessError::NotFound => SecretError::NotFound,
                 SecretAccessError::Unavailable => SecretError::Unavailable,
-            })
+            })?;
+        let context = self
+            .execution_context
+            .as_ref()
+            .ok_or(SecretError::AccessNotActive)?;
+        self.transport
+            .contexts
+            .try_validate_execution(context, true)
+            .map_err(|_| SecretError::AccessNotActive)?;
+        Ok(value.expose_secret().to_string())
     }
 }
 
@@ -1240,6 +1269,12 @@ impl RuntimeTasksHost for WasmHostState {
         if interval_ms < self.min_background_task_interval_ms || interval_ms == 0 {
             return Err(RuntimeTaskError::InvalidInterval);
         }
+        self.active_tasks.retain(|_, task| {
+            !task
+                .policy
+                .revoked
+                .load(std::sync::atomic::Ordering::Acquire)
+        });
         let owned_count = self
             .active_tasks
             .values()
@@ -1254,9 +1289,23 @@ impl RuntimeTasksHost for WasmHostState {
             .checked_add(1)
             .ok_or(RuntimeTaskError::Unavailable)?;
         let interval = Duration::from_millis(u64::from(interval_ms));
+        let policy = self
+            .runtime_permissions
+            .register_resource(
+                &owner,
+                self.execution_context
+                    .as_ref()
+                    .ok_or(RuntimeTaskError::RuntimeNotActive)?
+                    .principal
+                    .activation,
+                RuntimePermission::BackgroundTask,
+                None,
+            )
+            .map_err(|_| RuntimeTaskError::PermissionDenied)?;
         self.active_tasks.insert(
             handle,
             ActiveWasmTask {
+                policy,
                 context: self
                     .execution_context
                     .clone()
@@ -1274,11 +1323,9 @@ impl RuntimeTasksHost for WasmHostState {
             return Err(RuntimeTaskError::RuntimeNotActive);
         }
         let owner = self
-            .runtime_permission_owner(RuntimePermission::BackgroundTask)
-            .map_err(|error| match error {
-                RuntimePermissionCheck::Denied => RuntimeTaskError::PermissionDenied,
-                RuntimePermissionCheck::Unavailable => RuntimeTaskError::Unavailable,
-            })?;
+            .current_execution_owner()
+            .cloned()
+            .ok_or(RuntimeTaskError::RuntimeNotActive)?;
         let Some(task) = self.active_tasks.get(&handle) else {
             return Err(RuntimeTaskError::UnknownTask);
         };
@@ -1762,6 +1809,25 @@ impl TransportHost for WasmHostState {
     fn poll_query(&mut self, handle: u64) -> Result<Option<Vec<Vec<u8>>>, TransportApiError> {
         self.transport
             .poll_query(self.polled_transport_context()?, handle)
+            .map_err(map_transport_error)
+    }
+    fn poll_query_sourced(
+        &mut self,
+        handle: u64,
+    ) -> Result<Option<Vec<WitSourcedReply>>, TransportApiError> {
+        self.transport
+            .poll_query_sourced(self.polled_transport_context()?, handle)
+            .map(|replies| {
+                replies.map(|replies| {
+                    replies
+                        .into_iter()
+                        .map(|reply| WitSourcedReply {
+                            provider: wit_principal(reply.provider),
+                            payload: reply.payload,
+                        })
+                        .collect()
+                })
+            })
             .map_err(map_transport_error)
     }
     fn close_query(&mut self, handle: u64) -> Result<(), TransportApiError> {
@@ -2293,7 +2359,7 @@ impl WasmComponent {
             Ok(response)
         })();
         let reply = match result {
-            Ok(bytes) => query.reply(query.key_expr().as_str(), bytes).wait(),
+            Ok(bytes) => reply_with_source(&query, &executing.principal, bytes),
             Err(error) => {
                 warn!(%error, %point, "WASM queryable failed to handle a request");
                 query.reply_err(b"provider failed".to_vec()).wait()
@@ -2834,6 +2900,12 @@ impl Component for WasmComponent {
         let result = {
             let instance = self.ensure_instance(&mut runtime)?;
             instance.store.data().validate_execution_owner(ctx)?;
+            instance.store.data_mut().active_tasks.retain(|_, task| {
+                !task
+                    .policy
+                    .revoked
+                    .load(std::sync::atomic::Ordering::Acquire)
+            });
             let now = Instant::now();
             let due = instance.store.data().due_tasks(now);
             if due.is_empty() {
@@ -2847,7 +2919,13 @@ impl Component for WasmComponent {
                         .data()
                         .active_tasks
                         .get(&handle)
-                        .is_some_and(|task| task.owner == task_owner)
+                        .is_some_and(|task| {
+                            task.owner == task_owner
+                                && !task
+                                    .policy
+                                    .revoked
+                                    .load(std::sync::atomic::Ordering::Acquire)
+                        })
                     {
                         continue;
                     }

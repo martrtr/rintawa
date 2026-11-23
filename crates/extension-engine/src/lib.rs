@@ -25,7 +25,11 @@ mod secrets;
 mod state;
 mod transport;
 
+mod live_policy;
 mod runtime_permissions;
+pub use live_policy::{
+    LivePolicyChange, LivePolicyControl, LivePolicyDelta, LivePolicySnapshot, LivePolicyTarget,
+};
 
 pub use activation::{ActivationPlan, ActivationPlanError};
 pub use artifact_host::{
@@ -818,6 +822,7 @@ mod tests {
                     target: ComponentTarget::new("example.runtime.native@1"),
                     entry: None,
                     required: true,
+                    published_preference: None,
                     permissions: ComponentPermissions {
                         secret_read: vec![SecretPathPattern::parse("ai.api_keys.*").unwrap()],
                         runtime: Vec::new(),
@@ -829,6 +834,7 @@ mod tests {
                     target: ComponentTarget::new("example.runtime.native@1"),
                     entry: None,
                     required: true,
+                    published_preference: None,
                     permissions: ComponentPermissions::default(),
                 },
             ],

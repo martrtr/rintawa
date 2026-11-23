@@ -557,6 +557,7 @@ fn test_provider_grants_control_binding_eligibility() -> anyhow::Result<()> {
             target: ComponentTarget::new("example.runtime.native@1"),
             entry: None,
             required: true,
+            published_preference: None,
             permissions: ComponentPermissions {
                 secret_read: vec![secret_pattern.clone()],
                 runtime: Vec::new(),
@@ -673,6 +674,7 @@ fn test_consumer_grant_controls_binding_eligibility() -> anyhow::Result<()> {
             target: ComponentTarget::new("example.runtime.native@1"),
             entry: None,
             required: true,
+            published_preference: None,
             permissions: ComponentPermissions {
                 secret_read: vec![secret_pattern.clone()],
                 runtime: Vec::new(),

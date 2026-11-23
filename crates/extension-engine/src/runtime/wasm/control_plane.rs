@@ -11,14 +11,17 @@ use crate::{
     },
     runtime::wasm::{
         ArtifactStoreError, ArtifactStoreHost, AssetStoreError, AssetStoreHost, CompositionError,
-        CompositionHost, PreferenceError, PreferencesHost, RuntimePermissionCheck,
-        RuntimePolicyError, RuntimePolicyHost, ScopedCompositionHost, ScopedRuntimePolicyHost,
-        UserResourceError, UserResourcesHost, WasmHostState, WitAssetRef, WitCompositionActivation,
+        CompositionHost, PreferenceError, PreferencesHost, PublishedPreferenceError,
+        PublishedPreferenceWriteError, RuntimePermissionCheck, RuntimePolicyError,
+        RuntimePolicyHost, ScopedCompositionHost, ScopedRuntimePolicyHost, UserResourceError,
+        UserResourcesHost, WasmHostState, WitAssetRef, WitCompositionActivation,
         WitImportedArtifact, WitRuntimeArtifactPolicy, WitRuntimeHttpOriginGrant,
         WitRuntimePolicyComponent, WitRuntimePolicyRequest, WitUserResourceRef, WitWorldSummary,
         WorldSessionError, WorldSessionsHost,
     },
 };
+
+const MAX_PUBLISHED_PREFERENCE_BYTES: usize = 64 * 1024;
 
 impl ArtifactStoreHost for WasmHostState {
     fn import_rtw(&mut self, bytes: Vec<u8>) -> Result<WitImportedArtifact, ArtifactStoreError> {
@@ -179,7 +182,11 @@ impl AssetStoreHost for WasmHostState {
     }
 
     fn cancel_upload(&mut self, handle: u64) -> Result<(), AssetStoreError> {
-        self.require_asset_import_access()?;
+        if !self.host_access_active {
+            return Err(AssetStoreError::AccessNotActive);
+        }
+        self.active_execution_context()
+            .map_err(|_| AssetStoreError::AccessNotActive)?;
         let owner = &self
             .execution_context
             .as_ref()
@@ -369,7 +376,11 @@ impl UserResourcesHost for WasmHostState {
     }
 
     fn cancel_upload(&mut self, handle: u64) -> Result<(), UserResourceError> {
-        self.require_user_resource_import_access()?;
+        if !self.host_access_active {
+            return Err(UserResourceError::AccessNotActive);
+        }
+        self.active_execution_context()
+            .map_err(|_| UserResourceError::AccessNotActive)?;
         let owner = &self
             .execution_context
             .as_ref()
@@ -647,6 +658,23 @@ impl WorldSessionsHost for WasmHostState {
             .map_err(map_world_session_access_error)?;
         self.bound_world_session_summary(value)
     }
+    fn create_from_template_with_permissions(
+        &mut self,
+        request: String,
+    ) -> Result<WitWorldSummary, WorldSessionError> {
+        self.require_world_session_permission(RuntimePermission::WorldSessionWrite)?;
+        self.require_world_session_permission(RuntimePermission::RuntimePolicyWrite)?;
+        self.consume_world_session_mutation_budget()?;
+        if request.len() > self.max_host_message_bytes.min(64 * 1024) {
+            return Err(WorldSessionError::MessageTooLarge);
+        }
+        let world = self
+            .host_access
+            .world_sessions
+            .create_from_template_with_permissions(&request)
+            .map_err(map_world_session_access_error)?;
+        self.bound_world_session_summary(world)
+    }
     fn entry(
         &mut self,
         world_id: String,
@@ -755,6 +783,154 @@ impl WorldSessionsHost for WasmHostState {
 }
 
 impl PreferencesHost for WasmHostState {
+    fn read_published_preference(&mut self) -> Result<Option<String>, PublishedPreferenceError> {
+        if !self.host_access_active || self.world_system_snapshot.is_some() {
+            return Err(PublishedPreferenceError::AccessNotActive);
+        }
+        let (scope, owner) = self
+            .preference_owner()
+            .map_err(|_| PublishedPreferenceError::AccessNotActive)?;
+        if self
+            .host_access
+            .runtime_context
+            .world_id_for_scope(&scope)
+            .map_err(|_| PublishedPreferenceError::Unavailable)?
+            .is_none()
+        {
+            return Err(PublishedPreferenceError::AccessNotActive);
+        }
+        self.runtime_permission_owner(RuntimePermission::PublishedPreferenceRead)
+            .map_err(|e| match e {
+                super::RuntimePermissionCheck::Denied => PublishedPreferenceError::PermissionDenied,
+                super::RuntimePermissionCheck::Unavailable => PublishedPreferenceError::Unavailable,
+            })?;
+        let context = self
+            .execution_context
+            .as_ref()
+            .ok_or(PublishedPreferenceError::AccessNotActive)?;
+        let read = self
+            .transport
+            .contexts
+            .published_preference_source(context)
+            .map_err(|e| match e {
+                crate::transport::TransportError::Inactive => {
+                    PublishedPreferenceError::AccessNotActive
+                }
+                _ => PublishedPreferenceError::Unavailable,
+            })?;
+        let value = self
+            .host_access
+            .preferences
+            .get(
+                read.source.scope.as_str(),
+                read.source.principal.instance_id.as_str(),
+                read.source.principal.component_id.as_str(),
+                &read.key,
+            )
+            .map_err(|_| PublishedPreferenceError::Unavailable)?;
+        if value
+            .as_ref()
+            .is_some_and(|v| v.len() > MAX_PUBLISHED_PREFERENCE_BYTES)
+        {
+            return Err(PublishedPreferenceError::MessageTooLarge);
+        }
+        self.runtime_permissions
+            .while_granted(&owner, RuntimePermission::PublishedPreferenceRead, || {
+                self.transport.contexts.validate_published_read(&read)
+            })
+            .map_err(|_| PublishedPreferenceError::Unavailable)?
+            .ok_or(PublishedPreferenceError::PermissionDenied)?
+            .map_err(|_| PublishedPreferenceError::Unavailable)?;
+        Ok(value)
+    }
+
+    fn compare_exchange_published_preference(
+        &mut self,
+        expected: Option<String>,
+        value: Option<String>,
+    ) -> Result<(), PublishedPreferenceWriteError> {
+        use PublishedPreferenceWriteError as Error;
+
+        if !self.host_access_active || self.world_system_snapshot.is_some() {
+            return Err(Error::AccessNotActive);
+        }
+        let context = self
+            .execution_context
+            .as_ref()
+            .filter(|context| self.registered_owner() == Some(context.principal.component()))
+            .ok_or(Error::AccessNotActive)?;
+        if expected
+            .iter()
+            .chain(&value)
+            .any(|input| input.len() > MAX_PUBLISHED_PREFERENCE_BYTES)
+        {
+            return Err(Error::MessageTooLarge);
+        }
+
+        let resolve = || {
+            self.transport
+                .contexts
+                .published_preference_source(context)
+                .map_err(|error| match error {
+                    crate::transport::TransportError::Inactive => Error::AccessNotActive,
+                    _ => Error::Unavailable,
+                })
+        };
+        let source = if context.scope.as_str() == "host" {
+            let source = resolve()?;
+            if source.source != *context {
+                return Err(Error::Unavailable);
+            }
+            source
+        } else {
+            if self
+                .host_access
+                .runtime_context
+                .world_id_for_scope(&context.scope)
+                .map_err(|_| Error::Unavailable)?
+                .is_none()
+            {
+                return Err(Error::AccessNotActive);
+            }
+            self.runtime_permissions
+                .while_granted(
+                    &context.principal.component(),
+                    RuntimePermission::PublishedPreferenceWrite,
+                    || {
+                        let source = resolve()?;
+                        if !source.write_requested {
+                            return Err(Error::PermissionDenied);
+                        }
+                        Ok(source)
+                    },
+                )
+                .map_err(|_| Error::Unavailable)?
+                .ok_or(Error::PermissionDenied)??
+        };
+
+        // Admission is complete. Retirement or revocation can proceed while an
+        // accepted write commits to the captured publisher, fenced by its digest.
+        let exchanged = self
+            .host_access
+            .preferences
+            .compare_exchange_published(
+                &source.source.principal.component(),
+                &source.digest,
+                &source.key,
+                expected.as_deref(),
+                value.as_deref(),
+            )
+            .map_err(|error| match error {
+                HostAccessError::PreferenceQuotaExceeded => Error::QuotaExceeded,
+                _ => Error::Unavailable,
+            })?;
+        if exchanged {
+            Ok(())
+        } else {
+            Err(Error::Conflict)
+        }
+    }
+
     fn get(&mut self, key: String) -> Result<Option<String>, PreferenceError> {
         let (scope_id, owner) = self.preference_owner()?;
         if key.len() > self.max_host_message_bytes {
@@ -833,6 +1009,37 @@ impl WasmHostState {
 }
 
 impl RuntimePolicyHost for WasmHostState {
+    fn live_component_policy(
+        &mut self,
+        scope_id: String,
+        instance_id: String,
+        component_id: String,
+    ) -> Result<String, RuntimePolicyError> {
+        self.require_runtime_policy_write()?;
+        if scope_id.len() + instance_id.len() + component_id.len() > self.max_host_message_bytes {
+            return Err(RuntimePolicyError::MessageTooLarge);
+        }
+        let result = self
+            .host_access
+            .runtime_policy
+            .live_component_policy(&scope_id, &instance_id, &component_id)
+            .map_err(map_runtime_policy_access_error)?;
+        if result.len() > self.max_host_message_bytes {
+            return Err(RuntimePolicyError::MessageTooLarge);
+        }
+        Ok(result)
+    }
+    fn apply_live_change(&mut self, change: String) -> Result<(), RuntimePolicyError> {
+        self.require_runtime_policy_write()?;
+        if change.len() > self.max_host_message_bytes {
+            return Err(RuntimePolicyError::MessageTooLarge);
+        }
+        self.host_access
+            .runtime_policy
+            .apply_live_change(&change)
+            .map_err(map_runtime_policy_access_error)
+    }
+
     fn inspect_artifact(
         &mut self,
         digest: String,

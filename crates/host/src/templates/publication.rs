@@ -136,6 +136,16 @@ impl HostHome {
         seed: Option<&Path>,
         manifest: &WorldManifest,
     ) -> HostResult<crate::CreatedTemplateWorld> {
+        self.publish_world_with_profile(recipe, seed, manifest, |_| {})
+    }
+
+    pub(super) fn publish_world_with_profile(
+        &self,
+        recipe: &CompositionProfile,
+        seed: Option<&Path>,
+        manifest: &WorldManifest,
+        configure: impl FnOnce(&mut CompositionProfile),
+    ) -> HostResult<crate::CreatedTemplateWorld> {
         let stage = Stage::new(self)?;
         let world = WorldId::new();
         let database = stage.path().join(WORLD_DATABASE_FILE);
@@ -143,7 +153,8 @@ impl HostHome {
             Some(seed) => SqliteWorldStorage::create_from_seed(seed, &database, world, manifest)?,
             None => SqliteWorldStorage::create_with_manifest(&database, world, manifest)?,
         };
-        let profile = recipe.materialize_all(world_runtime_scope_id(world));
+        let mut profile = recipe.materialize_all(world_runtime_scope_id(world));
+        configure(&mut profile);
         #[cfg(test)]
         crate::BEFORE_INITIAL_COMPOSITION.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {

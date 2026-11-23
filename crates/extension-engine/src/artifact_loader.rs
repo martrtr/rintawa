@@ -142,7 +142,7 @@ impl RtwExtensionLoader {
         scope_id: RuntimeScopeId,
     ) -> EngineResult<RtwExtensionLoadOutcome> {
         let archive = store.open_artifact(digest)?;
-        self.try_load_archive(engine, archive, instance_id, scope_id)
+        self.try_load_archive(engine, archive, digest.clone(), instance_id, scope_id)
     }
 
     /// Reads and validates the extension manifest from one exact stored artifact.
@@ -193,6 +193,7 @@ impl RtwExtensionLoader {
         &self,
         engine: &mut ExtensionEngine,
         mut archive: RtwArchive,
+        digest: ArtifactDigest,
         instance_id: ExtensionInstanceId,
         scope_id: RuntimeScopeId,
     ) -> EngineResult<RtwExtensionLoadOutcome> {
@@ -282,6 +283,7 @@ impl RtwExtensionLoader {
             manifest,
             components,
             execution_target_dependencies,
+            Some(digest),
         )?;
         Ok(RtwExtensionLoadOutcome::Loaded(RegisteredExtensionLoad {
             extension_id,

@@ -1746,9 +1746,27 @@ fn test_should_revoke_delegated_resources_when_provider_lock_is_poisoned() {
             .contexts
             .context(&owner, false)
             .expect("test context");
+        instance
+            .store
+            .data()
+            .runtime_permissions
+            .grant(owner.clone(), RuntimePermission::BackgroundTask)
+            .unwrap();
+        let policy = instance
+            .store
+            .data()
+            .runtime_permissions
+            .register_resource(
+                &owner,
+                task_context.principal.activation,
+                RuntimePermission::BackgroundTask,
+                None,
+            )
+            .unwrap();
         instance.store.data_mut().active_tasks.insert(
             7,
             ActiveWasmTask {
+                policy,
                 context: task_context,
                 owner: owner.clone(),
                 interval: Duration::from_millis(10),
@@ -2654,4 +2672,445 @@ fn test_world_failure_preserves_bounded_system_rejection_reason() {
         assert!(std::str::from_utf8(reason.as_bytes()).is_ok());
         assert!(reason.contains("stale-entry-id") || reason.contains('é'));
     }
+}
+
+#[derive(Default)]
+struct PublishedPreferences {
+    value: Mutex<Option<String>>,
+    reads: Mutex<Vec<(String, String, String, String)>>,
+    on_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    on_write: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+impl PreferenceAccess for PublishedPreferences {
+    fn get(
+        &self,
+        scope: &str,
+        instance: &str,
+        component: &str,
+        key: &str,
+    ) -> HostAccessResult<Option<String>> {
+        self.reads.lock().unwrap().push((
+            scope.into(),
+            instance.into(),
+            component.into(),
+            key.into(),
+        ));
+        if let Some(action) = self.on_read.lock().unwrap().take() {
+            action();
+        }
+        Ok(self.value.lock().unwrap().clone())
+    }
+    fn set(&self, _: &str, _: &str, _: &str, _: &str, _: &str) -> HostAccessResult<()> {
+        Err(HostAccessError::Rejected)
+    }
+    fn delete(&self, _: &str, _: &str, _: &str, _: &str) -> HostAccessResult<()> {
+        Err(HostAccessError::Rejected)
+    }
+    fn compare_exchange_published(
+        &self,
+        owner: &rintawa_sdk::contracts::ComponentRef,
+        digest: &rintawa_artifacts::ArtifactDigest,
+        key: &str,
+        expected: Option<&str>,
+        value: Option<&str>,
+    ) -> HostAccessResult<bool> {
+        assert_eq!(owner.instance_id.as_str(), "baseline-owner");
+        assert_eq!(owner.component_id.as_str(), "backend");
+        assert_eq!(
+            *digest,
+            rintawa_artifacts::ArtifactDigest::sha256(b"shared exact RTW")
+        );
+        assert_eq!("fixture.published.v1", key);
+        if let Some(action) = self.on_write.lock().unwrap().take() {
+            action();
+        }
+        let mut current = self.value.lock().unwrap();
+        if current.as_deref() != expected {
+            return Ok(false);
+        }
+        *current = value.map(str::to_owned);
+        Ok(true)
+    }
+}
+
+#[test]
+fn test_published_read_gates_and_revalidates_after_unlocked_preference_io() {
+    use crate::execution_context::VerifiedComponent;
+    use rintawa_sdk::contracts::ComponentRef;
+    let access = Arc::new(RecordingScopedHostAccess::default());
+    let preferences = Arc::new(PublishedPreferences::default());
+    let mut services = WasmHostServices::standalone(SecretManager::default());
+    services.host_access.preferences = preferences.clone();
+    services.host_access.runtime_context = access;
+    let mut state = WasmHostState::with_host_services_and_budget(
+        ComponentId::new("backend"),
+        services,
+        false,
+        &WasmExecutionBudget::default(),
+    );
+    begin_test_registration(&mut state, ExtensionId::new("fixture.shared"));
+    state.finish_registration().unwrap();
+    let identity = VerifiedComponent {
+        digest: rintawa_artifacts::ArtifactDigest::sha256(b"shared exact RTW"),
+        published_key: Some("fixture.published.v1".into()),
+        permissions: Default::default(),
+    };
+    let consumer = ComponentRef::new(test_instance_id(), "backend");
+    let source = ComponentRef::new("baseline-owner", "backend");
+    for (owner, scope) in [
+        (&consumer, test_scope_id()),
+        (&source, RuntimeScopeId::new("host")),
+    ] {
+        state
+            .transport
+            .contexts
+            .begin_verified(owner.clone(), scope, Some(identity.clone()))
+            .unwrap();
+        state
+            .transport
+            .contexts
+            .activate_instance(&owner.instance_id);
+    }
+    assert!(matches!(
+        PreferencesHost::read_published_preference(&mut state),
+        Err(PublishedPreferenceError::AccessNotActive)
+    ));
+    state.begin_guest_execution();
+    assert!(matches!(
+        PreferencesHost::read_published_preference(&mut state),
+        Err(PublishedPreferenceError::PermissionDenied)
+    ));
+    assert!(preferences.reads.lock().unwrap().is_empty());
+    state
+        .runtime_permissions
+        .grant(consumer.clone(), RuntimePermission::PublishedPreferenceRead)
+        .unwrap();
+    assert_eq!(
+        PreferencesHost::read_published_preference(&mut state).unwrap(),
+        None
+    );
+    *preferences.value.lock().unwrap() = Some("shared public config".into());
+    assert_eq!(
+        PreferencesHost::read_published_preference(&mut state)
+            .unwrap()
+            .as_deref(),
+        Some("shared public config")
+    );
+    assert!(preferences.reads.lock().unwrap().iter().all(|read| read
+        == &(
+            "host".into(),
+            "baseline-owner".into(),
+            "backend".into(),
+            "fixture.published.v1".into()
+        )));
+    *preferences.value.lock().unwrap() = Some("x".repeat(65537));
+    assert!(matches!(
+        PreferencesHost::read_published_preference(&mut state),
+        Err(PublishedPreferenceError::MessageTooLarge)
+    ));
+    *preferences.value.lock().unwrap() = Some("public".into());
+    let contexts = state.transport.contexts.clone();
+    let instance = source.instance_id.clone();
+    *preferences.on_read.lock().unwrap() = Some(Box::new(move || {
+        contexts.revoke_instance_if(&instance, None).dispose()
+    }));
+    assert!(matches!(
+        PreferencesHost::read_published_preference(&mut state),
+        Err(PublishedPreferenceError::Unavailable)
+    ));
+    state
+        .transport
+        .contexts
+        .begin_verified(source.clone(), RuntimeScopeId::new("host"), Some(identity))
+        .unwrap();
+    state
+        .transport
+        .contexts
+        .activate_instance(&source.instance_id);
+    assert!(PreferencesHost::read_published_preference(&mut state).is_ok());
+    let permissions = state.runtime_permissions.clone();
+    let contexts = state.transport.contexts.clone();
+    let owner = consumer.clone();
+    *preferences.on_read.lock().unwrap() = Some(Box::new(move || {
+        permissions.revoke_component(&owner, &contexts);
+    }));
+    assert!(matches!(
+        PreferencesHost::read_published_preference(&mut state),
+        Err(PublishedPreferenceError::PermissionDenied)
+    ));
+    state.discard_guest_execution();
+    assert!(matches!(
+        PreferencesHost::read_published_preference(&mut state),
+        Err(PublishedPreferenceError::AccessNotActive)
+    ));
+}
+
+#[test]
+fn test_published_write_admits_baseline_and_only_the_granted_exact_world_backend() {
+    use crate::execution_context::VerifiedComponent;
+    use PublishedPreferenceWriteError as Error;
+    use rintawa_sdk::contracts::ComponentRef;
+
+    let preferences = Arc::new(PublishedPreferences::default());
+    let mut services = WasmHostServices::standalone(SecretManager::default());
+    services.host_access.preferences = preferences.clone();
+    services.host_access.runtime_context = Arc::new(RecordingScopedHostAccess::default());
+    let permission = RuntimePermission::PublishedPreferenceWrite;
+    let identity = VerifiedComponent {
+        digest: rintawa_artifacts::ArtifactDigest::sha256(b"shared exact RTW"),
+        published_key: Some("fixture.published.v1".into()),
+        permissions: Default::default(),
+    };
+    let mut world_identity = identity.clone();
+    world_identity.permissions.runtime.push(permission);
+    let contexts = services.transport.contexts.clone();
+    let state = |instance_id: &str, component_id: &str, scope: RuntimeScopeId, identity| {
+        let owner = ComponentRef::new(instance_id, component_id);
+        let mut state = WasmHostState::with_host_services_and_budget(
+            owner.component_id.clone(),
+            services.clone(),
+            false,
+            &WasmExecutionBudget::default(),
+        );
+        contexts
+            .begin_verified(owner.clone(), scope.clone(), identity)
+            .unwrap();
+        state
+            .begin_registration(
+                ExtensionId::new("fixture.shared"),
+                owner.instance_id.clone(),
+                scope,
+            )
+            .unwrap();
+        assert!(matches!(
+            state.compare_exchange_published_preference(None, None),
+            Err(Error::AccessNotActive)
+        ));
+        state.finish_registration().unwrap();
+        (owner, state)
+    };
+    let (baseline, mut home) = state(
+        "baseline-owner",
+        "backend",
+        RuntimeScopeId::new("host"),
+        Some(identity.clone()),
+    );
+    let (consumer, mut world) = state(
+        "world-owner",
+        "backend",
+        test_scope_id(),
+        Some(world_identity.clone()),
+    );
+    home.begin_start_execution();
+    assert!(matches!(
+        home.compare_exchange_published_preference(None, None),
+        Err(Error::AccessNotActive)
+    ));
+    home.finish_guest_execution();
+    contexts.activate_instance(&baseline.instance_id);
+    contexts.activate_instance(&consumer.instance_id);
+    home.begin_guest_execution();
+    home.compare_exchange_published_preference(None, Some("initial".into()))
+        .unwrap();
+    world.begin_guest_execution();
+    let grant = |owner: &ComponentRef| {
+        services
+            .runtime_permissions
+            .grant(owner.clone(), permission)
+            .unwrap()
+    };
+    services
+        .runtime_permissions
+        .grant(consumer.clone(), RuntimePermission::PublishedPreferenceRead)
+        .unwrap();
+    assert!(matches!(
+        world.compare_exchange_published_preference(None, None),
+        Err(Error::PermissionDenied)
+    ));
+    grant(&consumer);
+    assert!(matches!(
+        world.compare_exchange_published_preference(None, None),
+        Err(Error::Conflict)
+    ));
+    for (expected, value) in [
+        (Some("é".repeat(32_769)), None),
+        (None, Some("x".repeat(65_537))),
+    ] {
+        assert!(matches!(
+            world.compare_exchange_published_preference(expected, value),
+            Err(Error::MessageTooLarge)
+        ));
+    }
+
+    let mut wrong_digest = world_identity.clone();
+    wrong_digest.digest = rintawa_artifacts::ArtifactDigest::sha256(b"other artifact");
+    for (instance, component, identity) in [
+        ("different-artifact", "backend", Some(wrong_digest)),
+        ("different-component", "other", Some(world_identity.clone())),
+        ("unverified", "backend", None),
+    ] {
+        let (owner, mut foreign) = state(instance, component, test_scope_id(), identity);
+        contexts.activate_instance(&owner.instance_id);
+        grant(&owner);
+        foreign.begin_guest_execution();
+        assert!(matches!(
+            foreign.compare_exchange_published_preference(None, None),
+            Err(Error::Unavailable)
+        ));
+    }
+    let (read_only, mut read_only_world) =
+        state("read-only", "backend", test_scope_id(), Some(identity));
+    contexts.activate_instance(&read_only.instance_id);
+    grant(&read_only);
+    read_only_world.begin_guest_execution();
+    assert!(matches!(
+        read_only_world.compare_exchange_published_preference(None, None),
+        Err(Error::PermissionDenied)
+    ));
+
+    home.begin_delegated_guest_execution(consumer.clone());
+    assert!(matches!(
+        home.compare_exchange_published_preference(None, None),
+        Err(Error::AccessNotActive)
+    ));
+    let (duplicate, _) = state(
+        "duplicate",
+        "backend",
+        RuntimeScopeId::new("host"),
+        Some(world_identity),
+    );
+    contexts.activate_instance(&duplicate.instance_id);
+    assert!(matches!(
+        world.compare_exchange_published_preference(None, None),
+        Err(Error::Unavailable)
+    ));
+    contexts
+        .revoke_instance_if(&duplicate.instance_id, None)
+        .dispose();
+
+    // Revocation and retirement occur after admission. The call reports what committed.
+    let permissions = services.runtime_permissions.clone();
+    let live = contexts.clone();
+    let writer = consumer.clone();
+    *preferences.on_write.lock().unwrap() = Some(Box::new(move || {
+        permissions.revoke_component(&writer, &live);
+        live.revoke_instance_if(&writer.instance_id, None).dispose();
+    }));
+    world
+        .compare_exchange_published_preference(Some("initial".into()), Some("world edit".into()))
+        .unwrap();
+    assert!(matches!(
+        world.compare_exchange_published_preference(None, None),
+        Err(Error::PermissionDenied)
+    ));
+    home.begin_guest_execution();
+    assert!(matches!(
+        home.compare_exchange_published_preference(Some("initial".into()), None),
+        Err(Error::Conflict)
+    ));
+    assert_eq!(
+        preferences.value.lock().unwrap().as_deref(),
+        Some("world edit")
+    );
+    grant(&consumer);
+    assert!(matches!(
+        world.compare_exchange_published_preference(None, None),
+        Err(Error::AccessNotActive)
+    ));
+    home.finish_guest_execution();
+    assert!(matches!(
+        home.compare_exchange_published_preference(None, None),
+        Err(Error::AccessNotActive)
+    ));
+}
+
+#[test]
+fn test_live_revoke_cancels_tasks_and_sockets_without_guest_poll_or_revival() {
+    let mut state = WasmHostState::new(ComponentId::new("runtime"));
+    begin_test_registration(&mut state, ExtensionId::new("rintawa.test"));
+    state.finish_registration().unwrap();
+    state.task_handler_available = true;
+    state.begin_guest_execution();
+    let owner = state.registered_owner().unwrap();
+    let policy = state.runtime_permissions.clone();
+    for permission in [
+        RuntimePermission::BackgroundTask,
+        RuntimePermission::LoopbackListen,
+        RuntimePermission::LoopbackConnect,
+    ] {
+        policy.grant(owner.clone(), permission).unwrap();
+    }
+    let task = RuntimeTasksHost::spawn_periodic(&mut state, 10).unwrap();
+    let listener = NetworkHost::listen_loopback(&mut state, 0).unwrap();
+    let client = NetworkHost::connect_loopback(&mut state, listener.port).unwrap();
+    let accepted = (0..100)
+        .find_map(
+            |_| match NetworkHost::accept(&mut state, listener.handle).unwrap() {
+                Some(socket) => Some(socket),
+                None => {
+                    std::thread::yield_now();
+                    None
+                }
+            },
+        )
+        .unwrap();
+    // Same lock order and cancellation call as the live-policy publication path.
+    {
+        let mut grants = policy.grants.write().unwrap();
+        grants
+            .get_mut(&owner)
+            .unwrap()
+            .remove(&RuntimePermission::LoopbackListen);
+        policy.cancel_resources(&owner, Some(RuntimePermission::LoopbackListen), None);
+    }
+    // The listening port closes natively, without another guest callback.
+    let rebound =
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, listener.port)).unwrap();
+    drop(rebound);
+    assert!(matches!(
+        NetworkHost::write(&mut state, accepted, vec![1]),
+        Err(NetworkError::PermissionDenied)
+    ));
+    // A connected socket uses its independent connect capability.
+    assert!(!matches!(
+        NetworkHost::write(&mut state, client, vec![1]),
+        Err(NetworkError::PermissionDenied)
+    ));
+    policy
+        .grant(owner.clone(), RuntimePermission::LoopbackListen)
+        .unwrap();
+    assert!(matches!(
+        NetworkHost::accept(&mut state, listener.handle),
+        Err(NetworkError::PermissionDenied)
+    ));
+    NetworkHost::close(&mut state, listener.handle).unwrap();
+    NetworkHost::close(&mut state, accepted).unwrap();
+    {
+        let mut grants = policy.grants.write().unwrap();
+        grants
+            .get_mut(&owner)
+            .unwrap()
+            .remove(&RuntimePermission::BackgroundTask);
+        policy.cancel_resources(&owner, Some(RuntimePermission::BackgroundTask), None);
+    }
+    assert!(
+        state
+            .due_tasks(Instant::now() + Duration::from_secs(1))
+            .is_empty()
+    );
+    policy
+        .grant(owner.clone(), RuntimePermission::BackgroundTask)
+        .unwrap();
+    assert!(
+        state
+            .due_tasks(Instant::now() + Duration::from_secs(1))
+            .is_empty()
+    );
+    RuntimeTasksHost::cancel(&mut state, task).unwrap();
+    let fresh = RuntimeTasksHost::spawn_periodic(&mut state, 10).unwrap();
+    assert_ne!(fresh, task);
+    // Cleanup remains available without the permission.
+    policy.revoke_component(&owner, &state.transport.contexts);
+    RuntimeTasksHost::cancel(&mut state, fresh).unwrap();
+    NetworkHost::close(&mut state, client).unwrap();
 }

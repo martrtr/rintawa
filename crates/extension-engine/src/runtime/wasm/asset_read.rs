@@ -85,7 +85,10 @@ impl WasmHostState {
         Ok(bytes)
     }
     pub(super) fn close_asset_reader(&mut self, handle: u64) -> Result<(), Error> {
-        let context = self.asset_reader_context()?;
+        let context = self
+            .active_execution_context()
+            .map_err(|_| Error::AccessNotActive)?
+            .clone();
         if !self
             .asset_readers
             .get(&handle)

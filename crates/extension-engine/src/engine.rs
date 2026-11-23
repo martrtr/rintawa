@@ -100,6 +100,7 @@ impl From<&OwnedWorldSchemaContribution> for RegisteredWorldSchema {
 }
 
 struct ManagedExtension {
+    verified_artifact: Option<rintawa_artifacts::ArtifactDigest>,
     instance_id: ExtensionInstanceId,
     scope_id: RuntimeScopeId,
     manifest: ExtensionManifest,
@@ -558,6 +559,15 @@ impl ExtensionEngine {
         self.transport.unsubscribe(caller, handle)
     }
 
+    /// Shared native policy control; never reenters the Engine during a guest import.
+    pub fn live_policy_control(&self) -> crate::LivePolicyControl {
+        crate::LivePolicyControl::new(
+            self.transport.contexts.clone(),
+            self.runtime_permissions.clone(),
+            self.secrets.clone(),
+        )
+    }
+
     /// Returns the current Host-attested activation of an active component.
     ///
     /// # Errors
@@ -760,6 +770,7 @@ impl ExtensionEngine {
             manifest,
             components,
             Vec::new(),
+            None,
         )
     }
 
@@ -770,6 +781,7 @@ impl ExtensionEngine {
         manifest: ExtensionManifest,
         mut components: Vec<Box<dyn Component>>,
         execution_target_dependencies: Vec<ExecutionTargetDependency>,
+        verified_artifact: Option<rintawa_artifacts::ArtifactDigest>,
     ) -> EngineResult<()> {
         manifest.validate()?;
 
@@ -842,6 +854,7 @@ impl ExtensionEngine {
         }
 
         let managed = ManagedExtension {
+            verified_artifact,
             instance_id: instance_id.clone(),
             scope_id,
             manifest,
@@ -1161,9 +1174,21 @@ impl ExtensionEngine {
             }
         }
         for component in &ext.components {
-            if let Err(error) = self.transport.contexts.begin(
+            let verified = ext.verified_artifact.as_ref().and_then(|digest| {
+                ext.manifest
+                    .components
+                    .iter()
+                    .find(|d| d.id == *component.id())
+                    .map(|d| crate::execution_context::VerifiedComponent {
+                        digest: digest.clone(),
+                        published_key: d.published_preference.clone(),
+                        permissions: d.permissions.clone(),
+                    })
+            });
+            if let Err(error) = self.transport.contexts.begin_verified(
                 ComponentRef::new(instance_id.clone(), component.id().clone()),
                 ext.scope_id.clone(),
+                verified,
             ) {
                 self.transport.revoke_instance(instance_id);
                 return Err(EngineError::InvalidState(error.to_string()));

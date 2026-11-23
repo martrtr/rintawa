@@ -3,7 +3,8 @@ use crate::{
     execution_context::{ExecutionContext, ExecutionContexts},
     transport::{
         MAX_DECLARATIONS_PER_OWNER, MAX_PAYLOAD_BYTES, MAX_REPLIES, MAX_TOTAL_REPLY_BYTES,
-        QUERY_TIMEOUT, State, Transport, TransportError as Error, scoped_key, session,
+        QUERY_TIMEOUT, State, Transport, TransportError as Error, reply_source, reply_with_source,
+        scoped_key, session,
     },
 };
 use rintawa_sdk::{
@@ -92,12 +93,20 @@ pub(crate) struct InboundQuery {
     pub(crate) caller: ComponentPrincipal,
     pub(crate) payload: Vec<u8>,
 }
+pub(crate) struct SourcedReply {
+    pub(crate) provider: ComponentPrincipal,
+    pub(crate) payload: Vec<u8>,
+}
+struct CollectedReply {
+    provider: Option<ComponentPrincipal>,
+    payload: Vec<u8>,
+}
 struct Outgoing {
     owner: ExecutionContext,
     deadline: Instant,
     dispatch_pending: bool,
     done: bool,
-    values: Vec<Vec<u8>>,
+    values: Vec<CollectedReply>,
     errors: usize,
     count: usize,
     bytes: usize,
@@ -395,6 +404,34 @@ impl Transport {
         owner: &ExecutionContext,
         handle: u64,
     ) -> Result<Option<Vec<Vec<u8>>>, Error> {
+        self.take_query_replies(owner, handle, false)
+            .map(|replies| replies.map(|replies| replies.into_iter().map(|r| r.payload).collect()))
+    }
+    pub(crate) fn poll_query_sourced(
+        &self,
+        owner: &ExecutionContext,
+        handle: u64,
+    ) -> Result<Option<Vec<SourcedReply>>, Error> {
+        self.take_query_replies(owner, handle, true)?
+            .map(|replies| {
+                replies
+                    .into_iter()
+                    .map(|reply| {
+                        Ok(SourcedReply {
+                            provider: reply.provider.ok_or(Error::Unavailable)?,
+                            payload: reply.payload,
+                        })
+                    })
+                    .collect()
+            })
+            .transpose()
+    }
+    fn take_query_replies(
+        &self,
+        owner: &ExecutionContext,
+        handle: u64,
+        verify_sources: bool,
+    ) -> Result<Option<Vec<CollectedReply>>, Error> {
         let mut state = match self.nonblocking_state(owner) {
             Ok(state) => state,
             Err(Error::Unavailable | Error::LimitExceeded) => return Ok(None),
@@ -412,6 +449,20 @@ impl Transport {
         {
             return Ok(None);
         }
+        // Revocation takes the same transport lock before retiring an activation.
+        let sources = if verify_sources && query.failure.is_none() {
+            query.values.iter().try_for_each(|reply| {
+                self.contexts.try_validate(&ExecutionContext {
+                    principal: reply.provider.clone().ok_or(Error::Inactive)?,
+                    scope: owner.scope.clone(),
+                })
+            })
+        } else {
+            Ok(())
+        };
+        if matches!(sources, Err(Error::Unavailable)) {
+            return Ok(None);
+        }
         let query = state.polled.outgoing.remove(&handle).unwrap();
         if let Some(error) = query.failure {
             return Err(error);
@@ -419,6 +470,7 @@ impl Transport {
         if query.values.is_empty() && query.errors > 0 {
             return Err(Error::Unavailable);
         }
+        sources.map_err(|_| Error::Unavailable)?;
         Ok(Some(query.values))
     }
     pub(crate) fn close_query(&self, owner: &ExecutionContext, handle: u64) -> Result<(), Error> {
@@ -492,7 +544,11 @@ impl Transport {
         owner: &ExecutionContext,
         queryable: u64,
     ) -> Result<Option<InboundQuery>, Error> {
-        let mut state = self.nonblocking_state(owner)?;
+        let mut state = match self.nonblocking_state(owner) {
+            Ok(state) => state,
+            Err(Error::Unavailable | Error::LimitExceeded) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let declaration = state
             .polled
             .declarations
@@ -596,10 +652,7 @@ fn run_work(weak: &Weak<std::sync::Mutex<State>>, contexts: &ExecutionContexts, 
             {
                 match payload {
                     Some(bytes) => {
-                        let _ = request
-                            .query
-                            .reply(request.query.key_expr().as_str(), bytes)
-                            .wait();
+                        let _ = reply_with_source(&request.query, &request.owner.principal, bytes);
                     }
                     None => {
                         let _ = request
@@ -762,7 +815,10 @@ fn collect_reply(weak: &Weak<std::sync::Mutex<State>>, handle: u64, reply: Reply
         return;
     }
     match result {
-        Ok(sample) => query.values.push(sample.payload().to_bytes().into_owned()),
+        Ok(sample) => query.values.push(CollectedReply {
+            provider: reply_source(sample),
+            payload: sample.payload().to_bytes().into_owned(),
+        }),
         Err(_) => query.errors += 1,
     }
 }

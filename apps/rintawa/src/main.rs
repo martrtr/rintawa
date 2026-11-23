@@ -1,5 +1,7 @@
 //! Command-line entry point for running and managing a local Rintawa host.
 
+mod secret_cli;
+
 use std::{
     env,
     path::PathBuf,
@@ -112,6 +114,26 @@ enum Commands {
         #[arg(long, default_value = HOST_SCOPE)]
         scope: String,
     },
+    /// Store a credential from UTF-8 stdin (at most 64 KiB), never from argv.
+    SecretSet { path: String },
+    /// Delete a credential without reading it back.
+    SecretDelete { path: String },
+    /// Approve an exact manifest-requested secret path for the next activation.
+    GrantSecretRead {
+        instance: String,
+        component: String,
+        path: String,
+        #[arg(long, default_value = HOST_SCOPE)]
+        scope: String,
+    },
+    /// Remove a local secret approval; stop/restart applies it to an active scope.
+    RevokeSecretRead {
+        instance: String,
+        component: String,
+        path: String,
+        #[arg(long, default_value = HOST_SCOPE)]
+        scope: String,
+    },
     /// Create an empty persistent authoritative world.
     WorldCreate {
         /// Exact installed template; omit to use the trusted default recipe.
@@ -202,6 +224,36 @@ fn main() -> Result<()> {
             origin,
             scope,
         } => revoke_http_origin(&home, instance, component, origin, scope),
+        Commands::SecretSet { path } => secret_cli::store(&home, &path),
+        Commands::SecretDelete { path } => secret_cli::delete(&home, &path),
+        Commands::GrantSecretRead {
+            instance,
+            component,
+            path,
+            scope,
+        } => {
+            home.grant_secret_read(
+                RuntimeScopeId::new(scope),
+                ComponentRef::new(instance, component),
+                rintawa_sdk::secrets::SecretPath::parse(path)?,
+            )?;
+            println!("Secret read approval saved; takes effect on the next activation.");
+            Ok(())
+        }
+        Commands::RevokeSecretRead {
+            instance,
+            component,
+            path,
+            scope,
+        } => {
+            home.revoke_secret_read(
+                &RuntimeScopeId::new(scope),
+                &ComponentRef::new(instance, component),
+                &rintawa_sdk::secrets::SecretPath::parse(path)?,
+            )?;
+            println!("Secret read approval removed; stop/restart applies it to a running scope.");
+            Ok(())
+        }
         Commands::WorldCreate {
             template,
             title,

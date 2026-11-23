@@ -115,6 +115,12 @@ impl exports::rintawa::engine::world_system::Guest for Fixture {
     fn evaluate(
         command_json: String,
     ) -> Result<String, exports::rintawa::engine::world_system::Error> {
+        use rintawa::engine::preferences::{self, PublishedWriteError};
+
+        assert!(matches!(
+            preferences::compare_exchange_published_preference(None, Some("forbidden")),
+            Err(PublishedWriteError::AccessNotActive)
+        ));
         assert!(rintawa::engine::user_resources::take_resource(&dummy_resource()).is_err());
         let command: serde_json::Value = serde_json::from_str(&command_json).map_err(|error| {
             exports::rintawa::engine::world_system::Error::Failed(error.to_string())

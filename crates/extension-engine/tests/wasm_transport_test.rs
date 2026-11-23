@@ -25,6 +25,7 @@ fn manifest(id: &str) -> ExtensionManifest {
             target: ComponentTarget::new(WASM_COMPONENT_TARGET_V1),
             entry: None,
             required: true,
+            published_preference: None,
             permissions: ComponentPermissions {
                 secret_read: Vec::new(),
                 runtime: Vec::new(),
@@ -75,6 +76,7 @@ fn test_should_exchange_wasm_fanout_and_revoke_on_stop_across_world_scopes() -> 
         )?,
         vec![b"consumer-ok".to_vec()]
     );
+    assert_sourced_wasm_callbacks(&engine, &caller)?;
 
     assert_eq!(
         engine.query_transport_contributions(&test_principal(&engine, &caller), point, b"ping")?,
@@ -225,6 +227,51 @@ fn test_should_exchange_wasm_fanout_and_revoke_on_stop_across_world_scopes() -> 
         engine.query_transport_contributions(&test_principal(&engine, &caller), point, b"ping"),
         Err(TransportError::Inactive)
     ));
+    Ok(())
+}
+
+fn assert_sourced_wasm_callbacks(engine: &ExtensionEngine, caller: &ComponentRef) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    let caller = engine.active_component_principal(caller)?;
+    let one = engine.active_component_principal(&ComponentRef::new("one", "runtime"))?;
+    let two = engine.active_component_principal(&ComponentRef::new("two", "runtime"))?;
+    let send = |request: &str| -> Result<String> {
+        let values = engine.query_transport_contributions(
+            &caller,
+            "fixture/consumer",
+            request.as_bytes(),
+        )?;
+        let [reply] = values.as_slice() else {
+            anyhow::bail!("expected one consumer reply, got {}", values.len());
+        };
+        Ok(String::from_utf8(reply.clone())?)
+    };
+    let claim = format!("one|runtime|{}", one.activation);
+    let until = Instant::now() + Duration::from_secs(2);
+    let handle: u64 = loop {
+        let reply = send(&format!("sourced-begin:{claim}"))?;
+        if reply != "error:Unavailable" {
+            break reply.parse()?;
+        }
+        anyhow::ensure!(Instant::now() < until, "consumer admission remained busy");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let replies = loop {
+        let reply = send(&format!("sourced-poll:{handle}"))?;
+        if reply != "pending" {
+            break reply;
+        }
+        anyhow::ensure!(Instant::now() < until, "consumer poll remained pending");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(
+        replies,
+        format!(
+            "one|runtime|{}|wasm:{claim}\ntwo|runtime|{}|wasm:{claim}",
+            one.activation, two.activation
+        )
+    );
     Ok(())
 }
 

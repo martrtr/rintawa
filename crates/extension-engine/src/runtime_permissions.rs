@@ -2,7 +2,10 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, Mutex, RwLock, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::execution_context::ExecutionContexts;
@@ -54,11 +57,151 @@ pub(crate) fn parse_exact_local_http_origin(value: &str) -> Result<String, HttpO
 
 #[derive(Clone, Default)]
 pub(crate) struct RuntimePermissionManager {
-    grants: Arc<RwLock<HashMap<ComponentRef, HashSet<RuntimePermission>>>>,
-    http_loopback_origins: Arc<RwLock<HashMap<ComponentRef, HashSet<String>>>>,
+    pub(crate) grants: Arc<RwLock<HashMap<ComponentRef, HashSet<RuntimePermission>>>>,
+    pub(crate) http_loopback_origins: Arc<RwLock<HashMap<ComponentRef, HashSet<String>>>>,
+    resources: Arc<Mutex<HashMap<ComponentRef, Vec<Weak<RuntimeCancellation>>>>>,
+}
+
+pub(crate) struct RuntimeCancellation {
+    pub(crate) cancelled: Arc<AtomicBool>,
+    pub(crate) revoked: AtomicBool,
+    pub(crate) activation: u64,
+    permission: RuntimePermission,
+    origin: Option<String>,
+    cleanup: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl RuntimePermissionManager {
+    pub(crate) fn while_http_authorized<T>(
+        &self,
+        owner: &ComponentRef,
+        origin: Option<&Url>,
+        action: impl FnOnce() -> T,
+    ) -> Result<Option<T>, ()> {
+        let grants = self.grants.try_read().map_err(|_| ())?;
+        if !grants
+            .get(owner)
+            .is_some_and(|g| g.contains(&RuntimePermission::HttpRequest))
+        {
+            return Ok(None);
+        }
+        let origins = self.http_loopback_origins.try_read().map_err(|_| ())?;
+        if origin.is_some_and(|url| {
+            !origins
+                .get(owner)
+                .is_some_and(|g| g.contains(&url.origin().ascii_serialization()))
+        }) {
+            return Ok(None);
+        }
+        let result = action();
+        drop(origins);
+        drop(grants);
+        Ok(Some(result))
+    }
+
+    /// Register while both admission locks are held: revoke cannot miss a new worker.
+    pub(crate) fn register_http(
+        &self,
+        owner: &ComponentRef,
+        activation: u64,
+        url: &Url,
+        cancelled: Arc<AtomicBool>,
+        cleanup: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<Arc<RuntimeCancellation>, ()> {
+        let grants = self.grants.try_read().map_err(|_| ())?;
+        if !grants
+            .get(owner)
+            .is_some_and(|g| g.contains(&RuntimePermission::HttpRequest))
+        {
+            return Err(());
+        }
+        let origins = self.http_loopback_origins.try_read().map_err(|_| ())?;
+        let origin = (url.scheme() == "http").then(|| url.origin().ascii_serialization());
+        if origin
+            .as_ref()
+            .is_some_and(|o| !origins.get(owner).is_some_and(|v| v.contains(o)))
+        {
+            return Err(());
+        }
+        let token = Arc::new(RuntimeCancellation {
+            permission: RuntimePermission::HttpRequest,
+            cancelled,
+            revoked: AtomicBool::new(false),
+            activation,
+            origin,
+            cleanup: Mutex::new(cleanup),
+        });
+        let mut book = self.resources.lock().map_err(|_| ())?;
+        let entries = book.entry(owner.clone()).or_default();
+        entries.retain(|e| e.strong_count() != 0);
+        entries.push(Arc::downgrade(&token));
+        Ok(token)
+    }
+
+    /// Own a cancellable task or socket under the same admission lock as revocation.
+    pub(crate) fn register_resource(
+        &self,
+        owner: &ComponentRef,
+        activation: u64,
+        permission: RuntimePermission,
+        cleanup: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<Arc<RuntimeCancellation>, ()> {
+        self.while_granted(owner, permission, || {
+            let token = Arc::new(RuntimeCancellation {
+                permission,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                revoked: AtomicBool::new(false),
+                activation,
+                origin: None,
+                cleanup: Mutex::new(cleanup),
+            });
+            let mut book = self.resources.lock().map_err(|_| ())?;
+            let entries = book.entry(owner.clone()).or_default();
+            entries.retain(|e| e.strong_count() != 0);
+            entries.push(Arc::downgrade(&token));
+            Ok(token)
+        })?
+        .ok_or(())?
+    }
+
+    pub(crate) fn cancel_http(&self, owner: &ComponentRef, origin: Option<&str>) {
+        self.cancel_resources(owner, Some(RuntimePermission::HttpRequest), origin);
+    }
+
+    pub(crate) fn cancel_resources(
+        &self,
+        owner: &ComponentRef,
+        permission: Option<RuntimePermission>,
+        origin: Option<&str>,
+    ) {
+        let mut book = self.resources.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entries) = book.get_mut(owner) {
+            entries.retain(|entry| {
+                let Some(token) = entry.upgrade() else {
+                    return false;
+                };
+                if permission.is_none_or(|p| token.permission == p)
+                    && (origin.is_none() || token.origin.as_deref() == origin)
+                {
+                    token.revoked.store(true, Ordering::Release);
+                    token.cancelled.store(true, Ordering::Release);
+                    if let Some(cleanup) = token
+                        .cleanup
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                    {
+                        cleanup();
+                    }
+                }
+                !token.revoked.load(Ordering::Acquire)
+            });
+            if entries.is_empty() {
+                book.remove(owner);
+            }
+        }
+    }
+
     /// Executes bounded resource admission while the effective grant cannot change.
     pub(crate) fn while_granted<T>(
         &self,
@@ -155,6 +298,7 @@ impl RuntimePermissionManager {
                 approvals.remove(owner);
             }
         }
+        self.cancel_http(owner, Some(&origin));
         Ok(())
     }
 
@@ -164,6 +308,7 @@ impl RuntimePermissionManager {
             Err(poisoned) => poisoned.into_inner(),
         };
         grants.remove(owner);
+        self.cancel_resources(owner, None, None);
         if let Some(cleanup) = contexts.detach_resource_access(owner) {
             cleanup.dispose();
         }
