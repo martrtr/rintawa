@@ -18,6 +18,20 @@ impl exports::rintawa::engine::transport_handler::Guest for Fixture {
     ) -> Vec<u8> {
         use rintawa::engine::transport;
         let point = "chat/send-controls/v1";
+        if let Some(request) = payload.strip_prefix(b"directed-begin:") {
+            let request = std::str::from_utf8(request).unwrap();
+            let (route, payload) = request.split_once('\n').unwrap();
+            let mut route = route.split('|');
+            let point = route.next().unwrap();
+            let expected = rintawa::engine::runtime_context::Principal {
+                instance_id: route.next().unwrap().into(),
+                component_id: route.next().unwrap().into(),
+                activation: route.next().unwrap().parse().unwrap(),
+            };
+            return transport::begin_query_to(point, payload.as_bytes(), &expected)
+                .map(|handle| handle.to_string().into_bytes())
+                .unwrap_or_else(|error| format!("error:{error:?}").into_bytes());
+        }
         if let Some(claim) = payload.strip_prefix(b"sourced-begin:") {
             return transport::begin_query(point, claim)
                 .map(|handle| handle.to_string().into_bytes())
@@ -25,9 +39,9 @@ impl exports::rintawa::engine::transport_handler::Guest for Fixture {
         }
         if let Some(handle) = payload.strip_prefix(b"sourced-poll:") {
             let handle = std::str::from_utf8(handle).unwrap().parse().unwrap();
-            return match transport::poll_query_sourced(handle).expect("sourced poll") {
-                None => b"pending".to_vec(),
-                Some(replies) => {
+            return match transport::poll_query_sourced(handle) {
+                Ok(None) => b"pending".to_vec(),
+                Ok(Some(replies)) => {
                     let mut rows = replies
                         .into_iter()
                         .map(|reply| {
@@ -43,6 +57,7 @@ impl exports::rintawa::engine::transport_handler::Guest for Fixture {
                     rows.sort();
                     rows.join("\n").into_bytes()
                 }
+                Err(error) => format!("error:{error:?}").into_bytes(),
             };
         }
         let mut replies = transport::query(point, b"ping").expect("same-scope query");

@@ -1806,6 +1806,25 @@ impl TransportHost for WasmHostState {
             .begin_query(self.polled_transport_context()?, &point, &payload)
             .map_err(map_transport_error)
     }
+    fn begin_query_to(
+        &mut self,
+        point: String,
+        payload: Vec<u8>,
+        expected: WitPrincipal,
+    ) -> Result<u64, TransportApiError> {
+        self.transport
+            .begin_query_to(
+                self.polled_transport_context()?,
+                &point,
+                &payload,
+                ComponentPrincipal {
+                    instance_id: ExtensionInstanceId::new(expected.instance_id),
+                    component_id: ComponentId::new(expected.component_id),
+                    activation: expected.activation,
+                },
+            )
+            .map_err(map_transport_error)
+    }
     fn poll_query(&mut self, handle: u64) -> Result<Option<Vec<Vec<u8>>>, TransportApiError> {
         self.transport
             .poll_query(self.polled_transport_context()?, handle)

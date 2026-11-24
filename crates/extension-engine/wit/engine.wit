@@ -876,6 +876,9 @@ interface transport {
     unsubscribe: func(handle: u64) -> result<_, error>;
     /// Admits a query without waiting for dispatch or replies.
     begin-query: func(point: string, payload: list<u8>) -> result<u64, error>;
+    /// Admits a query only for the live principal at an existing scoped Host pin.
+    /// A begin error dispatches nothing. A handle does not guarantee delivery.
+    begin-query-to: func(point: string, payload: list<u8>, expected: principal) -> result<u64, error>;
     poll-query: func(handle: u64) -> result<option<list<list<u8>>>, error>;
     /// Consumes the same result as poll-query and verifies each live responder.
     /// Fails with unavailable if any successful reply lacks a live same-scope source.

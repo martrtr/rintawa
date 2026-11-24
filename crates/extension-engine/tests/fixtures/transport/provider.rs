@@ -4,6 +4,7 @@ wit_bindgen::generate!({ path: "wit", world: "plugin-transport" });
 use std::sync::Mutex;
 
 static SUBSCRIPTION: Mutex<Option<u64>> = Mutex::new(None);
+static EFFECTS: Mutex<u64> = Mutex::new(0);
 
 struct Fixture;
 
@@ -53,6 +54,7 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
         assert!(rintawa::engine::transport::query("chat/send-controls/v1", b"ping").is_err());
         assert!(rintawa::engine::transport::publish("chat/updates/v1", b"stop").is_err());
         *SUBSCRIPTION.lock().expect("fixture subscription lock") = None;
+        *EFFECTS.lock().expect("fixture effect count") = 0;
     }
 }
 
@@ -64,10 +66,27 @@ impl exports::rintawa::engine::transport_handler::Guest for Fixture {
     ) -> Vec<u8> {
         assert!(point == "chat/send-controls/v1" || point == "fixture/caller");
         if payload == b"clock" {
-            return rintawa::engine::host::monotonic_millis().unwrap().to_be_bytes().to_vec();
+            return rintawa::engine::host::monotonic_millis()
+                .unwrap()
+                .to_be_bytes()
+                .to_vec();
         }
         if let Some(result) = d8_control(&payload) {
             return result;
+        }
+        if payload == b"directed-count" {
+            return EFFECTS.lock().unwrap().to_string().into_bytes();
+        }
+        if let Some(action) = payload.strip_prefix(b"directed-effect:") {
+            *EFFECTS.lock().unwrap() += 1;
+            return format!(
+                "{}|{}|{}|{}",
+                caller.instance_id,
+                caller.component_id,
+                caller.activation,
+                std::str::from_utf8(action).unwrap(),
+            )
+            .into_bytes();
         }
         if let Some(forward) = payload.strip_prefix(b"forward:") {
             let split = forward

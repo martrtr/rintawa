@@ -86,8 +86,28 @@ struct State {
     polled: polled::PolledState,
 }
 
+impl State {
+    fn matches_pin(
+        &self,
+        scope: &RuntimeScopeId,
+        point: &str,
+        expected: &ComponentPrincipal,
+    ) -> bool {
+        self.authoritative.get(&(scope.clone(), point.into())) == Some(&expected.component())
+    }
+
+    fn admits_recipient(
+        &self,
+        recipient: &ExecutionContext,
+        point: &str,
+        expected: &ComponentPrincipal,
+    ) -> bool {
+        recipient.principal == *expected && self.matches_pin(&recipient.scope, point, expected)
+    }
+}
+
 struct OwnedQueryable {
-    owner: ComponentRef,
+    owner: ExecutionContext,
     key: String,
     declaration: Queryable<()>,
 }
@@ -227,7 +247,7 @@ impl Transport {
         if state
             .queryables
             .iter()
-            .any(|entry| entry.key == key && entry.owner != *owner)
+            .any(|entry| entry.key == key && entry.owner.principal.component() != *owner)
             || state.polled.conflicting(&key, owner)
         {
             return Err(TransportError::ActiveConflict);
@@ -295,18 +315,16 @@ impl Transport {
         {
             return Err(TransportError::NotSelected);
         }
-        if state
-            .queryables
-            .iter()
-            .any(|registered| registered.owner == *owner && registered.key == key)
-            || state.polled.duplicate(&key, owner)
+        if state.queryables.iter().any(|registered| {
+            registered.owner.principal.component() == *owner && registered.key == key
+        }) || state.polled.duplicate(&key, owner)
         {
             return Err(TransportError::Duplicate);
         }
         if state
             .queryables
             .iter()
-            .filter(|registered| registered.owner == *owner)
+            .filter(|registered| registered.owner.principal.component() == *owner)
             .count()
             + state.polled.declarations_for(owner)
             >= MAX_DECLARATIONS_PER_OWNER
@@ -316,6 +334,9 @@ impl Transport {
         let zenoh = session(&mut state)?;
         let active_callbacks = Arc::clone(&self.active_callbacks);
         let callback = Arc::new(callback);
+        let shared = Arc::downgrade(&self.state);
+        let callback_owner = executing.clone();
+        let callback_point: Arc<str> = Arc::from(point);
         #[cfg(test)]
         let before_callback = self.before_callback.clone();
         #[cfg(test)]
@@ -335,15 +356,19 @@ impl Transport {
                     let _ = query.reply_err(b"provider busy".to_vec()).wait();
                     return;
                 }
-                let caller = polled::request_caller(&query).ok();
-                let Some(caller) = caller else {
+                let permit = CallbackPermit(Arc::clone(&active_callbacks));
+                let Ok(request) = polled::read_metadata(&query) else {
                     let _ = query.reply_err(b"missing caller".to_vec()).wait();
-                    active_callbacks.fetch_sub(1, Ordering::AcqRel);
                     return;
                 };
-                let permit = CallbackPermit(Arc::clone(&active_callbacks));
                 let contexts = contexts.clone();
-                let executing = executing.clone();
+                let executing = callback_owner.clone();
+                let caller = ExecutionContext {
+                    principal: request.caller,
+                    scope: executing.scope.clone(),
+                };
+                let shared = shared.clone();
+                let point = callback_point.clone();
                 let callback = Arc::clone(&callback);
                 #[cfg(test)]
                 let before_callback = before_callback.clone();
@@ -354,14 +379,11 @@ impl Transport {
                     .stack_size(512 * 1024)
                     .spawn(move || {
                         let _permit = permit;
-                        let valid =
-                            contexts
-                                .context(&caller.component(), false)
-                                .is_ok_and(|context| {
-                                    context.principal == caller && context.scope == executing.scope
-                                })
-                                && contexts.validate(&executing).is_ok();
-                        if valid {
+                        let contexts_are_live = || {
+                            contexts.validate(&caller).is_ok()
+                                && contexts.validate(&executing).is_ok()
+                        };
+                        if contexts_are_live() {
                             #[cfg(test)]
                             {
                                 let hook = before_callback.lock().unwrap().take();
@@ -369,16 +391,18 @@ impl Transport {
                                     hook();
                                 }
                             }
-                            let live_caller = contexts
-                                .context(&caller.component(), false)
-                                .is_ok_and(|bound| {
-                                    bound.principal == caller && bound.scope == executing.scope
-                                });
-                            if live_caller
-                                && contexts.validate(&executing).is_ok()
-                                && !polled::expired_metadata(&query)
-                            {
-                                callback(query, caller);
+                            let admitted = match &request.expected {
+                                Some(expected) => shared.upgrade().is_some_and(|state| {
+                                    state.lock().is_ok_and(|state| {
+                                        state.admits_recipient(&executing, &point, expected)
+                                            && contexts_are_live()
+                                            && request.deadline > Instant::now()
+                                    })
+                                }),
+                                None => contexts_are_live() && request.deadline > Instant::now(),
+                            };
+                            if admitted {
+                                callback(query, caller.principal);
                             } else {
                                 let _ = query
                                     .reply_err(b"expired caller or provider".to_vec())
@@ -405,7 +429,7 @@ impl Transport {
             .wait()
             .map_err(|_| TransportError::Unavailable)?;
         state.queryables.push(OwnedQueryable {
-            owner: owner.clone(),
+            owner: executing,
             key,
             declaration,
         });
@@ -448,7 +472,7 @@ impl Transport {
             }
             session(&mut state)?
         };
-        let metadata = polled::metadata(&executing.principal, Instant::now() + timeout)?;
+        let metadata = polled::metadata(&executing.principal, Instant::now() + timeout, None)?;
         let replies = zenoh
             .get(key)
             .payload(payload.to_vec())
@@ -636,8 +660,8 @@ impl Transport {
             let mut kept = Vec::new();
             let mut removed = Vec::new();
             for declaration in std::mem::take(&mut state.queryables) {
-                if &declaration.owner.instance_id == instance
-                    || revoked.contains(&declaration.owner)
+                if &declaration.owner.principal.instance_id == instance
+                    || revoked.contains(&declaration.owner.principal.component())
                 {
                     removed.push(declaration.declaration);
                 } else {
@@ -773,7 +797,7 @@ mod tests {
                 .map_err(|_| TransportError::Unavailable)?;
             session(&mut state)?
         };
-        for metadata in [None, Some(polled::metadata(&foreign.principal,Instant::now()+QUERY_TIMEOUT).expect("foreign metadata")), Some(polled::metadata(&stale,Instant::now()+QUERY_TIMEOUT).expect("stale metadata")), Some(br#"{"instance_id":"caller","component_id":"component","activation":0,"scope":"world-a"}"#.to_vec())] {
+        for metadata in [None, Some(polled::metadata(&foreign.principal,Instant::now()+QUERY_TIMEOUT,None).expect("foreign metadata")), Some(polled::metadata(&stale,Instant::now()+QUERY_TIMEOUT,None).expect("stale metadata")), Some(br#"{"instance_id":"caller","component_id":"component","activation":0,"scope":"world-a"}"#.to_vec())] {
             let request = zenoh.get(scoped_key(&scope, point)?).payload(b"claim-caller".to_vec()).timeout(QUERY_TIMEOUT);
             let replies = match metadata { Some(bytes) => request.attachment(bytes).wait(), None => request.wait() }.map_err(|_| TransportError::Unavailable)?;
             let replies: Vec<_> = replies.into_iter().collect();

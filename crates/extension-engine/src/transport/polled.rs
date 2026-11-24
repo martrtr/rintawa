@@ -2,9 +2,9 @@
 use crate::{
     execution_context::{ExecutionContext, ExecutionContexts},
     transport::{
-        MAX_DECLARATIONS_PER_OWNER, MAX_PAYLOAD_BYTES, MAX_REPLIES, MAX_TOTAL_REPLY_BYTES,
-        QUERY_TIMEOUT, State, Transport, TransportError as Error, reply_source, reply_with_source,
-        scoped_key, session,
+        MAX_DECLARATIONS_PER_OWNER, MAX_PAYLOAD_BYTES, MAX_REPLIES, MAX_REPLY_SOURCE_BYTES,
+        MAX_TOTAL_REPLY_BYTES, QUERY_TIMEOUT, State, Transport, TransportError as Error,
+        reply_source, reply_with_source, scoped_key, session,
     },
 };
 use rintawa_sdk::{
@@ -47,33 +47,30 @@ struct Metadata {
     #[serde(flatten)]
     caller: ComponentPrincipal,
     deadline_tick: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected: Option<ComponentPrincipal>,
 }
-pub(super) fn metadata(caller: &ComponentPrincipal, deadline: Instant) -> Result<Vec<u8>, Error> {
+pub(super) fn metadata(
+    caller: &ComponentPrincipal,
+    deadline: Instant,
+    expected: Option<ComponentPrincipal>,
+) -> Result<Vec<u8>, Error> {
     let nanos = deadline.saturating_duration_since(clock()).as_nanos();
     let deadline_tick = u64::try_from(nanos).map_err(|_| Error::Unavailable)?;
     serde_json::to_vec(&Metadata {
         caller: caller.clone(),
         deadline_tick,
+        expected,
     })
     .map_err(|_| Error::Unavailable)
 }
-pub(super) fn request_caller(query: &Query) -> Result<ComponentPrincipal, Error> {
-    read_metadata(query).map(|(caller, _)| caller)
+pub(super) struct RequestMetadata {
+    pub(super) caller: ComponentPrincipal,
+    pub(super) deadline: Instant,
+    pub(super) expected: Option<ComponentPrincipal>,
 }
 
-pub(super) fn expired_metadata(query: &Query) -> bool {
-    let Some(attachment) = query.attachment() else {
-        return false;
-    };
-    let bytes = attachment.to_bytes();
-    serde_json::from_slice::<Metadata>(&bytes).is_ok_and(|metadata| {
-        clock()
-            .checked_add(std::time::Duration::from_nanos(metadata.deadline_tick))
-            .is_none_or(|deadline| deadline <= Instant::now())
-    })
-}
-
-fn read_metadata(query: &Query) -> Result<(ComponentPrincipal, Instant), Error> {
+pub(super) fn read_metadata(query: &Query) -> Result<RequestMetadata, Error> {
     let bytes = query.attachment().ok_or(Error::Unavailable)?.to_bytes();
     if bytes.len() > 1024 * 1024 {
         return Err(Error::LimitExceeded);
@@ -85,7 +82,11 @@ fn read_metadata(query: &Query) -> Result<(ComponentPrincipal, Instant), Error> 
     if deadline <= Instant::now() {
         return Err(Error::InvalidHandle);
     }
-    Ok((metadata.caller, deadline))
+    Ok(RequestMetadata {
+        caller: metadata.caller,
+        deadline,
+        expected: metadata.expected,
+    })
 }
 /// DTO handed to an owner; the Zenoh reply route never leaves Host.
 pub(crate) struct InboundQuery {
@@ -115,6 +116,7 @@ struct Outgoing {
 struct Declaration {
     owner: ExecutionContext,
     key: String,
+    point: String,
     declaration: Option<Queryable<()>>,
     failed: bool,
     queued: VecDeque<u64>,
@@ -123,6 +125,7 @@ struct Incoming {
     owner: ExecutionContext,
     caller: ExecutionContext,
     deadline: Instant,
+    expected: Option<ComponentPrincipal>,
     queryable: u64,
     query: Query,
     payload: Vec<u8>,
@@ -147,6 +150,7 @@ enum Work {
         point: String,
         payload: Vec<u8>,
         deadline: Instant,
+        expected: Option<ComponentPrincipal>,
         permit: Arc<RunningPermit>,
     },
     Reply {
@@ -345,6 +349,24 @@ impl Transport {
         point: &str,
         payload: &[u8],
     ) -> Result<u64, Error> {
+        self.begin(owner, point, payload, None)
+    }
+    pub(crate) fn begin_query_to(
+        &self,
+        owner: &ExecutionContext,
+        point: &str,
+        payload: &[u8],
+        expected: ComponentPrincipal,
+    ) -> Result<u64, Error> {
+        self.begin(owner, point, payload, Some(expected))
+    }
+    fn begin(
+        &self,
+        owner: &ExecutionContext,
+        point: &str,
+        payload: &[u8],
+        expected: Option<ComponentPrincipal>,
+    ) -> Result<u64, Error> {
         clock();
         let deadline = Instant::now() + QUERY_TIMEOUT;
         let key = scoped_key(&owner.scope, point)?;
@@ -352,6 +374,22 @@ impl Transport {
             return Err(Error::LimitExceeded);
         }
         let mut state = self.nonblocking_state(owner)?;
+        if let Some(expected) = &expected {
+            if expected.instance_id.as_str().len() + expected.component_id.as_str().len()
+                > MAX_REPLY_SOURCE_BYTES
+            {
+                return Err(Error::LimitExceeded);
+            }
+            if !state.matches_pin(&owner.scope, point, expected) {
+                return Err(Error::NotSelected);
+            }
+            self.contexts
+                .try_validate(&ExecutionContext {
+                    scope: owner.scope.clone(),
+                    principal: expected.clone(),
+                })
+                .map_err(|_| Error::Unavailable)?;
+        }
         // Sixteen results at 512 KiB each also enforce the 8 MiB owner byte cap.
         if state
             .polled
@@ -395,6 +433,7 @@ impl Transport {
             point: point.into(),
             payload: payload.to_vec(),
             deadline,
+            expected,
             permit,
         });
         Ok(handle)
@@ -504,7 +543,7 @@ impl Transport {
         if state
             .queryables
             .iter()
-            .any(|d| d.owner == component && d.key == key)
+            .any(|d| d.owner.principal.component() == component && d.key == key)
             || state.polled.duplicate(&key, &component)
         {
             return Err(Error::Duplicate);
@@ -512,7 +551,7 @@ impl Transport {
         if state
             .queryables
             .iter()
-            .filter(|d| d.owner == component)
+            .filter(|d| d.owner.principal.component() == component)
             .count()
             + state.polled.declarations_for(&component)
             >= MAX_DECLARATIONS_PER_OWNER
@@ -527,6 +566,7 @@ impl Transport {
             Declaration {
                 owner: owner.clone(),
                 key: key.clone(),
+                point: point.into(),
                 declaration: None,
                 failed: false,
                 queued: VecDeque::new(),
@@ -552,15 +592,47 @@ impl Transport {
         let declaration = state
             .polled
             .declarations
-            .get_mut(&queryable)
+            .get(&queryable)
             .filter(|d| d.owner == *owner)
             .ok_or(Error::InvalidHandle)?;
         if declaration.failed {
             return Err(Error::Unavailable);
         }
-        let Some(id) = declaration.queued.pop_front() else {
+        let Some(&id) = declaration.queued.front() else {
             return Ok(None);
         };
+        let request = state.polled.incoming.get(&id).ok_or(Error::InvalidHandle)?;
+        if let Some(expected) = &request.expected {
+            // Wait for disposal capacity before deciding handoff, so a rejected
+            // entry can be removed atomically with that decision.
+            if state.polled.room().is_err() {
+                return Ok(None);
+            }
+            let caller_live = match self.contexts.try_validate(&request.caller) {
+                Ok(()) => true,
+                Err(Error::Inactive) => false,
+                Err(Error::Unavailable) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            if !caller_live
+                || request.deadline <= Instant::now()
+                || !state.admits_recipient(owner, &declaration.point, expected)
+            {
+                let request = state.polled.remove_request(id).unwrap();
+                state.polled.push(Work::Dispose(Disposal {
+                    queries: vec![request.query],
+                    declarations: Vec::new(),
+                }));
+                return Ok(None);
+            }
+        }
+        state
+            .polled
+            .declarations
+            .get_mut(&queryable)
+            .unwrap()
+            .queued
+            .pop_front();
         let request = state
             .polled
             .incoming
@@ -714,6 +786,7 @@ fn run_work(weak: &Weak<std::sync::Mutex<State>>, contexts: &ExecutionContexts, 
             point,
             payload,
             deadline,
+            expected,
             permit,
         } => {
             let Some(shared) = weak.upgrade() else {
@@ -727,16 +800,37 @@ fn run_work(weak: &Weak<std::sync::Mutex<State>>, contexts: &ExecutionContexts, 
                 if contexts.validate(&owner).is_err() || deadline <= Instant::now() {
                     return;
                 }
-                if state
-                    .authoritative
-                    .contains_key(&(owner.scope.clone(), point))
-                    && !state.queryables.iter().any(|d| d.key == key)
-                    && !state
-                        .polled
-                        .declarations
-                        .values()
-                        .any(|d| d.key == key && d.declaration.is_some())
-                {
+                let published =
+                    |admitted: Option<&ExecutionContext>| {
+                        let matches = |candidate: &ExecutionContext| {
+                            admitted.is_none_or(|target| candidate == target)
+                        };
+                        state
+                            .queryables
+                            .iter()
+                            .any(|d| d.key == key && matches(&d.owner))
+                            || state.polled.declarations.values().any(|d| {
+                                d.key == key && d.declaration.is_some() && matches(&d.owner)
+                            })
+                    };
+                let available = match &expected {
+                    Some(expected) => {
+                        let target = ExecutionContext {
+                            scope: owner.scope.clone(),
+                            principal: expected.clone(),
+                        };
+                        state.matches_pin(&owner.scope, &point, expected)
+                            && contexts.validate(&target).is_ok()
+                            && published(Some(&target))
+                    }
+                    None => {
+                        !state
+                            .authoritative
+                            .contains_key(&(owner.scope.clone(), point))
+                            || published(None)
+                    }
+                };
+                if !available {
                     Err(Error::Unavailable)
                 } else {
                     session(&mut state)
@@ -751,7 +845,7 @@ fn run_work(weak: &Weak<std::sync::Mutex<State>>, contexts: &ExecutionContexts, 
                 let replies_weak = weak.clone();
                 let dropped_weak = weak.clone();
                 let mut held_permit = Some(permit.clone());
-                let metadata = metadata(&owner.principal, deadline)?;
+                let metadata = metadata(&owner.principal, deadline, expected)?;
                 session
                     .get(key)
                     .payload(payload)
@@ -833,19 +927,24 @@ fn admit_incoming(
         let Some(shared) = weak.upgrade() else {
             return Some(query);
         };
-        let (caller, deadline) = match read_metadata(&query) {
+        let request = match read_metadata(&query) {
             Ok(value) => value,
             Err(_) => return Some(query),
         };
         let caller = ExecutionContext {
             scope: owner.scope.clone(),
-            principal: caller,
+            principal: request.caller,
         };
         let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
-        if deadline <= Instant::now()
+        let Some(declaration) = state.polled.declarations.get(&queryable) else {
+            return Some(query);
+        };
+        if request.deadline <= Instant::now()
             || contexts.validate(owner).is_err()
             || contexts.validate(&caller).is_err()
-            || !state.polled.declarations.contains_key(&queryable)
+            || request.expected.as_ref().is_some_and(|expected| {
+                !state.admits_recipient(owner, &declaration.point, expected)
+            })
         {
             return Some(query);
         }
@@ -885,7 +984,8 @@ fn admit_incoming(
             Incoming {
                 owner: owner.clone(),
                 caller,
-                deadline,
+                deadline: request.deadline,
+                expected: request.expected,
                 queryable,
                 query,
                 payload,

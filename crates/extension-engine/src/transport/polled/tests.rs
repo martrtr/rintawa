@@ -2,13 +2,263 @@
 use super::*;
 use std::time::Duration;
 fn context(transport: &Transport, id: &str, scope: &str) -> ExecutionContext {
-    let owner = ComponentRef::new(id, "runtime");
+    component_context(transport, ComponentRef::new(id, "runtime"), scope)
+}
+fn component_context(transport: &Transport, owner: ComponentRef, scope: &str) -> ExecutionContext {
     transport
         .contexts
         .begin(owner.clone(), scope.into())
         .unwrap();
     transport.contexts.activate_instance(&owner.instance_id);
     transport.contexts.context(&owner, false).unwrap()
+}
+
+fn counted_recipient(
+    transport: &Transport,
+    provider: &ExecutionContext,
+    point: &str,
+    entries: &Arc<AtomicUsize>,
+) -> Result<(), Error> {
+    let entries = entries.clone();
+    let provider_id = provider.principal.clone();
+    transport.declare(
+        &provider.principal.component(),
+        &provider.scope,
+        point,
+        move |query, caller| {
+            entries.fetch_add(1, Ordering::Relaxed);
+            let _ = reply_with_source(
+                &query,
+                &provider_id,
+                caller.instance_id.as_str().as_bytes().to_vec(),
+            );
+        },
+    )
+}
+
+#[test]
+fn test_directed_admission_uses_scoped_pin_and_exact_live_discovery_source() -> Result<(), Error> {
+    let transport = Transport::default();
+    let caller = context(&transport, "caller", "world-a");
+    let provider = context(&transport, "package", "world-a");
+    let impostor = component_context(&transport, ComponentRef::new("package", "other"), "world-a");
+    let foreign = context(&transport, "foreign", "world-b");
+    let discovery = "fixture/discover";
+    let action = "fixture/action";
+    let entries = Arc::new(AtomicUsize::new(0));
+    for responder in [&provider, &impostor] {
+        let identity = responder.principal.clone();
+        transport.declare(
+            &identity.component(),
+            &caller.scope,
+            discovery,
+            move |query, _| {
+                let _ = reply_with_source(&query, &identity, action.as_bytes().to_vec());
+            },
+        )?;
+    }
+    counted_recipient(&transport, &provider, action, &entries)?;
+    transport.select_authoritative(&foreign.scope, action, &foreign.principal.component())?;
+    let handle = retry(|| transport.begin_query(&caller, discovery, b"discover"))?;
+    let sources = wait_result(|| transport.poll_query_sourced(&caller, handle))?;
+    assert_eq!(sources.len(), 2);
+    assert!(sources.iter().all(|row| row.payload == action.as_bytes()));
+    let claimed = sources
+        .iter()
+        .find(|row| row.provider == impostor.principal)
+        .unwrap();
+    let selected = sources
+        .iter()
+        .find(|row| row.provider == provider.principal)
+        .unwrap();
+    let begin = |expected: &ComponentPrincipal| {
+        transport.begin_query_to(&caller, action, b"private", expected.clone())
+    };
+    assert!(matches!(begin(&selected.provider), Err(Error::NotSelected)));
+    transport.select_authoritative(&caller.scope, action, &provider.principal.component())?;
+    let mut stale = selected.provider.clone();
+    stale.activation = 0;
+    for _ in 0..(MAX_OWNED_QUERIES * 2) {
+        assert!(matches!(begin(&claimed.provider), Err(Error::NotSelected)));
+        assert!(matches!(begin(&stale), Err(Error::Unavailable)));
+    }
+    let oversized = ComponentPrincipal {
+        instance_id: "a".repeat(MAX_REPLY_SOURCE_BYTES).into(),
+        component_id: "б".into(),
+        activation: 0,
+    };
+    assert!(matches!(begin(&oversized), Err(Error::LimitExceeded)));
+    let foreign_point = "fixture/foreign";
+    transport.select_authoritative(&caller.scope, foreign_point, &foreign.principal.component())?;
+    assert!(matches!(
+        transport.begin_query_to(&caller, foreign_point, b"private", foreign.principal),
+        Err(Error::Unavailable)
+    ));
+    let unpublished = "fixture/unpublished";
+    transport.select_authoritative(&caller.scope, unpublished, &provider.principal.component())?;
+    let handle = retry(|| {
+        transport.begin_query_to(&caller, unpublished, b"private", selected.provider.clone())
+    })?;
+    assert!(matches!(
+        result(&transport, &caller, handle),
+        Err(Error::Unavailable)
+    ));
+    assert_eq!(entries.load(Ordering::Relaxed), 0);
+    wait_for(|| {
+        transport
+            .state
+            .lock()
+            .unwrap()
+            .polled
+            .running
+            .load(Ordering::Acquire)
+            == 0
+    });
+    let pause = PausedWork::install(&transport);
+    let mut handles = vec![retry(|| begin(&selected.provider))?];
+    pause.wait();
+    for _ in 1..MAX_OWNED_QUERIES {
+        handles.push(retry(|| begin(&selected.provider))?);
+    }
+    assert!(matches!(
+        begin(&selected.provider),
+        Err(Error::LimitExceeded)
+    ));
+    for handle in handles {
+        retry(|| transport.close_query(&caller, handle))?;
+    }
+    drop(pause);
+    let handle = retry(|| begin(&selected.provider))?;
+    let replies = wait_result(|| transport.poll_query_sourced(&caller, handle))?;
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].provider, selected.provider);
+    assert_eq!(replies[0].payload, b"caller");
+    assert_eq!(entries.load(Ordering::Relaxed), 1);
+    Ok(())
+}
+
+#[test]
+fn test_directed_callback_rechecks_at_dispatch_and_handoff() -> Result<(), Error> {
+    let transport = Transport::default();
+    let point = "fixture/action";
+    let caller = context(&transport, "caller", "world-a");
+    let provider = context(&transport, "provider", "world-a");
+    let other_caller = context(&transport, "other-caller", "world-b");
+    let other_provider = context(&transport, "other-provider", "world-b");
+    let entries = Arc::new(AtomicUsize::new(0));
+    let other_entries = Arc::new(AtomicUsize::new(0));
+    for (owner, counter) in [(&provider, &entries), (&other_provider, &other_entries)] {
+        transport.select_authoritative(&owner.scope, point, &owner.principal.component())?;
+        counted_recipient(&transport, owner, point, counter)?;
+    }
+    let begin = |caller, provider: &ExecutionContext| {
+        retry(|| transport.begin_query_to(caller, point, b"private", provider.principal.clone()))
+    };
+    let worker = PausedWork::install(&transport);
+    let undispatched = begin(&caller, &provider)?;
+    worker.wait();
+    transport.revoke_instance(&provider.principal.instance_id);
+    let replacement = context(&transport, "provider", "world-a");
+    counted_recipient(&transport, &replacement, point, &entries)?;
+    drop(worker);
+    assert!(matches!(
+        result(&transport, &caller, undispatched),
+        Err(Error::Unavailable)
+    ));
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    *transport.before_callback.lock().unwrap() = Some(Box::new(move || {
+        entered_tx.send(()).unwrap();
+        let _ = resume_rx.recv();
+    }));
+    let waiting = begin(&caller, &replacement)?;
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    transport.clear_authoritative_in_scope(&caller.scope);
+    let unaffected = begin(&other_caller, &other_provider)?;
+    assert_eq!(
+        result(&transport, &other_caller, unaffected)?,
+        vec![b"other-caller".to_vec()]
+    );
+    resume_tx.send(()).unwrap();
+    assert!(matches!(
+        result(&transport, &caller, waiting),
+        Err(Error::Unavailable)
+    ));
+    assert_eq!(entries.load(Ordering::Relaxed), 0);
+    assert_eq!(other_entries.load(Ordering::Relaxed), 1);
+    Ok(())
+}
+
+#[test]
+fn test_directed_checkout_discards_lost_pins_and_never_replays_handed_off_work() -> Result<(), Error>
+{
+    let transport = Transport::default();
+    let point = "fixture/action";
+    let caller = context(&transport, "caller", "world-a");
+    let provider = context(&transport, "provider", "world-a");
+    let select = |owner: &ExecutionContext| {
+        transport.select_authoritative(&owner.scope, point, &owner.principal.component())
+    };
+    let begin = |owner: &ExecutionContext| {
+        retry(|| transport.begin_query_to(&caller, point, b"private", owner.principal.clone()))
+    };
+    let queued = |id| {
+        wait_for(|| {
+            !transport.state.lock().unwrap().polled.declarations[&id]
+                .queued
+                .is_empty()
+        })
+    };
+    select(&provider)?;
+    let declaration = retry(|| transport.declare_polled(&provider, point))?;
+    let outgoing = begin(&provider)?;
+    queued(declaration);
+    transport.clear_authoritative_in_scope(&caller.scope);
+    assert!(retry(|| transport.next_query(&provider, declaration))?.is_none());
+    assert!(matches!(
+        result(&transport, &caller, outgoing),
+        Err(Error::Unavailable)
+    ));
+
+    select(&provider)?;
+    let outgoing = begin(&provider)?;
+    queued(declaration);
+    transport.revoke_instance(&provider.principal.instance_id);
+    let replacement = context(&transport, "provider", "world-a");
+    let fresh = retry(|| transport.declare_polled(&replacement, point))?;
+    assert!(matches!(
+        transport.next_query(&replacement, declaration),
+        Err(Error::InvalidHandle)
+    ));
+    assert!(matches!(
+        result(&transport, &caller, outgoing),
+        Err(Error::Unavailable)
+    ));
+    assert!(retry(|| transport.next_query(&replacement, fresh))?.is_none());
+
+    let outgoing = begin(&replacement)?;
+    let request = next(&transport, &replacement, fresh);
+    assert_eq!(request.caller, caller.principal);
+    assert_eq!(request.payload, b"private");
+    retry(|| transport.close_query(&caller, outgoing))?;
+    retry(|| transport.reply_query(&replacement, request.handle, Some(b"effect".to_vec())))?;
+    wait_for(|| {
+        transport
+            .state
+            .lock()
+            .unwrap()
+            .polled
+            .running
+            .load(Ordering::Acquire)
+            == 0
+    });
+    assert!(matches!(
+        transport.poll_query_sourced(&caller, outgoing),
+        Err(Error::InvalidHandle)
+    ));
+    assert!(retry(|| transport.next_query(&replacement, fresh))?.is_none());
+    Ok(())
 }
 fn retry<T>(mut action: impl FnMut() -> Result<T, Error>) -> Result<T, Error> {
     let deadline = Instant::now() + Duration::from_secs(3);
