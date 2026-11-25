@@ -6,6 +6,7 @@ use std::{
         IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream,
         ToSocketAddrs, UdpSocket,
     },
+    sync::{Arc, Mutex, atomic::Ordering},
     time::Duration,
 };
 
@@ -31,7 +32,10 @@ pub(super) enum NetworkHandleKind {
 
 pub(super) struct OwnedNetworkHandle {
     pub(super) owner: ComponentRef,
-    pub(super) kind: NetworkHandleKind,
+    activation: u64,
+    kind: Arc<Mutex<Option<NetworkHandleKind>>>,
+    policy: Arc<crate::runtime_permissions::RuntimeCancellation>,
+    permission: RuntimePermission,
 }
 
 impl WasmHostState {
@@ -39,6 +43,7 @@ impl WasmHostState {
         &mut self,
         owner: ComponentRef,
         kind: NetworkHandleKind,
+        permission: RuntimePermission,
     ) -> Result<u64, NetworkError> {
         let owned_count = self
             .network_handles
@@ -54,8 +59,35 @@ impl WasmHostState {
             .next_network_handle
             .checked_add(1)
             .ok_or(NetworkError::Unavailable)?;
-        self.network_handles
-            .insert(handle, OwnedNetworkHandle { owner, kind });
+        let activation = self
+            .execution_context
+            .as_ref()
+            .ok_or(NetworkError::PermissionDenied)?
+            .principal
+            .activation;
+        let kind = Arc::new(Mutex::new(Some(kind)));
+        let cleanup = kind.clone();
+        let policy = self
+            .runtime_permissions
+            .register_resource(
+                &owner,
+                activation,
+                permission,
+                Some(Box::new(move || {
+                    cleanup.lock().unwrap_or_else(|e| e.into_inner()).take();
+                })),
+            )
+            .map_err(|_| NetworkError::PermissionDenied)?;
+        self.network_handles.insert(
+            handle,
+            OwnedNetworkHandle {
+                owner,
+                activation,
+                kind,
+                policy,
+                permission,
+            },
+        );
         Ok(handle)
     }
 }
@@ -87,7 +119,11 @@ impl NetworkHost for WasmHostState {
                 NetworkError::Unavailable
             })?
             .port();
-        let handle = self.allocate_network_handle(owner, NetworkHandleKind::Listener(listener))?;
+        let handle = self.allocate_network_handle(
+            owner,
+            NetworkHandleKind::Listener(listener),
+            RuntimePermission::LoopbackListen,
+        )?;
         Ok(WitNetworkListener {
             handle,
             port: bound_port,
@@ -108,15 +144,22 @@ impl NetworkHost for WasmHostState {
                 RuntimePermissionCheck::Unavailable => NetworkError::Unavailable,
             })?;
         let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
-        let stream = TcpStream::connect_timeout(
-            &address.into(),
+        let stream = self.blocking_import(
             Duration::from_millis(self.loopback_connect_timeout_ms),
-        )
-        .map_err(|_| NetworkError::Unavailable)?;
+            NetworkError::Unavailable,
+            |timeout| {
+                TcpStream::connect_timeout(&address.into(), timeout)
+                    .map_err(|_| NetworkError::Unavailable)
+            },
+        )?;
         stream
             .set_nonblocking(true)
             .map_err(|_| NetworkError::Unavailable)?;
-        self.allocate_network_handle(owner, NetworkHandleKind::Stream(stream))
+        self.allocate_network_handle(
+            owner,
+            NetworkHandleKind::Stream(stream),
+            RuntimePermission::LoopbackConnect,
+        )
     }
 
     fn accept(&mut self, listener: u64) -> Result<Option<u64>, NetworkError> {
@@ -140,10 +183,23 @@ impl NetworkHost for WasmHostState {
             let Some(resource) = self.network_handles.get(&listener) else {
                 return Err(NetworkError::UnknownHandle);
             };
-            if resource.owner != owner {
+            if resource.owner != owner
+                || Some(resource.activation)
+                    != self
+                        .execution_context
+                        .as_ref()
+                        .map(|context| context.principal.activation)
+            {
                 return Err(NetworkError::UnknownHandle);
             }
-            let NetworkHandleKind::Listener(listener) = &resource.kind else {
+            let kind = resource
+                .kind
+                .lock()
+                .map_err(|_| NetworkError::Unavailable)?;
+            if resource.policy.revoked.load(Ordering::Acquire) {
+                return Err(NetworkError::PermissionDenied);
+            }
+            let Some(NetworkHandleKind::Listener(listener)) = kind.as_ref() else {
                 return Err(NetworkError::WrongKind);
             };
             match listener.accept() {
@@ -158,8 +214,17 @@ impl NetworkHost for WasmHostState {
         stream
             .set_nonblocking(true)
             .map_err(|_| NetworkError::Unavailable)?;
-        self.allocate_network_handle(owner, NetworkHandleKind::Stream(stream))
-            .map(Some)
+        let permission = self.network_handles[&listener].permission;
+        let parent = self.network_handles[&listener].policy.clone();
+        let handle =
+            self.allocate_network_handle(owner, NetworkHandleKind::Stream(stream), permission)?;
+        // Revoke followed by regrant between accept and admission must not adopt
+        // a stream accepted by the retired listener authorization.
+        if parent.revoked.load(Ordering::Acquire) {
+            self.network_handles.remove(&handle);
+            return Err(NetworkError::PermissionDenied);
+        }
+        Ok(Some(handle))
     }
 
     fn read(&mut self, socket: u64, max_bytes: u32) -> Result<WitNetworkReadResult, NetworkError> {
@@ -177,10 +242,23 @@ impl NetworkHost for WasmHostState {
         let Some(resource) = self.network_handles.get_mut(&socket) else {
             return Err(NetworkError::UnknownHandle);
         };
-        if resource.owner != owner {
+        if resource.owner != owner
+            || Some(resource.activation)
+                != self
+                    .execution_context
+                    .as_ref()
+                    .map(|context| context.principal.activation)
+        {
             return Err(NetworkError::UnknownHandle);
         }
-        let NetworkHandleKind::Stream(stream) = &mut resource.kind else {
+        let mut kind = resource
+            .kind
+            .lock()
+            .map_err(|_| NetworkError::Unavailable)?;
+        if resource.policy.revoked.load(Ordering::Acquire) {
+            return Err(NetworkError::PermissionDenied);
+        }
+        let Some(NetworkHandleKind::Stream(stream)) = kind.as_mut() else {
             return Err(NetworkError::WrongKind);
         };
         if requested == 0 {
@@ -218,10 +296,23 @@ impl NetworkHost for WasmHostState {
         let Some(resource) = self.network_handles.get_mut(&socket) else {
             return Err(NetworkError::UnknownHandle);
         };
-        if resource.owner != owner {
+        if resource.owner != owner
+            || Some(resource.activation)
+                != self
+                    .execution_context
+                    .as_ref()
+                    .map(|context| context.principal.activation)
+        {
             return Err(NetworkError::UnknownHandle);
         }
-        let NetworkHandleKind::Stream(stream) = &mut resource.kind else {
+        let mut kind = resource
+            .kind
+            .lock()
+            .map_err(|_| NetworkError::Unavailable)?;
+        if resource.policy.revoked.load(Ordering::Acquire) {
+            return Err(NetworkError::PermissionDenied);
+        }
+        let Some(NetworkHandleKind::Stream(stream)) = kind.as_mut() else {
             return Err(NetworkError::WrongKind);
         };
         match stream.write(&data) {
@@ -242,7 +333,13 @@ impl NetworkHost for WasmHostState {
         let Some(resource) = self.network_handles.get(&handle) else {
             return Err(NetworkError::UnknownHandle);
         };
-        if resource.owner != owner {
+        if resource.owner != owner
+            || Some(resource.activation)
+                != self
+                    .execution_context
+                    .as_ref()
+                    .map(|context| context.principal.activation)
+        {
             return Err(NetworkError::UnknownHandle);
         }
         self.network_handles.remove(&handle);
@@ -255,88 +352,134 @@ impl HttpFetchHost for WasmHostState {
         if !self.host_access_active {
             return Err(HttpFetchError::AccessNotActive);
         }
-        self.runtime_permission_owner(RuntimePermission::HttpFetch)
+        let owner = self
+            .runtime_permission_owner(RuntimePermission::HttpFetch)
             .map_err(|error| match error {
                 RuntimePermissionCheck::Denied => HttpFetchError::PermissionDenied,
                 RuntimePermissionCheck::Unavailable => HttpFetchError::Unavailable,
             })?;
 
-        let requested_limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
-        let response_limit = requested_limit.min(self.max_http_fetch_bytes);
-        let timeout = Duration::from_millis(self.http_fetch_timeout_ms);
-        let mut current = Url::parse(&url).map_err(|_| HttpFetchError::InvalidUrl)?;
+        let activation = self
+            .execution_context
+            .as_ref()
+            .ok_or(HttpFetchError::AccessNotActive)?
+            .principal
+            .activation;
+        let policy = self
+            .runtime_permissions
+            .register_resource(&owner, activation, RuntimePermission::HttpFetch, None)
+            .map_err(|_| HttpFetchError::PermissionDenied)?;
+        let limit = (max_bytes as usize).min(self.max_http_fetch_bytes);
+        let redirects = self.max_http_redirects;
+        let result = self.blocking_import(
+            Duration::from_millis(self.http_fetch_timeout_ms),
+            HttpFetchError::Unavailable,
+            |timeout| bounded_http_get(&url, limit, redirects, timeout),
+        );
+        if policy.revoked.load(Ordering::Acquire) {
+            return Err(HttpFetchError::PermissionDenied);
+        }
+        result
+    }
+}
+fn bounded_http_get(
+    url: &str,
+    response_limit: usize,
+    max_redirects: usize,
+    timeout: Duration,
+) -> Result<WitHttpResponse, HttpFetchError> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut current = Url::parse(url).map_err(|_| HttpFetchError::InvalidUrl)?;
 
-        for redirect_count in 0..=self.max_http_redirects {
-            let client = build_bounded_https_client(&current, timeout)?;
-            let response = client
-                .get(current.clone())
-                .header(reqwest::header::USER_AGENT, "Rintawa/0.0.1")
-                .send()
-                .map_err(map_http_request_error)?;
+    for redirect_count in 0..=max_redirects {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(HttpFetchError::Unavailable);
+        }
+        let client = build_bounded_https_client(&current, remaining)?;
+        let response = client
+            .get(current.clone())
+            .header(reqwest::header::USER_AGENT, "Rintawa/0.0.1")
+            .send()
+            .map_err(map_http_request_error)?;
 
-            let status = response.status();
-            if is_followed_redirect(status) {
-                if redirect_count >= self.max_http_redirects {
-                    return Err(HttpFetchError::TooManyRedirects);
-                }
-                let location = response
-                    .headers()
-                    .get(LOCATION)
-                    .ok_or(HttpFetchError::InvalidUrl)?
-                    .to_str()
-                    .map_err(|_| HttpFetchError::InvalidUrl)?;
-                current = current
-                    .join(location)
-                    .map_err(|_| HttpFetchError::InvalidUrl)?;
-                continue;
+        let status = response.status();
+        if is_followed_redirect(status) {
+            if redirect_count >= max_redirects {
+                return Err(HttpFetchError::TooManyRedirects);
             }
-
-            if response
-                .content_length()
-                .is_some_and(|length| length > u64::try_from(response_limit).unwrap_or(u64::MAX))
-            {
-                return Err(HttpFetchError::ResponseTooLarge);
-            }
-
-            let content_type = response
+            let location = response
                 .headers()
-                .get(CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            let final_url = current.to_string();
-            let mut body = Vec::with_capacity(
-                response_limit
-                    .min(response.content_length().unwrap_or(0) as usize)
-                    .min(1024 * 1024),
-            );
-            let read_limit = u64::try_from(response_limit)
-                .unwrap_or(u64::MAX)
-                .saturating_add(1);
-            response
-                .take(read_limit)
-                .read_to_end(&mut body)
-                .map_err(|_| HttpFetchError::Unavailable)?;
-            if body.len() > response_limit {
-                return Err(HttpFetchError::ResponseTooLarge);
-            }
-
-            return Ok(WitHttpResponse {
-                status: status.as_u16(),
-                final_url,
-                content_type,
-                body,
-            });
+                .get(LOCATION)
+                .ok_or(HttpFetchError::InvalidUrl)?
+                .to_str()
+                .map_err(|_| HttpFetchError::InvalidUrl)?;
+            current = current
+                .join(location)
+                .map_err(|_| HttpFetchError::InvalidUrl)?;
+            continue;
         }
 
-        Err(HttpFetchError::TooManyRedirects)
+        if response
+            .content_length()
+            .is_some_and(|length| length > u64::try_from(response_limit).unwrap_or(u64::MAX))
+        {
+            return Err(HttpFetchError::ResponseTooLarge);
+        }
+
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let final_url = current.to_string();
+        let mut body = Vec::with_capacity(
+            response_limit
+                .min(response.content_length().unwrap_or(0) as usize)
+                .min(1024 * 1024),
+        );
+        let read_limit = u64::try_from(response_limit)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        response
+            .take(read_limit)
+            .read_to_end(&mut body)
+            .map_err(|_| HttpFetchError::Unavailable)?;
+        if body.len() > response_limit {
+            return Err(HttpFetchError::ResponseTooLarge);
+        }
+
+        return Ok(WitHttpResponse {
+            status: status.as_u16(),
+            final_url,
+            content_type,
+            body,
+        });
     }
+
+    Err(HttpFetchError::TooManyRedirects)
 }
 
 pub(super) fn build_bounded_https_client(
     url: &Url,
     timeout: Duration,
 ) -> Result<HttpClient, HttpFetchError> {
-    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+    build_bounded_http_client(url, timeout, false)
+}
+
+/// Builds a destination-pinned HTTP client for one validated origin.
+///
+/// Public HTTPS remains the default. Local HTTP is permitted only when its exact
+/// origin was separately granted by the host to the executing component.
+pub(super) fn build_bounded_http_client(
+    url: &Url,
+    timeout: Duration,
+    is_local_origin_approved: bool,
+) -> Result<HttpClient, HttpFetchError> {
+    if (url.scheme() != "https" && !(url.scheme() == "http" && is_local_origin_approved))
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
         return Err(HttpFetchError::InvalidUrl);
     }
     let host = url.host().ok_or(HttpFetchError::InvalidUrl)?;
@@ -345,6 +488,7 @@ pub(super) fn build_bounded_https_client(
         .ok_or(HttpFetchError::InvalidUrl)?;
 
     let mut builder = HttpClient::builder()
+        .no_proxy()
         .redirect(RedirectPolicy::none())
         .timeout(timeout)
         .connect_timeout(timeout.min(Duration::from_secs(5)));
@@ -354,25 +498,61 @@ pub(super) fn build_bounded_https_client(
             let addresses = (domain, port)
                 .to_socket_addrs()
                 .map_err(|_| HttpFetchError::Unavailable)?;
-            let allowed = addresses
-                .into_iter()
-                .find(|address| is_allowed_domain_destination(*address))
-                .ok_or(HttpFetchError::ForbiddenDestination)?;
-            builder = builder.resolve(domain, allowed);
+            let addresses = addresses.collect::<Vec<_>>();
+            select_allowed_destination(&addresses, is_local_origin_approved)?;
+            // Retain *all* validated addresses so IPv4-only local runtimes still
+            // work when localhost resolves to IPv6 first; never re-resolve DNS.
+            builder = builder.resolve_to_addrs(domain, &addresses);
         }
         UrlHost::Ipv4(address) => {
-            if !is_allowed_public_ip(IpAddr::V4(address)) {
+            if !is_allowed_http_destination(IpAddr::V4(address), is_local_origin_approved) {
                 return Err(HttpFetchError::ForbiddenDestination);
             }
         }
         UrlHost::Ipv6(address) => {
-            if !is_allowed_public_ip(IpAddr::V6(address)) {
+            if !is_allowed_http_destination(IpAddr::V6(address), is_local_origin_approved) {
                 return Err(HttpFetchError::ForbiddenDestination);
             }
         }
     }
 
     builder.build().map_err(|_| HttpFetchError::Unavailable)
+}
+
+/// Rejects the entire DNS answer if *any* resolved address violates the policy.
+/// One public answer cannot make a mixed public/private DNS set acceptable.
+pub(super) fn select_allowed_destination(
+    addresses: &[SocketAddr],
+    is_local_origin_approved: bool,
+) -> Result<SocketAddr, HttpFetchError> {
+    if addresses.is_empty() {
+        return Err(HttpFetchError::Unavailable);
+    }
+    if addresses.iter().any(|address| {
+        if is_local_origin_approved {
+            !is_loopback_ip(address.ip())
+        } else {
+            !is_allowed_domain_destination(*address)
+        }
+    }) {
+        return Err(HttpFetchError::ForbiddenDestination);
+    }
+    Ok(addresses[0])
+}
+
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(address) => address.is_loopback(),
+        IpAddr::V6(address) => address.is_loopback(),
+    }
+}
+
+fn is_allowed_http_destination(ip: IpAddr, is_local_origin_approved: bool) -> bool {
+    if is_local_origin_approved {
+        is_loopback_ip(ip)
+    } else {
+        is_allowed_public_ip(ip)
+    }
 }
 
 fn is_allowed_domain_destination(address: SocketAddr) -> bool {
@@ -487,4 +667,109 @@ fn is_allowed_public_ipv6(address: Ipv6Addr) -> bool {
     }
 
     true
+}
+
+#[cfg(test)]
+mod destination_selection_tests {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    use super::*;
+
+    #[test]
+    fn test_should_reject_mixed_public_and_private_dns_answers() {
+        let mixed = [
+            SocketAddr::from((Ipv4Addr::new(93, 184, 216, 34), 443)),
+            SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1), 443)),
+        ];
+        assert!(matches!(
+            select_allowed_destination(&mixed, false),
+            Err(HttpFetchError::ForbiddenDestination)
+        ));
+        let reversed = [mixed[1], mixed[0]];
+        assert!(matches!(
+            select_allowed_destination(&reversed, false),
+            Err(HttpFetchError::ForbiddenDestination)
+        ));
+    }
+
+    #[test]
+    fn test_should_reject_link_local_metadata_or_ipv6_private_dns_answers() {
+        for address in [
+            SocketAddr::from((Ipv4Addr::new(169, 254, 169, 254), 443)),
+            SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 443)),
+            SocketAddr::from((Ipv6Addr::LOCALHOST, 443)),
+            SocketAddr::from(("fe80::1".parse::<Ipv6Addr>().expect("test IPv6"), 443)),
+        ] {
+            assert!(matches!(
+                select_allowed_destination(&[address], false),
+                Err(HttpFetchError::ForbiddenDestination)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_should_reject_empty_dns_result_without_guessing_destination() {
+        assert!(matches!(
+            select_allowed_destination(&[], false),
+            Err(HttpFetchError::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn test_should_allow_only_all_loopback_dns_answers_for_approved_origin() {
+        let v4 = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1), 11434));
+        let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 11434));
+        assert_eq!(
+            select_allowed_destination(&[v4, v6], true).expect("loopback DNS accepted"),
+            v4
+        );
+        assert!(matches!(
+            select_allowed_destination(
+                &[v4, SocketAddr::from((Ipv4Addr::new(192, 168, 1, 1), 11434))],
+                true
+            ),
+            Err(HttpFetchError::ForbiddenDestination)
+        ));
+        assert!(matches!(
+            select_allowed_destination(
+                &[
+                    v4,
+                    SocketAddr::from((Ipv4Addr::new(93, 184, 216, 34), 11434))
+                ],
+                true
+            ),
+            Err(HttpFetchError::ForbiddenDestination)
+        ));
+    }
+
+    #[test]
+    fn test_should_never_allow_insecure_public_http_without_local_approval() {
+        let url = Url::parse("http://example.com/path").expect("URL should parse");
+        assert!(matches!(
+            build_bounded_http_client(&url, Duration::from_millis(100), false),
+            Err(HttpFetchError::InvalidUrl)
+        ));
+    }
+
+    #[test]
+    fn test_should_never_allow_non_loopback_http_even_with_approval_flag() {
+        for url in [
+            "http://10.0.0.1:11434/",
+            "http://169.254.169.254/",
+            "http://192.168.0.2/",
+            "http://93.184.216.34:11434/",
+        ] {
+            assert!(
+                matches!(
+                    build_bounded_http_client(
+                        &Url::parse(url).expect("test URL should parse"),
+                        Duration::from_millis(100),
+                        true,
+                    ),
+                    Err(HttpFetchError::ForbiddenDestination)
+                ),
+                "unexpectedly accepted {url}"
+            );
+        }
+    }
 }

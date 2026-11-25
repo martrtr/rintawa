@@ -6,7 +6,6 @@ use rintawa_extension_engine::{
 use rintawa_sdk::{
     api::{LogLevel, LoggerApi},
     context::{ComponentContext, RegistrationContext},
-    contracts::{ContractKey, ContractVersion},
     contributions::ContributionDescriptor,
     errors::{ExtensionError, ExtensionResult},
     manifest::{
@@ -16,7 +15,6 @@ use rintawa_sdk::{
     runtime_permissions::RuntimePermission,
     traits::Component,
     types::{ComponentId, ComponentTarget, ExtensionId, ExtensionInstanceId, RuntimeScopeId},
-    ui::{UiActionEvent, UiActionId, UiActionPayload, UiNodeId, UiSurfaceId},
 };
 use std::{fs, time::Duration};
 
@@ -112,6 +110,7 @@ fn test_should_execute_granted_background_task_through_engine_runtime_pump() -> 
             target: ComponentTarget::new(WASM_COMPONENT_TARGET_V1),
             entry: None,
             required: true,
+            published_preference: None,
             permissions: ComponentPermissions {
                 secret_read: Vec::new(),
                 runtime: vec![RuntimePermission::BackgroundTask],
@@ -133,281 +132,7 @@ fn test_should_execute_granted_background_task_through_engine_runtime_pump() -> 
     std::thread::sleep(delay + Duration::from_millis(2));
     assert_eq!(engine.poll_runtime()?, None);
 
-    let effects = engine.active_runtime_effect_principals();
-    assert_eq!(effects.len(), 1);
-    assert_eq!(effects[0].1.component_id, component_id);
-
     engine.stop_extension(&extension_id)?;
-    assert!(engine.active_runtime_effect_principals().is_empty());
-    Ok(())
-}
-
-#[test]
-fn test_should_dispatch_service_request_to_wasm_guest() -> EngineResult<()> {
-    let runtime = WasmRuntimeEngine::new()?;
-    let mut component = runtime.load_component_from_bytes(
-        ComponentId::new("stateful-component"),
-        STATEFUL_WASM_COMPONENT.as_bytes(),
-    )?;
-    let mut context = TestComponentContext::new();
-
-    component.register(&mut context)?;
-    component.start(&mut context)?;
-    let response = component.handle_service(
-        &mut context,
-        &ContractKey::new("example.service", ContractVersion::new(1)),
-        b"payload",
-    )?;
-
-    assert!(response.is_empty());
-    Ok(())
-}
-
-#[test]
-fn test_should_use_dedicated_fuel_budget_for_service_requests() -> EngineResult<()> {
-    let low_service_budget = WasmExecutionBudget {
-        fuel_per_service_request: 1,
-        ..WasmExecutionBudget::default()
-    };
-    let runtime = WasmRuntimeEngine::with_execution_budget(low_service_budget)?;
-    let mut component = runtime.load_component_from_bytes(
-        ComponentId::new("stateful-component"),
-        STATEFUL_WASM_COMPONENT.as_bytes(),
-    )?;
-    let mut context = TestComponentContext::new();
-    component.register(&mut context)?;
-    component.start(&mut context)?;
-    assert!(matches!(
-        component.handle_service(
-            &mut context,
-            &ContractKey::new("example.service", ContractVersion::new(1)),
-            b"payload",
-        ),
-        Err(ExtensionError::ExecutionBudgetExceeded {
-            resource: "fuel",
-            operation: "service request",
-        })
-    ));
-
-    let larger_service_budget = WasmExecutionBudget {
-        fuel_per_service_request: 10_000_000,
-        ..WasmExecutionBudget::default()
-    };
-    let runtime = WasmRuntimeEngine::with_execution_budget(larger_service_budget)?;
-    let mut component = runtime.load_component_from_bytes(
-        ComponentId::new("stateful-component"),
-        STATEFUL_WASM_COMPONENT.as_bytes(),
-    )?;
-    let mut context = TestComponentContext::new();
-    component.register(&mut context)?;
-    component.start(&mut context)?;
-    assert!(
-        component
-            .handle_service(
-                &mut context,
-                &ContractKey::new("example.service", ContractVersion::new(1)),
-                b"payload",
-            )?
-            .is_empty()
-    );
-    Ok(())
-}
-
-#[test]
-fn test_should_reject_oversized_wasm_service_request() -> EngineResult<()> {
-    let budget = WasmExecutionBudget {
-        max_host_message_bytes: 16,
-        max_service_message_bytes: 32,
-        ..WasmExecutionBudget::default()
-    };
-    let runtime = WasmRuntimeEngine::with_execution_budget(budget)?;
-    let mut component = runtime.load_component_from_bytes(
-        ComponentId::new("stateful-component"),
-        STATEFUL_WASM_COMPONENT.as_bytes(),
-    )?;
-    let mut context = TestComponentContext::new();
-
-    component.register(&mut context)?;
-    component.start(&mut context)?;
-    let error = component
-        .handle_service(
-            &mut context,
-            &ContractKey::new("x", ContractVersion::new(1)),
-            &[0; 33],
-        )
-        .unwrap_err();
-
-    assert!(matches!(
-        error,
-        ExtensionError::HostMessageTooLarge {
-            operation: "service request",
-            actual_bytes: 33,
-            maximum_bytes: 32,
-        }
-    ));
-    Ok(())
-}
-
-#[test]
-fn test_should_report_wasm_trap_from_service_handler() -> EngineResult<()> {
-    let runtime = WasmRuntimeEngine::new()?;
-    let mut component = runtime.load_component_from_bytes(
-        ComponentId::new("stateful-component"),
-        STATEFUL_WASM_COMPONENT.as_bytes(),
-    )?;
-    let mut context = TestComponentContext::new();
-
-    component.register(&mut context)?;
-    component.start(&mut context)?;
-    let error = component
-        .handle_service(
-            &mut context,
-            &ContractKey::new("example.service", ContractVersion::new(99)),
-            b"payload",
-        )
-        .unwrap_err();
-
-    assert!(matches!(
-        error,
-        ExtensionError::Message(message) if message.contains("service request failed")
-    ));
-    Ok(())
-}
-
-#[test]
-fn test_should_dispatch_validated_ui_action_to_wasm_guest() -> EngineResult<()> {
-    let runtime = WasmRuntimeEngine::new()?;
-    let mut component = runtime.load_component_from_bytes(
-        ComponentId::new("stateful-component"),
-        STATEFUL_WASM_COMPONENT.as_bytes(),
-    )?;
-    let mut context = TestComponentContext::new();
-
-    component.register(&mut context)?;
-    component.start(&mut context)?;
-    component.handle_ui_action(
-        &mut context,
-        &UiActionEvent {
-            owner_instance_id: ExtensionInstanceId::new("test-extension"),
-            surface_id: UiSurfaceId::new("example.main"),
-            node_id: UiNodeId::new("send"),
-            action_id: UiActionId::new("example.send"),
-            surface_revision: 1,
-            payload: UiActionPayload::None,
-        },
-    )?;
-
-    Ok(())
-}
-
-#[test]
-fn test_should_use_dedicated_fuel_budget_for_ui_actions() -> EngineResult<()> {
-    let expensive_ui_component = STATEFUL_WASM_COMPONENT.replace(
-        r#"(func (export "handle-ui-action") (param i32 i32))"#,
-        r#"(func (export "handle-ui-action") (param i32 i32)
-                (local $remaining i32)
-                (loop $work
-                    (local.set $remaining
-                        (i32.add (local.get $remaining) (i32.const 1)))
-                    (br_if $work
-                        (i32.lt_u (local.get $remaining) (i32.const 8000)))))"#,
-    );
-    let event = UiActionEvent {
-        owner_instance_id: ExtensionInstanceId::new("test-extension"),
-        surface_id: UiSurfaceId::new("example.main"),
-        node_id: UiNodeId::new("send"),
-        action_id: UiActionId::new("example.send"),
-        surface_revision: 1,
-        payload: UiActionPayload::None,
-    };
-
-    let low_ui_budget = WasmExecutionBudget {
-        fuel_per_callback: 10_000,
-        fuel_per_ui_action: 1_000,
-        ..WasmExecutionBudget::default()
-    };
-    let runtime = WasmRuntimeEngine::with_execution_budget(low_ui_budget)?;
-    let mut component = runtime.load_component_from_bytes(
-        ComponentId::new("stateful-component"),
-        expensive_ui_component.as_bytes(),
-    )?;
-    let mut context = TestComponentContext::new();
-    component.register(&mut context)?;
-    component.start(&mut context)?;
-    assert!(matches!(
-        component.handle_ui_action(&mut context, &event),
-        Err(ExtensionError::ComponentRuntimeInvalidated {
-            operation: "UI action",
-            reason,
-        }) if reason.contains("execution budget for `fuel` was exhausted during `UI action`")
-    ));
-
-    let larger_ui_budget = WasmExecutionBudget {
-        fuel_per_callback: 10_000,
-        fuel_per_ui_action: 100_000,
-        ..WasmExecutionBudget::default()
-    };
-    let runtime = WasmRuntimeEngine::with_execution_budget(larger_ui_budget)?;
-    let mut component = runtime.load_component_from_bytes(
-        ComponentId::new("stateful-component"),
-        expensive_ui_component.as_bytes(),
-    )?;
-    let mut context = TestComponentContext::new();
-    component.register(&mut context)?;
-    component.start(&mut context)?;
-    component.handle_ui_action(&mut context, &event)?;
-
-    Ok(())
-}
-
-#[test]
-fn test_should_preserve_guest_state_across_component_lifecycle() -> EngineResult<()> {
-    let runtime = WasmRuntimeEngine::new()?;
-    let mut component = runtime.load_component_from_bytes(
-        ComponentId::new("stateful-component"),
-        STATEFUL_WASM_COMPONENT.as_bytes(),
-    )?;
-    let mut context = TestComponentContext::new();
-
-    component.register(&mut context)?;
-    component.start(&mut context)?;
-    component.dispatch_event(&mut context, "chat.message", b"first")?;
-    component.stop(&mut context)?;
-    component.start(&mut context)?;
-    component.dispatch_event(&mut context, "chat.message", b"second")?;
-
-    Ok(())
-}
-
-#[test]
-fn test_should_dispatch_events_only_while_component_is_active() -> EngineResult<()> {
-    let runtime = WasmRuntimeEngine::new()?;
-    let mut component = runtime.load_component_from_bytes(
-        ComponentId::new("stateful-component"),
-        STATEFUL_WASM_COMPONENT.as_bytes(),
-    )?;
-    let mut context = TestComponentContext::new();
-
-    component.register(&mut context)?;
-    assert!(matches!(
-        component.dispatch_event(&mut context, "chat.message", b"before-start"),
-        Err(ExtensionError::Message(message))
-            if message.contains("not active during event dispatch")
-    ));
-
-    component.start(&mut context)?;
-    component.dispatch_event(&mut context, "chat.message", b"active")?;
-    component.stop(&mut context)?;
-
-    assert!(matches!(
-        component.dispatch_event(&mut context, "chat.message", b"after-stop"),
-        Err(ExtensionError::Message(message))
-            if message.contains("not active during event dispatch")
-    ));
-
-    component.start(&mut context)?;
-    component.dispatch_event(&mut context, "chat.message", b"after-restart")?;
-
     Ok(())
 }
 
@@ -458,34 +183,6 @@ fn test_should_bound_file_reads_before_compiling_an_oversized_artifact() -> Engi
             maximum_bytes: 8,
             ..
         }
-    ));
-
-    Ok(())
-}
-
-#[test]
-fn test_should_reject_messages_above_the_host_budget() -> EngineResult<()> {
-    let budget = WasmExecutionBudget {
-        max_host_message_bytes: 3,
-        ..WasmExecutionBudget::default()
-    };
-    let runtime = WasmRuntimeEngine::with_execution_budget(budget)?;
-    let mut component = runtime.load_component_from_bytes(
-        ComponentId::new("stateful-component"),
-        STATEFUL_WASM_COMPONENT.as_bytes(),
-    )?;
-    let mut context = TestComponentContext::new();
-
-    component.register(&mut context)?;
-    component.start(&mut context)?;
-
-    assert!(matches!(
-        component.dispatch_event(&mut context, "chat", b"ok"),
-        Err(ExtensionError::HostMessageTooLarge {
-            operation: "event topic",
-            actual_bytes: 4,
-            maximum_bytes: 3,
-        })
     ));
 
     Ok(())
@@ -557,54 +254,6 @@ fn test_should_discard_wasm_instance_after_failed_stop() -> EngineResult<()> {
         Err(ExtensionError::Message(message))
             if message.contains("discarded after failed `stop` callback")
     ));
-
-    Ok(())
-}
-
-#[test]
-fn test_should_reset_fuel_for_each_callback_on_the_same_guest_instance() -> EngineResult<()> {
-    let budget = WasmExecutionBudget {
-        fuel_per_callback: 100_000,
-        ..WasmExecutionBudget::default()
-    };
-    let runtime = WasmRuntimeEngine::with_execution_budget(budget)?;
-    let fuel_consuming_component = STATEFUL_WASM_COMPONENT
-        .replace(
-            r#"(func (export "start")
-                (global.set $event-count
-                    (i32.add (global.get $event-count) (i32.const 1))))"#,
-            r#"(func (export "start")
-                (local $remaining i32)
-                (loop $work
-                    (local.set $remaining
-                        (i32.add (local.get $remaining) (i32.const 1)))
-                    (br_if $work
-                        (i32.lt_u (local.get $remaining) (i32.const 8000)))))"#,
-        )
-        .replace(
-            r#"(func (export "on-event") (param i32 i32 i32 i32)
-                (if (i32.eqz
-                    (i32.or
-                        (i32.eq (global.get $event-count) (i32.const 2))
-                        (i32.eq (global.get $event-count) (i32.const 3))))
-                    (then unreachable)))"#,
-            r#"(func (export "on-event") (param i32 i32 i32 i32)
-                (local $remaining i32)
-                (loop $work
-                    (local.set $remaining
-                        (i32.add (local.get $remaining) (i32.const 1)))
-                    (br_if $work
-                        (i32.lt_u (local.get $remaining) (i32.const 8000)))))"#,
-        );
-    let mut component = runtime.load_component_from_bytes(
-        ComponentId::new("stateful-component"),
-        fuel_consuming_component.as_bytes(),
-    )?;
-    let mut context = TestComponentContext::new();
-
-    component.register(&mut context)?;
-    component.start(&mut context)?;
-    component.dispatch_event(&mut context, "chat.message", b"message")?;
 
     Ok(())
 }

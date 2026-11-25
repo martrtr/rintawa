@@ -4,11 +4,9 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use rintawa_sdk::{
     context::{ComponentContext, RegistrationContext},
-    contracts::ContractKey,
     errors::{ExtensionError, ExtensionResult},
     traits::Component,
     types::ComponentId,
-    ui::UiActionEvent,
 };
 use tracing::warn;
 use wasmtime::component::Resource;
@@ -127,6 +125,9 @@ impl WasmTargetProviderEndpoint {
             .resource_table
             .delete(source_resource)
             .map_err(|error| RtwComponentHostError::Host(error.to_string()));
+        if result.is_err() {
+            runtime.quarantine("target load");
+        }
         let provider_result = result?;
         cleanup?;
         provider_result.map_err(|error| {
@@ -202,6 +203,7 @@ impl WasmTargetProviderEndpoint {
                     .store
                     .data_mut()
                     .cancel_target_component_registration();
+                runtime.quarantine("target register");
                 Err(error)
             }
         }
@@ -215,6 +217,33 @@ impl WasmTargetProviderEndpoint {
         let mut runtime = self.runtime_for_callback()?;
         let instance = Self::live_instance_for_callback(&mut runtime)?;
         WasmComponent::set_callback_fuel(&mut instance.store, &self.budget, "target start")?;
+        let executing = instance
+            .store
+            .data()
+            .transport
+            .contexts
+            .context(&owner, true)
+            .map_err(|error| ExtensionError::Message(error.to_string()))?;
+        if &executing.scope != ctx.runtime_scope_id() {
+            return Err(ExtensionError::Message(String::from(
+                "hosted scope mismatch",
+            )));
+        }
+        let provider =
+            instance.store.data().registered_owner().ok_or_else(|| {
+                ExtensionError::Message(String::from("missing provider identity"))
+            })?;
+        instance
+            .store
+            .data()
+            .transport
+            .contexts
+            .bind_provider(&executing, provider)
+            .map_err(|error| ExtensionError::Message(error.to_string()))?;
+        instance
+            .store
+            .data_mut()
+            .revoke_runtime_resources_for_owner(&owner);
         instance
             .store
             .data_mut()
@@ -229,15 +258,19 @@ impl WasmTargetProviderEndpoint {
             ))),
         };
         match result {
-            Ok(Ok(())) => match instance.store.data_mut().finish_guest_execution(ctx) {
-                Ok(()) => Ok(()),
-                Err(error) => Err(instance.store.data_mut().abort_guest_execution(ctx, error)),
-            },
+            Ok(Ok(())) => {
+                instance.store.data_mut().finish_guest_execution();
+                Ok(())
+            }
             Ok(Err(error)) => {
                 let error = map_wit_target_host_error("start", error);
-                Err(instance.store.data_mut().abort_guest_execution(ctx, error))
+                Err(instance.store.data_mut().abort_guest_execution(error))
             }
-            Err(error) => Err(instance.store.data_mut().abort_guest_execution(ctx, error)),
+            Err(error) => {
+                let error = instance.store.data_mut().abort_guest_execution(error);
+                runtime.quarantine("target start");
+                Err(error)
+            }
         }
     }
 
@@ -253,9 +286,7 @@ impl WasmTargetProviderEndpoint {
         let (mut runtime, lock_failure) = match self.runtime.try_lock() {
             Ok(runtime) => (runtime, None),
             Err(TryLockError::WouldBlock) => {
-                return Err(ExtensionError::Message(String::from(
-                    "WASM target-provider runtime is busy",
-                )));
+                return Err(ExtensionError::CleanupBusy);
             }
             Err(TryLockError::Poisoned(poisoned)) => (
                 poisoned.into_inner(),
@@ -264,6 +295,7 @@ impl WasmTargetProviderEndpoint {
                 ))),
             ),
         };
+        let mut trapped = false;
         let result = if let Some(error) = lock_failure {
             Err(error)
         } else {
@@ -277,7 +309,10 @@ impl WasmTargetProviderEndpoint {
                         Some(provider) => provider
                             .rintawa_engine_target_provider()
                             .call_stop_component(&mut instance.store, handle)
-                            .map_err(|error| WasmComponent::execution_error("target stop", error))
+                            .map_err(|error| {
+                                trapped = true;
+                                WasmComponent::execution_error("target stop", error)
+                            })
                             .and_then(|result| {
                                 result.map_err(|error| map_wit_target_host_error("stop", error))
                             }),
@@ -294,174 +329,19 @@ impl WasmTargetProviderEndpoint {
             instance
                 .store
                 .data_mut()
-                .forget_effect_handles_for_owner(&owner);
-            instance
-                .store
-                .data_mut()
                 .revoke_runtime_resources_for_owner(&owner);
         }
+        if trapped {
+            runtime.quarantine("target stop");
+        }
         result
-    }
-
-    fn handle_event(
-        &self,
-        handle: u64,
-        ctx: &mut dyn ComponentContext,
-        topic: &str,
-        payload: &[u8],
-    ) -> ExtensionResult<()> {
-        if topic.len() > self.budget.max_host_message_bytes {
-            return Err(ExtensionError::HostMessageTooLarge {
-                operation: "target event topic",
-                actual_bytes: topic.len(),
-                maximum_bytes: self.budget.max_host_message_bytes,
-            });
-        }
-        if payload.len() > self.budget.max_host_message_bytes {
-            return Err(ExtensionError::HostMessageTooLarge {
-                operation: "target event payload",
-                actual_bytes: payload.len(),
-                maximum_bytes: self.budget.max_host_message_bytes,
-            });
-        }
-
-        let owner = rintawa_sdk::contracts::ComponentRef::new(
-            ctx.extension_instance_id().clone(),
-            ctx.component_id().clone(),
-        );
-        let mut runtime = self.runtime_for_callback()?;
-        let instance = Self::live_instance_for_callback(&mut runtime)?;
-        WasmComponent::set_callback_fuel(&mut instance.store, &self.budget, "target event")?;
-        instance
-            .store
-            .data_mut()
-            .begin_delegated_guest_execution(owner);
-        let result = match instance.target_provider.as_ref() {
-            Some(provider) => provider
-                .rintawa_engine_target_provider()
-                .call_handle_event(&mut instance.store, handle, topic, payload)
-                .map_err(|error| WasmComponent::execution_error("target event", error)),
-            None => Err(ExtensionError::Message(String::from(
-                "target-provider export view is unavailable",
-            ))),
-        };
-
-        match result {
-            Ok(Ok(())) => match instance.store.data_mut().finish_guest_execution(ctx) {
-                Ok(()) => Ok(()),
-                Err(error) => Err(instance.store.data_mut().abort_guest_execution(ctx, error)),
-            },
-            Ok(Err(error)) => {
-                let error = map_wit_target_host_error("event", error);
-                Err(instance.store.data_mut().abort_guest_execution(ctx, error))
-            }
-            Err(error) => Err(instance.store.data_mut().abort_guest_execution(ctx, error)),
-        }
-    }
-
-    fn handle_ui_action(
-        &self,
-        handle: u64,
-        ctx: &mut dyn ComponentContext,
-        payload: &[u8],
-    ) -> ExtensionResult<()> {
-        if payload.len() > self.budget.max_host_message_bytes {
-            return Err(ExtensionError::HostMessageTooLarge {
-                operation: "target UI action",
-                actual_bytes: payload.len(),
-                maximum_bytes: self.budget.max_host_message_bytes,
-            });
-        }
-        let owner = rintawa_sdk::contracts::ComponentRef::new(
-            ctx.extension_instance_id().clone(),
-            ctx.component_id().clone(),
-        );
-        let mut runtime = self.runtime_for_callback()?;
-        let instance = Self::live_instance_for_callback(&mut runtime)?;
-        WasmComponent::set_ui_action_fuel(&mut instance.store, &self.budget, "target UI action")?;
-        instance
-            .store
-            .data_mut()
-            .begin_delegated_guest_execution(owner);
-        let result = match instance.target_provider.as_ref() {
-            Some(provider) => provider
-                .rintawa_engine_target_provider()
-                .call_handle_ui_action(&mut instance.store, handle, payload)
-                .map_err(|error| WasmComponent::execution_error("target UI action", error)),
-            None => Err(ExtensionError::Message(String::from(
-                "target-provider export view is unavailable",
-            ))),
-        };
-        match result {
-            Ok(Ok(())) => match instance.store.data_mut().finish_guest_execution(ctx) {
-                Ok(()) => Ok(()),
-                Err(error) => Err(instance.store.data_mut().abort_guest_execution(ctx, error)),
-            },
-            Ok(Err(error)) => {
-                let error = map_wit_target_host_error("UI action", error);
-                Err(instance.store.data_mut().abort_guest_execution(ctx, error))
-            }
-            Err(error) => Err(instance.store.data_mut().abort_guest_execution(ctx, error)),
-        }
-    }
-
-    fn handle_service(
-        &self,
-        handle: u64,
-        ctx: &mut dyn ComponentContext,
-        contract: &ContractKey,
-        request: &[u8],
-    ) -> ExtensionResult<Vec<u8>> {
-        if request.len() > self.budget.max_service_message_bytes {
-            return Err(ExtensionError::HostMessageTooLarge {
-                operation: "target service request",
-                actual_bytes: request.len(),
-                maximum_bytes: self.budget.max_service_message_bytes,
-            });
-        }
-        let owner = rintawa_sdk::contracts::ComponentRef::new(
-            ctx.extension_instance_id().clone(),
-            ctx.component_id().clone(),
-        );
-        let mut runtime = self.runtime_for_callback()?;
-        let instance = Self::live_instance_for_callback(&mut runtime)?;
-        WasmComponent::set_callback_fuel(&mut instance.store, &self.budget, "target service")?;
-        instance
-            .store
-            .data_mut()
-            .begin_delegated_service_execution(owner);
-        let result = match instance.target_provider.as_ref() {
-            Some(provider) => provider
-                .rintawa_engine_target_provider()
-                .call_handle_service(
-                    &mut instance.store,
-                    handle,
-                    contract.id.as_str(),
-                    contract.version.major(),
-                    request,
-                )
-                .map_err(|error| WasmComponent::execution_error("target service", error)),
-            None => Err(ExtensionError::Message(String::from(
-                "target-provider export view is unavailable",
-            ))),
-        };
-        instance.store.data_mut().finish_service_execution();
-        let response = result?.map_err(|error| map_wit_target_host_error("service", error))?;
-        if response.len() > self.budget.max_service_message_bytes {
-            return Err(ExtensionError::HostMessageTooLarge {
-                operation: "target service response",
-                actual_bytes: response.len(),
-                maximum_bytes: self.budget.max_service_message_bytes,
-            });
-        }
-        Ok(response)
     }
 
     fn drop_component(&self, handle: u64) -> ExtensionResult<()> {
         let mut runtime = self.runtime_for_callback()?;
         let instance = Self::live_instance_for_callback(&mut runtime)?;
         WasmComponent::set_callback_fuel(&mut instance.store, &self.budget, "target drop")?;
-        instance
+        let result = instance
             .target_provider
             .as_ref()
             .ok_or_else(|| {
@@ -469,8 +349,11 @@ impl WasmTargetProviderEndpoint {
             })?
             .rintawa_engine_target_provider()
             .call_drop_component(&mut instance.store, handle)
-            .map_err(|error| WasmComponent::execution_error("target drop", error))?
-            .map_err(|error| map_wit_target_host_error("drop", error))
+            .map_err(|error| WasmComponent::execution_error("target drop", error));
+        if result.is_err() {
+            runtime.quarantine("target drop");
+        }
+        result?.map_err(|error| map_wit_target_host_error("drop", error))
     }
 }
 
@@ -496,6 +379,10 @@ impl RtwComponentHost for WasmExecutionTargetHost {
 }
 
 impl Component for WasmExecutionTargetProxy {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn id(&self) -> &ComponentId {
         &self.id
     }
@@ -511,40 +398,6 @@ impl Component for WasmExecutionTargetProxy {
 
     fn stop(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
         self.provider.stop_component(self.handle, ctx)
-    }
-
-    fn handle_event(
-        &mut self,
-        ctx: &mut dyn ComponentContext,
-        topic: &str,
-        payload: &[u8],
-    ) -> ExtensionResult<()> {
-        self.provider.handle_event(self.handle, ctx, topic, payload)
-    }
-
-    fn handle_ui_action(
-        &mut self,
-        ctx: &mut dyn ComponentContext,
-        event: &UiActionEvent,
-    ) -> ExtensionResult<()> {
-        let payload = serde_json::to_vec(event).map_err(|error| {
-            ExtensionError::Message(format!("could not encode target UI action: {error}"))
-        })?;
-        self.provider.handle_ui_action(self.handle, ctx, &payload)
-    }
-
-    fn service_message_limit(&self) -> Option<usize> {
-        Some(self.provider.budget.max_service_message_bytes)
-    }
-
-    fn handle_service(
-        &mut self,
-        ctx: &mut dyn ComponentContext,
-        contract: &ContractKey,
-        request: &[u8],
-    ) -> ExtensionResult<Vec<u8>> {
-        self.provider
-            .handle_service(self.handle, ctx, contract, request)
     }
 }
 

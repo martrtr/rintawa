@@ -1,5 +1,7 @@
 //! Command-line entry point for running and managing a local Rintawa host.
 
+mod secret_cli;
+
 use std::{
     env,
     path::PathBuf,
@@ -9,7 +11,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use rintawa_host::{HOST_SCOPE, HostHome, HostRuntime, UserContentId};
+use rintawa_artifacts::ArtifactDigest;
+use rintawa_host::{HOST_SCOPE, HostHome, HostRuntime};
 use rintawa_sdk::{
     contracts::ComponentRef, runtime_permissions::RuntimePermission, types::RuntimeScopeId,
     world::WorldId,
@@ -35,6 +38,14 @@ enum Commands {
         #[arg(long)]
         disabled: bool,
     },
+    /// Store a verified RTW without activation or permission changes.
+    PackageInstall { path: PathBuf },
+    /// List immutable installed World templates.
+    TemplateList,
+    /// Inspect exact template composition and requested capabilities.
+    TemplateInfo { digest: ArtifactDigest },
+    /// Export a stopped supported World, including committed data, as a template.
+    WorldExport { id: WorldId, path: PathBuf },
     /// Show baseline extension activations.
     List,
     /// Enable one baseline activation by extension ID.
@@ -73,27 +84,104 @@ enum Commands {
         #[arg(long, default_value = HOST_SCOPE)]
         scope: String,
     },
-    /// Import a validated RTW into the generic persistent user-content library.
-    ContentImport {
-        /// Local RTW content file.
-        path: PathBuf,
+    /// List explicitly approved local HTTP origins for one composition scope.
+    ListHttpOrigins {
+        /// Baseline, default-world recipe or exact World runtime scope.
+        #[arg(long, default_value = HOST_SCOPE)]
+        scope: String,
     },
-    /// List persistent generic user-content entries.
-    ContentList,
-    /// Replace one logical user-content item with a validated RTW revision.
-    ContentReplace {
-        /// Stable logical user-content identity.
-        id: UserContentId,
-        /// Replacement local RTW content file.
-        path: PathBuf,
+    /// Approve one exact local HTTP origin for a manifest-authorized component.
+    GrantHttpOrigin {
+        /// Concrete extension instance receiving the origin grant.
+        instance: String,
+        /// Component within this exact instance.
+        component: String,
+        /// Local origin, for example http://127.0.0.1:11434.
+        origin: String,
+        /// Composition scope containing this principal.
+        #[arg(long, default_value = HOST_SCOPE)]
+        scope: String,
     },
-    /// Remove one logical user-content item from the library index.
-    ContentRemove {
-        /// Stable logical user-content identity.
-        id: UserContentId,
+    /// Revoke one exact local HTTP origin without changing other permissions.
+    RevokeHttpOrigin {
+        /// Concrete extension instance receiving the origin grant.
+        instance: String,
+        /// Component within this exact instance.
+        component: String,
+        /// Exact local origin previously approved.
+        origin: String,
+        /// Composition scope containing this principal.
+        #[arg(long, default_value = HOST_SCOPE)]
+        scope: String,
+    },
+    /// Store a credential from UTF-8 stdin (at most 64 KiB), never from argv.
+    SecretSet { path: String },
+    /// Delete a credential without reading it back.
+    SecretDelete { path: String },
+    /// Inspect or explicitly select the home-local secret backend (no migration).
+    SecretBackend {
+        backend: Option<rintawa_host::SecretBackend>,
+    },
+    /// Create a shared secret from bounded UTF-8 stdin, without granting any reader.
+    #[cfg(target_os = "linux")]
+    SecretCreate { label: String },
+    /// Explicitly import a legacy system path into a new managed system entry.
+    #[cfg(target_os = "linux")]
+    SecretImport { path: String, label: String },
+    /// List shared metadata and persisted consumers; never print secret values.
+    #[cfg(target_os = "linux")]
+    SecretList,
+    /// Rename an entry, requiring its current revision from secret-list.
+    #[cfg(target_os = "linux")]
+    SecretRename {
+        id: String,
+        revision: u64,
+        label: String,
+    },
+    /// Replace a shared value from stdin for all readers, with explicit confirmation.
+    #[cfg(target_os = "linux")]
+    SecretReplace {
+        id: String,
+        revision: u64,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Delete a shared entry; consumers keep a missing reference until disconnected.
+    #[cfg(target_os = "linux")]
+    SecretRemove {
+        id: String,
+        revision: u64,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Approve an exact manifest-requested secret path for the next activation.
+    GrantSecretRead {
+        instance: String,
+        component: String,
+        path: String,
+        #[arg(long, default_value = HOST_SCOPE)]
+        scope: String,
+    },
+    /// Remove a local secret approval; stop/restart applies it to an active scope.
+    RevokeSecretRead {
+        instance: String,
+        component: String,
+        path: String,
+        #[arg(long, default_value = HOST_SCOPE)]
+        scope: String,
     },
     /// Create an empty persistent authoritative world.
-    WorldCreate,
+    WorldCreate {
+        /// Exact installed template; omit to use the trusted default recipe.
+        #[arg(long)]
+        template: Option<ArtifactDigest>,
+        /// Override the template name before publishing the new World.
+        #[arg(long, requires = "template")]
+        title: Option<String>,
+        /// Explicitly approve only the template's requested World capabilities.
+        #[arg(long, requires = "template")]
+        approve_runtime_permissions: bool,
+    },
     /// List persistent worlds in the local Rintawa home.
     WorldList,
     /// Show durable metadata for one persistent world.
@@ -115,6 +203,34 @@ fn main() -> Result<()> {
     let home = HostHome::open(resolve_home(cli.home)?)?;
     match cli.command {
         Commands::Install { path, disabled } => install(&home, path, disabled),
+        Commands::PackageInstall { path } => {
+            let result = home.install_package(path)?;
+            println!("digest = {}", result.digest);
+            println!("content = {}", result.content);
+            Ok(())
+        }
+        Commands::TemplateList => {
+            for template in home.list_templates()? {
+                if let Some(reason) = template.invalid_reason {
+                    println!("{} invalid: {}", template.digest, reason);
+                } else {
+                    println!("{} {}", template.digest, template.name);
+                }
+            }
+            Ok(())
+        }
+        Commands::TemplateInfo { digest } => {
+            println!("{}", home.template_info(&digest)?);
+            Ok(())
+        }
+        Commands::WorldExport { id, path } => {
+            home.export_world_template(id, &path)?;
+            println!("exported = {}", path.display());
+            println!(
+                "Includes all committed World data. Secrets and local approvals are excluded."
+            );
+            Ok(())
+        }
         Commands::List => list(&home),
         Commands::Enable { id } => set_enabled(&home, id, true),
         Commands::Disable { id } => set_enabled(&home, id, false),
@@ -131,11 +247,111 @@ fn main() -> Result<()> {
             permission,
             scope,
         } => revoke_runtime_permission(&home, instance, component, permission, scope),
-        Commands::ContentImport { path } => content_import(&home, path),
-        Commands::ContentList => content_list(&home),
-        Commands::ContentReplace { id, path } => content_replace(&home, id, path),
-        Commands::ContentRemove { id } => content_remove(&home, id),
-        Commands::WorldCreate => world_create(&home),
+        Commands::ListHttpOrigins { scope } => list_http_origins(&home, scope),
+        Commands::GrantHttpOrigin {
+            instance,
+            component,
+            origin,
+            scope,
+        } => grant_http_origin(&home, instance, component, origin, scope),
+        Commands::RevokeHttpOrigin {
+            instance,
+            component,
+            origin,
+            scope,
+        } => revoke_http_origin(&home, instance, component, origin, scope),
+        Commands::SecretSet { path } => secret_cli::store(&home, &path),
+        Commands::SecretDelete { path } => secret_cli::delete(&home, &path),
+        Commands::SecretBackend { backend } => secret_cli::backend(&home, backend),
+        #[cfg(target_os = "linux")]
+        Commands::SecretCreate { label } => secret_cli::create(&home, &label),
+        #[cfg(target_os = "linux")]
+        Commands::SecretImport { path, label } => {
+            let entry =
+                home.import_legacy_secret(&rintawa_sdk::secrets::SecretPath::parse(path)?, &label)?;
+            println!(
+                "{} revision={} {:?}; original legacy value retained.",
+                entry.id, entry.revision, entry.label
+            );
+            Ok(())
+        }
+        #[cfg(target_os = "linux")]
+        Commands::SecretList => secret_cli::list(&home),
+        #[cfg(target_os = "linux")]
+        Commands::SecretRename {
+            id,
+            revision,
+            label,
+        } => {
+            let entry = home.rename_shared_secret(id.parse()?, revision, &label)?;
+            println!("{} revision={} {:?}", entry.id, entry.revision, entry.label);
+            Ok(())
+        }
+        #[cfg(target_os = "linux")]
+        Commands::SecretReplace {
+            id,
+            revision,
+            confirm: _,
+        } => secret_cli::replace(&home, &id, revision),
+        #[cfg(target_os = "linux")]
+        Commands::SecretRemove {
+            id,
+            revision,
+            confirm: _,
+        } => {
+            home.delete_shared_secret(id.parse()?, revision)?;
+            println!("Shared secret deleted; consumer bindings are now missing.");
+            Ok(())
+        }
+        Commands::GrantSecretRead {
+            instance,
+            component,
+            path,
+            scope,
+        } => {
+            home.grant_secret_read(
+                RuntimeScopeId::new(scope),
+                ComponentRef::new(instance, component),
+                rintawa_sdk::secrets::SecretPath::parse(path)?,
+            )?;
+            println!("Secret read approval saved; takes effect on the next activation.");
+            Ok(())
+        }
+        Commands::RevokeSecretRead {
+            instance,
+            component,
+            path,
+            scope,
+        } => {
+            home.revoke_secret_read(
+                &RuntimeScopeId::new(scope),
+                &ComponentRef::new(instance, component),
+                &rintawa_sdk::secrets::SecretPath::parse(path)?,
+            )?;
+            println!("Secret read approval removed; stop/restart applies it to a running scope.");
+            Ok(())
+        }
+        Commands::WorldCreate {
+            template,
+            title,
+            approve_runtime_permissions,
+        } => {
+            if let Some(template) = template {
+                let result = home.create_world_from_template(
+                    &template,
+                    title.as_deref(),
+                    approve_runtime_permissions,
+                )?;
+                println!("world = {}", result.world.id);
+                println!("title = {}", result.world.title);
+                if let Some(entry) = result.entry {
+                    println!("entry = {}/{}", entry.instance_id, entry.component_id);
+                }
+                Ok(())
+            } else {
+                world_create(&home)
+            }
+        }
         Commands::WorldList => world_list(&home),
         Commands::WorldInfo { id } => world_info(&home, id),
         Commands::Run { once } => run(&home, once),
@@ -238,65 +454,60 @@ fn revoke_runtime_permission(
     Ok(())
 }
 
-fn content_import(home: &HostHome, path: PathBuf) -> Result<()> {
-    let mut runtime = HostRuntime::start(home)?;
-    let operation = (|| {
-        let entry = runtime.import_user_content_rtw(home, path)?;
-        print_user_content_entry(&entry);
-        Ok(())
-    })();
-    finish_runtime_operation(runtime, operation)
-}
-
-fn content_list(home: &HostHome) -> Result<()> {
-    let entries = home.list_user_content()?;
-    if entries.is_empty() {
-        println!("No user content imported.");
-        return Ok(());
-    }
-    for entry in entries {
-        println!("{} {} {}", entry.id, entry.content, entry.revision);
-    }
-    Ok(())
-}
-
-fn content_replace(home: &HostHome, id: UserContentId, path: PathBuf) -> Result<()> {
-    let mut runtime = HostRuntime::start(home)?;
-    let operation = (|| {
-        let entry = runtime.replace_user_content_rtw(home, id, path)?;
-        print_user_content_entry(&entry);
-        Ok(())
-    })();
-    finish_runtime_operation(runtime, operation)
-}
-
-fn content_remove(home: &HostHome, id: UserContentId) -> Result<()> {
-    let entry = home.remove_user_content(id)?;
-    print_user_content_entry(&entry);
-    Ok(())
-}
-
-fn print_user_content_entry(entry: &rintawa_host::UserContentEntry) {
-    println!("id = {}", entry.id);
-    println!("content = {}", entry.content);
-    println!("revision = {}", entry.revision);
-}
-
-fn finish_runtime_operation(runtime: HostRuntime, operation: Result<()>) -> Result<()> {
-    let shutdown = runtime.shutdown().map_err(anyhow::Error::from);
-    match (operation, shutdown) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(operation_error), Err(shutdown_error)) => {
-            Err(operation_error.context(format!("runtime shutdown also failed: {shutdown_error}")))
+fn list_http_origins(home: &HostHome, scope: String) -> Result<()> {
+    let scope_id = RuntimeScopeId::new(scope);
+    let origins = home.list_http_loopback_origins(&scope_id)?;
+    if origins.is_empty() {
+        println!("No approved HTTP loopback origins in scope {scope_id}.");
+    } else {
+        for grant in origins {
+            println!(
+                "{} {} {} {}",
+                grant.scope_id, grant.instance_id, grant.component_id, grant.origin
+            );
         }
     }
+    Ok(())
+}
+
+fn grant_http_origin(
+    home: &HostHome,
+    instance: String,
+    component: String,
+    origin: String,
+    scope: String,
+) -> Result<()> {
+    let scope_id = RuntimeScopeId::new(scope);
+    let owner = ComponentRef::new(instance, component);
+    home.grant_http_loopback_origin(scope_id, owner.clone(), &origin)?;
+    println!(
+        "{} {} {}: origin granted",
+        owner.instance_id, owner.component_id, origin
+    );
+    Ok(())
+}
+
+fn revoke_http_origin(
+    home: &HostHome,
+    instance: String,
+    component: String,
+    origin: String,
+    scope: String,
+) -> Result<()> {
+    let scope_id = RuntimeScopeId::new(scope);
+    let owner = ComponentRef::new(instance, component);
+    home.revoke_http_loopback_origin(&scope_id, &owner, &origin)?;
+    println!(
+        "{} {} {}: origin revoked",
+        owner.instance_id, owner.component_id, origin
+    );
+    Ok(())
 }
 
 fn world_create(home: &HostHome) -> Result<()> {
     let world = home.create_world()?;
     println!("world = {}", world.id);
-    println!("commit_position = {}", world.commit_position);
+    println!("title = {}", world.title);
     Ok(())
 }
 
@@ -307,16 +518,23 @@ fn world_list(home: &HostHome) -> Result<()> {
         return Ok(());
     }
     for world in worlds {
-        println!("{} {}", world.id, world.commit_position);
+        println!("{} {}", world.id, world.title);
     }
     Ok(())
 }
 
 fn world_info(home: &HostHome, world_id: WorldId) -> Result<()> {
     let world = home.load_world_state(world_id)?;
+    let title = world
+        .manifest()
+        .as_value()
+        .get("metadata")
+        .and_then(|metadata| metadata.get("title"))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("world manifest has no valid title"))?;
     println!("world = {}", world.id());
-    println!("commit_position = {}", world.commit_position());
-    println!("schemas = {}", world.schemas().len());
+    println!("title = {title}");
+    println!("properties = {}", world.properties().len());
     Ok(())
 }
 
@@ -388,6 +606,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_should_reject_retired_content_commands() {
+        for args in [
+            vec!["rintawa", "content-import", "content.rtw"],
+            vec!["rintawa", "content-list"],
+            vec!["rintawa", "content-remove", "legacy-id"],
+            vec!["rintawa", "content-replace", "legacy-id", "content.rtw"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
     fn test_should_parse_runtime_permission_commands() {
         let grant = Cli::try_parse_from([
             "rintawa",
@@ -405,13 +635,6 @@ mod tests {
                 permission: RuntimePermission::BackgroundTask,
                 scope,
             } if instance == "example.runtime" && component == "runtime" && scope == HOST_SCOPE
-        ));
-
-        let content_import = Cli::try_parse_from(["rintawa", "content-import", "/tmp/content.rtw"])
-            .expect("content-import command should parse");
-        assert!(matches!(
-            content_import.command,
-            Commands::ContentImport { path } if path == std::path::Path::new("/tmp/content.rtw")
         ));
 
         let world_default = Cli::try_parse_from(["rintawa", "world-default", "example.runtime"])
@@ -446,6 +669,53 @@ mod tests {
                 scope,
                 ..
             } if scope == "world:test"
+        ));
+    }
+
+    #[test]
+    fn test_should_parse_http_origin_policy_commands() {
+        let grant = Cli::try_parse_from([
+            "rintawa",
+            "grant-http-origin",
+            "provider.instance",
+            "runtime",
+            "http://127.0.0.1:11434",
+            "--scope",
+            "world:example",
+        ])
+        .expect("grant-http-origin must parse");
+        assert!(matches!(
+            grant.command,
+            Commands::GrantHttpOrigin { instance, component, origin, scope }
+                if instance == "provider.instance"
+                    && component == "runtime"
+                    && origin == "http://127.0.0.1:11434"
+                    && scope == "world:example"
+        ));
+
+        let revoke = Cli::try_parse_from([
+            "rintawa",
+            "revoke-http-origin",
+            "provider.instance",
+            "runtime",
+            "http://localhost:11434",
+        ])
+        .expect("revoke-http-origin must parse");
+        assert!(matches!(
+            revoke.command,
+            Commands::RevokeHttpOrigin { instance, component, origin, scope }
+                if instance == "provider.instance"
+                    && component == "runtime"
+                    && origin == "http://localhost:11434"
+                    && scope == HOST_SCOPE
+        ));
+
+        let list =
+            Cli::try_parse_from(["rintawa", "list-http-origins", "--scope", "default-world"])
+                .expect("list-http-origins must parse");
+        assert!(matches!(
+            list.command,
+            Commands::ListHttpOrigins { scope } if scope == "default-world"
         ));
     }
 

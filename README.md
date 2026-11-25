@@ -14,24 +14,31 @@
 
 # Rintawa
 
-Rintawa is a local-first runtime for persistent interactive worlds. It manages
-world state, extension execution, permissions and presentation while keeping
-experiences configurable through RTW packages.
+Rintawa is a local-first runtime for persistent Worlds assembled from immutable
+RTW packages. Core owns package execution, owner-scoped permissions, bounded
+extension transport and atomic World storage; product behavior and presentation
+belong to extension packages.
 
 The runtime provides:
 
-- **Persistent worlds:** authoritative state changes, events and SQLite-backed recovery.
-- **Composable extensions:** versioned contracts, scoped services and isolated execution.
-- **RTW packages:** content-addressed artifacts with explicit installation and activation.
-- **Portable UI:** extension-provided interfaces rendered by a selected UI layer.
+- **Persistent Worlds:** four-table SQLite state, bounded single-writer commands
+  and atomic change sets.
+- **Composable extensions:** sandboxed WASM execution, exact scoped identities,
+  lifecycle cleanup and explicit capabilities.
+- **RTW packages:** content-addressed installation, exact activation and portable
+  World templates.
+- **Extension transport:** bounded request/reply and notification primitives owned
+  by the active components rather than a Core UI framework.
 
 The standard web interface and application packages are developed in
 [rtwKit](https://github.com/martrtr/rtwKit).
 
 ## Status
 
-Rintawa is in early development. The engine and initial World/Chat workflows are
-available on the `dev` branch; the full `0.0.1` experience has not been released.
+Rintawa is in early development. The `dev` branch contains the current MVP Core;
+the end-to-end character, Chat and AI experience is supplied by compatible
+[rtwKit](https://github.com/martrtr/rtwKit) packages. The full `0.0.1` experience
+has not been released.
 See the [roadmap](docs/roadmap.md) and [open issues](https://github.com/martrtr/rintawa/issues)
 for current progress.
 
@@ -48,16 +55,32 @@ cargo build --locked --release -p rintawa
 cargo test --locked --workspace
 ```
 
-The CLI manages installed RTW artifacts and starts a configured composition:
+The CLI installs exact RTW artifacts, creates isolated Worlds and starts a
+configured composition:
 
 ```sh
 ./target/release/rintawa install ./package.rtw
 ./target/release/rintawa list
+./target/release/rintawa package-install ./TextRoleplay.rtw
+./target/release/rintawa template-list
+./target/release/rintawa world-create --template sha256:<digest> --approve-runtime-permissions
 ./target/release/rintawa run
 ```
 
 A fresh build does not include a preconfigured graphical experience. The compatible
-web runtime, UI and application packages are maintained separately in rtwKit.
+web runtime, UI and application packages are maintained separately in rtwKit. See
+[the architecture](docs/architecture.md) for lifecycle and capability boundaries,
+and [the roadmap](docs/roadmap.md) for the remaining MVP work.
 
 For development checks and contribution guidelines, see
 [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=martrtr%2Frintawa&type=date&legend=bottom-right">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=martrtr/rintawa&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=martrtr/rintawa&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=martrtr/rintawa&type=date&legend=top-left" />
+ </picture>
+</a>

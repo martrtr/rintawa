@@ -1,36 +1,66 @@
 //! Durable metadata for one authoritative world session.
 
 use rintawa_sdk::world::WorldId;
+use serde::{Deserialize, Serialize};
 
-use crate::{SchemaDefinition, SchemaRegistration, SchemaRegistry, WorldResult};
+use crate::{DefinitionRegistration, PropertyDefinition, PropertyRegistry, WorldResult};
 
-/// Current on-disk world format understood by this runtime.
-pub const WORLD_FORMAT_VERSION: u32 = 1;
+/// The single JSON manifest embedded in `world.manifest`.
+///
+/// The manifest is the authoritative document for world metadata.
+/// Host-owned title, description and cover live in its metadata object; local
+/// composition approvals remain independent from this transferable World.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WorldManifest(serde_json::Value);
 
-/// Feature-neutral durable state needed to open one authoritative world session.
+impl WorldManifest {
+    /// Wraps an already-validated manifest document.
+    pub fn new(value: serde_json::Value) -> Self {
+        Self(value)
+    }
+
+    /// Returns the manifest document.
+    pub const fn as_value(&self) -> &serde_json::Value {
+        &self.0
+    }
+
+    /// Consumes the wrapper and returns the manifest document.
+    pub fn into_value(self) -> serde_json::Value {
+        self.0
+    }
+}
+
+impl Default for WorldManifest {
+    fn default() -> Self {
+        Self(serde_json::json!({}))
+    }
+}
+
+/// Feature-neutral durable state needed to open one authoritative world.
 #[derive(Debug, Clone)]
 pub struct WorldSessionState {
     id: WorldId,
-    commit_position: u64,
-    schemas: SchemaRegistry,
+    manifest: WorldManifest,
+    properties: PropertyRegistry,
 }
 
 impl WorldSessionState {
-    /// Creates a new empty world with commit position zero.
+    /// Creates a new empty world with an empty manifest.
     pub fn new(id: WorldId) -> Self {
         Self {
             id,
-            commit_position: 0,
-            schemas: SchemaRegistry::new(),
+            manifest: WorldManifest::default(),
+            properties: PropertyRegistry::new(),
         }
     }
 
-    /// Restores persisted world metadata and schema definitions.
-    pub fn restore(id: WorldId, commit_position: u64, schemas: SchemaRegistry) -> Self {
+    /// Restores persisted world metadata and the property vocabulary.
+    pub fn restore(id: WorldId, manifest: WorldManifest, properties: PropertyRegistry) -> Self {
         Self {
             id,
-            commit_position,
-            schemas,
+            manifest,
+            properties,
         }
     }
 
@@ -39,26 +69,26 @@ impl WorldSessionState {
         self.id
     }
 
-    /// Returns the last committed local world position.
-    pub const fn commit_position(&self) -> u64 {
-        self.commit_position
+    /// Returns the embedded world manifest.
+    pub const fn manifest(&self) -> &WorldManifest {
+        &self.manifest
     }
 
-    /// Returns the immutable schema registry.
-    pub const fn schemas(&self) -> &SchemaRegistry {
-        &self.schemas
+    /// Returns the property vocabulary known to this world.
+    pub const fn properties(&self) -> &PropertyRegistry {
+        &self.properties
     }
 
-    /// Registers one world schema.
+    /// Registers one property definition in this session vocabulary.
     ///
     /// # Errors
     ///
-    /// Returns a conflict when the same key already has different semantics.
-    pub fn register_schema(
+    /// Returns a conflict when the same versioned name has other semantics.
+    pub fn register_property(
         &mut self,
-        definition: SchemaDefinition,
-    ) -> WorldResult<SchemaRegistration> {
-        self.schemas.register(definition)
+        definition: PropertyDefinition,
+    ) -> WorldResult<DefinitionRegistration> {
+        self.properties.register(definition)
     }
 }
 
@@ -70,7 +100,7 @@ mod tests {
     fn test_should_create_empty_world_session() {
         let world = WorldSessionState::new(WorldId::new());
 
-        assert_eq!(world.commit_position(), 0);
-        assert!(world.schemas().is_empty());
+        assert!(world.properties().is_empty());
+        assert_eq!(world.manifest().as_value(), &serde_json::json!({}));
     }
 }

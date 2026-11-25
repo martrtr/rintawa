@@ -1,22 +1,22 @@
-//! Submitted command envelope and causal metadata.
+//! Submitted command envelope for an authoritative world.
+//!
+//! A command is an in-memory request. It is not persisted, has no stored receipt
+//! and no optimistic position: concurrency is controlled by the single-writer
+//! queue, and atomicity by one SQLite transaction per accepted change.
 
-use rintawa_sdk::world::{
-    CommandId, CorrelationId, EffectJobId, PrincipalId, SchemaKey, UnixTimeMillis, WorldEventId,
-};
+use rintawa_sdk::world::{CommandId, PrincipalId, SchemaKey};
 use serde::{Deserialize, Serialize};
 
-use crate::{ActorRef, SchemaKind, SchemaRegistry, WorldResult};
+use crate::{SchemaRegistry, WorldResult};
 
-/// Durable reference to the operation that directly caused another command/event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", tag = "kind", content = "id")]
-pub enum CausationRef {
-    /// Another submitted command.
-    Command(CommandId),
-    /// A previously committed world event.
-    Event(WorldEventId),
-    /// A durable external effect result.
-    Effect(EffectJobId),
+/// Origin attested by the Host for one submitted World command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorldCommandOrigin {
+    /// A Host-approved active System submitted this command.
+    System,
+    /// A trusted Host ingress authenticated this outside principal.
+    Interactive(PrincipalId),
 }
 
 /// Immutable input envelope submitted to one authoritative world.
@@ -24,77 +24,36 @@ pub enum CausationRef {
 pub struct WorldCommand {
     id: CommandId,
     schema: SchemaKey,
-    principal: PrincipalId,
-    actor: ActorRef,
-    expected_position: Option<u64>,
-    causation: Option<CausationRef>,
-    correlation_id: CorrelationId,
-    effective_at: Option<UnixTimeMillis>,
+    origin: WorldCommandOrigin,
     payload: serde_json::Value,
 }
 
 impl WorldCommand {
-    /// Creates a new command and correlation identity.
-    pub fn new(
+    /// Creates a command submitted by one Host-approved active System.
+    pub fn system(schema: SchemaKey, payload: serde_json::Value) -> Self {
+        Self {
+            id: CommandId::new(),
+            schema,
+            origin: WorldCommandOrigin::System,
+            payload,
+        }
+    }
+
+    /// Creates a command from an authenticated outside principal.
+    pub fn interactive(
         schema: SchemaKey,
         principal: PrincipalId,
-        actor: ActorRef,
         payload: serde_json::Value,
     ) -> Self {
         Self {
             id: CommandId::new(),
             schema,
-            principal,
-            actor,
-            expected_position: None,
-            causation: None,
-            correlation_id: CorrelationId::new(),
-            effective_at: None,
+            origin: WorldCommandOrigin::Interactive(principal),
             payload,
         }
     }
 
-    /// Creates a command with externally preserved durable identities.
-    pub fn with_ids(
-        id: CommandId,
-        correlation_id: CorrelationId,
-        schema: SchemaKey,
-        principal: PrincipalId,
-        actor: ActorRef,
-        payload: serde_json::Value,
-    ) -> Self {
-        Self {
-            id,
-            schema,
-            principal,
-            actor,
-            expected_position: None,
-            causation: None,
-            correlation_id,
-            effective_at: None,
-            payload,
-        }
-    }
-
-    /// Requires the world to still be at the supplied snapshot position.
-    pub const fn expecting_position(mut self, position: u64) -> Self {
-        self.expected_position = Some(position);
-        self
-    }
-
-    /// Attaches direct causal provenance.
-    pub const fn caused_by(mut self, causation: CausationRef) -> Self {
-        self.causation = Some(causation);
-        self
-    }
-
-    /// Sets semantic effective time without affecting commit ordering.
-    pub const fn effective_at(mut self, timestamp: UnixTimeMillis) -> Self {
-        self.effective_at = Some(timestamp);
-        self
-    }
-
-    /// Returns the stable command idempotency identity.
+    /// Returns the command identity used for logs and correlation.
     pub const fn id(&self) -> CommandId {
         self.id
     }
@@ -104,34 +63,17 @@ impl WorldCommand {
         &self.schema
     }
 
-    /// Returns the authenticated outside principal.
-    pub const fn principal(&self) -> PrincipalId {
-        self.principal
+    /// Returns the Host-attested command origin.
+    pub const fn origin(&self) -> WorldCommandOrigin {
+        self.origin
     }
 
-    /// Returns the role on whose behalf the command executes.
-    pub const fn actor(&self) -> ActorRef {
-        self.actor
-    }
-
-    /// Returns the optional optimistic-concurrency snapshot position.
-    pub const fn expected_position(&self) -> Option<u64> {
-        self.expected_position
-    }
-
-    /// Returns direct causal provenance, if any.
-    pub const fn causation(&self) -> Option<CausationRef> {
-        self.causation
-    }
-
-    /// Returns the stable correlation identity shared by one operation chain.
-    pub const fn correlation_id(&self) -> CorrelationId {
-        self.correlation_id
-    }
-
-    /// Returns semantic effective time, if supplied.
-    pub const fn effective_at_timestamp(&self) -> Option<UnixTimeMillis> {
-        self.effective_at
+    /// Returns the authenticated outside principal for an interactive command.
+    pub const fn interactive_principal(&self) -> Option<PrincipalId> {
+        match self.origin {
+            WorldCommandOrigin::System => None,
+            WorldCommandOrigin::Interactive(principal) => Some(principal),
+        }
     }
 
     /// Returns the immutable command payload.
@@ -139,12 +81,36 @@ impl WorldCommand {
         &self.payload
     }
 
-    /// Validates this command payload against the registered command schema.
+    /// Validates this command payload against the registered runtime command schema.
+    ///
+    /// Command schemas are extension runtime API descriptions; they are never
+    /// stored in the property vocabulary.
     ///
     /// # Errors
     ///
-    /// Returns a missing/wrong-kind schema or payload validation error.
+    /// Returns a missing definition or payload validation error.
     pub fn validate_schema(&self, schemas: &SchemaRegistry) -> WorldResult<()> {
-        schemas.validate_payload(self.schema(), SchemaKind::Command, self.payload())
+        schemas.validate_payload(&self.schema, crate::SchemaKind::Command, &self.payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_keep_system_and_interactive_origins_distinct() {
+        let schema: SchemaKey = "test.command@1".parse().expect("test schema must be valid");
+        let system = WorldCommand::system(schema.clone(), serde_json::json!({}));
+        assert_eq!(system.origin(), WorldCommandOrigin::System);
+        assert_eq!(system.interactive_principal(), None);
+
+        let principal = PrincipalId::new();
+        let interactive = WorldCommand::interactive(schema, principal, serde_json::json!({}));
+        assert_eq!(
+            interactive.origin(),
+            WorldCommandOrigin::Interactive(principal)
+        );
+        assert_eq!(interactive.interactive_principal(), Some(principal));
     }
 }

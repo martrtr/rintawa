@@ -39,6 +39,10 @@ impl ContractComponent {
 }
 
 impl Component for ContractComponent {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn id(&self) -> &ComponentId {
         &self.id
     }
@@ -553,6 +557,7 @@ fn test_provider_grants_control_binding_eligibility() -> anyhow::Result<()> {
             target: ComponentTarget::new("example.runtime.native@1"),
             entry: None,
             required: true,
+            published_preference: None,
             permissions: ComponentPermissions {
                 secret_read: vec![secret_pattern.clone()],
                 runtime: Vec::new(),
@@ -669,6 +674,7 @@ fn test_consumer_grant_controls_binding_eligibility() -> anyhow::Result<()> {
             target: ComponentTarget::new("example.runtime.native@1"),
             entry: None,
             required: true,
+            published_preference: None,
             permissions: ComponentPermissions {
                 secret_read: vec![secret_pattern.clone()],
                 runtime: Vec::new(),
@@ -735,34 +741,6 @@ fn test_unresolved_consumer_preserves_required_flag() -> anyhow::Result<()> {
         snapshot.unresolved[0].reason,
         UnresolvedContractReason::NoProvider
     );
-    Ok(())
-}
-
-#[test]
-fn test_conflicting_contract_protocols_are_rejected() -> anyhow::Result<()> {
-    let contract = contract("example.protocol-conflict");
-    let mut engine = ExtensionEngine::new();
-
-    engine.register_extension(
-        manifest("binding-definition"),
-        vec![Box::new(ContractComponent::new("runtime").defining(
-            ContractDefinition::new(contract.clone(), ContractResolutionPolicy::Single),
-        ))],
-    )?;
-
-    let error = engine
-        .register_extension(
-            manifest("service-definition"),
-            vec![Box::new(ContractComponent::new("runtime").defining(
-                ContractDefinition::service(contract, ContractResolutionPolicy::Single),
-            ))],
-        )
-        .unwrap_err();
-
-    assert!(matches!(
-        error,
-        EngineError::ContractDefinitionConflict { .. }
-    ));
     Ok(())
 }
 
@@ -873,32 +851,6 @@ fn test_should_clear_all_preferred_provider_policy_in_one_scope() -> anyhow::Res
             vec![ComponentRef::new("a-provider", "runtime")]
         );
     }
-    Ok(())
-}
-
-#[test]
-fn test_should_reject_platform_contract_protocol_change() -> anyhow::Result<()> {
-    let scope = RuntimeScopeId::new("host");
-    let contract = contract("rintawa.test.platform-role");
-    let mut engine = ExtensionEngine::new();
-
-    engine.define_platform_binding_contract_in_scope(
-        scope.clone(),
-        contract.clone(),
-        ContractResolutionPolicy::Single,
-    )?;
-    let error = engine
-        .define_platform_service_contract_in_scope(
-            scope,
-            contract,
-            ContractResolutionPolicy::Single,
-        )
-        .unwrap_err();
-
-    assert!(matches!(
-        error,
-        EngineError::ContractDefinitionConflict { .. }
-    ));
     Ok(())
 }
 

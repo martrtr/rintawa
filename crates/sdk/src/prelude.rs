@@ -15,11 +15,9 @@ pub use crate::api::{LogLevel, LoggerApi};
 pub use crate::context::{ComponentContext, RegistrationContext};
 
 pub use crate::contracts::{
-    ComponentRef, ContractConsumer, ContractDefinition, ContractGrantRequirement, ContractKey,
-    ContractProtocol, ContractProvider, ContractResolutionPolicy, ContractVersion,
-    HOST_SHELL_CONTRACT_ID, HOST_SHELL_CONTRACT_VERSION, UI_LAYER_CONTRACT_ID,
-    UI_LAYER_CONTRACT_VERSION, WORLD_PRESENTATION_CONTRACT_ID, WORLD_PRESENTATION_CONTRACT_VERSION,
-    host_shell_contract_key, ui_layer_contract_key, world_presentation_contract_key,
+    ComponentPrincipal, ComponentRef, ContractConsumer, ContractDefinition,
+    ContractGrantRequirement, ContractKey, ContractProvider, ContractResolutionPolicy,
+    ContractVersion, HOST_SHELL_CONTRACT_ID, HOST_SHELL_CONTRACT_VERSION, host_shell_contract_key,
 };
 pub use crate::contributions::{ContributionDescriptor, ContributionKind};
 
@@ -31,34 +29,18 @@ pub use crate::manifest::{
     validate_component_target,
 };
 
-pub use crate::runtime_effects::RuntimeEffect;
 pub use crate::runtime_permissions::{RuntimePermission, RuntimePermissionParseError};
-pub use crate::runtime_signals::RuntimeSignal;
 
 pub use crate::secrets::{SecretAccessError, SecretPath, SecretPathPattern, SecretValue};
-
-pub use crate::services::{ServiceCallError, ServiceCallResult, ServiceProviderHandle};
 
 pub use crate::traits::Component;
 
 pub use crate::types::{
     ComponentId, ComponentTarget, ContractId, ContributionId, ExtensionId, ExtensionInstanceId,
-    RuntimeEffectId, RuntimeScopeId,
-};
-
-pub use crate::ui::{
-    PORTABLE_UI_PROTOCOL_MAJOR, UiActionAssetRef, UiActionEvent, UiActionId, UiActionPayload,
-    UiActionUserResourceRef, UiActivityContribution, UiActivityId, UiAssetImageNode,
-    UiAssetPickerNode, UiButtonAppearance, UiButtonNode, UiCapabilityId, UiCheckboxNode,
-    UiContainerNode, UiDataGridColumn, UiDataGridNode, UiDataGridSortDirection, UiError,
-    UiIconNode, UiIconSlotId, UiImageNode, UiLayerDescriptor, UiMarkdownNode, UiNode, UiNodeId,
-    UiNodeKind, UiNodeSemanticTraitId, UiPatch, UiPatchBatch, UiPlacementHint, UiResult,
-    UiSelectNode, UiSelectOption, UiSplitAxis, UiSplitNode, UiSurfaceContribution, UiSurfaceId,
-    UiSurfaceSnapshot, UiSurfaceTraitId, UiTextAreaNode, UiTextInputNode, UiTextNode,
+    RuntimeScopeId,
 };
 
 pub use crate::world::{
-    CommandId, ControlGrantId, CorrelationId, EffectJobId, EntityId, PrincipalId, RelationId,
-    SchemaId, SchemaIdentifierError, SchemaKey, SchemaKeyParseError, SchemaVersion,
-    SchemaVersionError, UnixTimeMillis, WorldEventId, WorldId,
+    CommandId, ItemId, PrincipalId, SchemaId, SchemaIdentifierError, SchemaKey,
+    SchemaKeyParseError, SchemaVersion, SchemaVersionError, WorldId,
 };

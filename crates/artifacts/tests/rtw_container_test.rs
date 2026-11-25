@@ -304,3 +304,95 @@ fn test_should_support_serial_reads_across_archive_fork() -> Result<()> {
     assert_eq!(original.read(&entry)?, b"portable\n");
     Ok(())
 }
+
+#[test]
+fn test_should_stream_entries_with_limits_and_writer_errors() -> Result<()> {
+    let root = TempDir::new()?;
+    let source = write_source(&root)?;
+    let bytes = vec![b'x'; 192 * 1024 + 17];
+    fs::write(source.join("assets/large.bin"), &bytes)?;
+    let output = root.path().join("stream.rtw");
+    pack_directory(&source, &output, RtwLimits::default())?;
+    let mut archive = RtwArchive::open(&output, RtwLimits::default())?;
+    let entry = ArtifactPath::parse("assets/large.bin")?;
+    struct Chunks {
+        bytes: Vec<u8>,
+        calls: usize,
+    }
+    impl Write for Chunks {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            assert!(data.len() <= 64 * 1024, "bounded decompression buffer");
+            self.calls += 1;
+            self.bytes.extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut sink = Chunks {
+        bytes: Vec::new(),
+        calls: 0,
+    };
+    assert!(matches!(
+        archive.copy_to(&entry, &mut sink, bytes.len() as u64 - 1),
+        Err(RtwError::EntryTooLarge { .. })
+    ));
+    assert_eq!(sink.calls, 0, "declared limit checked before writing");
+    assert_eq!(
+        archive.copy_to(&entry, &mut sink, bytes.len() as u64)?,
+        bytes.len() as u64
+    );
+    assert_eq!(sink.bytes, bytes);
+    assert!(sink.calls > 1);
+    struct Refuse;
+    impl Write for Refuse {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    assert!(matches!(
+        archive.copy_to(&entry, &mut Refuse, u64::MAX),
+        Err(RtwError::Io(_))
+    ));
+    assert_eq!(
+        archive.read(&entry)?,
+        bytes,
+        "failed writer does not corrupt archive view"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_corrupt_streamed_payload_crc() -> Result<()> {
+    let root = TempDir::new()?;
+    let output = root.path().join("crc.rtw");
+    let content = b"unique-streamed-payload";
+    write_zip(
+        &output,
+        &[
+            (
+                "rtw.toml",
+                b"format = 1\ncontent = \"example.content@1\"\nentry = \"payload.bin\"\n",
+            ),
+            ("payload.bin", content),
+        ],
+    )?;
+    let mut bytes = fs::read(&output)?;
+    let position = bytes
+        .windows(content.len())
+        .position(|part| part == content)
+        .expect("payload in stored ZIP");
+    bytes[position] ^= 1;
+    fs::write(&output, bytes)?;
+    let mut archive = RtwArchive::open(&output, RtwLimits::default())?;
+    assert!(
+        archive
+            .copy_to(&ArtifactPath::parse("payload.bin")?, &mut Vec::new(), 1024)
+            .is_err()
+    );
+    Ok(())
+}

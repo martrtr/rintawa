@@ -6,6 +6,13 @@ use thiserror::Error;
 /// Read-side errors visible to a world System.
 #[derive(Debug, Error)]
 pub enum WorldReadError {
+    /// The pinned snapshot became unavailable after an internal failure.
+    #[error("world snapshot is unavailable")]
+    SnapshotUnavailable,
+    /// The calling System does not own this active property definition.
+    #[error("System cannot read property {0}: no active owner binding")]
+    PropertyAccessDenied(SchemaKey),
+
     /// Persistent world state could not be read.
     #[error("world snapshot read failed")]
     Storage(#[source] rintawa_storage::StorageError),
@@ -14,6 +21,28 @@ pub enum WorldReadError {
 impl From<rintawa_storage::StorageError> for WorldReadError {
     fn from(source: rintawa_storage::StorageError) -> Self {
         Self::Storage(source)
+    }
+}
+
+impl WorldReadError {
+    /// Whether arguments or the requested exact property version are invalid.
+    pub fn invalid_request(&self) -> bool {
+        matches!(
+            self,
+            Self::Storage(
+                rintawa_storage::StorageError::StalePropertyVersion { .. }
+                    | rintawa_storage::StorageError::InvalidQueryPageSize { .. }
+                    | rintawa_storage::StorageError::InvalidQueryBatchSize { .. }
+                    | rintawa_storage::StorageError::InvalidPropertyReadKeyCount { .. }
+            )
+        )
+    }
+    /// Whether the native read result exceeds its bounded byte budget.
+    pub fn message_too_large(&self) -> bool {
+        matches!(
+            self,
+            Self::Storage(rintawa_storage::StorageError::QueryPageTooLarge { .. })
+        )
     }
 }
 
@@ -71,6 +100,14 @@ pub enum WorldRuntimeError {
     #[error("world command queue is full")]
     QueueFull,
 
+    /// Serialized queued and evaluating commands exhaust the World byte budget.
+    #[error("world pending-command byte budget exceeded")]
+    PendingCommandBytesExceeded,
+
+    /// Graceful shutdown is incomplete; worker/writer ownership is retained.
+    #[error("world shutdown is busy; retry after admitted work finishes")]
+    ShutdownBusy,
+
     /// The worker has already stopped accepting commands.
     #[error("world runtime is stopped")]
     RuntimeStopped,
@@ -97,9 +134,19 @@ pub enum WorldRuntimeError {
     #[error("World System for {0} panicked")]
     SystemPanicked(SchemaKey),
 
-    /// Ordinary extension Systems may not mint or revoke Core control grants.
-    #[error("World System for {0} attempted a privileged authority mutation")]
-    AuthorityMutationDenied(SchemaKey),
+    /// A System produced a change set that the world model or vocabulary rejected.
+    #[error("World System for {schema} produced an invalid transaction")]
+    InvalidTransaction {
+        /// Command schema owned by the System.
+        schema: SchemaKey,
+        /// World-model validation error.
+        #[source]
+        source: rintawa_world::WorldError,
+    },
+
+    /// The runtime session state could not be locked after an internal panic.
+    #[error("world runtime session state is unavailable")]
+    RuntimePoisoned,
 
     /// The runtime worker thread could not be spawned.
     #[error("failed to spawn world runtime worker")]
@@ -108,3 +155,39 @@ pub enum WorldRuntimeError {
 
 /// Result type used by the world runtime.
 pub type WorldRuntimeResult<T> = Result<T, WorldRuntimeError>;
+
+impl WorldRuntimeError {
+    /// Whether a command completion error fails to establish that no COMMIT occurred.
+    /// Callers must report unavailable and must not automatically retry the command.
+    pub fn command_outcome_unknown(&self) -> bool {
+        match self {
+            Self::WorkerStopped | Self::WorkerPanicked => true,
+            Self::Storage(rintawa_storage::StorageError::Io(_)) => true,
+            Self::Storage(rintawa_storage::StorageError::Sqlite(error)) => {
+                !matches!(error, rusqlite::Error::SqliteFailure(error, _)
+                    if error.code == rusqlite::ErrorCode::ConstraintViolation)
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_should_distinguish_unknown_commit_from_constraint_rejection() {
+        let storage_error = |code| {
+            WorldRuntimeError::Storage(rintawa_storage::StorageError::Sqlite(
+                rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None),
+            ))
+        };
+        assert!(storage_error(rusqlite::ffi::SQLITE_IOERR).command_outcome_unknown());
+        assert!(!storage_error(rusqlite::ffi::SQLITE_CONSTRAINT).command_outcome_unknown());
+        assert!(WorldRuntimeError::WorkerStopped.command_outcome_unknown());
+        assert!(
+            !WorldRuntimeError::SystemPanicked("fixture.test@1".parse().unwrap())
+                .command_outcome_unknown()
+        );
+    }
+}

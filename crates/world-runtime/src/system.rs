@@ -7,9 +7,12 @@ use crate::{SystemResult, WorldSnapshot};
 
 /// Deterministic command evaluator for one exact versioned command schema.
 ///
-/// Systems read a fixed snapshot and return proposed authoritative mutations,
-/// semantic events, and durable effects. They must not perform irreversible
-/// external side effects during evaluation; those belong in durable effect jobs.
+/// Systems read a pinned, property-owner-scoped snapshot and return one atomic
+/// item/property change set. The exact instance owner is taken from the Host binding of the command
+/// schema, not from the command Principal or a guest-supplied payload. They must
+/// not perform irreversible external side effects during evaluation:
+/// the runtime validates the change set and commits it as one SQLite transaction.
+/// Any external work belongs outside authoritative command evaluation.
 pub trait WorldSystem: Send + Sync + 'static {
     /// Returns the exact command schema owned by this System.
     fn command_schema(&self) -> &SchemaKey;

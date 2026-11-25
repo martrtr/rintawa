@@ -17,19 +17,10 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
 
     fn stop() {}
 
-    fn on_event(_topic: String, _payload: Vec<u8>) {}
-
-    fn handle_ui_action(_action_json: Vec<u8>) {}
-
-    fn handle_service(_contract: String, _version: u32, _payload: Vec<u8>) -> Vec<u8> {
-        Vec::new()
-    }
 }
 
 impl exports::rintawa::engine::task_handler::Guest for Fixture {
     fn on_task(handle: u64) {
-        let effect = rintawa::engine::runtime_effects::subscribe_event("fixture.task");
-        assert!(effect.is_ok());
         let cancelled = rintawa::engine::runtime_tasks::cancel(handle);
         assert!(cancelled.is_ok());
     }

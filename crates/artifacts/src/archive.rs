@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::File,
-    io::{Cursor, Read, Seek},
+    io::{Cursor, Read, Seek, Write},
     path::Path,
 };
 
@@ -113,6 +113,11 @@ impl RtwArchive {
         self.entries.values()
     }
 
+    /// Returns the total ZIP record count, including explicit directory entries.
+    pub fn entry_count(&self) -> usize {
+        self.archive.len()
+    }
+
     /// Returns whether a regular file exists at the given artifact path.
     pub fn contains(&self, path: &ArtifactPath) -> bool {
         self.entries.contains_key(path)
@@ -159,6 +164,39 @@ impl RtwArchive {
             path.as_str(),
             entry.uncompressed_size,
             maximum_bytes.min(self.limits.max_entry_bytes),
+        )
+    }
+
+    /// Streams one regular entry to a caller-owned writer within existing limits.
+    ///
+    /// A failure may leave partial bytes in the writer; the caller must discard
+    /// them. Declared limits are checked before the first write, and decompression,
+    /// size/CRC and writer errors are propagated without publishing output.
+    ///
+    /// # Errors
+    /// Returns an unknown entry, size-limit, corrupt ZIP or writer error.
+    pub fn copy_to(
+        &mut self,
+        path: &ArtifactPath,
+        writer: &mut impl Write,
+        maximum_bytes: u64,
+    ) -> RtwResult<u64> {
+        let index = self
+            .entry_indices
+            .get(path)
+            .copied()
+            .ok_or_else(|| RtwError::EntryNotFound(path.to_string()))?;
+        let entry = self
+            .entries
+            .get(path)
+            .ok_or_else(|| RtwError::EntryNotFound(path.to_string()))?;
+        copy_zip_entry(
+            &mut self.archive,
+            index,
+            path.as_str(),
+            entry.uncompressed_size,
+            maximum_bytes.min(self.limits.max_entry_bytes),
+            writer,
         )
     }
 }
@@ -362,6 +400,19 @@ fn read_zip_entry<R: Read + Seek>(
     declared_size: u64,
     maximum: u64,
 ) -> RtwResult<Vec<u8>> {
+    let mut output = Vec::new();
+    copy_zip_entry(archive, index, path, declared_size, maximum, &mut output)?;
+    Ok(output)
+}
+
+fn copy_zip_entry<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    index: usize,
+    path: &str,
+    declared_size: u64,
+    maximum: u64,
+    writer: &mut impl Write,
+) -> RtwResult<u64> {
     if declared_size > maximum {
         return Err(RtwError::EntryTooLarge {
             path: path.to_string(),
@@ -369,16 +420,30 @@ fn read_zip_entry<R: Read + Seek>(
             maximum,
         });
     }
-    let file = archive.by_index(index)?;
-    let mut output = Vec::new();
-    file.take(maximum.saturating_add(1))
-        .read_to_end(&mut output)?;
-    if u64::try_from(output.len()).unwrap_or(u64::MAX) > maximum {
-        return Err(RtwError::EntryTooLarge {
-            path: path.to_string(),
-            actual: u64::try_from(output.len()).unwrap_or(u64::MAX),
-            maximum,
-        });
+    let mut file = archive.by_index(index)?;
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > maximum {
+            return Err(RtwError::EntryTooLarge {
+                path: path.to_string(),
+                actual: total,
+                maximum,
+            });
+        }
+        writer.write_all(&buffer[..read])?;
     }
-    Ok(output)
+    if total != declared_size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ZIP entry size differs from declared size",
+        )
+        .into());
+    }
+    Ok(total)
 }

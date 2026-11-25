@@ -1,6 +1,6 @@
 # WASM target-provider fixture
 
-`component.wasm` is the release-size Component Model fixture used by
+`component.wasm` is the compact Component Model fixture used by
 `artifact_loader_test.rs` to exercise the generic execution-target WIT boundary.
 `guest.rs` is its auditable source.
 
@@ -11,6 +11,11 @@ its normal `start` callback and reads `payload.bin` only through the borrowed
 `artifact-source` resource before returning a provider-local component handle.
 
 The checked-in component must be regenerated whenever the provider WIT ABI
-changes. Although the generic authoring world exposes host-gated task/loopback
-imports, this fixture must not use those capabilities. It must not gain filesystem
-or CAS-path access, raw host resources, or any Web-specific API.
+changes. Its task-capable authoring world also exercises D6: when granted,
+provider/dependent tasks report their actual scope, World and activation through
+Zenoh; foreign subscription/upload handles fail. The two-World integration probe
+checks stop isolation and invalidation of shared clients after a hosted task trap.
+Tasks require each dependent's own grants. The fixture has no filesystem or
+CAS-path access, raw host resources, or Web-specific API.
+
+Run `bash build.sh` to regenerate it.

@@ -5,7 +5,6 @@ use std::io;
 use rintawa_artifacts::RtwError;
 use rintawa_sdk::{
     errors::ExtensionError, manifest::ManifestValidationError, secrets::SecretAccessError,
-    ui::UiError,
 };
 use thiserror::Error;
 
@@ -88,6 +87,17 @@ pub enum EngineError {
         /// Runtime instance containing the target-host owner.
         instance_id: String,
         /// Component expected to own the target host.
+        component_id: String,
+    },
+
+    /// A declared World command has no active WASM System callback.
+    #[error(
+        "component `{component_id}` in extension instance `{instance_id}` cannot execute a World System"
+    )]
+    WorldSystemUnavailable {
+        /// Runtime instance containing the declared component.
+        instance_id: String,
+        /// Component that declared the command schema.
         component_id: String,
     },
 
@@ -180,6 +190,10 @@ pub enum EngineError {
     #[error("runtime permission policy is unavailable")]
     RuntimePermissionUnavailable,
 
+    /// The Host attempted to grant an invalid or non-loopback HTTP origin.
+    #[error("invalid HTTP loopback origin; an exact localhost origin is required")]
+    InvalidHttpLoopbackOrigin,
+
     /// A WASM component artifact exceeded the host-owned byte limit.
     #[error(
         "WASM component `{component_id}` is at least {observed_bytes} bytes, exceeding the {maximum_bytes}-byte limit"
@@ -200,14 +214,6 @@ pub enum EngineError {
     /// An error occurred during Wasmtime runtime operations.
     #[error("WASM runtime error: {0}")]
     WasmRuntime(#[from] wasmtime::Error),
-
-    /// Portable UI registration, lifecycle, patching, or action validation failed.
-    #[error("portable UI error: {0}")]
-    Ui(#[from] UiError),
-
-    /// The internal service-routing state is unavailable.
-    #[error("service runtime is unavailable")]
-    ServiceRuntimeUnavailable,
 
     /// The requested activation composition cannot produce a valid start order.
     #[error(transparent)]
@@ -261,29 +267,6 @@ pub enum EngineError {
     /// The specified extension runtime instance is already registered.
     #[error("extension instance `{0}` is already registered")]
     ExtensionInstanceAlreadyExists(String),
-
-    /// A host attempted to dispatch an invalid runtime event topic.
-    #[error("runtime event topic must not be empty")]
-    InvalidRuntimeEventTopic,
-
-    /// A host attempted to dispatch an invalid runtime signal topic.
-    #[error("runtime signal topic must not be empty")]
-    InvalidRuntimeSignalTopic,
-
-    /// A component failed while handling a validated portable UI action.
-    #[error(
-        "component `{component_id}` in extension `{extension_id}` failed UI action `{action_id}`: {reason}"
-    )]
-    UiActionFailed {
-        /// ID of the extension owning the component.
-        extension_id: String,
-        /// ID of the component handling the action.
-        component_id: String,
-        /// Semantic action identifier.
-        action_id: String,
-        /// Failure returned by the component.
-        reason: String,
-    },
 
     /// A component failed during a lifecycle transition.
     #[error("component `{component_id}` in extension `{extension_id}` failed: {reason}")]

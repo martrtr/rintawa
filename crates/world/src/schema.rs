@@ -1,108 +1,101 @@
-//! Versioned world-schema definitions and registry.
+//! The world property vocabulary: immutable versioned JSON Schema definitions.
+//!
+//! A property definition is the replacement for the retired entity/relation type
+//! schemas and facets. `name` is unversioned (for example `psychology.mood`);
+//! `version` is a positive integer; the definition body is a JSON Schema document
+//! compiled locally when it is registered. Dotted names are flat identifiers.
 
 use std::collections::BTreeMap;
 
 use jsonschema::Validator;
-pub use rintawa_sdk::world::SchemaKind;
 use rintawa_sdk::{types::ExtensionId, world::SchemaKey};
 use serde::{Deserialize, Serialize};
 
 use crate::{WorldError, WorldResult};
 
-/// Complete immutable definition of one versioned world schema.
-///
-/// The definition is a JSON Schema document. Rintawa compiles it locally when
-/// registered; external HTTP/file schema resolution is intentionally unavailable.
+/// Complete immutable definition of one versioned property.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SchemaDefinition {
+pub struct PropertyDefinition {
     key: SchemaKey,
-    kind: SchemaKind,
     owner: ExtensionId,
-    definition: serde_json::Value,
+    schema: serde_json::Value,
 }
 
-impl SchemaDefinition {
-    /// Creates a schema definition owned by one extension.
-    pub fn new(
-        key: SchemaKey,
-        kind: SchemaKind,
-        owner: ExtensionId,
-        definition: serde_json::Value,
-    ) -> Self {
-        Self {
-            key,
-            kind,
-            owner,
-            definition,
-        }
+impl PropertyDefinition {
+    /// Creates a property definition owned by one extension.
+    pub fn new(key: SchemaKey, owner: ExtensionId, schema: serde_json::Value) -> Self {
+        Self { key, owner, schema }
     }
 
-    /// Returns the stable versioned schema identity.
+    /// Returns the exact versioned property name.
     pub const fn key(&self) -> &SchemaKey {
         &self.key
     }
 
-    /// Returns the semantic schema category.
-    pub const fn kind(&self) -> SchemaKind {
-        self.kind
-    }
-
-    /// Returns the extension that owns this schema definition.
+    /// Returns the extension that owns this definition.
     pub const fn owner(&self) -> &ExtensionId {
         &self.owner
     }
 
-    /// Returns the extension-defined JSON Schema document.
-    pub const fn definition(&self) -> &serde_json::Value {
-        &self.definition
+    /// Returns the JSON Schema document.
+    pub const fn schema(&self) -> &serde_json::Value {
+        &self.schema
     }
 }
 
-/// Result category for one schema registration.
+/// Result category for one property-definition registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SchemaRegistration {
-    /// A previously unknown schema definition entered the registry.
+pub enum DefinitionRegistration {
+    /// A previously unknown definition entered the vocabulary.
     Registered,
     /// The exact same definition was already registered.
     AlreadyPresent,
 }
 
-/// In-memory registry of immutable versioned world schemas and compiled validators.
+/// In-memory property vocabulary with compiled JSON Schema validators.
 #[derive(Debug, Clone, Default)]
-pub struct SchemaRegistry {
-    definitions: BTreeMap<SchemaKey, SchemaDefinition>,
+pub struct PropertyRegistry {
+    definitions: BTreeMap<SchemaKey, PropertyDefinition>,
     validators: BTreeMap<SchemaKey, Validator>,
 }
 
-impl SchemaRegistry {
-    /// Creates an empty schema registry.
+impl PropertyRegistry {
+    /// Creates an empty property vocabulary.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Registers one immutable schema definition.
+    /// Registers one immutable property definition.
     ///
-    /// Re-registering the exact same definition is idempotent, which permits
-    /// extensions to activate again after a world restart.
+    /// Re-registering the exact same definition is idempotent, so an extension can
+    /// activate again after a world restart. Mutating an existing `(name, version)`
+    /// is rejected.
     ///
     /// # Errors
     ///
-    /// Returns a conflict when the key exists with different semantics, or
-    /// InvalidSchemaDefinition when the JSON Schema cannot be compiled locally.
-    pub fn register(&mut self, definition: SchemaDefinition) -> WorldResult<SchemaRegistration> {
+    /// Returns DefinitionConflict when the key exists with other semantics, or
+    /// InvalidDefinition when the JSON Schema cannot be compiled locally.
+    pub fn register(
+        &mut self,
+        definition: PropertyDefinition,
+    ) -> WorldResult<DefinitionRegistration> {
         if let Some(existing) = self.definitions.get(definition.key()) {
-            if existing == &definition {
-                return Ok(SchemaRegistration::AlreadyPresent);
+            // The definition is the JSON Schema document. Ownership is Host
+            // composition metadata that is not persisted in `property_registry`,
+            // so re-registering the same document from an installed package after a
+            // restart must stay idempotent.
+            if existing.schema() == definition.schema() {
+                return Ok(DefinitionRegistration::AlreadyPresent);
             }
-            return Err(WorldError::SchemaConflict {
+            return Err(WorldError::DefinitionConflict {
                 key: definition.key().clone(),
                 existing_owner: existing.owner().to_string(),
                 incoming_owner: definition.owner().to_string(),
             });
         }
 
-        let validator = jsonschema::validator_for(definition.definition()).map_err(|error| {
-            WorldError::InvalidSchemaDefinition {
+        let validator = jsonschema::validator_for(definition.schema()).map_err(|error| {
+            WorldError::InvalidDefinition {
                 key: definition.key().clone(),
                 reason: error.masked().to_string(),
             }
@@ -111,53 +104,28 @@ impl SchemaRegistry {
         let key = definition.key().clone();
         self.definitions.insert(key.clone(), definition);
         self.validators.insert(key, validator);
-        Ok(SchemaRegistration::Registered)
+        Ok(DefinitionRegistration::Registered)
     }
 
-    /// Returns one registered schema definition.
-    pub fn get(&self, key: &SchemaKey) -> Option<&SchemaDefinition> {
+    /// Returns one registered definition.
+    pub fn get(&self, key: &SchemaKey) -> Option<&PropertyDefinition> {
         self.definitions.get(key)
     }
 
-    /// Requires a registered schema to have a particular semantic kind.
+    /// Validates a property value against its registered definition.
     ///
     /// # Errors
     ///
-    /// Returns SchemaNotRegistered or SchemaKindMismatch.
-    pub fn require_kind(&self, key: &SchemaKey, expected: SchemaKind) -> WorldResult<()> {
-        let definition = self
-            .definitions
-            .get(key)
-            .ok_or_else(|| WorldError::SchemaNotRegistered { key: key.clone() })?;
-        if definition.kind() != expected {
-            return Err(WorldError::SchemaKindMismatch {
-                key: key.clone(),
-                expected,
-                actual: definition.kind(),
-            });
-        }
-        Ok(())
-    }
-
-    /// Validates a feature payload against a registered schema of the expected kind.
-    ///
-    /// # Errors
-    ///
-    /// Returns a registry/kind error or a masked validation error.
-    pub fn validate_payload(
-        &self,
-        key: &SchemaKey,
-        expected: SchemaKind,
-        payload: &serde_json::Value,
-    ) -> WorldResult<()> {
-        self.require_kind(key, expected)?;
+    /// Returns DefinitionNotRegistered when the exact versioned name is unknown,
+    /// or PropertyValidationFailed when the value does not match the schema.
+    pub fn validate(&self, key: &SchemaKey, data: &serde_json::Value) -> WorldResult<()> {
         let validator = self
             .validators
             .get(key)
-            .ok_or_else(|| WorldError::SchemaNotRegistered { key: key.clone() })?;
+            .ok_or_else(|| WorldError::DefinitionNotRegistered { key: key.clone() })?;
 
-        if let Err(error) = validator.validate(payload) {
-            return Err(WorldError::PayloadValidationFailed {
+        if let Err(error) = validator.validate(data) {
+            return Err(WorldError::PropertyValidationFailed {
                 key: key.clone(),
                 instance_path: error.instance_path().to_string(),
                 reason: error.masked().to_string(),
@@ -167,16 +135,16 @@ impl SchemaRegistry {
     }
 
     /// Returns registered definitions in deterministic key order.
-    pub fn iter(&self) -> impl Iterator<Item = &SchemaDefinition> {
+    pub fn iter(&self) -> impl Iterator<Item = &PropertyDefinition> {
         self.definitions.values()
     }
 
-    /// Returns the number of registered schema definitions.
+    /// Returns the number of registered property definitions.
     pub fn len(&self) -> usize {
         self.definitions.len()
     }
 
-    /// Returns whether no schema definitions are registered.
+    /// Returns whether no property definitions are registered.
     pub fn is_empty(&self) -> bool {
         self.definitions.is_empty()
     }
@@ -188,10 +156,9 @@ mod tests {
 
     use super::*;
 
-    fn definition(owner: &str, marker: u64) -> SchemaDefinition {
-        SchemaDefinition::new(
-            "rintawa.test.facet@1".parse::<SchemaKey>().unwrap(),
-            SchemaKind::Facet,
+    fn definition(owner: &str, marker: u64) -> PropertyDefinition {
+        PropertyDefinition::new(
+            "psychology.mood@1".parse::<SchemaKey>().unwrap(),
             ExtensionId::new(owner),
             serde_json::json!({
                 "type": "object",
@@ -205,54 +172,50 @@ mod tests {
     }
 
     #[test]
-    fn test_should_register_same_schema_idempotently() -> WorldResult<()> {
-        let mut registry = SchemaRegistry::new();
+    fn test_should_register_same_definition_idempotently() -> WorldResult<()> {
+        let mut registry = PropertyRegistry::new();
         let definition = definition("example.extension", 1);
 
         assert_eq!(
             registry.register(definition.clone())?,
-            SchemaRegistration::Registered
+            DefinitionRegistration::Registered
         );
         assert_eq!(
             registry.register(definition)?,
-            SchemaRegistration::AlreadyPresent
+            DefinitionRegistration::AlreadyPresent
         );
         assert_eq!(registry.len(), 1);
         Ok(())
     }
 
     #[test]
-    fn test_should_reject_conflicting_schema_definition() -> WorldResult<()> {
-        let mut registry = SchemaRegistry::new();
+    fn test_should_reject_conflicting_definition() -> WorldResult<()> {
+        let mut registry = PropertyRegistry::new();
         registry.register(definition("example.first", 1))?;
 
         let error = registry
             .register(definition("example.second", 2))
             .unwrap_err();
 
-        assert!(matches!(error, WorldError::SchemaConflict { .. }));
+        assert!(matches!(error, WorldError::DefinitionConflict { .. }));
         assert_eq!(registry.len(), 1);
         Ok(())
     }
 
     #[test]
-    fn test_should_validate_payload_without_exposing_rejected_value() -> WorldResult<()> {
-        let mut registry = SchemaRegistry::new();
+    fn test_should_validate_value_without_exposing_rejected_data() -> WorldResult<()> {
+        let mut registry = PropertyRegistry::new();
         let definition = definition("example.extension", 7);
         let key = definition.key().clone();
         registry.register(definition)?;
 
-        registry.validate_payload(&key, SchemaKind::Facet, &serde_json::json!({ "marker": 7 }))?;
+        registry.validate(&key, &serde_json::json!({ "marker": 7 }))?;
         let error = registry
-            .validate_payload(
-                &key,
-                SchemaKind::Facet,
-                &serde_json::json!({ "marker": "secret-value" }),
-            )
+            .validate(&key, &serde_json::json!({ "marker": "secret-value" }))
             .unwrap_err();
         let rendered = error.to_string();
 
-        assert!(matches!(error, WorldError::PayloadValidationFailed { .. }));
+        assert!(matches!(error, WorldError::PropertyValidationFailed { .. }));
         assert!(!rendered.contains("secret-value"));
         Ok(())
     }
