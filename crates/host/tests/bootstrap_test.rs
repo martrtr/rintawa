@@ -9,7 +9,7 @@ use rintawa_host::{
     world_runtime_scope_id,
 };
 use rintawa_sdk::{
-    contracts::{ComponentRef, host_shell_contract_key, ui_layer_contract_key},
+    contracts::{ComponentRef, host_shell_contract_key},
     runtime_permissions::RuntimePermission,
     types::RuntimeScopeId,
 };
@@ -18,8 +18,6 @@ const TEST_TARGET_PROVIDER_COMPONENT: &[u8] =
     include_bytes!("../../extension-engine/tests/fixtures/target-provider/component.wasm");
 const TEST_TASK_COMPONENT: &[u8] =
     include_bytes!("../../extension-engine/tests/fixtures/task-runtime/component.wasm");
-const TEST_SERVICE_PROVIDER_COMPONENT: &[u8] =
-    include_bytes!("../../extension-engine/tests/fixtures/service-routing/provider.wasm");
 
 fn build_target_provider(root: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     let source = root.join("target-provider-source");
@@ -90,32 +88,23 @@ entry = "task.wasm"
     Ok(artifact)
 }
 
-fn build_service_provider(root: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
-    let source = root.join("service-provider-source");
-    fs::create_dir_all(&source)?;
+fn build_http_runtime(root: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    // Reuse an existing test component and select its manifest-requested HTTP
+    // permission; no provider-specific networking behavior is embedded here.
+    let _original = build_task_runtime(root, true)?;
+    let source = root.join("task-runtime-source-requested");
+    let manifest_path = source.join("manifest.toml");
+    let manifest = fs::read_to_string(&manifest_path)?;
+    let old = "runtime = [\"background-task\"]";
+    assert!(
+        manifest.contains(old),
+        "test fixture must request background tasks"
+    );
     fs::write(
-        source.join("rtw.toml"),
-        "format = 1\ncontent = \"rintawa.extension@1\"\nentry = \"manifest.toml\"\n",
+        &manifest_path,
+        manifest.replace(old, "runtime = [\"background-task\", \"http-request\"]"),
     )?;
-    fs::write(
-        source.join("manifest.toml"),
-        r#"id = "bootstrap.service-provider"
-name = "Service Provider"
-version = "0.1.0"
-sdk = "^0.0"
-
-[[components]]
-id = "runtime"
-kind = "runtime"
-target = "rintawa.runtime.wasm-component@1"
-entry = "provider.wasm"
-"#,
-    )?;
-    fs::write(
-        source.join("provider.wasm"),
-        TEST_SERVICE_PROVIDER_COMPONENT,
-    )?;
-    let artifact = root.join("service-provider.rtw");
+    let artifact = root.join("http-runtime.rtw");
     pack_directory(&source, &artifact, RtwLimits::default())?;
     Ok(artifact)
 }
@@ -189,9 +178,8 @@ fn test_should_persist_local_install_enable_disable_and_restart() -> anyhow::Res
     reopened.set_enabled("example.bootstrap", true)?;
     let restarted = HostHome::open(&home_path)?;
     assert!(restarted.list_activations()?[0].enabled);
-    let runtime = HostRuntime::start(&restarted)?;
+    let mut runtime = HostRuntime::start(&restarted)?;
     assert_eq!(runtime.host_shell_provider(), None);
-    assert_eq!(runtime.ui_layer_provider(), None);
     runtime.shutdown()?;
     Ok(())
 }
@@ -199,7 +187,7 @@ fn test_should_persist_local_install_enable_disable_and_restart() -> anyhow::Res
 #[test]
 fn test_should_materialize_cas_only_default_without_baseline_activation() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
-    let artifact = build_service_provider(root.path())?;
+    let artifact = build_task_runtime(root.path(), false)?;
     let home = HostHome::open(root.path().join("home"))?;
     let imported = home.import_rtw_bytes(&fs::read(&artifact)?)?;
 
@@ -355,139 +343,33 @@ fn test_should_materialize_independent_default_world_recipe_into_new_worlds() ->
 }
 
 #[test]
-fn test_should_migrate_legacy_world_defaults_into_independent_recipe() -> anyhow::Result<()> {
+fn test_should_not_migrate_legacy_profile_during_host_open() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let home_path = root.path().join("home");
-    let task_artifact = build_task_runtime(root.path(), true)?;
-    let provider_artifact = build_extension(root.path(), "0.0.1", "Bootstrap")?;
     let home = HostHome::open(&home_path)?;
-    let task = home.install_local_rtw(&task_artifact, Some(false))?;
-    let provider = home.install_local_rtw(&provider_artifact, Some(true))?;
-    let host_scope = RuntimeScopeId::new(HOST_SCOPE);
-    let host_owner = ComponentRef::new(task.activation.instance_id.clone(), "runtime");
-    let contract = host_shell_contract_key();
-
-    home.grant_runtime_permission(
-        host_scope.clone(),
-        host_owner.clone(),
-        RuntimePermission::BackgroundTask,
-    )?;
-    home.set_preference(
-        host_scope.clone(),
-        host_owner,
-        "mode".to_string(),
-        "legacy".to_string(),
-    )?;
-    home.set_preferred_provider(
-        host_scope,
-        contract.clone(),
-        ComponentRef::new(provider.activation.instance_id.clone(), "shell"),
+    let profile_dir = home_path.join("profiles");
+    let legacy = profile_dir.join(rintawa_host::BASELINE_PROFILE_FILE);
+    fs::write(
+        &legacy,
+        "schema = 5
+[[activations]]
+world-default = true
+",
     )?;
     drop(home);
+    let before = fs::read(&legacy)?;
 
-    let baseline_path = home_path
-        .join("profiles")
-        .join(rintawa_host::BASELINE_PROFILE_FILE);
-    let mut legacy = fs::read_to_string(&baseline_path)?;
-    assert!(legacy.contains("schema = 6"));
-    assert_eq!(legacy.matches("world-default = false").count(), 2);
-    legacy = legacy.replacen("schema = 6", "schema = 5", 1);
-    legacy = legacy.replace("world-default = false", "world-default = true");
-    fs::write(&baseline_path, legacy)?;
-    assert!(
-        !home_path
-            .join("profiles")
-            .join(DEFAULT_WORLD_PROFILE_FILE)
-            .exists()
-    );
-
-    let migrated = HostHome::open(&home_path)?;
-    assert!(
-        migrated
-            .load_profile()?
-            .activations
-            .iter()
-            .all(|activation| !activation.world_default)
-    );
-    let recipe = migrated.load_default_world_recipe()?;
-    assert_eq!(recipe.activations.len(), 2);
-    assert_eq!(recipe.runtime_permissions.len(), 1);
-    assert_eq!(recipe.preferences.len(), 1);
-    assert_eq!(recipe.preferred_providers.len(), 1);
-    assert!(
-        recipe
-            .activations
-            .iter()
-            .all(|activation| activation.scope_id.as_str() == DEFAULT_WORLD_SCOPE)
-    );
-    let recipe_task = recipe
-        .activations
-        .iter()
-        .find(|activation| activation.subject == task.activation.subject)
-        .expect("legacy task must migrate");
-    let recipe_provider = recipe
-        .activations
-        .iter()
-        .find(|activation| activation.subject == provider.activation.subject)
-        .expect("legacy provider must migrate");
-    assert!(!recipe_task.enabled);
-    assert!(recipe_provider.enabled);
-    assert_ne!(recipe_task.instance_id, task.activation.instance_id);
-    assert_eq!(
-        recipe.runtime_permissions[0].instance_id,
-        recipe_task.instance_id
-    );
-    assert_eq!(recipe.preferences[0].instance_id, recipe_task.instance_id);
-    assert_eq!(recipe.preferences[0].value, "legacy");
-    assert_eq!(recipe.preferred_providers[0].contract(), contract);
-    assert_eq!(
-        recipe.preferred_providers[0].provider(),
-        ComponentRef::new(recipe_provider.instance_id.clone(), "shell")
-    );
-    assert_eq!(recipe.schema, rintawa_host::PROFILE_SCHEMA);
-    assert!(
-        fs::read_to_string(&baseline_path)?.contains("schema = 6"),
-        "migrated baseline must persist the current schema"
-    );
-    let recipe_path = home_path.join("profiles").join(DEFAULT_WORLD_PROFILE_FILE);
-    assert!(fs::read_to_string(&recipe_path)?.contains("schema = 6"));
     let reopened = HostHome::open(&home_path)?;
-    assert_eq!(reopened.load_default_world_recipe()?, recipe);
-
-    let baseline_view = migrated.list_activations()?;
-    assert!(
-        !baseline_view
-            .iter()
-            .find(|activation| activation.subject == task.activation.subject)
-            .expect("baseline task must remain selected")
-            .world_default,
-        "disabled recipe entries are not reported as active defaults"
-    );
-    assert!(
-        baseline_view
-            .iter()
-            .find(|activation| activation.subject == provider.activation.subject)
-            .expect("baseline provider must remain selected")
-            .world_default
-    );
-
-    let world = migrated.create_world()?.id;
-    let world_activations = migrated.list_world_activations(world)?;
-    assert_eq!(world_activations.len(), 2);
-    assert!(
-        !world_activations
-            .iter()
-            .find(|activation| activation.subject == task.activation.subject)
-            .expect("migrated disabled task must materialize")
-            .enabled
-    );
+    assert_eq!(fs::read(&legacy)?, before);
+    assert!(!profile_dir.join(DEFAULT_WORLD_PROFILE_FILE).exists());
+    drop(reopened);
     Ok(())
 }
 
 #[test]
 fn test_should_activate_same_exact_rtw_in_independent_world_overlays() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
-    let artifact = build_service_provider(root.path())?;
+    let artifact = build_task_runtime(root.path(), true)?;
     let home = HostHome::open(root.path().join("home"))?;
     let imported = home.import_rtw_bytes(&fs::read(&artifact)?)?;
     let world_a = home.create_world()?.id;
@@ -496,6 +378,15 @@ fn test_should_activate_same_exact_rtw_in_independent_world_overlays() -> anyhow
     let activation_a = home.select_world_stored_rtw(world_a, imported.digest(), Some(true))?;
     let activation_b = home.select_world_stored_rtw(world_b, imported.digest(), Some(true))?;
     let activation_a_reselected = home.select_world_stored_rtw(world_a, imported.digest(), None)?;
+    // The cooperative-task fixture requires a requested and explicitly granted
+    // capability before its start callback may schedule a task in either world.
+    for activation in [&activation_a, &activation_b] {
+        home.grant_runtime_permission(
+            activation.scope_id.clone(),
+            ComponentRef::new(activation.instance_id.clone(), "runtime"),
+            RuntimePermission::BackgroundTask,
+        )?;
+    }
 
     assert_eq!(
         activation_a.instance_id,
@@ -528,7 +419,7 @@ fn test_should_activate_same_exact_rtw_in_independent_world_overlays() -> anyhow
 #[test]
 fn test_should_reject_cross_world_preferred_provider_identity() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
-    let artifact = build_service_provider(root.path())?;
+    let artifact = build_task_runtime(root.path(), false)?;
     let home = HostHome::open(root.path().join("home"))?;
     let imported = home.import_rtw_bytes(&fs::read(&artifact)?)?;
     let world_a = home.create_world()?.id;
@@ -568,7 +459,7 @@ fn test_should_reject_cross_world_preferred_provider_identity() -> anyhow::Resul
 #[test]
 fn test_should_reject_world_composition_record_from_foreign_scope() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
-    let artifact = build_service_provider(root.path())?;
+    let artifact = build_task_runtime(root.path(), false)?;
     let home_path = root.path().join("home");
     let home = HostHome::open(&home_path)?;
     let imported = home.import_rtw_bytes(&fs::read(&artifact)?)?;
@@ -748,23 +639,22 @@ fn test_should_reuse_cas_object_for_identical_bytes() -> anyhow::Result<()> {
 }
 
 #[test]
-fn test_should_read_legacy_profile_schemas_without_runtime_permissions() -> anyhow::Result<()> {
-    for schema in [1, 2, 3, 4] {
+fn test_should_reject_unsupported_profile_schemas_without_rewriting() -> anyhow::Result<()> {
+    for schema in 1..rintawa_host::PROFILE_SCHEMA {
         let root = tempfile::tempdir()?;
         let home_path = root.path().join(format!("home-{schema}"));
         let profile_dir = home_path.join("profiles");
+        let path = profile_dir.join(rintawa_host::BASELINE_PROFILE_FILE);
         fs::create_dir_all(&profile_dir)?;
-        fs::write(
-            profile_dir.join(rintawa_host::BASELINE_PROFILE_FILE),
-            format!("schema = {schema}\n"),
-        )?;
+        let source = format!("schema = {schema}\n");
+        fs::write(&path, &source)?;
 
         let home = HostHome::open(&home_path)?;
-        let profile = home.load_profile()?;
-        assert_eq!(profile.schema, rintawa_host::PROFILE_SCHEMA);
-        assert!(profile.activations.is_empty());
-        assert!(profile.preferred_providers.is_empty());
-        assert!(profile.runtime_permissions.is_empty());
+        assert!(matches!(
+            home.load_profile(),
+            Err(HostError::UnsupportedProfileSchema(actual)) if actual == schema
+        ));
+        assert_eq!(fs::read_to_string(path)?, source);
     }
     Ok(())
 }
@@ -907,7 +797,7 @@ fn test_should_persist_runtime_permission_and_apply_it_during_bootstrap() -> any
             .join("profiles")
             .join(rintawa_host::BASELINE_PROFILE_FILE),
     )?;
-    assert!(profile_source.contains("schema = 6"));
+    assert!(profile_source.contains("schema = 8"));
     assert!(profile_source.contains("[[runtime_permissions]]"));
     assert!(profile_source.contains("permission = \"background-task\""));
 
@@ -971,7 +861,7 @@ permission = "loopback-listen"
     fs::write(&profile_path, profile_source)?;
 
     let error = match HostRuntime::start(&home) {
-        Ok(runtime) => {
+        Ok(mut runtime) => {
             runtime.shutdown()?;
             anyhow::bail!("stale runtime permission must not expand manifest policy");
         }
@@ -995,7 +885,7 @@ fn test_should_reject_duplicate_runtime_permission_records() -> anyhow::Result<(
     fs::create_dir_all(&profile_dir)?;
     fs::write(
         profile_dir.join(rintawa_host::BASELINE_PROFILE_FILE),
-        r#"schema = 3
+        r#"schema = 8
 
 [[runtime_permissions]]
 scope-id = "host"
@@ -1011,8 +901,9 @@ permission = "background-task"
 "#,
     )?;
 
+    let home = HostHome::open(&home_path)?;
     assert!(matches!(
-        HostHome::open(&home_path),
+        home.load_profile(),
         Err(HostError::DuplicateRuntimePermissionGrant { .. })
     ));
     Ok(())
@@ -1056,6 +947,134 @@ fn test_should_persist_preferred_provider_in_flat_profile_schema() -> anyhow::Re
 }
 
 #[test]
+fn test_should_persist_authoritative_selection_in_host_and_independent_worlds() -> anyhow::Result<()>
+{
+    let root = tempfile::tempdir()?;
+    let artifact = build_task_runtime(root.path(), false)?;
+    let home_path = root.path().join("home");
+    let home = HostHome::open(&home_path)?;
+    home.install_local_rtw(&artifact, None)?;
+
+    let scope = RuntimeScopeId::new(HOST_SCOPE);
+    let point = "rintawa/ai/generate/v1";
+    let provider = ComponentRef::new("bootstrap.task-runtime", "runtime");
+    assert!(matches!(
+        home.set_authoritative_transport_provider(scope.clone(), "../foreign", provider.clone()),
+        Err(HostError::InvalidAuthoritativePoint)
+    ));
+    assert!(matches!(
+        home.set_authoritative_transport_provider(
+            scope.clone(),
+            point,
+            ComponentRef::new("bootstrap.task-runtime", "unknown")
+        ),
+        Err(HostError::AuthoritativeProviderComponentNotFound(_))
+    ));
+    home.set_authoritative_transport_provider(scope.clone(), point, provider.clone())?;
+
+    let reopened = HostHome::open(&home_path)?;
+    let baseline = reopened.load_profile()?;
+    assert_eq!(baseline.authoritative_providers.len(), 1);
+    assert_eq!(baseline.authoritative_providers[0].scope_id, scope);
+    assert_eq!(baseline.authoritative_providers[0].point, point);
+    assert_eq!(baseline.authoritative_providers[0].provider(), provider);
+    let source = fs::read_to_string(
+        home_path
+            .join("profiles")
+            .join(rintawa_host::BASELINE_PROFILE_FILE),
+    )?;
+    assert!(source.contains("[[authoritative_providers]]"));
+    assert!(source.contains("point = \"rintawa/ai/generate/v1\""));
+
+    reopened.set_world_default("bootstrap.task-runtime", true)?;
+    let recipe = reopened.load_default_world_recipe()?;
+    assert_eq!(recipe.authoritative_providers.len(), 1);
+    let template_selected = &recipe.authoritative_providers[0];
+    assert_eq!(
+        template_selected.scope_id,
+        RuntimeScopeId::new(DEFAULT_WORLD_SCOPE)
+    );
+    assert_ne!(template_selected.provider_instance_id, provider.instance_id);
+
+    let world_a = reopened.create_world()?.id;
+    let world_b = reopened.create_world()?.id;
+    let composition_a = reopened.load_world_composition(world_a)?;
+    let composition_b = reopened.load_world_composition(world_b)?;
+    assert_eq!(composition_a.authoritative_providers.len(), 1);
+    assert_eq!(composition_b.authoritative_providers.len(), 1);
+    assert_eq!(
+        composition_a.authoritative_providers[0].scope_id,
+        world_runtime_scope_id(world_a)
+    );
+    assert_eq!(
+        composition_b.authoritative_providers[0].scope_id,
+        world_runtime_scope_id(world_b)
+    );
+    assert_ne!(
+        composition_a.authoritative_providers[0].provider_instance_id,
+        composition_b.authoritative_providers[0].provider_instance_id
+    );
+    assert_ne!(
+        composition_a.authoritative_providers[0].provider_instance_id,
+        template_selected.provider_instance_id
+    );
+
+    reopened.clear_authoritative_transport_provider(&world_runtime_scope_id(world_a), point)?;
+    assert!(
+        reopened
+            .load_world_composition(world_a)?
+            .authoritative_providers
+            .is_empty()
+    );
+    assert_eq!(
+        reopened
+            .load_world_composition(world_b)?
+            .authoritative_providers
+            .len(),
+        1
+    );
+    reopened.set_world_enabled(world_b, "bootstrap.task-runtime", false)?;
+    let disabled = reopened.load_world_composition(world_b)?;
+    assert!(!disabled.activations[0].enabled);
+    assert_eq!(disabled.authoritative_providers.len(), 1);
+
+    reopened.remove_default_world_activation("bootstrap.task-runtime")?;
+    assert!(reopened.load_default_world_recipe()?.activations.is_empty());
+    assert_eq!(
+        reopened
+            .load_default_world_recipe()?
+            .authoritative_providers
+            .len(),
+        1
+    );
+    let world_c = reopened.create_world()?.id;
+    let copied_without_owner = reopened.load_world_composition(world_c)?;
+    assert!(copied_without_owner.activations.is_empty());
+    assert_eq!(copied_without_owner.authoritative_providers.len(), 1);
+    assert_eq!(
+        copied_without_owner.authoritative_providers[0].scope_id,
+        world_runtime_scope_id(world_c)
+    );
+    // Removing the chosen activation cannot silently change the point
+    // into an unprotected fan-out: Host must explicitly clear/replace it.
+    reopened.remove_world_activation(world_b, "bootstrap.task-runtime")?;
+    let removed = reopened.load_world_composition(world_b)?;
+    assert!(removed.activations.is_empty());
+    assert_eq!(removed.authoritative_providers.len(), 1);
+
+    reopened.clear_authoritative_transport_provider(&scope, point)?;
+    assert!(reopened.load_profile()?.authoritative_providers.is_empty());
+    assert_eq!(
+        reopened
+            .load_world_composition(world_b)?
+            .authoritative_providers
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
 fn test_should_fail_explicit_unavailable_host_shell_without_fallback() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let artifact = build_extension(root.path(), "0.0.1", "Bootstrap")?;
@@ -1068,7 +1087,7 @@ fn test_should_fail_explicit_unavailable_host_shell_without_fallback() -> anyhow
     )?;
 
     let error = match HostRuntime::start(&home) {
-        Ok(runtime) => {
+        Ok(mut runtime) => {
             runtime.shutdown()?;
             anyhow::bail!("explicit unavailable Host Shell selection should fail startup");
         }
@@ -1097,7 +1116,7 @@ fn test_should_revisit_deferred_activation_after_runtime_provider_starts() -> an
     assert_eq!(profile.activations[0].subject, "bootstrap.target-dependent");
     assert_eq!(profile.activations[1].subject, "bootstrap.target-provider");
 
-    let runtime = HostRuntime::start(&home)?;
+    let mut runtime = HostRuntime::start(&home)?;
     runtime.shutdown()?;
     Ok(())
 }
@@ -1111,7 +1130,7 @@ fn test_should_report_fixed_point_when_required_execution_target_never_appears()
     home.install_local_rtw(&dependent, Some(true))?;
 
     let error = match HostRuntime::start(&home) {
-        Ok(runtime) => {
+        Ok(mut runtime) => {
             runtime.shutdown()?;
             anyhow::bail!("bootstrap should not ignore a permanently deferred activation");
         }
@@ -1135,30 +1154,395 @@ fn test_should_report_fixed_point_when_required_execution_target_never_appears()
 }
 
 #[test]
-fn test_should_fail_explicit_unavailable_ui_layer_without_fallback() -> anyhow::Result<()> {
+fn test_should_persist_exact_http_origin_and_restore_it_on_bootstrap() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
-    let artifact = build_extension(root.path(), "0.0.1", "Bootstrap")?;
+    let artifact = build_http_runtime(root.path())?;
+    let home_path = root.path().join("home");
+    let home = HostHome::open(&home_path)?;
+    home.install_local_rtw(&artifact, None)?;
+    let scope = RuntimeScopeId::new(HOST_SCOPE);
+    let owner = ComponentRef::new("bootstrap.task-runtime", "runtime");
+
+    assert!(matches!(
+        home.grant_http_loopback_origin(scope.clone(), owner.clone(), "http://localhost:11434"),
+        Err(HostError::HttpRequestPermissionRequired)
+    ));
+    home.grant_runtime_permission(scope.clone(), owner.clone(), RuntimePermission::HttpRequest)?;
+    home.grant_runtime_permission(
+        scope.clone(),
+        owner.clone(),
+        RuntimePermission::BackgroundTask,
+    )?;
+    home.grant_http_loopback_origin(scope.clone(), owner.clone(), "http://LOCALHOST:11434/")?;
+    home.grant_http_loopback_origin(scope.clone(), owner.clone(), "http://localhost:11434")?;
+    home.grant_http_loopback_origin(scope.clone(), owner.clone(), "http://127.0.0.1:11434")?;
+
+    let origins = home.list_http_loopback_origins(&scope)?;
+    assert_eq!(origins.len(), 2, "duplicate approval must be idempotent");
+    assert_eq!(origins[0].origin, "http://127.0.0.1:11434");
+    assert_eq!(origins[1].origin, "http://localhost:11434");
+
+    let source = fs::read_to_string(
+        home_path
+            .join("profiles")
+            .join(rintawa_host::BASELINE_PROFILE_FILE),
+    )?;
+    assert!(source.contains("schema = 8"));
+    assert!(source.contains("[[http_loopback_origins]]"));
+    assert!(source.contains("origin = \"http://127.0.0.1:11434\""));
+
+    let reopened = HostHome::open(&home_path)?;
+    assert_eq!(reopened.list_http_loopback_origins(&scope)?, origins);
+    let mut runtime = HostRuntime::start(&reopened)?;
+    assert!(
+        runtime.poll_runtime()?.is_some(),
+        "restored runtime must be active"
+    );
+    runtime.shutdown()?;
+
+    reopened.revoke_http_loopback_origin(&scope, &owner, "http://localhost:11434")?;
+    let remaining = reopened.list_http_loopback_origins(&scope)?;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].origin, "http://127.0.0.1:11434");
+    reopened.revoke_runtime_permission(&scope, &owner, RuntimePermission::HttpRequest)?;
+    assert!(reopened.list_http_loopback_origins(&scope)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_should_fail_closed_on_tampered_origin_or_unapproved_http_permission() -> anyhow::Result<()>
+{
+    let root = tempfile::tempdir()?;
+    let artifact = build_http_runtime(root.path())?;
+    let home_path = root.path().join("home");
+    let home = HostHome::open(&home_path)?;
+    home.install_local_rtw(&artifact, None)?;
+    let scope = RuntimeScopeId::new(HOST_SCOPE);
+    let owner = ComponentRef::new("bootstrap.task-runtime", "runtime");
+    home.grant_runtime_permission(scope.clone(), owner.clone(), RuntimePermission::HttpRequest)?;
+    home.grant_http_loopback_origin(scope.clone(), owner.clone(), "http://127.0.0.1:11434")?;
+
+    let profile_path = home_path
+        .join("profiles")
+        .join(rintawa_host::BASELINE_PROFILE_FILE);
+    let original = fs::read_to_string(&profile_path)?;
+
+    for invalid_origin in [
+        "http://192.168.1.1:11434",
+        "http://169.254.169.254:80",
+        "http://example.com:11434",
+        "http://127.0.0.1:11434/api",
+        "http://127.0.0.1:11434?hidden=1",
+        "http://user@localhost:11434",
+        "https://127.0.0.1:11434",
+    ] {
+        let invalid = original.replace(
+            "origin = \"http://127.0.0.1:11434\"",
+            &format!("origin = \"{invalid_origin}\""),
+        );
+        fs::write(&profile_path, invalid)?;
+        assert!(
+            matches!(
+                home.load_profile(),
+                Err(HostError::InvalidHttpLoopbackOrigin)
+            ),
+            "unexpectedly accepted altered origin: {invalid_origin}"
+        );
+    }
+
+    let ungranted = original.replace(
+        "permission = \"http-request\"",
+        "permission = \"background-task\"",
+    );
+    fs::write(&profile_path, ungranted)?;
+    assert!(matches!(
+        home.load_profile(),
+        Err(HostError::HttpRequestPermissionRequired)
+    ));
+    fs::write(&profile_path, original)?;
+    assert_eq!(home.list_http_loopback_origins(&scope)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_duplicate_http_origin_records_on_profile_load() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let artifact = build_http_runtime(root.path())?;
+    let home_path = root.path().join("home");
+    let home = HostHome::open(&home_path)?;
+    home.install_local_rtw(&artifact, None)?;
+    let scope = RuntimeScopeId::new(HOST_SCOPE);
+    let owner = ComponentRef::new("bootstrap.task-runtime", "runtime");
+    home.grant_runtime_permission(scope.clone(), owner.clone(), RuntimePermission::HttpRequest)?;
+    home.grant_http_loopback_origin(scope, owner, "http://localhost:11434")?;
+
+    let profile_path = home_path
+        .join("profiles")
+        .join(rintawa_host::BASELINE_PROFILE_FILE);
+    let original = fs::read_to_string(&profile_path)?;
+    let duplicate = "[[http_loopback_origins]]\nscope-id = \"host\"\ninstance-id = \"bootstrap.task-runtime\"\ncomponent-id = \"runtime\"\norigin = \"http://localhost:11434\"\n";
+    fs::write(&profile_path, format!("{original}\n{duplicate}"))?;
+    assert!(matches!(
+        home.load_profile(),
+        Err(HostError::DuplicateHttpLoopbackOriginGrant)
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_should_isolate_http_origins_between_worlds_and_baseline() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let artifact = build_http_runtime(root.path())?;
+    let home = HostHome::open(root.path().join("home"))?;
+    let digest = home
+        .import_rtw_bytes(&fs::read(&artifact)?)?
+        .digest()
+        .clone();
+    let first_world = home.create_world()?.id;
+    let second_world = home.create_world()?.id;
+    let first = home.select_world_stored_rtw(first_world, &digest, Some(true))?;
+    let second = home.select_world_stored_rtw(second_world, &digest, Some(true))?;
+    let first_owner = ComponentRef::new(first.instance_id.clone(), "runtime");
+    let second_owner = ComponentRef::new(second.instance_id.clone(), "runtime");
+
+    home.grant_runtime_permission(
+        first.scope_id.clone(),
+        first_owner.clone(),
+        RuntimePermission::HttpRequest,
+    )?;
+    home.grant_runtime_permission(
+        first.scope_id.clone(),
+        first_owner.clone(),
+        RuntimePermission::BackgroundTask,
+    )?;
+    home.grant_http_loopback_origin(
+        first.scope_id.clone(),
+        first_owner,
+        "http://localhost:11434",
+    )?;
+    assert_eq!(home.list_http_loopback_origins(&first.scope_id)?.len(), 1);
+    assert!(
+        home.list_http_loopback_origins(&second.scope_id)?
+            .is_empty()
+    );
+    assert!(home.load_profile()?.http_loopback_origins.is_empty());
+    assert!(matches!(
+        home.grant_http_loopback_origin(
+            second.scope_id.clone(),
+            second_owner,
+            "http://localhost:11434",
+        ),
+        Err(HostError::HttpRequestPermissionRequired)
+    ));
+
+    let mut runtime = HostRuntime::start(&home)?;
+    runtime.activate_world(&home, first_world)?;
+    runtime.deactivate_world(first_world)?;
+    runtime.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn test_should_copy_http_origin_policy_to_default_world_then_new_world_only() -> anyhow::Result<()>
+{
+    let root = tempfile::tempdir()?;
+    let artifact = build_http_runtime(root.path())?;
     let home = HostHome::open(root.path().join("home"))?;
     home.install_local_rtw(&artifact, None)?;
-    home.set_preferred_provider(
-        RuntimeScopeId::new(HOST_SCOPE),
-        ui_layer_contract_key(),
-        ComponentRef::new("example.bootstrap", "missing-layer"),
-    )?;
+    let scope = RuntimeScopeId::new(HOST_SCOPE);
+    let owner = ComponentRef::new("bootstrap.task-runtime", "runtime");
+    home.grant_runtime_permission(scope.clone(), owner.clone(), RuntimePermission::HttpRequest)?;
+    home.grant_http_loopback_origin(scope.clone(), owner.clone(), "http://localhost:11434")?;
 
-    let error = match HostRuntime::start(&home) {
-        Ok(runtime) => {
-            runtime.shutdown()?;
-            anyhow::bail!("explicit unavailable UI Layer selection should fail startup");
-        }
-        Err(error) => error,
-    };
+    home.set_world_default("bootstrap.task-runtime", true)?;
+    let recipe = home.load_default_world_recipe()?;
+    assert_eq!(recipe.http_loopback_origins.len(), 1);
+    assert_eq!(
+        recipe.http_loopback_origins[0].scope_id.as_str(),
+        "default-world"
+    );
+    assert_ne!(
+        recipe.http_loopback_origins[0].instance_id,
+        owner.instance_id
+    );
+
+    let first_world = home.create_world()?.id;
+    let first = home.load_world_composition(first_world)?;
+    assert_eq!(first.http_loopback_origins.len(), 1);
+    assert_eq!(
+        first.http_loopback_origins[0].origin,
+        "http://localhost:11434"
+    );
+    assert_ne!(
+        first.http_loopback_origins[0].instance_id,
+        recipe.http_loopback_origins[0].instance_id
+    );
+
+    home.revoke_http_loopback_origin(&scope, &owner, "http://localhost:11434")?;
+    let second_world = home.create_world()?.id;
+    assert_eq!(
+        home.load_world_composition(second_world)?
+            .http_loopback_origins
+            .len(),
+        1
+    );
+    assert_eq!(
+        home.load_world_composition(first_world)?
+            .http_loopback_origins
+            .len(),
+        1
+    );
+    assert!(home.load_profile()?.http_loopback_origins.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_should_prune_origins_when_extension_is_replaced_without_http_request() -> anyhow::Result<()>
+{
+    let root = tempfile::tempdir()?;
+    let with_http = build_http_runtime(root.path())?;
+    let without_http = build_task_runtime(root.path(), false)?;
+    let home = HostHome::open(root.path().join("home"))?;
+    home.install_local_rtw(&with_http, None)?;
+    let scope = RuntimeScopeId::new(HOST_SCOPE);
+    let owner = ComponentRef::new("bootstrap.task-runtime", "runtime");
+    home.grant_runtime_permission(scope.clone(), owner.clone(), RuntimePermission::HttpRequest)?;
+    home.grant_http_loopback_origin(scope.clone(), owner, "http://localhost:11434")?;
+    home.install_local_rtw(&without_http, None)?;
+    let profile = home.load_profile()?;
+    assert!(profile.http_loopback_origins.is_empty());
+    assert!(profile.runtime_permissions.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_invalid_origin_without_mutating_persisted_policy() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let artifact = build_http_runtime(root.path())?;
+    let home = HostHome::open(root.path().join("home"))?;
+    home.install_local_rtw(&artifact, None)?;
+    let scope = RuntimeScopeId::new(HOST_SCOPE);
+    let owner = ComponentRef::new("bootstrap.task-runtime", "runtime");
+    home.grant_runtime_permission(scope.clone(), owner.clone(), RuntimePermission::HttpRequest)?;
+    let before = home.load_profile()?;
+    for origin in [
+        "http://192.168.1.1:11434",
+        "http://127.0.0.1:0",
+        "http://127.0.0.1:11434/api",
+        "http://user:pass@localhost:11434",
+    ] {
+        assert!(matches!(
+            home.grant_http_loopback_origin(scope.clone(), owner.clone(), origin),
+            Err(HostError::InvalidHttpLoopbackOrigin)
+        ));
+    }
+    assert_eq!(home.load_profile()?, before);
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_http_origin_quota_without_persisting_partial_grants() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let artifact = build_http_runtime(root.path())?;
+    let home = HostHome::open(root.path().join("home"))?;
+    home.install_local_rtw(&artifact, None)?;
+    let scope = RuntimeScopeId::new(HOST_SCOPE);
+    let owner = ComponentRef::new("bootstrap.task-runtime", "runtime");
+    home.grant_runtime_permission(scope.clone(), owner.clone(), RuntimePermission::HttpRequest)?;
+
+    for port in 10000..10032 {
+        home.grant_http_loopback_origin(
+            scope.clone(),
+            owner.clone(),
+            &format!("http://127.0.0.1:{port}"),
+        )?;
+    }
+    let before = home.load_profile()?;
+    assert_eq!(before.http_loopback_origins.len(), 32);
     assert!(matches!(
-        error,
-        HostError::ContractRoleUnavailable {
-            reason: UnresolvedContractReason::PreferredProviderUnavailable,
-            ..
-        }
+        home.grant_http_loopback_origin(scope.clone(), owner.clone(), "http://127.0.0.1:10032"),
+        Err(HostError::HttpLoopbackOriginLimitExceeded)
+    ));
+    assert_eq!(home.load_profile()?, before);
+    home.revoke_http_loopback_origin(&scope, &owner, "http://127.0.0.1:10031")?;
+    home.grant_http_loopback_origin(scope.clone(), owner.clone(), "http://127.0.0.1:10032")?;
+    assert_eq!(home.list_http_loopback_origins(&scope)?.len(), 32);
+    Ok(())
+}
+
+#[test]
+fn test_should_remove_http_origins_with_removed_extension_activation() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let artifact = build_http_runtime(root.path())?;
+    let home = HostHome::open(root.path().join("home"))?;
+    home.install_local_rtw(&artifact, None)?;
+    let scope = RuntimeScopeId::new(HOST_SCOPE);
+    let owner = ComponentRef::new("bootstrap.task-runtime", "runtime");
+    home.grant_runtime_permission(scope.clone(), owner.clone(), RuntimePermission::HttpRequest)?;
+    home.grant_http_loopback_origin(scope.clone(), owner, "http://127.0.0.1:11434")?;
+    home.remove_activation("bootstrap.task-runtime")?;
+    let profile = home.load_profile()?;
+    assert!(profile.activations.is_empty());
+    assert!(profile.http_loopback_origins.is_empty());
+    assert!(profile.runtime_permissions.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_wrong_scope_inside_stored_http_origin_record() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let artifact = build_http_runtime(root.path())?;
+    let home_path = root.path().join("home");
+    let home = HostHome::open(&home_path)?;
+    home.install_local_rtw(&artifact, None)?;
+    let scope = RuntimeScopeId::new(HOST_SCOPE);
+    let owner = ComponentRef::new("bootstrap.task-runtime", "runtime");
+    home.grant_runtime_permission(scope.clone(), owner.clone(), RuntimePermission::HttpRequest)?;
+    home.grant_http_loopback_origin(scope, owner, "http://127.0.0.1:11434")?;
+    let profile_path = home_path
+        .join("profiles")
+        .join(rintawa_host::BASELINE_PROFILE_FILE);
+    let original = fs::read_to_string(&profile_path)?;
+    let altered = original.replace(
+        "[[http_loopback_origins]]\nscope-id = \"host\"",
+        "[[http_loopback_origins]]\nscope-id = \"world:foreign\"",
+    );
+    assert_ne!(altered, original, "fixture should contain the grant record");
+    fs::write(&profile_path, altered)?;
+    assert!(matches!(
+        home.load_profile(),
+        Err(HostError::CompositionScopeMismatch { .. } | HostError::HttpRequestPermissionRequired)
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_stale_http_origin_if_profile_permission_was_removed() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let artifact = build_http_runtime(root.path())?;
+    let home_path = root.path().join("home");
+    let home = HostHome::open(&home_path)?;
+    home.install_local_rtw(&artifact, None)?;
+    let scope = RuntimeScopeId::new(HOST_SCOPE);
+    let owner = ComponentRef::new("bootstrap.task-runtime", "runtime");
+    home.grant_runtime_permission(scope.clone(), owner.clone(), RuntimePermission::HttpRequest)?;
+    home.grant_http_loopback_origin(scope, owner, "http://localhost:11434")?;
+    let profile_path = home_path
+        .join("profiles")
+        .join(rintawa_host::BASELINE_PROFILE_FILE);
+    let original = fs::read_to_string(&profile_path)?;
+    let without_permission = original.replace(
+        "[[runtime_permissions]]\nscope-id = \"host\"\ninstance-id = \"bootstrap.task-runtime\"\ncomponent-id = \"runtime\"\npermission = \"http-request\"",
+        "",
+    );
+    assert_ne!(
+        original, without_permission,
+        "fixture must contain explicit HTTP permission"
+    );
+    fs::write(&profile_path, without_permission)?;
+    assert!(matches!(
+        HostRuntime::start(&home),
+        Err(HostError::HttpRequestPermissionRequired)
     ));
     Ok(())
 }

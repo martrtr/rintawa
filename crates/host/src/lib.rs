@@ -1,18 +1,24 @@
 //! Local host composition for exact RTW artifacts.
 //!
-//! This crate intentionally contains no repository, HTTP, update, or version-selection
-//! policy. It persists exact artifact activations that a CLI, installer, or package
-//! manager can request after obtaining RTW bytes by any means.
+//! This crate intentionally contains no repository fetching, HTTP request execution,
+//! update, or version-selection policy. It persists exact artifact activations and
+//! Host-approved network permissions, leaving transport implementation to the Engine.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, rustdoc::broken_intra_doc_links)]
+// Host errors wrap storage, world-model and runtime errors, which are themselves
+// structured. Boxing them would change the public Host error surface for no gain
+// in a host process that fails fast on any of them.
+#![allow(clippy::result_large_err)]
 
-mod identity;
 mod profile;
+#[cfg(test)]
+mod published_preference_tests;
 mod runtime;
-mod runtime_signal;
-mod user_content;
-mod world_catalog;
+mod secret_config;
+mod shared_secrets;
+mod templates;
+mod world_metadata;
 
 use std::{
     fmt,
@@ -25,38 +31,30 @@ use rintawa_artifacts::{
 };
 use rintawa_extension_engine::{
     ActivationPlanError, DeferredExecutionTarget, EngineError, ExtensionEngine, RtwExtensionLoader,
-    UnresolvedContractReason,
+    TransportError, UnresolvedContractReason, canonical_http_loopback_origin,
+    validate_transport_point,
 };
 use rintawa_sdk::{
     contracts::{ComponentRef, ContractKey},
     runtime_permissions::RuntimePermission,
     types::{ComponentId, ExtensionInstanceId, RuntimeScopeId},
-    ui::WorldPresentationDescriptor,
-    world::{PrincipalId, SchemaKey, WorldId},
+    world::WorldId,
 };
 use rintawa_storage::SqliteWorldStorage;
-use rintawa_world::WorldSessionState;
+use rintawa_world::{WorldManifest, WorldSessionState};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub use identity::HOST_IDENTITY_SCHEMA;
 pub use profile::{
-    ActivationRecord, BaselineProfile, CompositionProfile, PROFILE_SCHEMA,
-    PreferredProviderSelection, RuntimePermissionGrant,
+    ActivationRecord, AuthoritativeProviderSelection, CompositionEntry, CompositionProfile,
+    HostExecutionRequirement, HttpLoopbackOriginGrant, PROFILE_SCHEMA, PreferredProviderSelection,
+    RuntimePermissionGrant, SecretReadGrant,
 };
-pub use runtime::{
-    EFFECT_JOB_LEASE_MILLIS, EFFECT_RETRY_BASE_MILLIS, EFFECT_RETRY_MAX_MILLIS, HostRuntime,
-    MAX_EFFECT_JOBS_PER_PUMP, WorldCommandDispatchOutcome,
-};
-pub use runtime_signal::{
-    DEFAULT_RUNTIME_SIGNAL_QUEUE_CAPACITY, MAX_RUNTIME_SIGNAL_MESSAGE_BYTES,
-    MAX_RUNTIME_SIGNAL_TOPIC_BYTES,
-};
-pub use user_content::{USER_CONTENT_LIBRARY_SCHEMA, UserContentEntry, UserContentId};
-pub use world_catalog::{
-    MAX_WORLD_TITLE_BYTES, WORLD_CATALOG_METADATA_FILE, WORLD_CATALOG_METADATA_SCHEMA,
-    WorldCatalogMetadata,
-};
+pub use runtime::HostRuntime;
+pub use shared_secrets::{ManagedSecretEntry, SecretBackend, SecretStorageError};
+pub use templates::{CreatedTemplateWorld, PackageInstallResult, TemplateSummary};
+use world_metadata::WorldMetadata;
+pub use world_metadata::{MAX_WORLD_DESCRIPTION_BYTES, MAX_WORLD_TITLE_BYTES};
 
 /// Stable runtime scope used by the pre-world/bootstrap composition.
 pub const HOST_SCOPE: &str = "host";
@@ -77,10 +75,8 @@ pub const BASELINE_PROFILE_FILE: &str = "baseline.toml";
 /// File name of the composition recipe materialized into newly created Worlds.
 pub const DEFAULT_WORLD_PROFILE_FILE: &str = "default-world.toml";
 const EXTENSION_CONTENT_V1: &str = "rintawa.extension@1";
-const HOST_IDENTITY_FILE: &str = "identity.toml";
 const WORLD_DATABASE_FILE: &str = "world.sqlite";
 const WORLD_COMPOSITION_FILE: &str = "composition.toml";
-const WORLD_ID_CREATION_ATTEMPTS: usize = 8;
 /// Maximum single raw asset size accepted by the local host asset store.
 pub const MAX_ASSET_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -261,6 +257,27 @@ impl std::error::Error for HostShutdownFailures {
 /// Errors returned by local host composition operations.
 #[derive(Debug, Error)]
 pub enum HostError {
+    /// Native shared credential storage failure with sanitized diagnostics.
+    #[error(transparent)]
+    SecretStorage(#[from] SecretStorageError),
+    /// A local exact secret-read approval is invalid or exceeds its quota.
+    #[error("invalid local secret policy: {0}")]
+    InvalidSecretPolicy(String),
+    /// The platform credential store rejected an operation without exposing values.
+    #[error(transparent)]
+    Secret(#[from] rintawa_sdk::secrets::SecretAccessError),
+    /// A World is activating, active or still cleaning up its components.
+    #[error("World lifecycle is busy: {0}")]
+    WorldLifecycleBusy(WorldId),
+    /// A template or its portable dependency closure is invalid.
+    #[error("invalid World template: {0}")]
+    InvalidTemplate(String),
+    /// Local approval is required before creating a World with requested capabilities.
+    #[error("template runtime permission approval required: {0}")]
+    TemplateApprovalRequired(String),
+    /// Trusted interactive session and World command Principal do not match.
+    #[error("interactive World command Principal differs from authenticated session")]
+    InteractiveWorldCommandPrincipalMismatch,
     /// An RTW artifact operation failed.
     #[error(transparent)]
     Artifact(#[from] rintawa_artifacts::RtwError),
@@ -276,12 +293,6 @@ pub enum HostError {
     /// Authoritative world command runtime failed.
     #[error(transparent)]
     WorldRuntime(#[from] rintawa_world_runtime::WorldRuntimeError),
-    /// A Principal-specific world projection could not be built safely.
-    #[error(transparent)]
-    WorldProjection(#[from] rintawa_world_runtime::WorldProjectionError),
-    /// No registered Projection schema is available under this exact key.
-    #[error("world projection `{0}` is not available in the active world")]
-    WorldProjectionUnavailable(SchemaKey),
     /// A filesystem operation failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -322,43 +333,21 @@ pub enum HostError {
         /// Maximum accepted UTF-8 byte length.
         maximum_bytes: usize,
     },
-    /// A World catalog metadata sidecar is absent where one was explicitly requested.
-    #[error("world catalog metadata file `{0}` is missing")]
-    WorldCatalogMetadataMissing(PathBuf),
-    /// A World catalog metadata path is not a safe regular file.
-    #[error("invalid world catalog metadata file `{0}`")]
-    InvalidWorldCatalogMetadataFile(PathBuf),
-    /// Persisted World catalog metadata could not be decoded.
-    #[error("invalid world catalog metadata: {source}")]
-    WorldCatalogMetadataDecode {
-        /// TOML decoding failure.
-        #[source]
-        source: toml::de::Error,
-    },
-    /// World catalog metadata could not be encoded.
-    #[error("failed to encode world catalog metadata: {source}")]
-    WorldCatalogMetadataEncode {
-        /// TOML encoding failure.
-        #[source]
-        source: toml::ser::Error,
-    },
-    /// Persisted World catalog metadata uses a newer schema.
-    #[error("unsupported world catalog metadata schema {0}")]
-    UnsupportedWorldCatalogMetadataSchema(u32),
+    /// A World manifest has invalid or absent human-facing metadata.
+    #[error("invalid World manifest metadata: {0}")]
+    InvalidWorldMetadata(String),
+    /// Shutdown has closed Host admission; the caller may retry cleanup only.
+    #[error("Host is stopping; new activation is refused")]
+    HostStopping,
+    /// Host admission refuses more than eight active/draining Worlds.
+    #[error("active World admission limit (8) exceeded")]
+    ActiveWorldLimitExceeded,
     /// A world runtime is already active in this host process.
     #[error("world `{0}` is already active")]
     WorldAlreadyActive(WorldId),
     /// A world runtime is not active in this host process.
     #[error("world `{0}` is not active")]
     WorldNotActive(WorldId),
-    /// The selected World presentation entry surface is not currently mounted.
-    #[error("world `{world_id}` presentation entry surface `{surface_id}` is not mounted")]
-    WorldPresentationEntryUnavailable {
-        /// Active World whose presentation could not be focused.
-        world_id: WorldId,
-        /// Exact owner-scoped entry surface declared by the selected provider.
-        surface_id: String,
-    },
     /// Persisted composition policy contains a record for another runtime scope.
     #[error("composition scope mismatch: expected `{expected_scope}`, found `{actual_scope}`")]
     CompositionScopeMismatch {
@@ -381,9 +370,6 @@ pub enum HostError {
         /// Filesystem cleanup failure.
         cleanup: String,
     },
-    /// A runtime event envelope could not be serialized for extension delivery.
-    #[error("failed to encode runtime event envelope: {0}")]
-    EventEnvelopeEncode(#[from] serde_json::Error),
     /// An extension declared malformed JSON for one immutable world schema.
     #[error("world schema `{schema}` contains invalid JSON: {source}")]
     InvalidWorldSchemaJson {
@@ -393,59 +379,19 @@ pub enum HostError {
         #[source]
         source: serde_json::Error,
     },
-    /// One delivery batch mixed events owned by different authoritative worlds.
-    #[error("world event delivery batch contains multiple WorldIds")]
-    MixedWorldEventBatch,
-    /// An ephemeral runtime signal used an empty or oversized routing topic.
-    #[error("runtime signal topic must be non-empty and within host bounds")]
-    InvalidRuntimeSignalTopic,
-    /// Shared deferred user-content write control state became unavailable.
-    #[error("user-content deferred write control is unavailable")]
-    UserContentWriteControlUnavailable,
+    /// Different registered components declared the same World schema identity.
+    #[error("world schema {schema} has ambiguous declaring components {first} and {second}")]
+    AmbiguousWorldSchemaDeclaration {
+        /// Conflicting versioned World schema.
+        schema: rintawa_sdk::world::SchemaKey,
+        /// First registered instance/component principal.
+        first: String,
+        /// Second registered instance/component principal.
+        second: String,
+    },
     /// Shared deferred world-session lifecycle control state became unavailable.
     #[error("world-session lifecycle control is unavailable")]
     WorldSessionControlUnavailable,
-    /// Shared deferred world-command control state became unavailable.
-    #[error("world-command deferred control is unavailable")]
-    WorldCommandControlUnavailable,
-    /// Shared deferred world-projection control state became unavailable.
-    #[error("world-projection deferred control is unavailable")]
-    WorldProjectionControlUnavailable,
-    /// An active world's bounded ephemeral signal queue has no remaining capacity.
-    #[error("runtime signal queue for world `{0}` is full")]
-    RuntimeSignalQueueFull(WorldId),
-    /// A runtime signal envelope exceeded the host message bound.
-    #[error("runtime signal envelope is {actual_bytes} bytes; maximum is {maximum_bytes}")]
-    RuntimeSignalMessageTooLarge {
-        /// Encoded envelope size observed by the host.
-        actual_bytes: usize,
-        /// Maximum encoded envelope size accepted by the host.
-        maximum_bytes: usize,
-    },
-    /// A runtime signal envelope could not be serialized for extension delivery.
-    #[error("failed to encode runtime signal envelope: {source}")]
-    RuntimeSignalEncode {
-        /// Serialization failure from the host envelope codec.
-        #[source]
-        source: serde_json::Error,
-    },
-    /// Host identity metadata path is not a safe regular file.
-    #[error("invalid host identity file `{path}`: {reason}")]
-    InvalidHostIdentityFile {
-        /// Rejected host identity path.
-        path: PathBuf,
-        /// Identity storage invariant that was violated.
-        reason: &'static str,
-    },
-    /// Persisted host identity metadata could not be decoded.
-    #[error("invalid host identity metadata: {0}")]
-    HostIdentityDecode(toml::de::Error),
-    /// Host identity metadata could not be encoded.
-    #[error("failed to encode host identity metadata: {0}")]
-    HostIdentityEncode(toml::ser::Error),
-    /// Persisted host identity schema is newer than this host understands.
-    #[error("unsupported host identity schema {0}")]
-    UnsupportedHostIdentitySchema(u32),
     /// Persisted host state could not be decoded.
     #[error("invalid host profile: {0}")]
     ProfileDecode(#[from] toml::de::Error),
@@ -468,6 +414,26 @@ pub enum HostError {
         /// Contract selected more than once.
         contract: String,
     },
+    /// One authoritative Zenoh point was selected twice in one scope.
+    #[error("duplicate authoritative provider selection for point {point} in scope {scope_id}")]
+    DuplicateAuthoritativeProviderSelection {
+        /// Runtime scope containing the selection.
+        scope_id: String,
+        /// Zenoh point selected more than once.
+        point: String,
+    },
+    /// The selected Zenoh point name contains unsupported characters.
+    #[error("invalid authoritative transport point")]
+    InvalidAuthoritativePoint,
+    /// Too many authoritative point selections in a composition.
+    #[error("authoritative transport selection limit exceeded")]
+    AuthoritativeProviderLimitExceeded,
+    /// A selected component is not present in the installed RTW artifact.
+    #[error("authoritative provider component {0} is not present in the installed package")]
+    AuthoritativeProviderComponentNotFound(String),
+    /// The selected point cannot be admitted by the engine.
+    #[error("transport selection rejected: {0}")]
+    Transport(#[from] TransportError),
     /// The baseline profile contains the same runtime capability approval more than once.
     #[error(
         "duplicate runtime permission `{permission}` for component `{component_id}` in instance `{instance_id}` scope `{scope_id}`"
@@ -482,6 +448,19 @@ pub enum HostError {
         /// Runtime permission approved more than once.
         permission: String,
     },
+    /// A local HTTP approval contains a non-loopback or noncanonical origin.
+    #[error("invalid HTTP loopback origin; specify the exact canonical local origin")]
+    InvalidHttpLoopbackOrigin,
+    /// A local HTTP origin was stored twice for the same component in one scope.
+    #[error("duplicate HTTP loopback origin approval for one component")]
+    DuplicateHttpLoopbackOriginGrant,
+    /// The origin quota for a profile or one component has been exceeded.
+    #[error("HTTP loopback origin approval limit exceeded")]
+    HttpLoopbackOriginLimitExceeded,
+    /// A local HTTP origin requires its own previously approved HTTP request capability.
+    #[error("approve the manifest-requested http-request permission before approving an origin")]
+    HttpRequestPermissionRequired,
+
     /// A preferred provider references an activation not installed in the baseline profile.
     #[error("preferred provider instance `{0}` is not installed in the baseline profile")]
     PreferredProviderActivationNotFound(String),
@@ -577,85 +556,6 @@ pub enum HostError {
     /// A persisted activation uses a content type for which this host has no handler.
     #[error("no activation handler is available for RTW content `{0}`")]
     UnsupportedContent(String),
-    /// The generic user-content library path is not a regular host-owned file.
-    #[error("invalid user-content library file `{0}`")]
-    InvalidUserContentLibraryFile(PathBuf),
-    /// The persisted generic user-content library uses an unsupported schema.
-    #[error("unsupported user-content library schema {0}")]
-    UnsupportedUserContentLibrarySchema(u32),
-    /// The persisted generic user-content library contains a duplicate logical ID.
-    #[error("duplicate user-content library id `{0}`")]
-    DuplicateUserContentId(UserContentId),
-    /// The requested logical user-content item is absent from the library index.
-    #[error("user-content item `{0}` is not present in the library")]
-    UserContentNotFound(UserContentId),
-    /// An edit attempted to change the versioned content type of one logical item.
-    #[error("user-content item `{id}` has type `{expected}`, not `{actual}`")]
-    UserContentTypeMismatch {
-        /// Stable logical content identity.
-        id: UserContentId,
-        /// Existing versioned content type.
-        expected: String,
-        /// Rejected replacement content type.
-        actual: String,
-    },
-    /// The persisted user-content library could not be decoded.
-    #[error("invalid user-content library: {source}")]
-    UserContentLibraryDecode {
-        /// TOML decoding failure.
-        #[source]
-        source: toml::de::Error,
-    },
-    /// The user-content library could not be encoded for persistence.
-    #[error("failed to encode user-content library: {source}")]
-    UserContentLibraryEncode {
-        /// TOML encoding failure.
-        #[source]
-        source: toml::ser::Error,
-    },
-    /// A content-handler request could not be serialized.
-    #[error("failed to encode RTW content-handler request for `{content}`: {source}")]
-    ContentHandlerRequestEncode {
-        /// Exact versioned RTW content type.
-        content: String,
-        /// JSON encoding failure.
-        #[source]
-        source: serde_json::Error,
-    },
-    /// The selected content-handler service could not complete validation.
-    #[error("RTW content handler for `{content}` is unavailable: {source}")]
-    ContentHandlerCall {
-        /// Exact versioned RTW content type.
-        content: String,
-        /// Generic service transport failure.
-        #[source]
-        source: rintawa_sdk::services::ServiceCallError,
-    },
-    /// A content handler returned malformed protocol bytes.
-    #[error("RTW content handler for `{content}` returned an invalid response: {source}")]
-    ContentHandlerResponseDecode {
-        /// Exact versioned RTW content type.
-        content: String,
-        /// JSON decoding failure.
-        #[source]
-        source: serde_json::Error,
-    },
-    /// A content handler rejected an immutable RTW descriptor.
-    #[error("RTW content `{content}` was rejected by its handler: {diagnostic}")]
-    UserContentRejected {
-        /// Exact versioned RTW content type.
-        content: String,
-        /// Bounded handler diagnostic.
-        diagnostic: String,
-    },
-    /// A content handler returned a rejection diagnostic above the protocol bound.
-    #[error("RTW content handler diagnostic for `{content}` exceeds {maximum_bytes} bytes")]
-    ContentHandlerDiagnosticTooLarge {
-        /// Exact versioned RTW content type.
-        content: String,
-        /// Maximum accepted UTF-8 byte length.
-        maximum_bytes: usize,
-    },
 }
 
 /// Result type used by local host composition operations.
@@ -680,8 +580,8 @@ pub struct InstalledActivation {
     pub scope_id: RuntimeScopeId,
     /// Whether the selected composition activation should start automatically.
     pub enabled: bool,
-    /// Compatibility view indicating that this exact enabled baseline artifact is selected
-    /// in the independent default-World recipe. Always false outside the baseline view.
+    /// Whether this exact enabled baseline artifact is selected in the independent
+    /// default-World recipe. Always false outside the baseline view.
     pub world_default: bool,
 }
 
@@ -721,25 +621,12 @@ enum PersistedCompositionScope {
 pub struct WorldSummary {
     /// Stable authoritative world identity.
     pub id: WorldId,
-    /// Human-facing host-owned catalog title.
+    /// Human-facing title stored in world.manifest.
     pub title: String,
     /// Optional human-facing description.
     pub description: Option<String>,
     /// Optional immutable cover asset reference.
     pub cover: Option<rintawa_artifacts::AssetRef>,
-    /// Last committed local world position.
-    pub commit_position: u64,
-}
-
-/// One resolved entry point for an active World's presentation in a concrete UI session.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorldPresentationTarget {
-    /// Active authoritative World being presented.
-    pub world_id: WorldId,
-    /// Exact active component selected by the World's composition policy.
-    pub provider: ComponentRef,
-    /// Owner-scoped entry surface and optional semantic intent registered by the provider.
-    pub descriptor: WorldPresentationDescriptor,
 }
 
 /// Persistent local Rintawa home containing CAS bytes, worlds, and baseline composition.
@@ -747,11 +634,17 @@ pub struct HostHome {
     root: PathBuf,
     store: ArtifactStore,
     asset_store: AssetStore,
-    local_principal: PrincipalId,
     profile_path: PathBuf,
     default_world_profile_path: PathBuf,
-    user_content_path: PathBuf,
     worlds_directory: PathBuf,
+}
+
+#[cfg(test)]
+type InitialCompositionHook = Box<dyn FnOnce(WorldId)>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_INITIAL_COMPOSITION: std::cell::RefCell<Option<InitialCompositionHook>> = const { std::cell::RefCell::new(None) };
 }
 
 impl HostHome {
@@ -762,39 +655,26 @@ impl HostHome {
         let root = root.canonicalize()?;
         let store = ArtifactStore::open(root.join("artifacts"), RtwLimits::default())?;
         let asset_store = AssetStore::open(root.join("assets"), MAX_ASSET_BYTES)?;
-        let local_principal =
-            identity::load_or_create_local_principal(&root.join(HOST_IDENTITY_FILE))?;
         let profiles_directory = root.join("profiles");
         ensure_real_directory(&profiles_directory)?;
         let profile_path = profiles_directory.join(BASELINE_PROFILE_FILE);
         let default_world_profile_path = profiles_directory.join(DEFAULT_WORLD_PROFILE_FILE);
-        let content_directory = root.join("content");
-        ensure_real_directory(&content_directory)?;
-        let user_content_path = content_directory.join("library.toml");
         let worlds_directory = root.join("worlds");
         ensure_real_directory(&worlds_directory)?;
         let home = Self {
             root,
             store,
             asset_store,
-            local_principal,
             profile_path,
             default_world_profile_path,
-            user_content_path,
             worlds_directory,
         };
-        home.migrate_legacy_world_defaults()?;
         Ok(home)
     }
 
     /// Returns the canonical local Rintawa home path.
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    /// Returns the stable authenticated Principal of this local single-user host.
-    pub const fn local_principal(&self) -> PrincipalId {
-        self.local_principal
     }
 
     /// Returns the immutable artifact store.
@@ -814,46 +694,11 @@ impl HostHome {
     /// Returns a filesystem or storage error if the world directory/database
     /// cannot be created safely.
     pub fn create_world(&self) -> HostResult<WorldSummary> {
-        let default_world = self.load_default_world_recipe()?;
-        for _ in 0..WORLD_ID_CREATION_ATTEMPTS {
-            let world_id = WorldId::new();
-            let directory = self.worlds_directory.join(world_id.to_string());
-            match std::fs::create_dir(&directory) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error.into()),
-            }
-
-            let database = directory.join(WORLD_DATABASE_FILE);
-            let creation: HostResult<WorldSummary> =
-                match SqliteWorldStorage::create(&database, world_id) {
-                    Ok(storage) => (|| {
-                        let state = storage.load_session()?;
-                        drop(storage);
-                        let metadata = WorldCatalogMetadata::new("New World", None)?;
-                        metadata.save(&directory.join(WORLD_CATALOG_METADATA_FILE))?;
-                        let scope_id = world_runtime_scope_id(world_id);
-                        let profile = default_world.materialize_all(scope_id);
-                        self.save_world_composition(world_id, &profile)?;
-                        Ok(world_summary(&state, metadata))
-                    })(),
-                    Err(error) => Err(error.into()),
-                };
-            match creation {
-                Ok(summary) => return Ok(summary),
-                Err(error) => {
-                    if let Err(cleanup) = std::fs::remove_dir_all(&directory) {
-                        return Err(HostError::WorldCreateRollbackFailed {
-                            creation: error.to_string(),
-                            cleanup: cleanup.to_string(),
-                        });
-                    }
-                    return Err(error);
-                }
-            }
-        }
-
-        Err(HostError::WorldIdCollision)
+        let recipe = self.load_default_world_recipe()?;
+        let metadata = WorldMetadata::new("New World", None, None)?;
+        let manifest = metadata.write_to_manifest(&WorldManifest::default())?;
+        self.publish_world(&recipe, None, &manifest)
+            .map(|created| created.world)
     }
 
     /// Lists all persistent worlds in deterministic identifier order.
@@ -868,7 +713,7 @@ impl HostHome {
         entries.sort_by_key(std::fs::DirEntry::file_name);
 
         let mut worlds = Vec::with_capacity(entries.len());
-        for (index, entry) in entries.into_iter().enumerate() {
+        for entry in entries {
             let directory = entry.path();
             validate_world_directory(&directory)?;
             let name =
@@ -885,47 +730,49 @@ impl HostHome {
                         path: directory.clone(),
                         reason: "directory name must be a canonical WorldId",
                     })?;
-            let storage = open_world_database(&directory, world_id)?;
-            let metadata_path = directory.join(WORLD_CATALOG_METADATA_FILE);
-            let metadata = match WorldCatalogMetadata::load(&metadata_path) {
-                Ok(metadata) => metadata,
-                Err(HostError::WorldCatalogMetadataMissing(_)) => {
-                    let metadata = WorldCatalogMetadata::new(format!("World {}", index + 1), None)?;
-                    metadata.save(&metadata_path)?;
-                    metadata
-                }
-                Err(error) => return Err(error),
-            };
-            worlds.push(world_summary(&storage.load_session()?, metadata));
+            let state = read_world_session(&directory, world_id)?;
+            worlds.push(world_summary(&state)?);
         }
 
         worlds.sort_by_key(|world| world.id);
         Ok(worlds)
     }
 
-    /// Updates host-owned human-facing metadata for one persistent World.
+    /// Updates human-facing metadata atomically in world.manifest.
     ///
+    /// This obtains temporary ownership for an inactive World. For an active World,
+    /// use Host World-session access, which submits metadata to its existing writer.
     /// The cover, when supplied, must already exist in the immutable host asset store.
     ///
     /// # Errors
     ///
-    /// Returns an error when the World is absent, title is invalid, cover verification fails,
-    /// or the metadata sidecar cannot be persisted atomically.
-    pub fn update_world_catalog_metadata(
+    /// Returns a storage or validation error if the update cannot be committed.
+    pub fn update_world_metadata(
         &self,
         world_id: WorldId,
         title: impl Into<String>,
         description: Option<String>,
         cover: Option<rintawa_artifacts::AssetRef>,
     ) -> HostResult<WorldSummary> {
-        let directory = self.worlds_directory.join(world_id.to_string());
         let storage = self.open_world_storage(world_id)?;
+        let metadata = self.validate_world_metadata(title, description, cover)?;
+        storage.set_manifest_metadata(
+            serde_json::to_value(metadata)
+                .map_err(|error| HostError::InvalidWorldMetadata(error.to_string()))?,
+        )?;
+        world_summary(&storage.load_session()?)
+    }
+
+    fn validate_world_metadata(
+        &self,
+        title: impl Into<String>,
+        description: Option<String>,
+        cover: Option<rintawa_artifacts::AssetRef>,
+    ) -> HostResult<WorldMetadata> {
         if let Some(reference) = &cover {
             self.asset_store.verify(reference)?;
         }
-        let metadata = WorldCatalogMetadata::new(title, cover)?.with_description(description)?;
-        metadata.save(&directory.join(WORLD_CATALOG_METADATA_FILE))?;
-        Ok(world_summary(&storage.load_session()?, metadata))
+        WorldMetadata::new(title, description, cover)
     }
 
     /// Deletes one inactive persistent World including its exact world composition.
@@ -937,28 +784,21 @@ impl HostHome {
     /// Returns an error when the World does not exist, its directory identity is unsafe,
     /// or the host cannot remove the validated World directory.
     pub fn delete_world(&self, world_id: WorldId) -> HostResult<()> {
+        let _lifecycle = self.lock_world_lifecycle(world_id)?;
+        let _profile_lock = self.lock_composition_scope(&world_runtime_scope_id(world_id))?;
         let directory = self.worlds_directory.join(world_id.to_string());
         let storage = open_world_database(&directory, world_id)?;
-        drop(storage);
+        storage.delete()?;
         std::fs::remove_dir_all(directory)?;
         Ok(())
     }
 
-    /// Reads host-owned human-facing metadata for one persistent World.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the World or metadata sidecar is absent or invalid.
-    pub fn load_world_catalog_metadata(
-        &self,
-        world_id: WorldId,
-    ) -> HostResult<WorldCatalogMetadata> {
-        let directory = self.worlds_directory.join(world_id.to_string());
-        self.open_world_storage(world_id)?;
-        WorldCatalogMetadata::load(&directory.join(WORLD_CATALOG_METADATA_FILE))
+    pub(crate) fn open_world_storage(&self, world_id: WorldId) -> HostResult<SqliteWorldStorage> {
+        let directory = self.existing_world_directory(world_id)?;
+        open_world_database(&directory, world_id)
     }
 
-    pub(crate) fn open_world_storage(&self, world_id: WorldId) -> HostResult<SqliteWorldStorage> {
+    fn existing_world_directory(&self, world_id: WorldId) -> HostResult<PathBuf> {
         let directory = self.worlds_directory.join(world_id.to_string());
         match std::fs::symlink_metadata(&directory) {
             Ok(_) => {}
@@ -968,7 +808,7 @@ impl HostHome {
             Err(error) => return Err(error.into()),
         }
         validate_world_directory(&directory)?;
-        open_world_database(&directory, world_id)
+        Ok(directory)
     }
 
     /// Loads durable metadata for one persistent world.
@@ -978,12 +818,13 @@ impl HostHome {
     /// Returns WorldNotFound when the world directory is absent, or a storage
     /// integrity/version error when the world cannot be opened safely.
     pub fn load_world_state(&self, world_id: WorldId) -> HostResult<WorldSessionState> {
-        Ok(self.open_world_storage(world_id)?.load_session()?)
+        let directory = self.existing_world_directory(world_id)?;
+        read_world_session(&directory, world_id)
     }
 
     /// Loads the baseline pre-world composition.
-    pub fn load_profile(&self) -> HostResult<BaselineProfile> {
-        let profile = BaselineProfile::load(&self.profile_path)?;
+    pub fn load_profile(&self) -> HostResult<CompositionProfile> {
+        let profile = CompositionProfile::load(&self.profile_path)?;
         profile.validate_scope(&RuntimeScopeId::new(HOST_SCOPE))?;
         Ok(profile)
     }
@@ -1000,34 +841,17 @@ impl HostHome {
         profile.save(&self.default_world_profile_path)
     }
 
-    fn migrate_legacy_world_defaults(&self) -> HostResult<()> {
-        let host_scope = RuntimeScopeId::new(HOST_SCOPE);
-        let default_scope = RuntimeScopeId::new(DEFAULT_WORLD_SCOPE);
-        let mut baseline = BaselineProfile::load(&self.profile_path)?;
-        baseline.validate_scope(&host_scope)?;
-        if !baseline
-            .activations
-            .iter()
-            .any(|activation| activation.world_default)
-        {
-            return Ok(());
-        }
-
-        if self.default_world_profile_path.exists() {
-            let recipe = CompositionProfile::load(&self.default_world_profile_path)?;
-            recipe.validate_scope(&default_scope)?;
-        } else {
-            let recipe = baseline.materialize_legacy_world_defaults(default_scope);
-            recipe.save(&self.default_world_profile_path)?;
-        }
-
-        baseline.clear_legacy_world_defaults();
-        baseline.save(&self.profile_path)
-    }
-
     /// Loads the exact composition overlay persisted with one world.
     pub fn load_world_composition(&self, world_id: WorldId) -> HostResult<CompositionProfile> {
+        let _profile_lock = self.lock_composition_scope(&world_runtime_scope_id(world_id))?;
+        self.load_world_composition_locked(world_id)
+    }
+
+    fn load_world_composition_locked(&self, world_id: WorldId) -> HostResult<CompositionProfile> {
         let path = self.world_composition_path(world_id)?;
+        // Only baseline/recipe absence denotes a default profile. A World must
+        // have finished publishing its initial overlay before it can activate.
+        std::fs::metadata(&path)?;
         let profile = CompositionProfile::load(&path)?;
         profile.validate_scope(&world_runtime_scope_id(world_id))?;
         Ok(profile)
@@ -1043,8 +867,7 @@ impl HostHome {
     }
 
     fn world_composition_path(&self, world_id: WorldId) -> HostResult<PathBuf> {
-        let storage = self.open_world_storage(world_id)?;
-        drop(storage);
+        self.load_world_state(world_id)?;
         Ok(self
             .worlds_directory
             .join(world_id.to_string())
@@ -1082,6 +905,28 @@ impl HostHome {
             PersistedCompositionScope::DefaultWorld => self.load_default_world_recipe(),
             PersistedCompositionScope::World(world_id) => self.load_world_composition(world_id),
         }
+    }
+
+    fn load_composition_for_scope_locked(
+        &self,
+        scope_id: &RuntimeScopeId,
+    ) -> HostResult<CompositionProfile> {
+        match self.persisted_composition_scope(scope_id)? {
+            PersistedCompositionScope::Baseline => self.load_profile(),
+            PersistedCompositionScope::DefaultWorld => self.load_default_world_recipe(),
+            PersistedCompositionScope::World(world_id) => {
+                self.load_world_composition_locked(world_id)
+            }
+        }
+    }
+
+    fn lock_composition_scope(&self, scope_id: &RuntimeScopeId) -> HostResult<std::fs::File> {
+        let path = match self.persisted_composition_scope(scope_id)? {
+            PersistedCompositionScope::Baseline => self.profile_path.clone(),
+            PersistedCompositionScope::DefaultWorld => self.default_world_profile_path.clone(),
+            PersistedCompositionScope::World(id) => self.world_composition_path(id)?,
+        };
+        CompositionProfile::lock(&path)
     }
 
     fn save_composition_for_scope(
@@ -1166,6 +1011,16 @@ impl HostHome {
         digest: &ArtifactDigest,
         enabled: Option<bool>,
     ) -> HostResult<InstalledActivation> {
+        let _profile_lock = self.lock_composition_scope(&scope_id)?;
+        self.select_stored_rtw_in_scope_locked(scope_id, digest, enabled)
+    }
+
+    fn select_stored_rtw_in_scope_locked(
+        &self,
+        scope_id: RuntimeScopeId,
+        digest: &ArtifactDigest,
+        enabled: Option<bool>,
+    ) -> HostResult<InstalledActivation> {
         let archive = self.store.open_artifact(digest)?;
         let content = archive.manifest().content.clone();
         if content.to_string() != EXTENSION_CONTENT_V1 {
@@ -1177,7 +1032,7 @@ impl HostHome {
         let manifest =
             RtwExtensionLoader::new().read_stored_manifest(&engine, &self.store, digest)?;
         let composition_scope = self.persisted_composition_scope(&scope_id)?;
-        let mut profile = self.load_composition_for_scope(&scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(&scope_id)?;
         let subject = manifest.id.to_string();
         let instance_id = match composition_scope {
             PersistedCompositionScope::Baseline => ExtensionInstanceId::new(subject.clone()),
@@ -1200,7 +1055,6 @@ impl HostHome {
                 instance_id: instance_id.clone(),
                 scope_id: scope_id.clone(),
                 enabled: true,
-                world_default: false,
             },
             enabled,
         );
@@ -1212,6 +1066,29 @@ impl HostHome {
                 component.id == grant.component_id
                     && component.permissions.runtime.contains(&grant.permission)
             })
+        });
+        profile.http_loopback_origins.retain(|grant| {
+            if grant.scope_id != scope_id || grant.instance_id != instance_id {
+                return true;
+            }
+            profile.runtime_permissions.iter().any(|permission| {
+                permission.scope_id == grant.scope_id
+                    && permission.instance_id == grant.instance_id
+                    && permission.component_id == grant.component_id
+                    && permission.permission == RuntimePermission::HttpRequest
+            })
+        });
+        profile.secret_read_grants.retain(|grant| {
+            grant.scope_id != scope_id
+                || grant.instance_id != instance_id
+                || manifest.components.iter().any(|component| {
+                    component.id == grant.component_id
+                        && component
+                            .permissions
+                            .secret_read
+                            .iter()
+                            .any(|pattern| pattern.matches(&grant.path))
+                })
         });
         self.save_composition_for_scope(&scope_id, &profile)?;
         let world_default = matches!(composition_scope, PersistedCompositionScope::Baseline)
@@ -1250,8 +1127,7 @@ impl HostHome {
         self.set_enabled_in_scope(&RuntimeScopeId::new(HOST_SCOPE), subject, enabled)
     }
 
-    /// Compatibility helper that adds or removes the current baseline artifact from the
-    /// independent default-World recipe.
+    /// Adds or removes the current baseline artifact from the independent default-World recipe.
     ///
     /// Existing Worlds and later baseline policy changes are never propagated implicitly.
     pub fn set_world_default(&self, subject: &str, world_default: bool) -> HostResult<()> {
@@ -1262,7 +1138,8 @@ impl HostHome {
             .find(|activation| activation.subject == subject)
             .ok_or_else(|| HostError::ActivationNotFound(subject.to_string()))?;
         let default_scope = RuntimeScopeId::new(DEFAULT_WORLD_SCOPE);
-        let recipe = self.load_default_world_recipe()?;
+        let _profile_lock = self.lock_composition_scope(&default_scope)?;
+        let mut recipe = self.load_default_world_recipe()?;
         let has_recipe_activation = recipe
             .activations
             .iter()
@@ -1270,12 +1147,13 @@ impl HostHome {
 
         if !world_default {
             if has_recipe_activation {
-                self.remove_activation_in_scope(&default_scope, subject)?;
+                recipe.remove_activation(subject)?;
+                self.save_default_world_recipe(&recipe)?;
             }
             return Ok(());
         }
 
-        let selected = self.select_stored_rtw_in_scope(
+        let selected = self.select_stored_rtw_in_scope_locked(
             default_scope.clone(),
             &activation.artifact,
             Some(true),
@@ -1296,6 +1174,18 @@ impl HostHome {
                 component_id: grant.component_id.clone(),
                 permission: grant.permission,
             });
+        }
+        for grant in baseline
+            .http_loopback_origins
+            .iter()
+            .filter(|grant| grant.instance_id == activation.instance_id)
+        {
+            recipe.grant_http_loopback_origin(HttpLoopbackOriginGrant {
+                scope_id: default_scope.clone(),
+                instance_id: selected.instance_id.clone(),
+                component_id: grant.component_id.clone(),
+                origin: grant.origin.clone(),
+            })?;
         }
         for preference in baseline
             .preferences
@@ -1320,6 +1210,20 @@ impl HostHome {
             recipe.set_preferred_provider(PreferredProviderSelection::new(
                 default_scope.clone(),
                 selection.contract(),
+                ComponentRef::new(
+                    selected.instance_id.clone(),
+                    selection.provider_component_id.clone(),
+                ),
+            ));
+        }
+        for selection in baseline
+            .authoritative_providers
+            .iter()
+            .filter(|selection| selection.provider_instance_id == activation.instance_id)
+        {
+            recipe.set_authoritative_provider(AuthoritativeProviderSelection::new(
+                default_scope.clone(),
+                selection.point.clone(),
                 ComponentRef::new(
                     selected.instance_id.clone(),
                     selection.provider_component_id.clone(),
@@ -1354,7 +1258,8 @@ impl HostHome {
         subject: &str,
         enabled: bool,
     ) -> HostResult<()> {
-        let mut profile = self.load_composition_for_scope(scope_id)?;
+        let _profile_lock = self.lock_composition_scope(scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(scope_id)?;
         profile.set_enabled(subject, enabled)?;
         self.save_composition_for_scope(scope_id, &profile)
     }
@@ -1371,7 +1276,8 @@ impl HostHome {
         scope_id: &RuntimeScopeId,
         subject: &str,
     ) -> HostResult<()> {
-        let mut profile = self.load_composition_for_scope(scope_id)?;
+        let _profile_lock = self.lock_composition_scope(scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(scope_id)?;
         profile.remove_activation(subject)?;
         self.save_composition_for_scope(scope_id, &profile)
     }
@@ -1395,7 +1301,8 @@ impl HostHome {
         key: String,
         value: String,
     ) -> HostResult<()> {
-        let mut profile = self.load_composition_for_scope(&scope_id)?;
+        let _profile_lock = self.lock_composition_scope(&scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(&scope_id)?;
         profile.set_preference(scope_id.clone(), owner, key, value)?;
         self.save_composition_for_scope(&scope_id, &profile)
     }
@@ -1407,9 +1314,51 @@ impl HostHome {
         owner: &ComponentRef,
         key: &str,
     ) -> HostResult<()> {
-        let mut profile = self.load_composition_for_scope(scope_id)?;
+        let _profile_lock = self.lock_composition_scope(scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(scope_id)?;
         profile.delete_preference(scope_id, owner, key)?;
         self.save_composition_for_scope(scope_id, &profile)
+    }
+
+    fn compare_exchange_published_preference(
+        &self,
+        owner: &ComponentRef,
+        digest: &ArtifactDigest,
+        key: &str,
+        expected: Option<&str>,
+        value: Option<&str>,
+    ) -> HostResult<bool> {
+        let scope_id = RuntimeScopeId::new(HOST_SCOPE);
+        let _profile_lock = CompositionProfile::try_lock(&self.profile_path)?;
+        let mut profile = self.load_profile()?;
+        let mut selections = profile
+            .activations
+            .iter()
+            .filter(|activation| activation.instance_id == owner.instance_id);
+        if !selections
+            .next()
+            .is_some_and(|activation| activation.artifact == *digest && activation.enabled)
+            || selections.next().is_some()
+        {
+            return Err(HostError::ActivationNotFound(owner.instance_id.to_string()));
+        }
+
+        if profile.get_preference(&scope_id, owner, key)?.as_deref() != expected {
+            return Ok(false);
+        }
+        if expected != value {
+            match value {
+                Some(value) => profile.set_preference(
+                    scope_id.clone(),
+                    owner.clone(),
+                    key.to_string(),
+                    value.to_string(),
+                )?,
+                None => profile.delete_preference(&scope_id, owner, key)?,
+            }
+            self.save_composition_for_scope(&scope_id, &profile)?;
+        }
+        Ok(true)
     }
 
     /// Lists requested and granted runtime permissions for the baseline composition.
@@ -1478,7 +1427,8 @@ impl HostHome {
         owner: ComponentRef,
         permission: RuntimePermission,
     ) -> HostResult<()> {
-        let mut profile = self.load_composition_for_scope(&scope_id)?;
+        let _profile_lock = self.lock_composition_scope(&scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(&scope_id)?;
         let activation = profile
             .activations
             .iter()
@@ -1537,8 +1487,80 @@ impl HostHome {
         owner: &ComponentRef,
         permission: RuntimePermission,
     ) -> HostResult<()> {
-        let mut profile = self.load_composition_for_scope(scope_id)?;
+        let _profile_lock = self.lock_composition_scope(scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(scope_id)?;
         profile.revoke_runtime_permission(scope_id, owner, permission);
+        self.save_composition_for_scope(scope_id, &profile)
+    }
+
+    /// Returns the exact local HTTP origins currently approved in this scope.
+    ///
+    /// These records are Host-controlled policy, not guest preferences. No
+    /// component can read another scope's policy through normal HTTP imports.
+    pub fn list_http_loopback_origins(
+        &self,
+        scope_id: &RuntimeScopeId,
+    ) -> HostResult<Vec<HttpLoopbackOriginGrant>> {
+        let mut origins = self
+            .load_composition_for_scope(scope_id)?
+            .http_loopback_origins;
+        origins.sort_by(|left, right| {
+            left.instance_id
+                .as_str()
+                .cmp(right.instance_id.as_str())
+                .then_with(|| left.component_id.as_str().cmp(right.component_id.as_str()))
+                .then_with(|| left.origin.cmp(&right.origin))
+        });
+        Ok(origins)
+    }
+
+    /// Persists an explicit local HTTP origin approval for an exact component.
+    ///
+    /// The host must first approve the ordinary `http-request` permission for
+    /// this component. This is a separate decision and cannot grant new runtime
+    /// capabilities by itself.
+    pub fn grant_http_loopback_origin(
+        &self,
+        scope_id: RuntimeScopeId,
+        owner: ComponentRef,
+        origin: &str,
+    ) -> HostResult<()> {
+        let canonical_origin =
+            canonical_http_loopback_origin(origin).ok_or(HostError::InvalidHttpLoopbackOrigin)?;
+        let _profile_lock = self.lock_composition_scope(&scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(&scope_id)?;
+        let has_http_grant = profile.runtime_permissions.iter().any(|grant| {
+            grant.scope_id == scope_id
+                && grant.instance_id == owner.instance_id
+                && grant.component_id == owner.component_id
+                && grant.permission == RuntimePermission::HttpRequest
+        });
+        if !has_http_grant {
+            return Err(HostError::HttpRequestPermissionRequired);
+        }
+        profile.grant_http_loopback_origin(HttpLoopbackOriginGrant::new(
+            scope_id.clone(),
+            owner,
+            canonical_origin,
+        ))?;
+        self.save_composition_for_scope(&scope_id, &profile)
+    }
+
+    /// Removes one persisted local HTTP origin approval from an exact component.
+    ///
+    /// This does not need to reload the original artifact manifest, so a valid
+    /// persisted policy can still be changed when that artifact is unavailable.
+    pub fn revoke_http_loopback_origin(
+        &self,
+        scope_id: &RuntimeScopeId,
+        owner: &ComponentRef,
+        origin: &str,
+    ) -> HostResult<()> {
+        let canonical_origin =
+            canonical_http_loopback_origin(origin).ok_or(HostError::InvalidHttpLoopbackOrigin)?;
+        let _profile_lock = self.lock_composition_scope(scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(scope_id)?;
+        profile.revoke_http_loopback_origin(scope_id, owner, &canonical_origin);
         self.save_composition_for_scope(scope_id, &profile)
     }
 
@@ -1546,13 +1568,86 @@ impl HostHome {
     ///
     /// The provider instance must already be installed in the same runtime scope.
     /// Provider capability itself is validated during composition activation.
+    /// Chooses the only component allowed to declare one scoped Zenoh point.
+    ///
+    /// This is machine-local Host policy, not a guest-controlled preference.
+    /// A disabled provider remains selected; it never silently falls back.
+    ///
+    /// # Errors
+    /// Rejects invalid names, missing package/components, and storage errors.
+    pub fn set_authoritative_transport_provider(
+        &self,
+        scope_id: RuntimeScopeId,
+        point: &str,
+        provider: ComponentRef,
+    ) -> HostResult<()> {
+        validate_transport_point(point).map_err(|_| HostError::InvalidAuthoritativePoint)?;
+        let _profile_lock = self.lock_composition_scope(&scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(&scope_id)?;
+        let activation = profile
+            .activations
+            .iter()
+            .find(|entry| entry.instance_id == provider.instance_id)
+            .ok_or_else(|| {
+                HostError::PreferredProviderActivationNotFound(provider.instance_id.to_string())
+            })?;
+        if activation.scope_id != scope_id {
+            return Err(HostError::PreferredProviderScopeMismatch {
+                instance_id: provider.instance_id.to_string(),
+                selected_scope: scope_id.to_string(),
+                actual_scope: activation.scope_id.to_string(),
+            });
+        }
+        let manifest = RtwExtensionLoader::new().read_stored_manifest(
+            &ExtensionEngine::new(),
+            &self.store,
+            &activation.artifact,
+        )?;
+        if !manifest
+            .components
+            .iter()
+            .any(|component| component.id == provider.component_id)
+        {
+            return Err(HostError::AuthoritativeProviderComponentNotFound(
+                provider.component_id.to_string(),
+            ));
+        }
+        profile.set_authoritative_provider(AuthoritativeProviderSelection::new(
+            scope_id.clone(),
+            point.to_owned(),
+            provider,
+        ));
+        self.save_composition_for_scope(&scope_id, &profile)
+    }
+
+    /// Removes a persisted point selection, restoring ordinary Zenoh fan-out.
+    ///
+    /// # Errors
+    /// Returns a profile or filesystem error if the composition cannot be updated.
+    pub fn clear_authoritative_transport_provider(
+        &self,
+        scope_id: &RuntimeScopeId,
+        point: &str,
+    ) -> HostResult<()> {
+        validate_transport_point(point).map_err(|_| HostError::InvalidAuthoritativePoint)?;
+        let _profile_lock = self.lock_composition_scope(scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(scope_id)?;
+        profile.clear_authoritative_provider(scope_id, point);
+        self.save_composition_for_scope(scope_id, &profile)
+    }
+
+    /// Persists the selected implementation of a legacy versioned contract.
+    ///
+    /// # Errors
+    /// Rejects unknown instances and invalid profile changes.
     pub fn set_preferred_provider(
         &self,
         scope_id: RuntimeScopeId,
         contract: ContractKey,
         provider: ComponentRef,
     ) -> HostResult<()> {
-        let mut profile = self.load_composition_for_scope(&scope_id)?;
+        let _profile_lock = self.lock_composition_scope(&scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(&scope_id)?;
         let activation = profile
             .activations
             .iter()
@@ -1581,7 +1676,8 @@ impl HostHome {
         scope_id: &RuntimeScopeId,
         contract: &ContractKey,
     ) -> HostResult<()> {
-        let mut profile = self.load_composition_for_scope(scope_id)?;
+        let _profile_lock = self.lock_composition_scope(scope_id)?;
+        let mut profile = self.load_composition_for_scope_locked(scope_id)?;
         profile.clear_preferred_provider(scope_id, contract);
         self.save_composition_for_scope(scope_id, &profile)
     }
@@ -1709,12 +1805,114 @@ fn open_world_database(directory: &Path, directory_id: WorldId) -> HostResult<Sq
     Ok(storage)
 }
 
-fn world_summary(state: &WorldSessionState, metadata: WorldCatalogMetadata) -> WorldSummary {
-    WorldSummary {
+fn read_world_session(directory: &Path, directory_id: WorldId) -> HostResult<WorldSessionState> {
+    validate_world_directory(directory)?;
+    let state = SqliteWorldStorage::load_session_read_only(directory.join(WORLD_DATABASE_FILE))?;
+    if state.id() != directory_id {
+        return Err(HostError::WorldDirectoryIdMismatch {
+            directory_id,
+            database_id: state.id(),
+        });
+    }
+    Ok(state)
+}
+
+fn world_summary(state: &WorldSessionState) -> HostResult<WorldSummary> {
+    let metadata = WorldMetadata::from_manifest(state.manifest())?;
+    Ok(WorldSummary {
         id: state.id(),
         title: metadata.title().to_string(),
         description: metadata.description().map(str::to_string),
         cover: metadata.cover().cloned(),
-        commit_position: state.commit_position(),
+    })
+}
+
+#[cfg(test)]
+mod creation_review_tests {
+    use super::*;
+    use std::{sync::mpsc, time::Duration};
+
+    #[test]
+    fn test_should_hide_world_until_composition_is_published() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path())?;
+        let creator_home = HostHome::open(root.path())?;
+        let (ready, paused) = mpsc::channel();
+        let (resume, release) = mpsc::channel();
+        let creator = std::thread::spawn(move || {
+            BEFORE_INITIAL_COMPOSITION.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |world| {
+                    ready.send(world).unwrap();
+                    release.recv_timeout(Duration::from_secs(10)).unwrap();
+                }));
+            });
+            creator_home.create_world()
+        });
+        let world = paused.recv_timeout(Duration::from_secs(5))?;
+        assert!(home.list_worlds()?.is_empty());
+        assert!(matches!(
+            home.load_world_composition(world),
+            Err(HostError::WorldNotFound(_))
+        ));
+        // Startup recovery must leave a live creator's private stage alone.
+        home.recover_world_staging()?;
+        resume.send(())?;
+        let created = creator.join().unwrap()?;
+        assert_eq!(created.id, world);
+        let owner = ComponentRef::new("review-owner", "runtime");
+        let scope = world_runtime_scope_id(world);
+        home.set_preference(
+            scope.clone(),
+            owner.clone(),
+            "review-key".into(),
+            "confirmed".into(),
+        )?;
+        assert_eq!(
+            home.get_preference(&scope, &owner, "review-key")?,
+            Some("confirmed".into())
+        );
+        let mut runtime = crate::HostRuntime::start(&home)?;
+        runtime.activate_world(&home, world)?;
+        runtime.deactivate_world(world)?;
+        runtime.shutdown()?;
+        home.delete_world(world)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_incomplete_overlay_after_failed_creation() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path())?;
+        // Force atomic profile publication to fail, after the database is ready.
+        BEFORE_INITIAL_COMPOSITION.with(|hook| {
+            let directory = home.root.join("world-staging");
+            *hook.borrow_mut() = Some(Box::new(move |_world| {
+                let stage = std::fs::read_dir(&directory)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                std::fs::create_dir(stage.join(WORLD_COMPOSITION_FILE)).unwrap();
+            }));
+        });
+        assert!(home.create_world().is_err());
+        assert!(home.list_worlds()?.is_empty());
+        assert_eq!(std::fs::read_dir(&home.worlds_directory)?.count(), 0);
+        // Missing overlays in an interrupted creation must not become an empty
+        // default profile that could be activated as a completed World.
+        let world = home.create_world()?;
+        let overlay = home
+            .worlds_directory
+            .join(world.id.to_string())
+            .join(WORLD_COMPOSITION_FILE);
+        std::fs::remove_file(overlay)?;
+        assert!(home.load_world_composition(world.id).is_err());
+        let mut runtime = crate::HostRuntime::start(&home)?;
+        assert!(runtime.activate_world(&home, world.id).is_err());
+        assert!(!runtime.is_world_active(world.id));
+        runtime.shutdown()?;
+        home.delete_world(world.id)?;
+        Ok(())
     }
 }

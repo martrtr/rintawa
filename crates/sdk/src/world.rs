@@ -84,83 +84,33 @@ opaque_world_id!(
     WorldId,
     "Opaque globally unique identifier of one authoritative world."
 );
-opaque_world_id!(EntityId, "Opaque globally unique identifier of one entity.");
 opaque_world_id!(
-    RelationId,
-    "Opaque globally unique identifier of one relation."
+    ItemId,
+    "Opaque globally unique identifier of one item: an object or a relation."
 );
 opaque_world_id!(
     CommandId,
     "Opaque globally unique identifier of one submitted world command."
 );
 opaque_world_id!(
-    WorldEventId,
-    "Opaque globally unique identifier of one durable world event."
-);
-opaque_world_id!(
-    EffectJobId,
-    "Opaque globally unique identifier of one durable external effect job."
-);
-opaque_world_id!(
     PrincipalId,
     "Opaque globally unique identifier of one authenticated outside principal."
 );
-opaque_world_id!(
-    ControlGrantId,
-    "Opaque globally unique identifier of one durable actor-control grant."
-);
-opaque_world_id!(
-    CorrelationId,
-    "Opaque globally unique identifier that correlates one causal operation chain."
-);
-
-/// Signed Unix timestamp in milliseconds used for durable provenance metadata.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct UnixTimeMillis(i64);
-
-impl UnixTimeMillis {
-    /// Creates a timestamp from milliseconds relative to the Unix epoch.
-    pub const fn new(value: i64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the signed millisecond value relative to the Unix epoch.
-    pub const fn get(self) -> i64 {
-        self.0
-    }
-}
-
 /// Semantic category of one versioned world schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SchemaKind {
-    /// Schema identifying an entity type.
-    Entity,
-    /// Schema identifying a relation type.
-    Relation,
-    /// Schema describing one extension-owned facet payload.
-    Facet,
+    /// JSON Schema of one property value registered in a world vocabulary.
+    Property,
     /// Schema describing one world command payload.
     Command,
-    /// Schema describing one durable world-event payload.
-    Event,
-    /// Schema describing one durable external effect/job payload.
-    Effect,
-    /// Schema describing one extension-owned policy-filtered projection payload.
-    Projection,
 }
 
 impl fmt::Display for SchemaKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::Entity => "entity",
-            Self::Relation => "relation",
-            Self::Facet => "facet",
+            Self::Property => "property",
             Self::Command => "command",
-            Self::Event => "event",
-            Self::Effect => "effect",
-            Self::Projection => "projection",
         })
     }
 }
@@ -192,9 +142,10 @@ impl SchemaIdentifierError {
     }
 }
 
-/// Canonical unversioned identifier of one world schema.
+/// Canonical unversioned identifier of one world schema or property name.
 ///
-/// Schema IDs are lowercase ASCII namespaces such as example.entity.identity.
+/// Identifiers are lowercase ASCII namespaces such as character.identity. Dotted
+/// property names are flat identifiers, never an inheritance path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SchemaId(String);

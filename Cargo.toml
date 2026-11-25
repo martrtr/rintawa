@@ -27,6 +27,7 @@ tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+same-file = "1.0.6"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 url = "2"
@@ -39,3 +40,13 @@ toml = "0.9"
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 wasmtime = { version = "29", features = ["component-model", "async"] }
 wit-component = "=0.221.3"
+
+# Wasmtime and its dependencies produce very large debug artifacts. Keep local
+# builds and test runs compact on machines with limited SSD capacity.
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false

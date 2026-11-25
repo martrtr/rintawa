@@ -11,34 +11,38 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimePermission {
+    /// Allows requesting a trusted secret picker; grants no secret administration.
+    SecretPrompt,
+    /// Allows baseline administration of shared secret metadata, input and bindings.
+    SecretManage,
     /// Allows owner-scoped cooperative background task scheduling.
     BackgroundTask,
+    /// Allows a World backend to read its exact baseline counterpart's published configuration.
+    PublishedPreferenceRead,
+    /// Allows a World backend to exchange its exact baseline counterpart's published configuration.
+    PublishedPreferenceWrite,
     /// Allows binding a TCP listener only on the local loopback interface.
     LoopbackListen,
     /// Allows opening a TCP connection only to the local loopback interface.
     LoopbackConnect,
     /// Allows bounded outbound HTTPS GET requests through the host HTTP client.
     HttpFetch,
+    /// Allows bounded asynchronous outbound HTTPS requests with explicit host grants.
+    HttpRequest,
     /// Allows importing validated RTW bytes into the local immutable artifact store.
     ArtifactImport,
     /// Allows importing bounded immutable raw assets into the local asset store.
     AssetImport,
+    /// Allows reading known exact refs from the installation-wide immutable asset CAS.
+    AssetRead,
     /// Allows creating bounded ephemeral user-selected resources for semantic import workflows.
     UserResourceImport,
     /// Allows reading exact opaque ephemeral resources explicitly passed to the component.
     UserResourceRead,
-    /// Allows reading the persistent generic user-content library and descriptors.
-    UserContentRead,
-    /// Allows requesting deferred validated imports/replacements in the user-content library.
-    UserContentWrite,
     /// Allows reading the persistent world catalog and runtime lifecycle status.
     WorldSessionRead,
     /// Allows creating worlds and requesting active/inactive world lifecycle transitions.
     WorldSessionWrite,
-    /// Allows submitting bounded authoritative commands as the host-authenticated principal.
-    WorldCommandSubmit,
-    /// Allows requesting Principal-filtered views from active authoritative Worlds.
-    WorldProjectionRead,
     /// Allows reading the selected host composition without mutating it.
     CompositionRead,
     /// Allows changing exact artifact selections and enabled state in host composition.
@@ -52,20 +56,22 @@ pub enum RuntimePermission {
 impl fmt::Display for RuntimePermission {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SecretManage => formatter.write_str("secret-manage"),
+            Self::SecretPrompt => formatter.write_str("secret-prompt"),
+            Self::PublishedPreferenceRead => formatter.write_str("published-preference-read"),
+            Self::PublishedPreferenceWrite => formatter.write_str("published-preference-write"),
             Self::BackgroundTask => formatter.write_str("background-task"),
             Self::LoopbackListen => formatter.write_str("loopback-listen"),
             Self::LoopbackConnect => formatter.write_str("loopback-connect"),
             Self::HttpFetch => formatter.write_str("http-fetch"),
+            Self::HttpRequest => formatter.write_str("http-request"),
             Self::ArtifactImport => formatter.write_str("artifact-import"),
             Self::AssetImport => formatter.write_str("asset-import"),
+            Self::AssetRead => formatter.write_str("asset-read"),
             Self::UserResourceImport => formatter.write_str("user-resource-import"),
             Self::UserResourceRead => formatter.write_str("user-resource-read"),
-            Self::UserContentRead => formatter.write_str("user-content-read"),
-            Self::UserContentWrite => formatter.write_str("user-content-write"),
             Self::WorldSessionRead => formatter.write_str("world-session-read"),
             Self::WorldSessionWrite => formatter.write_str("world-session-write"),
-            Self::WorldCommandSubmit => formatter.write_str("world-command-submit"),
-            Self::WorldProjectionRead => formatter.write_str("world-projection-read"),
             Self::CompositionRead => formatter.write_str("composition-read"),
             Self::CompositionWrite => formatter.write_str("composition-write"),
             Self::RuntimePolicyRead => formatter.write_str("runtime-policy-read"),
@@ -91,20 +97,22 @@ impl FromStr for RuntimePermission {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
+            "secret-manage" => Ok(Self::SecretManage),
+            "secret-prompt" => Ok(Self::SecretPrompt),
+            "published-preference-read" => Ok(Self::PublishedPreferenceRead),
+            "published-preference-write" => Ok(Self::PublishedPreferenceWrite),
             "background-task" => Ok(Self::BackgroundTask),
             "loopback-listen" => Ok(Self::LoopbackListen),
             "loopback-connect" => Ok(Self::LoopbackConnect),
             "http-fetch" => Ok(Self::HttpFetch),
+            "http-request" => Ok(Self::HttpRequest),
             "artifact-import" => Ok(Self::ArtifactImport),
             "asset-import" => Ok(Self::AssetImport),
+            "asset-read" => Ok(Self::AssetRead),
             "user-resource-import" => Ok(Self::UserResourceImport),
             "user-resource-read" => Ok(Self::UserResourceRead),
-            "user-content-read" => Ok(Self::UserContentRead),
-            "user-content-write" => Ok(Self::UserContentWrite),
             "world-session-read" => Ok(Self::WorldSessionRead),
             "world-session-write" => Ok(Self::WorldSessionWrite),
-            "world-command-submit" => Ok(Self::WorldCommandSubmit),
-            "world-projection-read" => Ok(Self::WorldProjectionRead),
             "composition-read" => Ok(Self::CompositionRead),
             "composition-write" => Ok(Self::CompositionWrite),
             "runtime-policy-read" => Ok(Self::RuntimePolicyRead),
@@ -119,7 +127,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_should_round_trip_asset_import_permission() {
+    fn secret_prompt_is_an_explicit_round_trippable_permission() {
+        assert_eq!(RuntimePermission::SecretManage.to_string(), "secret-manage");
+        assert_eq!("secret-manage".parse(), Ok(RuntimePermission::SecretManage));
+        assert_eq!(RuntimePermission::SecretPrompt.to_string(), "secret-prompt");
+        assert_eq!("secret-prompt".parse(), Ok(RuntimePermission::SecretPrompt));
+    }
+
+    #[test]
+    fn test_should_reject_retired_user_content_permissions() {
+        for name in ["user-content-read", "user-content-write"] {
+            assert!(name.parse::<RuntimePermission>().is_err());
+        }
+    }
+
+    #[test]
+    fn test_should_round_trip_async_http_request_permission() {
+        assert_eq!(RuntimePermission::HttpRequest.to_string(), "http-request");
+        assert_eq!(
+            "http-request".parse::<RuntimePermission>(),
+            Ok(RuntimePermission::HttpRequest)
+        );
+        assert_eq!(RuntimePermission::HttpFetch.to_string(), "http-fetch");
+    }
+
+    #[test]
+    fn test_should_round_trip_asset_permissions() {
+        assert_eq!(RuntimePermission::AssetRead.to_string(), "asset-read");
+        assert_eq!(
+            "asset-read".parse::<RuntimePermission>(),
+            Ok(RuntimePermission::AssetRead)
+        );
         assert_eq!(RuntimePermission::AssetImport.to_string(), "asset-import");
         assert_eq!(
             "asset-import".parse::<RuntimePermission>(),
@@ -137,18 +175,6 @@ mod tests {
             assert_eq!(text.parse::<RuntimePermission>(), Ok(permission));
         }
     }
-
-    #[test]
-    fn test_should_round_trip_user_content_permissions() {
-        for permission in [
-            RuntimePermission::UserContentRead,
-            RuntimePermission::UserContentWrite,
-        ] {
-            let text = permission.to_string();
-            assert_eq!(text.parse::<RuntimePermission>(), Ok(permission));
-        }
-    }
-
     #[test]
     fn test_should_round_trip_world_session_permissions() {
         for permission in [
@@ -158,29 +184,5 @@ mod tests {
             let text = permission.to_string();
             assert_eq!(text.parse::<RuntimePermission>(), Ok(permission));
         }
-    }
-
-    #[test]
-    fn test_should_round_trip_world_projection_read_permission() {
-        assert_eq!(
-            RuntimePermission::WorldProjectionRead.to_string(),
-            "world-projection-read"
-        );
-        assert_eq!(
-            "world-projection-read".parse::<RuntimePermission>(),
-            Ok(RuntimePermission::WorldProjectionRead)
-        );
-    }
-
-    #[test]
-    fn test_should_round_trip_world_command_submit_permission() {
-        assert_eq!(
-            RuntimePermission::WorldCommandSubmit.to_string(),
-            "world-command-submit"
-        );
-        assert_eq!(
-            "world-command-submit".parse::<RuntimePermission>(),
-            Ok(RuntimePermission::WorldCommandSubmit)
-        );
     }
 }

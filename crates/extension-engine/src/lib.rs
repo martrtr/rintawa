@@ -4,7 +4,7 @@
 //! - parsing manifests and managing component lifecycles (`register`, `start`, `stop`);
 //! - canonical loading of stored `rintawa.extension@1` RTW artifacts via [`RtwExtensionLoader`];
 //! - transitional directory discovery via [`ExtensionLoader`] and [`ExtensionsStateConfig`];
-//! - WASM runtime isolation, services, portable UI, and owner-scoped runtime effects.
+//! - WASM runtime isolation and owner-scoped Host capabilities.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, rustdoc::broken_intra_doc_links)]
@@ -16,17 +16,21 @@ mod composition;
 mod context;
 mod engine;
 mod errors;
+mod execution_context;
 mod execution_targets;
 mod host_access;
 mod loader;
 mod runtime;
 mod secrets;
 mod state;
+mod transport;
 
-mod services;
-
-mod runtime_effects;
+mod live_policy;
 mod runtime_permissions;
+pub use live_policy::{
+    LivePolicyChange, LivePolicyControl, LivePolicyDelta, LivePolicySnapshot, LivePolicyTarget,
+    SecretPromptAuthority,
+};
 
 pub use activation::{ActivationPlan, ActivationPlanError};
 pub use artifact_host::{
@@ -42,39 +46,52 @@ pub use composition::{
 pub use engine::{ExtensionEngine, ExtensionState, RegisteredWorldSchema};
 pub use errors::{ComponentStopFailure, EngineError, EngineResult};
 pub use host_access::{
-    AcceptedUserContentWrite, AcceptedWorldCommand, AcceptedWorldProjectionRead,
     ArtifactStoreAccess, AssetStoreAccess, CompositionAccess, CompositionActivation,
     HostAccessError, HostAccessResult, ImportedArtifact, ImportedAsset, PreferenceAccess,
-    RuntimeArtifactPolicy, RuntimeContextAccess, RuntimePolicyAccess, RuntimePolicyComponent,
-    RuntimePolicyRequest, UserContentAccess, UserContentDocument, UserContentSummary,
-    UserContentWriteAccess, UserContentWriteStatus, UserResourceAccess, UserResourceRef,
-    WorldCommandAccess, WorldCommandAccessError, WorldCommandAccessResult, WorldCommandActor,
-    WorldCommandRequest, WorldProjectionAccess, WorldProjectionAccessError,
-    WorldProjectionAccessResult, WorldProjectionReadStatus, WorldProjectionReadView,
-    WorldProjectionRequest, WorldSessionAccess, WorldSessionAssetRef, WorldSessionSummary,
+    RuntimeArtifactPolicy, RuntimeContextAccess, RuntimeHttpOriginGrant, RuntimePolicyAccess,
+    RuntimePolicyComponent, RuntimePolicyRequest, SecretAccess, UserResourceAccess,
+    UserResourceRef, WorldDataAccess, WorldSessionAccess, WorldSessionAssetRef,
+    WorldSessionSummary,
 };
 pub use loader::ExtensionLoader;
-pub use runtime::{WasmComponent, WasmExecutionBudget, WasmRuntimeEngine};
-pub use secrets::SecretManager;
-pub use services::{BoundServiceCaller, PlatformServiceCaller};
+pub use runtime::{WasmComponent, WasmExecutionBudget, WasmRuntimeEngine, WasmWorldSystemEndpoint};
+
+/// Validates an exact Host-approved loopback HTTP origin and returns its canonical spelling.
+///
+/// Public HTTPS destinations never require this separate per-origin approval.
+/// Returns `None` for unsafe, malformed, non-loopback, or path-bearing origins.
+pub fn canonical_http_loopback_origin(origin: &str) -> Option<String> {
+    runtime_permissions::parse_exact_local_http_origin(origin).ok()
+}
+pub use secrets::{SecretManager, SecretVault, SystemSecretVault};
 pub use state::{ExtensionStateRecord, ExtensionsStateConfig, STATE_FILE_NAME};
+pub use transport::{TransportError, validate_transport_point};
 
 #[cfg(test)]
 mod tests {
+    fn test_principal(
+        engine: &crate::ExtensionEngine,
+        owner: &rintawa_sdk::contracts::ComponentRef,
+    ) -> rintawa_sdk::contracts::ComponentPrincipal {
+        engine
+            .active_component_principal(owner)
+            .unwrap_or_else(|_| rintawa_sdk::contracts::ComponentPrincipal {
+                instance_id: owner.instance_id.clone(),
+                component_id: owner.component_id.clone(),
+                activation: 0,
+            })
+    }
+
     use super::*;
     use crate::secrets::InMemorySecretVault;
     use rintawa_sdk::prelude::*;
     use std::fs;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+    use zenoh::Wait;
 
     struct DummyRuntime {
         id: ComponentId,
-    }
-
-    struct SubscriptionRuntime {
-        id: ComponentId,
-        should_fail_after_registering: bool,
     }
 
     struct SecretReaderRuntime {
@@ -123,16 +140,11 @@ mod tests {
         }
     }
 
-    impl SubscriptionRuntime {
-        fn new(id: &str, should_fail_after_registering: bool) -> Self {
-            Self {
-                id: ComponentId::new(id),
-                should_fail_after_registering,
-            }
-        }
-    }
-
     impl Component for LifecycleFailureRuntime {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn id(&self) -> &ComponentId {
             &self.id
         }
@@ -147,11 +159,7 @@ mod tests {
             Ok(())
         }
 
-        fn start(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
-            ctx.register_runtime_effect(RuntimeEffect::event_subscription(format!(
-                "test.{}",
-                self.id
-            )))?;
+        fn start(&mut self, _ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
             if self.fail_start {
                 return Err(ExtensionError::Message(String::from(
                     "simulated start failure",
@@ -160,12 +168,8 @@ mod tests {
             Ok(())
         }
 
-        fn stop(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
+        fn stop(&mut self, _ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
             if self.fail_stop {
-                ctx.register_runtime_effect(RuntimeEffect::event_subscription(format!(
-                    "stop.{}",
-                    self.id
-                )))?;
                 return Err(ExtensionError::Message(String::from(
                     "simulated stop failure",
                 )));
@@ -174,25 +178,11 @@ mod tests {
         }
     }
 
-    impl Component for SubscriptionRuntime {
-        fn id(&self) -> &ComponentId {
-            &self.id
-        }
-
-        fn start(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
-            ctx.register_runtime_effect(RuntimeEffect::event_subscription("dialogue.message"))?;
-
-            if self.should_fail_after_registering {
-                return Err(ExtensionError::Message(String::from(
-                    "simulated startup failure",
-                )));
-            }
-
-            Ok(())
-        }
-    }
-
     impl Component for SecretReaderRuntime {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn id(&self) -> &ComponentId {
             &self.id
         }
@@ -218,6 +208,10 @@ mod tests {
     }
 
     impl Component for DummyRuntime {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn id(&self) -> &ComponentId {
             &self.id
         }
@@ -229,6 +223,127 @@ mod tests {
             ))?;
             Ok(())
         }
+    }
+
+    #[test]
+    fn test_should_scope_zenoh_contributions_to_active_engine_components() -> anyhow::Result<()> {
+        use rintawa_sdk::{
+            contracts::ComponentRef,
+            types::{ExtensionInstanceId, RuntimeScopeId},
+        };
+
+        let mut engine = ExtensionEngine::new();
+        for (id, scope) in [
+            ("chat-a", "world-a"),
+            ("dice-a", "world-a"),
+            ("chat-b", "world-b"),
+        ] {
+            let manifest = engine.parse_manifest(&format!(
+                r#"
+                id = "{id}"
+                name = "{id}"
+                version = "0.0.1"
+                sdk = "^0.0"
+
+                [[components]]
+                id = "runtime"
+                kind = "runtime"
+                target = "example.runtime.native@1"
+                "#
+            ))?;
+            engine.register_extension_instance(
+                ExtensionInstanceId::new(id),
+                RuntimeScopeId::new(scope),
+                manifest,
+                vec![Box::new(LifecycleFailureRuntime::new(
+                    "runtime",
+                    Some(id),
+                    false,
+                    false,
+                ))],
+            )?;
+        }
+        let chat_a = ComponentRef::new("chat-a", "runtime");
+        let dice_a = ComponentRef::new("dice-a", "runtime");
+        let chat_b = ComponentRef::new("chat-b", "runtime");
+        let guessed = ComponentRef::new("missing", "runtime");
+        let point = "chat/send-controls/v1";
+        assert!(matches!(
+            engine.query_transport_contributions(
+                &test_principal(&engine, &chat_a),
+                point,
+                b"render"
+            ),
+            Err(TransportError::Inactive)
+        ));
+        for id in ["chat-a", "dice-a", "chat-b"] {
+            engine.start_extension_instance(&ExtensionInstanceId::new(id))?;
+        }
+        assert!(matches!(
+            engine.declare_transport_contribution(
+                &test_principal(&engine, &guessed),
+                point,
+                |_, _| {}
+            ),
+            Err(TransportError::Inactive)
+        ));
+        engine.declare_transport_contribution(
+            &test_principal(&engine, &chat_a),
+            point,
+            |query, _caller| {
+                let _ = query
+                    .reply(query.key_expr().as_str(), b"emoji".to_vec())
+                    .wait();
+            },
+        )?;
+        engine.declare_transport_contribution(
+            &test_principal(&engine, &dice_a),
+            point,
+            |query, _caller| {
+                let _ = query
+                    .reply(query.key_expr().as_str(), b"dice".to_vec())
+                    .wait();
+            },
+        )?;
+        let mut all = engine.query_transport_contributions(
+            &test_principal(&engine, &chat_a),
+            point,
+            b"render",
+        )?;
+        all.sort();
+        assert_eq!(all, vec![b"dice".to_vec(), b"emoji".to_vec()]);
+        assert!(
+            engine
+                .query_transport_contributions(&test_principal(&engine, &chat_b), point, b"render")?
+                .is_empty()
+        );
+
+        engine.stop_extension_instance(&ExtensionInstanceId::new("dice-a"))?;
+        assert_eq!(
+            engine.query_transport_contributions(
+                &test_principal(&engine, &chat_a),
+                point,
+                b"render"
+            )?,
+            vec![b"emoji".to_vec()]
+        );
+        assert!(matches!(
+            engine.query_transport_contributions(
+                &test_principal(&engine, &dice_a),
+                point,
+                b"render"
+            ),
+            Err(TransportError::Inactive)
+        ));
+        engine.stop_extension_instance(&ExtensionInstanceId::new("chat-a"))?;
+        engine.start_extension_instance(&ExtensionInstanceId::new("chat-a"))?;
+        assert!(
+            engine
+                .query_transport_contributions(&test_principal(&engine, &chat_a), point, b"render")?
+                .is_empty()
+        );
+        engine.stop_extension_instance(&ExtensionInstanceId::new("chat-b"))?;
+        Ok(())
     }
 
     #[test]
@@ -329,60 +444,6 @@ mod tests {
     }
 
     #[test]
-    fn test_should_scope_runtime_effects_and_cleanup_on_stop_and_failed_start() -> EngineResult<()>
-    {
-        let manifest_toml = r#"
-            id = "runtime-effects"
-            name = "Runtime Effects"
-            version = "0.0.1"
-            sdk = "^0.0"
-        "#;
-        let mut engine = ExtensionEngine::new();
-        let manifest = engine.parse_manifest(manifest_toml)?;
-
-        engine.register_extension(
-            manifest.clone(),
-            vec![Box::new(SubscriptionRuntime::new("subscriber", false))],
-        )?;
-        engine.start_extension(&manifest.id)?;
-
-        let effects = engine.active_runtime_effects();
-        assert_eq!(effects.len(), 1);
-        assert_eq!(effects[0].1, &manifest.id);
-        assert_eq!(effects[0].2.as_str(), "subscriber");
-        assert_eq!(
-            effects[0].3,
-            &RuntimeEffect::event_subscription("dialogue.message")
-        );
-
-        engine.stop_extension(&manifest.id)?;
-        assert!(engine.active_runtime_effects().is_empty());
-        engine.start_extension(&manifest.id)?;
-        assert_eq!(engine.active_runtime_effects().len(), 1);
-
-        let failed_manifest = engine.parse_manifest(
-            r#"
-                id = "failing-runtime-effects"
-                name = "Failing Runtime Effects"
-                version = "0.0.1"
-                sdk = "^0.0"
-            "#,
-        )?;
-        engine.register_extension(
-            failed_manifest.clone(),
-            vec![Box::new(SubscriptionRuntime::new(
-                "failing-subscriber",
-                true,
-            ))],
-        )?;
-
-        assert!(engine.start_extension(&failed_manifest.id).is_err());
-        assert_eq!(engine.active_runtime_effects().len(), 1);
-
-        Ok(())
-    }
-
-    #[test]
     fn test_should_return_stop_failures_after_host_cleanup() -> EngineResult<()> {
         let mut engine = ExtensionEngine::new();
         let manifest = engine.parse_manifest(
@@ -413,7 +474,6 @@ mod tests {
         )?;
         engine.start_extension(&manifest.id)?;
         assert_eq!(engine.active_contributions().len(), 2);
-        assert_eq!(engine.active_runtime_effects().len(), 2);
 
         let error = engine.stop_extension(&manifest.id).unwrap_err();
         match error {
@@ -444,7 +504,6 @@ mod tests {
             Some(ExtensionState::Stopped)
         );
         assert!(engine.active_contributions().is_empty());
-        assert!(engine.active_runtime_effects().is_empty());
 
         Ok(())
     }
@@ -481,7 +540,6 @@ mod tests {
             Some(ExtensionState::Stopped)
         );
         assert!(engine.active_contributions().is_empty());
-        assert!(engine.active_runtime_effects().is_empty());
 
         engine.unregister_extension(&manifest.id)?;
         assert_eq!(engine.extension_state(&manifest.id), None);
@@ -490,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn test_should_aggregate_startup_rollback_failures_and_revoke_effects() -> EngineResult<()> {
+    fn test_should_aggregate_startup_rollback_failures() -> EngineResult<()> {
         let mut engine = ExtensionEngine::new();
         let manifest = engine.parse_manifest(
             r#"
@@ -541,7 +599,6 @@ mod tests {
             engine.extension_state(&manifest.id),
             Some(ExtensionState::Registered)
         );
-        assert!(engine.active_runtime_effects().is_empty());
 
         Ok(())
     }
@@ -705,93 +762,6 @@ mod tests {
     }
 
     #[test]
-    fn test_should_scope_secret_reads_inside_wasm_service_callbacks() -> EngineResult<()> {
-        const PROVIDER_WASM: &[u8] =
-            include_bytes!("../tests/fixtures/service-routing/provider.wasm");
-        const CONSUMER_WASM: &[u8] =
-            include_bytes!("../tests/fixtures/service-routing/consumer.wasm");
-
-        let secret_manager = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
-        let secret_path = SecretPath::parse("service.credentials.fixture").unwrap();
-        let secret_pattern = SecretPathPattern::parse("service.credentials.fixture").unwrap();
-        secret_manager.store(&secret_path, &SecretValue::new("fixture-key"))?;
-
-        let mut engine = ExtensionEngine::with_secret_manager(secret_manager);
-        let provider_id = ExtensionId::new("secure-service-provider");
-        let consumer_id = ExtensionId::new("secure-service-consumer");
-        let component_id = ComponentId::new("runtime");
-        let provider_manifest = ExtensionManifest {
-            id: provider_id.clone(),
-            name: String::from("Secure Service Provider"),
-            version: String::from("0.0.1"),
-            sdk: String::from("^0.0"),
-            components: vec![ComponentDescriptor {
-                id: component_id.clone(),
-                kind: ComponentKind::Runtime,
-                target: ComponentTarget::new(WASM_COMPONENT_TARGET_V1),
-                entry: None,
-                required: true,
-                permissions: ComponentPermissions {
-                    secret_read: vec![secret_pattern.clone()],
-                    runtime: Vec::new(),
-                },
-            }],
-        };
-        let consumer_manifest = ExtensionManifest {
-            id: consumer_id.clone(),
-            name: String::from("Secure Service Consumer"),
-            version: String::from("0.0.1"),
-            sdk: String::from("^0.0"),
-            components: vec![ComponentDescriptor {
-                id: component_id.clone(),
-                kind: ComponentKind::Runtime,
-                target: ComponentTarget::new(WASM_COMPONENT_TARGET_V1),
-                entry: None,
-                required: true,
-                permissions: ComponentPermissions::default(),
-            }],
-        };
-        let provider = engine
-            .wasm_runtime_engine()?
-            .load_component_from_bytes(component_id.clone(), PROVIDER_WASM)?;
-        let consumer = engine
-            .wasm_runtime_engine()?
-            .load_component_from_bytes(component_id.clone(), CONSUMER_WASM)?;
-
-        engine.register_extension(provider_manifest, vec![Box::new(provider)])?;
-        engine.register_extension(consumer_manifest, vec![Box::new(consumer)])?;
-        engine.start_extension(&provider_id)?;
-        engine.start_extension(&consumer_id)?;
-
-        let caller =
-            rintawa_sdk::contracts::ComponentRef::new(consumer_id.as_str(), component_id.as_str());
-        let contract = ContractKey::new("example.secure-echo", ContractVersion::new(1));
-        assert_eq!(
-            engine.call_service(&caller, &contract, b"ping"),
-            Err(ServiceCallError::Unavailable)
-        );
-
-        engine.grant_requested_secret_read(&provider_id, &component_id, secret_pattern)?;
-        assert_eq!(
-            engine.call_service(&caller, &contract, b"ping"),
-            Ok(b"secure-pong".to_vec())
-        );
-
-        engine
-            .secret_manager()
-            .revoke_component(&rintawa_sdk::contracts::ComponentRef::new(
-                provider_id.as_str(),
-                component_id.as_str(),
-            ));
-        assert_eq!(
-            engine.call_service(&caller, &contract, b"ping"),
-            Err(ServiceCallError::Unavailable)
-        );
-
-        Ok(())
-    }
-
-    #[test]
     fn test_should_revoke_secret_grants_for_manifest_only_components() -> EngineResult<()> {
         let secret_manager = SecretManager::with_vault(Arc::new(InMemorySecretVault::default()));
         let secret_path = SecretPath::parse("ai.api_keys.openai").unwrap();
@@ -854,6 +824,7 @@ mod tests {
                     target: ComponentTarget::new("example.runtime.native@1"),
                     entry: None,
                     required: true,
+                    published_preference: None,
                     permissions: ComponentPermissions {
                         secret_read: vec![SecretPathPattern::parse("ai.api_keys.*").unwrap()],
                         runtime: Vec::new(),
@@ -865,6 +836,7 @@ mod tests {
                     target: ComponentTarget::new("example.runtime.native@1"),
                     entry: None,
                     required: true,
+                    published_preference: None,
                     permissions: ComponentPermissions::default(),
                 },
             ],

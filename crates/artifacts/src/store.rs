@@ -91,10 +91,30 @@ impl ArtifactStore {
     /// Returns an RTW validation error, a host-limit error, an I/O error, or
     /// [`RtwError::StoreCorruption`] if an existing digest path contains other bytes.
     pub fn import(&self, source: impl AsRef<Path>) -> RtwResult<ArtifactImport> {
-        let mut source_file = File::open(source.as_ref())?;
+        self.import_path(source.as_ref(), None)
+    }
+
+    /// Imports a dependency only if copied bytes match its expected exact identity.
+    ///
+    /// # Errors
+    /// Returns validation/I/O errors or a digest mismatch before CAS publication.
+    pub fn import_expected(
+        &self,
+        source: impl AsRef<Path>,
+        expected: &ArtifactDigest,
+    ) -> RtwResult<ArtifactImport> {
+        self.import_path(source.as_ref(), Some(expected))
+    }
+
+    fn import_path(
+        &self,
+        source: &Path,
+        expected: Option<&ArtifactDigest>,
+    ) -> RtwResult<ArtifactImport> {
+        let mut source_file = File::open(source)?;
         if !source_file.metadata()?.is_file() {
             return Err(RtwError::UnsupportedSourceEntry(
-                source.as_ref().display().to_string(),
+                source.display().to_string(),
             ));
         }
 
@@ -104,6 +124,11 @@ impl ArtifactStore {
             temporary.as_file_mut(),
             self.limits.max_archive_bytes,
         )?;
+        if let Some(expected) = expected
+            && expected != &digest
+        {
+            return Err(RtwError::StoreCorruption(expected.to_string()));
+        }
         temporary.as_file_mut().sync_all()?;
 
         let validated = RtwArchive::from_file(temporary.as_file().try_clone()?, self.limits)?;
@@ -230,6 +255,50 @@ impl ArtifactStore {
         Ok(())
     }
 
+    /// Lists canonical stored digests without interpreting or activating content.
+    ///
+    /// # Errors
+    /// Returns an error for a malformed entry in the Host-owned CAS directory.
+    pub fn digests(&self) -> RtwResult<Vec<ArtifactDigest>> {
+        let mut result = Vec::new();
+        for entry in fs::read_dir(&self.sha256_directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let digest = name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".rtw"))
+                .and_then(|hex| ArtifactDigest::parse(format!("sha256:{hex}")).ok())
+                .ok_or_else(|| RtwError::InvalidStoreEntry {
+                    path: entry.path().display().to_string(),
+                    reason: "expected canonical digest.rtw file",
+                })?;
+            ensure_regular_store_file(&entry.path(), &digest)?;
+            result.push(digest);
+        }
+        result.sort();
+        Ok(result)
+    }
+
+    /// Copies exact stored RTW bytes to a caller-owned writer, verifying their digest.
+    ///
+    /// # Errors
+    /// Returns corruption, validation or I/O errors. Discard partial output on error.
+    pub fn copy_artifact(
+        &self,
+        digest: &ArtifactDigest,
+        destination: &mut impl Write,
+    ) -> RtwResult<()> {
+        let path = self.path_for(digest);
+        ensure_regular_store_file(&path, digest)?;
+        let mut file = File::open(path)?;
+        let actual = copy_and_hash(&mut file, destination, self.limits.max_archive_bytes)?;
+        if actual != *digest {
+            return Err(RtwError::StoreCorruption(digest.to_string()));
+        }
+        RtwArchive::from_file(file, self.limits)?;
+        Ok(())
+    }
+
     fn path_for(&self, digest: &ArtifactDigest) -> PathBuf {
         self.sha256_directory.join(format!("{}.rtw", digest.hex()))
     }
@@ -269,7 +338,7 @@ fn ensure_regular_store_file(path: &Path, digest: &ArtifactDigest) -> RtwResult<
 }
 fn copy_and_hash(
     source: &mut impl Read,
-    destination: &mut File,
+    destination: &mut impl Write,
     maximum_bytes: u64,
 ) -> RtwResult<ArtifactDigest> {
     let mut hasher = Sha256::new();

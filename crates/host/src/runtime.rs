@@ -1,105 +1,73 @@
 //! Runtime orchestration for exact artifact activations in a local Rintawa host.
 
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
-    io::{Read, Write},
+    collections::{BTreeMap, HashSet},
+    io::Read,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
-use rintawa_artifacts::{
-    ArtifactDigest, AssetDigest, AssetMediaType, AssetRef, ContentType, RtwArchive, RtwLimits,
-};
+use rintawa_artifacts::{ArtifactDigest, AssetDigest, AssetMediaType, AssetRef};
 use rintawa_extension_engine::{
-    AcceptedUserContentWrite, AcceptedWorldCommand, AcceptedWorldProjectionRead,
     ActivationPlanError, ArtifactStoreAccess, AssetStoreAccess, CompositionAccess,
     CompositionActivation, EngineError, ExtensionEngine, HostAccessError, HostAccessResult,
-    ImportedArtifact, ImportedAsset, PreferenceAccess, RtwExtensionLoadOutcome, RtwExtensionLoader,
-    RuntimeArtifactPolicy, RuntimeContextAccess, RuntimePolicyAccess, RuntimePolicyComponent,
-    RuntimePolicyRequest, UnresolvedContractReason, UserContentAccess, UserContentDocument,
-    UserContentSummary, UserContentWriteAccess, UserContentWriteStatus, UserResourceAccess,
-    UserResourceRef, WorldCommandAccess, WorldCommandAccessError, WorldCommandAccessResult,
-    WorldCommandActor, WorldCommandRequest, WorldProjectionAccess, WorldProjectionAccessError,
-    WorldProjectionAccessResult, WorldProjectionReadStatus, WorldProjectionReadView,
-    WorldProjectionRequest, WorldSessionAccess, WorldSessionAssetRef, WorldSessionSummary,
+    ImportedArtifact, ImportedAsset, LivePolicyChange, LivePolicyControl, LivePolicyDelta,
+    PreferenceAccess, RtwExtensionLoadOutcome, RtwExtensionLoader, RuntimeArtifactPolicy,
+    RuntimeContextAccess, RuntimeHttpOriginGrant, RuntimePolicyAccess, RuntimePolicyComponent,
+    RuntimePolicyRequest, UnresolvedContractReason, UserResourceAccess, UserResourceRef,
+    WasmWorldSystemEndpoint, WorldDataAccess, WorldSessionAccess, WorldSessionAssetRef,
+    WorldSessionSummary,
 };
 use rintawa_sdk::{
-    content::{
-        ContentHandlerRequest, ContentHandlerResponse, MAX_CONTENT_HANDLER_DIAGNOSTIC_BYTES,
-        MAX_CONTENT_HANDLER_ENTRY_BYTES, content_handler_service_contract_key,
-    },
     contracts::{
-        ComponentRef, ContractKey, ContractResolutionPolicy, ContractVersion,
-        host_shell_contract_key, ui_layer_contract_key, world_presentation_contract_key,
+        ComponentPrincipal, ComponentRef, ContractKey, ContractResolutionPolicy, ContractVersion,
+        host_shell_contract_key,
     },
     runtime_permissions::RuntimePermission,
-    runtime_signals::RuntimeSignal,
     types::{ExtensionId, ExtensionInstanceId, RuntimeScopeId},
-    world::{EntityId, PrincipalId, SchemaKey, UnixTimeMillis, WorldId},
-    world_projection::MAX_WORLD_PROJECTION_INPUT_BYTES,
+    world::{PrincipalId, SchemaKey, WorldId},
 };
-use rintawa_storage::SqliteWorldStorage;
-use rintawa_world::{
-    ActorRef, CommitDisposition, SchemaDefinition, SchemaKind, StoredWorldEvent, WorldCommand,
-};
+use rintawa_world::{PropertyDefinition, RuntimeSchemaDefinition, SchemaKind, WorldCommand};
 use rintawa_world_runtime::{
-    MAX_WORLD_EFFECT_DIAGNOSTIC_BYTES, ServiceWorldEffectHandler, ServiceWorldProjection,
-    ServiceWorldSystem, WorldCommandOutcome, WorldEffectServiceResponse, WorldProjectionView,
-    WorldRuntime, WorldRuntimeBuilder, world_effect_service_contract_key,
-    world_projection_service_contract_key, world_system_service_contract_key,
+    SystemResult, WorldCommandOutcome, WorldRuntime, WorldRuntimeBuilder, WorldRuntimeClient,
+    WorldSnapshot, WorldSystem,
 };
 
-use tempfile::NamedTempFile;
-use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
     BootstrapBlockedActivation, BootstrapDeferredActivation, BootstrapRollback, BootstrapStall,
     CompositionProfile, HOST_SCOPE, HostCleanupFailure, HostCleanupOperation, HostError, HostHome,
-    HostResult, HostShutdownFailures, UserContentEntry, UserContentId, WorldPresentationTarget,
-    WorldRuntimeCleanupFailure, WorldSummary, runtime_signal::RuntimeSignalQueue,
+    HostResult, HostShutdownFailures, WorldRuntimeCleanupFailure, WorldSummary,
     world_runtime_scope_id,
 };
 
-/// Maximum durable effect jobs processed for one world in one cooperative pump.
-pub const MAX_EFFECT_JOBS_PER_PUMP: usize = 8;
-/// Lease duration assigned to one synchronous effect-handler attempt.
-pub const EFFECT_JOB_LEASE_MILLIS: i64 = 30_000;
-/// Initial host-owned retry delay after a failed effect attempt.
-pub const EFFECT_RETRY_BASE_MILLIS: i64 = 1_000;
-/// Maximum host-owned retry delay regardless of attempt count.
-pub const EFFECT_RETRY_MAX_MILLIS: i64 = 60_000;
-/// Maximum deferred user-content writes accepted before a host pump drains them.
-const MAX_PENDING_USER_CONTENT_WRITES: usize = 32;
-/// Maximum total RTW bytes retained by the deferred user-content write queue.
-const MAX_PENDING_USER_CONTENT_WRITE_BYTES: usize = 64 * 1024 * 1024;
-/// Maximum completed/pending write statuses retained for owner-scoped inspection.
-const MAX_RETAINED_USER_CONTENT_WRITE_STATUSES: usize = 256;
+#[cfg(test)]
+mod activation_cleanup_tests;
+#[cfg(test)]
+mod command_ticket_tests;
+#[cfg(test)]
+mod resource_transfer_tests;
+#[cfg(target_os = "linux")]
+mod secret_bindings;
+#[cfg(target_os = "linux")]
+mod secret_web;
+#[cfg(all(test, target_os = "linux"))]
+mod shared_secret_tests;
+
 /// Maximum one-shot user resources retained by one HostRuntime.
 const MAX_USER_RESOURCES: usize = 32;
 /// Maximum bytes accepted for one ephemeral user resource.
-const MAX_USER_RESOURCE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_USER_RESOURCE_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum total bytes retained across all ephemeral user resources.
 const MAX_USER_RESOURCE_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 /// Maximum UTF-8 bytes retained for one resource media type.
 const MAX_USER_RESOURCE_MEDIA_TYPE_BYTES: usize = 128;
 /// Maximum UTF-8 bytes retained for one optional original file name.
 const MAX_USER_RESOURCE_NAME_BYTES: usize = 512;
-/// Maximum diagnostic bytes retained for one failed deferred user-content write.
-const MAX_USER_CONTENT_WRITE_DIAGNOSTIC_BYTES: usize = 2 * 1024;
 /// Maximum distinct world lifecycle requests accepted before a host pump drains them.
 const MAX_PENDING_WORLD_SESSION_REQUESTS: usize = 64;
-/// Maximum deferred authoritative commands accepted before a host pump drains them.
-const MAX_PENDING_WORLD_COMMAND_REQUESTS: usize = 128;
-/// Maximum deferred policy-filtered projection reads accepted before a host pump drains them.
-const MAX_PENDING_WORLD_PROJECTION_REQUESTS: usize = 64;
-/// Maximum completed/pending projection statuses retained for owner-scoped inspection.
-const MAX_RETAINED_WORLD_PROJECTION_STATUSES: usize = 256;
-/// Maximum serialized projection view retained for one completed operation.
-const MAX_WORLD_PROJECTION_VIEW_BYTES: usize = 1024 * 1024;
-/// Maximum diagnostic bytes retained for one failed deferred projection read.
-const MAX_WORLD_PROJECTION_STATUS_DIAGNOSTIC_BYTES: usize = 2 * 1024;
 /// Maximum diagnostic bytes retained for one failed deferred world lifecycle request.
 const MAX_WORLD_SESSION_DIAGNOSTIC_BYTES: usize = 2 * 1024;
 
@@ -108,6 +76,85 @@ struct WorldSessionRuntimeState {
     active: HashSet<WorldId>,
     pending: BTreeMap<WorldId, bool>,
     last_errors: BTreeMap<WorldId, String>,
+}
+
+#[derive(Default)]
+struct WorldDataRuntimeState {
+    worlds: BTreeMap<WorldId, ActiveWorldData>,
+}
+
+struct ActiveWorldData {
+    client: WorldRuntimeClient,
+    command_owners: BTreeMap<SchemaKey, ComponentRef>,
+}
+
+#[derive(Clone, Default)]
+struct WorldDataRuntimeControl {
+    state: Arc<Mutex<WorldDataRuntimeState>>,
+}
+
+impl WorldDataRuntimeControl {
+    fn activate(
+        &self,
+        world_id: WorldId,
+        client: WorldRuntimeClient,
+        command_owners: BTreeMap<SchemaKey, ComponentRef>,
+    ) -> HostResult<()> {
+        self.state
+            .lock()
+            .map_err(|_| HostError::WorldSessionControlUnavailable)?
+            .worlds
+            .insert(
+                world_id,
+                ActiveWorldData {
+                    client,
+                    command_owners,
+                },
+            );
+        Ok(())
+    }
+
+    fn deactivate(&self, world_id: WorldId) {
+        if let Ok(mut state) = self.state.lock() {
+            state.worlds.remove(&world_id);
+        }
+    }
+
+    fn client(&self, scope: &RuntimeScopeId) -> HostAccessResult<WorldRuntimeClient> {
+        let Some(world_id) = canonical_scope_world_id(scope) else {
+            return Err(HostAccessError::Unavailable);
+        };
+        self.state
+            .lock()
+            .map_err(|_| HostAccessError::Unavailable)?
+            .worlds
+            .get(&world_id)
+            .map(|world| world.client.clone())
+            .ok_or(HostAccessError::Unavailable)
+    }
+
+    fn command_client(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ComponentRef,
+        schema: &SchemaKey,
+    ) -> HostAccessResult<WorldRuntimeClient> {
+        let Some(world_id) = canonical_scope_world_id(scope) else {
+            return Err(HostAccessError::Unavailable);
+        };
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| HostAccessError::Unavailable)?;
+        let world = state
+            .worlds
+            .get(&world_id)
+            .ok_or(HostAccessError::Unavailable)?;
+        if world.command_owners.get(schema) != Some(owner) {
+            return Err(HostAccessError::Rejected);
+        }
+        Ok(world.client.clone())
+    }
 }
 
 #[derive(Clone, Default)]
@@ -130,7 +177,6 @@ impl WorldSessionRuntimeControl {
                 size: reference.size,
                 media_type: reference.media_type.to_string(),
             }),
-            commit_position: world.commit_position,
             active: state.active.contains(&world.id),
             pending_active: state.pending.get(&world.id).copied(),
             last_error: state.last_errors.get(&world.id).cloned(),
@@ -166,18 +212,6 @@ impl WorldSessionRuntimeControl {
         delete().map_err(map_host_access_error)?;
         state.last_errors.remove(&world_id);
         Ok(())
-    }
-
-    fn accepts_deferred_world_access(&self, world_id: WorldId) -> HostAccessResult<bool> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| HostAccessError::Unavailable)?;
-        Ok(match state.pending.get(&world_id) {
-            Some(true) => true,
-            Some(false) => false,
-            None => state.active.contains(&world_id),
-        })
     }
 
     fn drain_pending(&self) -> HostResult<Vec<(WorldId, bool)>> {
@@ -220,7 +254,8 @@ impl WorldSessionRuntimeControl {
 #[derive(Clone)]
 struct StoredUserResource {
     reference: UserResourceRef,
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
+    owner: Option<ComponentPrincipal>,
 }
 
 #[derive(Default)]
@@ -258,19 +293,15 @@ impl UserResourceRuntimeControl {
         }) {
             return Err(HostAccessError::Rejected);
         }
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| HostAccessError::Unavailable)?;
-        let next_total = state.total_bytes.saturating_add(bytes.len());
-        if state.resources.len() >= MAX_USER_RESOURCES || next_total > MAX_USER_RESOURCE_TOTAL_BYTES
         {
-            return Err(HostAccessError::QueueFull);
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| HostAccessError::Unavailable)?;
+            Self::check_capacity(&state, bytes.len())?;
         }
+        let bytes: Arc<[u8]> = Arc::from(bytes);
         let id = Uuid::now_v7().to_string();
-        if state.resources.contains_key(&id) {
-            return Err(HostAccessError::Rejected);
-        }
         let size = u64::try_from(bytes.len()).map_err(|_| HostAccessError::Rejected)?;
         let reference = UserResourceRef {
             id: id.clone(),
@@ -278,364 +309,277 @@ impl UserResourceRuntimeControl {
             media_type: media_type.to_string(),
             name: name.map(str::to_string),
         };
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| HostAccessError::Unavailable)?;
+        Self::check_capacity(&state, bytes.len())?;
+        if state.resources.contains_key(&id) {
+            return Err(HostAccessError::Rejected);
+        }
+        state.total_bytes += bytes.len();
         state.resources.insert(
             id,
             StoredUserResource {
                 reference: reference.clone(),
-                bytes: bytes.to_vec(),
+                bytes,
+                owner: None,
             },
         );
-        state.total_bytes = next_total;
         Ok(reference)
     }
 
-    fn read(&self, reference: &UserResourceRef, maximum_bytes: usize) -> HostAccessResult<Vec<u8>> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| HostAccessError::Unavailable)?;
-        let resource = state
-            .resources
-            .get(&reference.id)
-            .ok_or(HostAccessError::NotFound)?;
-        if resource.reference != *reference {
-            return Err(HostAccessError::Rejected);
-        }
-        if resource.bytes.len() > maximum_bytes {
-            return Err(HostAccessError::Rejected);
-        }
-        Ok(resource.bytes.clone())
-    }
-
-    fn release(&self, reference: &UserResourceRef) -> HostAccessResult<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| HostAccessError::Unavailable)?;
-        let resource = state
-            .resources
-            .get(&reference.id)
-            .ok_or(HostAccessError::NotFound)?;
-        if resource.reference != *reference {
-            return Err(HostAccessError::Rejected);
-        }
-        let size = resource.bytes.len();
-        state.resources.remove(&reference.id);
-        state.total_bytes = state.total_bytes.saturating_sub(size);
-        Ok(())
-    }
-}
-
-enum DeferredUserContentWriteKind {
-    Import,
-    Replace(UserContentId),
-}
-
-struct DeferredUserContentWrite {
-    operation_id: String,
-    kind: DeferredUserContentWriteKind,
-    rtw: Vec<u8>,
-}
-
-#[derive(Clone)]
-struct OwnedUserContentWriteStatus {
-    owner: ComponentRef,
-    status: UserContentWriteStatus,
-}
-
-#[derive(Default)]
-struct UserContentWriteRuntimeState {
-    queue: VecDeque<DeferredUserContentWrite>,
-    pending_bytes: usize,
-    statuses: BTreeMap<String, OwnedUserContentWriteStatus>,
-    completed: VecDeque<String>,
-}
-
-#[derive(Clone, Default)]
-struct UserContentWriteRuntimeControl {
-    state: Arc<Mutex<UserContentWriteRuntimeState>>,
-}
-
-impl UserContentWriteRuntimeControl {
-    fn request(
-        &self,
-        owner: ComponentRef,
-        kind: DeferredUserContentWriteKind,
-        rtw: Vec<u8>,
-    ) -> HostAccessResult<AcceptedUserContentWrite> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| HostAccessError::Unavailable)?;
-        let pending_bytes = state.pending_bytes.saturating_add(rtw.len());
-        if state.queue.len() >= MAX_PENDING_USER_CONTENT_WRITES
-            || pending_bytes > MAX_PENDING_USER_CONTENT_WRITE_BYTES
+    fn check_capacity(state: &UserResourceRuntimeState, size: usize) -> HostAccessResult<()> {
+        if state.resources.len() >= MAX_USER_RESOURCES
+            || state.total_bytes.saturating_add(size) > MAX_USER_RESOURCE_TOTAL_BYTES
         {
             return Err(HostAccessError::QueueFull);
         }
-        while state.statuses.len() >= MAX_RETAINED_USER_CONTENT_WRITE_STATUSES {
-            let Some(expired) = state.completed.pop_front() else {
-                return Err(HostAccessError::QueueFull);
-            };
-            state.statuses.remove(&expired);
-        }
-
-        let operation_id = Uuid::now_v7().to_string();
-        if state.statuses.contains_key(&operation_id) {
-            return Err(HostAccessError::Rejected);
-        }
-        state.statuses.insert(
-            operation_id.clone(),
-            OwnedUserContentWriteStatus {
-                owner: owner.clone(),
-                status: UserContentWriteStatus::Pending,
-            },
-        );
-        state.pending_bytes = pending_bytes;
-        state.queue.push_back(DeferredUserContentWrite {
-            operation_id: operation_id.clone(),
-            kind,
-            rtw,
-        });
-        Ok(AcceptedUserContentWrite { operation_id })
+        Ok(())
     }
 
-    fn status(
+    #[cfg(test)]
+    fn read(&self, reference: &UserResourceRef, maximum_bytes: usize) -> HostAccessResult<Vec<u8>> {
+        self.read_for(reference, maximum_bytes, None)
+    }
+    fn read_for(
         &self,
-        owner: &ComponentRef,
-        operation_id: &str,
-    ) -> HostAccessResult<UserContentWriteStatus> {
-        let state = self
+        reference: &UserResourceRef,
+        maximum_bytes: usize,
+        principal: Option<&ComponentPrincipal>,
+    ) -> HostAccessResult<Vec<u8>> {
+        let bytes = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| HostAccessError::Unavailable)?;
+            let resource = state
+                .resources
+                .get(&reference.id)
+                .ok_or(HostAccessError::NotFound)?;
+            if resource.reference != *reference
+                || resource
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| Some(owner) != principal)
+                || resource.bytes.len() > maximum_bytes
+            {
+                return Err(HostAccessError::Rejected);
+            }
+            Arc::clone(&resource.bytes)
+        };
+        Ok(bytes.to_vec())
+    }
+    #[cfg(test)]
+    fn release(&self, reference: &UserResourceRef) -> HostAccessResult<()> {
+        self.release_for(reference, None)
+    }
+    fn release_for(
+        &self,
+        reference: &UserResourceRef,
+        principal: Option<&ComponentPrincipal>,
+    ) -> HostAccessResult<()> {
+        let removed = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| HostAccessError::Unavailable)?;
+            let resource = state
+                .resources
+                .get(&reference.id)
+                .ok_or(HostAccessError::NotFound)?;
+            if resource.reference != *reference
+                || resource
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| Some(owner) != principal)
+            {
+                return Err(HostAccessError::Rejected);
+            }
+            let removed = state
+                .resources
+                .remove(&reference.id)
+                .expect("verified resource");
+            state.total_bytes -= removed.bytes.len();
+            removed
+        };
+        drop(removed);
+        Ok(())
+    }
+    fn take(
+        &self,
+        reference: &UserResourceRef,
+        principal: &ComponentPrincipal,
+        replacement_id: &str,
+    ) -> HostAccessResult<UserResourceRef> {
+        let mut state = self
             .state
             .lock()
             .map_err(|_| HostAccessError::Unavailable)?;
-        let Some(operation) = state.statuses.get(operation_id) else {
-            return Err(HostAccessError::NotFound);
+        let resource = state
+            .resources
+            .get(&reference.id)
+            .ok_or(HostAccessError::NotFound)?;
+        if resource.reference != *reference
+            || resource.owner.is_some()
+            || replacement_id.is_empty()
+            || state.resources.contains_key(replacement_id)
+        {
+            return Err(HostAccessError::Rejected);
+        }
+        let mut resource = state
+            .resources
+            .remove(&reference.id)
+            .expect("verified resource");
+        resource.reference.id = replacement_id.to_string();
+        resource.owner = Some(principal.clone());
+        let result = resource.reference.clone();
+        state.resources.insert(replacement_id.to_string(), resource);
+        Ok(result)
+    }
+    fn release_owned(&self, principal: &ComponentPrincipal) {
+        let removed = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ids: Vec<_> = state
+                .resources
+                .iter()
+                .filter(|(_, resource)| resource.owner.as_ref() == Some(principal))
+                .map(|(id, _)| id.clone())
+                .collect();
+            let removed: Vec<_> = ids
+                .iter()
+                .filter_map(|id| state.resources.remove(id))
+                .collect();
+            state.total_bytes = state
+                .resources
+                .values()
+                .map(|resource| resource.bytes.len())
+                .sum();
+            self.state.clear_poison();
+            removed
         };
-        if &operation.owner != owner {
-            return Err(HostAccessError::NotFound);
-        }
-        Ok(operation.status.clone())
-    }
-
-    fn drain_pending(&self) -> HostResult<Vec<DeferredUserContentWrite>> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| HostError::UserContentWriteControlUnavailable)?;
-        state.pending_bytes = 0;
-        Ok(state.queue.drain(..).collect())
-    }
-
-    fn record_outcome(&self, operation_id: &str, status: UserContentWriteStatus) -> HostResult<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| HostError::UserContentWriteControlUnavailable)?;
-        let Some(operation) = state.statuses.get_mut(operation_id) else {
-            return Err(HostError::UserContentWriteControlUnavailable);
-        };
-        operation.status = status;
-        state.completed.push_back(operation_id.to_string());
-        while state.statuses.len() > MAX_RETAINED_USER_CONTENT_WRITE_STATUSES {
-            let Some(expired) = state.completed.pop_front() else {
-                return Err(HostError::UserContentWriteControlUnavailable);
-            };
-            state.statuses.remove(&expired);
-        }
-        Ok(())
-    }
-}
-
-struct DeferredWorldCommand {
-    world_id: WorldId,
-    command: WorldCommand,
-}
-
-#[derive(Clone, Default)]
-struct WorldCommandRuntimeControl {
-    queue: Arc<Mutex<VecDeque<DeferredWorldCommand>>>,
-}
-
-impl WorldCommandRuntimeControl {
-    fn request(
-        &self,
-        world_id: WorldId,
-        command: WorldCommand,
-    ) -> WorldCommandAccessResult<AcceptedWorldCommand> {
-        let command_id = command.id().to_string();
-        let correlation_id = command.correlation_id().to_string();
-        let mut queue = self
-            .queue
-            .lock()
-            .map_err(|_| WorldCommandAccessError::Unavailable)?;
-        if queue.len() >= MAX_PENDING_WORLD_COMMAND_REQUESTS {
-            return Err(WorldCommandAccessError::QueueFull);
-        }
-        queue.push_back(DeferredWorldCommand { world_id, command });
-        Ok(AcceptedWorldCommand {
-            command_id,
-            correlation_id,
-        })
-    }
-
-    fn drain_pending(&self) -> HostResult<Vec<DeferredWorldCommand>> {
-        let mut queue = self
-            .queue
-            .lock()
-            .map_err(|_| HostError::WorldCommandControlUnavailable)?;
-        Ok(queue.drain(..).collect())
-    }
-}
-
-struct DeferredWorldProjectionRead {
-    operation_id: String,
-    world_id: WorldId,
-    projection_schema: SchemaKey,
-    principal: PrincipalId,
-    input: serde_json::Value,
-}
-
-#[derive(Clone)]
-struct OwnedWorldProjectionStatus {
-    owner: ComponentRef,
-    status: WorldProjectionReadStatus,
-}
-
-#[derive(Default)]
-struct WorldProjectionRuntimeState {
-    queue: VecDeque<DeferredWorldProjectionRead>,
-    statuses: BTreeMap<String, OwnedWorldProjectionStatus>,
-    completed: VecDeque<String>,
-}
-
-#[derive(Clone, Default)]
-struct WorldProjectionRuntimeControl {
-    state: Arc<Mutex<WorldProjectionRuntimeState>>,
-}
-
-impl WorldProjectionRuntimeControl {
-    fn request(
-        &self,
-        owner: ComponentRef,
-        world_id: WorldId,
-        projection_schema: SchemaKey,
-        principal: PrincipalId,
-        input: serde_json::Value,
-    ) -> WorldProjectionAccessResult<AcceptedWorldProjectionRead> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| WorldProjectionAccessError::Unavailable)?;
-        if state.queue.len() >= MAX_PENDING_WORLD_PROJECTION_REQUESTS {
-            return Err(WorldProjectionAccessError::QueueFull);
-        }
-        while state.statuses.len() >= MAX_RETAINED_WORLD_PROJECTION_STATUSES {
-            let Some(expired) = state.completed.pop_front() else {
-                return Err(WorldProjectionAccessError::QueueFull);
-            };
-            state.statuses.remove(&expired);
-        }
-        let operation_id = Uuid::now_v7().to_string();
-        if state.statuses.contains_key(&operation_id) {
-            return Err(WorldProjectionAccessError::Rejected);
-        }
-        state.statuses.insert(
-            operation_id.clone(),
-            OwnedWorldProjectionStatus {
-                owner,
-                status: WorldProjectionReadStatus::Pending,
-            },
-        );
-        state.queue.push_back(DeferredWorldProjectionRead {
-            operation_id: operation_id.clone(),
-            world_id,
-            projection_schema,
-            principal,
-            input,
-        });
-        Ok(AcceptedWorldProjectionRead { operation_id })
-    }
-
-    fn status(
-        &self,
-        owner: &ComponentRef,
-        operation_id: &str,
-    ) -> WorldProjectionAccessResult<WorldProjectionReadStatus> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| WorldProjectionAccessError::Unavailable)?;
-        let Some(operation) = state.statuses.get(operation_id) else {
-            return Err(WorldProjectionAccessError::NotFound);
-        };
-        if &operation.owner != owner {
-            return Err(WorldProjectionAccessError::NotFound);
-        }
-        Ok(operation.status.clone())
-    }
-
-    fn drain_pending(&self) -> HostResult<Vec<DeferredWorldProjectionRead>> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| HostError::WorldProjectionControlUnavailable)?;
-        Ok(state.queue.drain(..).collect())
-    }
-
-    fn record_outcome(
-        &self,
-        operation_id: &str,
-        status: WorldProjectionReadStatus,
-    ) -> HostResult<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| HostError::WorldProjectionControlUnavailable)?;
-        let Some(operation) = state.statuses.get_mut(operation_id) else {
-            return Err(HostError::WorldProjectionControlUnavailable);
-        };
-        operation.status = status;
-        state.completed.push_back(operation_id.to_string());
-        while state.statuses.len() > MAX_RETAINED_WORLD_PROJECTION_STATUSES {
-            let Some(expired) = state.completed.pop_front() else {
-                return Err(HostError::WorldProjectionControlUnavailable);
-            };
-            state.statuses.remove(&expired);
-        }
-        Ok(())
+        drop(removed);
     }
 }
 
 struct LocalHostAccess {
+    #[cfg(target_os = "linux")]
+    secret_operations: secret_web::Operations,
+    #[cfg(target_os = "linux")]
+    secrets: Option<crate::shared_secrets::ManagedSecrets>,
+    live_policy: Mutex<Option<LivePolicyControl>>,
     home_root: PathBuf,
-    local_principal: PrincipalId,
-    user_content_writes: UserContentWriteRuntimeControl,
     user_resources: UserResourceRuntimeControl,
     world_sessions: WorldSessionRuntimeControl,
-    world_commands: WorldCommandRuntimeControl,
-    world_projections: WorldProjectionRuntimeControl,
+    world_data: WorldDataRuntimeControl,
 }
 
 impl LocalHostAccess {
     fn new(
         home_root: &Path,
-        local_principal: PrincipalId,
-        user_content_writes: UserContentWriteRuntimeControl,
         user_resources: UserResourceRuntimeControl,
         world_sessions: WorldSessionRuntimeControl,
-        world_commands: WorldCommandRuntimeControl,
-        world_projections: WorldProjectionRuntimeControl,
+        world_data: WorldDataRuntimeControl,
     ) -> Self {
         Self {
+            #[cfg(target_os = "linux")]
+            secret_operations: secret_web::Operations::default(),
+            #[cfg(target_os = "linux")]
+            secrets: None,
+            live_policy: Mutex::new(None),
             home_root: home_root.to_path_buf(),
-            local_principal,
-            user_content_writes,
             user_resources,
             world_sessions,
-            world_commands,
-            world_projections,
+            world_data,
         }
+    }
+
+    fn policy_control(&self) -> HostAccessResult<LivePolicyControl> {
+        self.live_policy
+            .lock()
+            .map_err(|_| HostAccessError::Unavailable)?
+            .clone()
+            .ok_or(HostAccessError::Unavailable)
+    }
+
+    fn apply_policy(&self, change: &LivePolicyChange) -> HostAccessResult<()> {
+        let home = self.home()?;
+        let t = &change.target;
+        let d = &change.delta;
+        let scope = RuntimeScopeId::new(t.scope_id.as_str());
+        let owner = ComponentRef::new(t.instance_id.as_str(), t.component_id.as_str());
+        // Keep the existing composition lock through live publication. The live
+        // control fences activation changes; neither path reenters Engine.
+        let _scope_lock = home
+            .lock_composition_scope(&scope)
+            .map_err(map_host_access_error)?;
+        let mut profile = home
+            .load_composition_for_scope_locked(&scope)
+            .map_err(map_host_access_error)?;
+        if !profile.activations.iter().any(|a| {
+            a.enabled
+                && a.scope_id == scope
+                && a.instance_id == owner.instance_id
+                && a.artifact.to_string() == t.artifact
+        }) {
+            return Err(HostAccessError::Rejected);
+        }
+        for p in &d.grant_runtime {
+            profile.grant_runtime_permission(crate::RuntimePermissionGrant::new(
+                scope.clone(),
+                owner.clone(),
+                *p,
+            ));
+        }
+        for p in &d.revoke_runtime {
+            profile.revoke_runtime_permission(&scope, &owner, *p);
+        }
+        for origin in &d.allow_http_origins {
+            profile
+                .grant_http_loopback_origin(crate::HttpLoopbackOriginGrant::new(
+                    scope.clone(),
+                    owner.clone(),
+                    origin.clone(),
+                ))
+                .map_err(map_host_access_error)?;
+        }
+        for origin in &d.deny_http_origins {
+            profile.revoke_http_loopback_origin(&scope, &owner, origin);
+        }
+        for path in &d.allow_secret_read {
+            profile
+                .grant_secret_read(crate::SecretReadGrant {
+                    scope_id: scope.clone(),
+                    instance_id: owner.instance_id.clone(),
+                    component_id: owner.component_id.clone(),
+                    path: path.clone(),
+                    entry_id: None,
+                })
+                .map_err(map_host_access_error)?;
+        }
+        for path in &d.deny_secret_read {
+            profile.revoke_secret_read(&scope, &owner, path);
+        }
+        self.policy_control()?.apply(change, || {
+            home.save_composition_for_scope(&scope, &profile)
+                .map_err(map_host_access_error)
+        })
+    }
+    fn apply_current_policy(
+        &self,
+        scope: &str,
+        instance: &str,
+        component: &str,
+        delta: LivePolicyDelta,
+    ) -> HostAccessResult<()> {
+        let target = self
+            .policy_control()?
+            .snapshot(scope, instance, component)?
+            .target;
+        self.apply_policy(&LivePolicyChange { target, delta })
     }
 
     fn home(&self) -> HostAccessResult<HostHome> {
@@ -658,6 +602,118 @@ impl RuntimeContextAccess for LocalHostAccess {
     }
 }
 
+fn canonical_scope_world_id(scope_id: &RuntimeScopeId) -> Option<WorldId> {
+    let value = scope_id.as_str().strip_prefix(crate::WORLD_SCOPE_PREFIX)?;
+    let world_id = value.parse::<WorldId>().ok()?;
+    (world_runtime_scope_id(world_id) == *scope_id).then_some(world_id)
+}
+
+impl WorldDataAccess for WorldDataRuntimeControl {
+    fn snapshot(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ExtensionInstanceId,
+    ) -> HostAccessResult<WorldSnapshot> {
+        self.client(scope)?
+            .snapshot_for_instance(owner.clone())
+            .map_err(|_| HostAccessError::Unavailable)
+    }
+    fn load_item(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ExtensionInstanceId,
+        item: rintawa_sdk::world::ItemId,
+    ) -> HostAccessResult<Option<String>> {
+        let value = self
+            .client(scope)?
+            .snapshot_for_instance(owner.clone())
+            .map_err(|_| HostAccessError::Unavailable)?
+            .load_item(item)
+            .map_err(|_| HostAccessError::Unavailable)?;
+        value
+            .map(|item| serde_json::to_string(&item).map_err(|_| HostAccessError::Unavailable))
+            .transpose()
+    }
+
+    fn load_property(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ExtensionInstanceId,
+        item: rintawa_sdk::world::ItemId,
+        key: &SchemaKey,
+    ) -> HostAccessResult<Option<String>> {
+        let value = self
+            .client(scope)?
+            .snapshot_for_instance(owner.clone())
+            .map_err(|_| HostAccessError::Unavailable)?
+            .load_property(item, key)
+            .map_err(|error| match error {
+                rintawa_world_runtime::WorldReadError::PropertyAccessDenied(_) => {
+                    HostAccessError::Rejected
+                }
+                other if other.invalid_request() => HostAccessError::InvalidRequest,
+                other if other.message_too_large() => HostAccessError::MessageTooLarge,
+                _ => HostAccessError::Unavailable,
+            })?;
+        value
+            .map(|property| {
+                serde_json::to_string(&property).map_err(|_| HostAccessError::Unavailable)
+            })
+            .transpose()
+    }
+
+    fn find_properties(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ExtensionInstanceId,
+        key: &SchemaKey,
+        after: Option<rintawa_sdk::world::ItemId>,
+        limit: usize,
+    ) -> HostAccessResult<Vec<String>> {
+        if !(1..=256).contains(&limit) {
+            return Err(HostAccessError::InvalidRequest);
+        }
+        self.client(scope)?
+            .snapshot_for_instance(owner.clone())
+            .map_err(|_| HostAccessError::Unavailable)?
+            .find_properties(key, after, limit)
+            .map_err(|error| match error {
+                rintawa_world_runtime::WorldReadError::PropertyAccessDenied(_) => {
+                    HostAccessError::Rejected
+                }
+                other if other.invalid_request() => HostAccessError::InvalidRequest,
+                other if other.message_too_large() => HostAccessError::MessageTooLarge,
+                _ => HostAccessError::Unavailable,
+            })?
+            .into_iter()
+            .map(|property| {
+                serde_json::to_string(&property).map_err(|_| HostAccessError::Unavailable)
+            })
+            .collect()
+    }
+
+    fn submit(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ComponentRef,
+        schema: SchemaKey,
+        payload: serde_json::Value,
+    ) -> HostAccessResult<rintawa_world_runtime::WorldCommandTicket> {
+        self.command_client(scope, owner, &schema)?
+            .submit(WorldCommand::system(schema, payload))
+            .map_err(|error| match error {
+                rintawa_world_runtime::WorldRuntimeError::QueueFull
+                | rintawa_world_runtime::WorldRuntimeError::PendingCommandBytesExceeded => {
+                    HostAccessError::QueueFull
+                }
+                rintawa_world_runtime::WorldRuntimeError::RuntimeStopped => {
+                    HostAccessError::Unavailable
+                }
+                _ => HostAccessError::Rejected,
+            })
+    }
+}
+
 impl ArtifactStoreAccess for LocalHostAccess {
     fn import_rtw(&self, bytes: &[u8]) -> HostAccessResult<ImportedArtifact> {
         let home = self.home()?;
@@ -676,6 +732,20 @@ impl ArtifactStoreAccess for LocalHostAccess {
 }
 
 impl AssetStoreAccess for LocalHostAccess {
+    fn open_asset(
+        &self,
+        digest: &str,
+        size: u64,
+        media_type: &str,
+    ) -> HostAccessResult<std::fs::File> {
+        let digest = AssetDigest::parse(digest).map_err(|_| HostAccessError::InvalidDigest)?;
+        let reference =
+            AssetRef::new(digest, size, media_type).map_err(|_| HostAccessError::InvalidAsset)?;
+        self.home()?
+            .asset_store()
+            .open_asset(&reference)
+            .map_err(map_asset_store_read_error)
+    }
     fn import_asset(&self, bytes: &[u8], media_type: &str) -> HostAccessResult<ImportedAsset> {
         let home = self.home()?;
         let imported = home
@@ -701,14 +771,7 @@ impl AssetStoreAccess for LocalHostAccess {
         if size == 0 || size > maximum_bytes {
             return Err(HostAccessError::Rejected);
         }
-        let digest = AssetDigest::parse(digest).map_err(|_| HostAccessError::InvalidDigest)?;
-        let reference =
-            AssetRef::new(digest, size, media_type).map_err(|_| HostAccessError::InvalidAsset)?;
-        let file = self
-            .home()?
-            .asset_store()
-            .open_asset(&reference)
-            .map_err(map_asset_store_read_error)?;
+        let file = self.open_asset(digest, size, media_type)?;
         let capacity = usize::try_from(size).map_err(|_| HostAccessError::Rejected)?;
         let mut bytes = Vec::with_capacity(capacity);
         file.take(maximum_bytes.saturating_add(1))
@@ -735,116 +798,120 @@ impl UserResourceAccess for LocalHostAccess {
         &self,
         reference: &UserResourceRef,
         maximum_bytes: usize,
+        principal: &ComponentPrincipal,
     ) -> HostAccessResult<Vec<u8>> {
-        self.user_resources.read(reference, maximum_bytes)
+        self.user_resources
+            .read_for(reference, maximum_bytes, Some(principal))
     }
-
-    fn release_resource(&self, reference: &UserResourceRef) -> HostAccessResult<()> {
-        self.user_resources.release(reference)
-    }
-}
-
-impl UserContentAccess for LocalHostAccess {
-    fn list_user_content(
+    fn release_resource(
         &self,
-        content: Option<&str>,
-    ) -> HostAccessResult<Vec<UserContentSummary>> {
-        let content = content
-            .map(ContentType::parse)
-            .transpose()
-            .map_err(|_| HostAccessError::InvalidContentType)?;
-        Ok(self
-            .home()?
-            .list_user_content()
-            .map_err(map_host_access_error)?
-            .into_iter()
-            .filter(|entry| {
-                content
-                    .as_ref()
-                    .is_none_or(|content| &entry.content == content)
-            })
-            .map(to_user_content_summary)
-            .collect())
+        reference: &UserResourceRef,
+        principal: &ComponentPrincipal,
+    ) -> HostAccessResult<()> {
+        self.user_resources.release_for(reference, Some(principal))
     }
-
-    fn read_user_content(&self, id: &str) -> HostAccessResult<UserContentDocument> {
-        let id = id
-            .parse::<UserContentId>()
-            .map_err(|_| HostAccessError::InvalidUserContentId)?;
-        let home = self.home()?;
-        let entry = home
-            .indexed_user_content(id)
-            .map_err(map_host_access_error)?;
-        let mut archive = home
-            .artifact_store()
-            .open_artifact(&entry.revision)
-            .map_err(|_| HostAccessError::Unavailable)?;
-        if archive.manifest().content != entry.content {
-            return Err(HostAccessError::Rejected);
-        }
-        let entry_path = archive.manifest().entry.clone();
-        let maximum_entry_bytes = u64::try_from(MAX_CONTENT_HANDLER_ENTRY_BYTES)
-            .map_err(|_| HostAccessError::Rejected)?;
-        let descriptor = archive
-            .read_with_limit(&entry_path, maximum_entry_bytes)
-            .map_err(|_| HostAccessError::Rejected)?;
-        Ok(UserContentDocument {
-            metadata: to_user_content_summary(entry),
-            descriptor,
-        })
-    }
-}
-
-fn to_user_content_summary(entry: UserContentEntry) -> UserContentSummary {
-    UserContentSummary {
-        id: entry.id.to_string(),
-        content: entry.content.to_string(),
-        revision: entry.revision.to_string(),
-    }
-}
-
-impl UserContentWriteAccess for LocalHostAccess {
-    fn request_import(
+    fn take_resource(
         &self,
-        owner: &ComponentRef,
-        rtw: &[u8],
-    ) -> HostAccessResult<AcceptedUserContentWrite> {
-        self.user_content_writes.request(
-            owner.clone(),
-            DeferredUserContentWriteKind::Import,
-            rtw.to_vec(),
-        )
+        reference: &UserResourceRef,
+        principal: &ComponentPrincipal,
+        replacement_id: &str,
+    ) -> HostAccessResult<UserResourceRef> {
+        self.user_resources
+            .take(reference, principal, replacement_id)
     }
-
-    fn request_replace(
-        &self,
-        owner: &ComponentRef,
-        id: &str,
-        rtw: &[u8],
-    ) -> HostAccessResult<AcceptedUserContentWrite> {
-        let id = id
-            .parse::<UserContentId>()
-            .map_err(|_| HostAccessError::InvalidUserContentId)?;
-        self.home()?
-            .indexed_user_content(id)
-            .map_err(map_host_access_error)?;
-        self.user_content_writes.request(
-            owner.clone(),
-            DeferredUserContentWriteKind::Replace(id),
-            rtw.to_vec(),
-        )
-    }
-
-    fn write_status(
-        &self,
-        owner: &ComponentRef,
-        operation_id: &str,
-    ) -> HostAccessResult<UserContentWriteStatus> {
-        self.user_content_writes.status(owner, operation_id)
+    fn release_owned_resources(&self, principal: &ComponentPrincipal) {
+        self.user_resources.release_owned(principal);
     }
 }
 
 impl WorldSessionAccess for LocalHostAccess {
+    fn package_staging(&self) -> Result<(tempfile::TempDir, std::fs::File), String> {
+        self.home()
+            .map_err(|e| format!("{e:?}"))?
+            .package_transfer_staging()
+            .map_err(|e| e.to_string())
+    }
+
+    fn install_package_file(&self, path: &Path) -> Result<String, String> {
+        self.home()
+            .map_err(|e| format!("{e:?}"))?
+            .install_package(path)
+            .map(|result| result.digest.to_string())
+            .map_err(|e| e.to_string())
+    }
+    fn export_world_file(&self, world_id: &str, path: &Path) -> Result<(), String> {
+        let world = world_id
+            .parse::<WorldId>()
+            .map_err(|_| "invalid World ID".to_string())?;
+        self.home()
+            .map_err(|e| format!("{e:?}"))?
+            .export_world_template(world, path)
+            .map_err(|e| e.to_string())
+    }
+
+    fn list_templates(&self) -> HostAccessResult<String> {
+        let rows = self
+            .home()?
+            .list_templates()
+            .map_err(map_host_access_error)?;
+        let rows: Vec<_> = rows.into_iter().map(|row| serde_json::json!({
+            "digest":row.digest.to_string(),"name":row.name,"description":row.description,"invalidReason":row.invalid_reason
+        })).collect();
+        let text = serde_json::to_string(&rows).map_err(|_| HostAccessError::Unavailable)?;
+        if text.len() > 64 * 1024 {
+            return Err(HostAccessError::MessageTooLarge);
+        }
+        Ok(text)
+    }
+    fn template_info(&self, digest: &str) -> HostAccessResult<String> {
+        let digest = ArtifactDigest::parse(digest).map_err(|_| HostAccessError::InvalidDigest)?;
+        let text = self
+            .home()?
+            .template_info(&digest)
+            .map_err(map_host_access_error)?;
+        if text.len() > 64 * 1024 {
+            return Err(HostAccessError::MessageTooLarge);
+        }
+        Ok(text)
+    }
+    fn create_from_template(
+        &self,
+        digest: &str,
+        title: &str,
+        approve_runtime_permissions: bool,
+    ) -> HostAccessResult<WorldSessionSummary> {
+        let digest = ArtifactDigest::parse(digest).map_err(|_| HostAccessError::InvalidDigest)?;
+        let result = self
+            .home()?
+            .create_world_from_template(&digest, Some(title), approve_runtime_permissions)
+            .map_err(map_host_access_error)?;
+        self.world_sessions.summary(result.world)
+    }
+    fn create_from_template_with_permissions(
+        &self,
+        request: &str,
+    ) -> HostAccessResult<WorldSessionSummary> {
+        if request.len() > 64 * 1024 {
+            return Err(HostAccessError::MessageTooLarge);
+        }
+        let result = self
+            .home()?
+            .create_world_from_template_with_permissions(request)
+            .map_err(map_host_access_error)?;
+        self.world_sessions.summary(result.world)
+    }
+    fn entry(&self, world_id: &str) -> HostAccessResult<Option<ComponentRef>> {
+        let id = world_id
+            .parse::<WorldId>()
+            .map_err(|_| HostAccessError::InvalidWorldId)?;
+        Ok(self
+            .home()?
+            .load_world_composition(id)
+            .map_err(map_host_access_error)?
+            .entry
+            .map(|entry| ComponentRef::new(entry.instance_id, entry.component_id)))
+    }
+
     fn list_worlds(&self) -> HostAccessResult<Vec<WorldSessionSummary>> {
         self.home()?
             .list_worlds()
@@ -880,10 +947,36 @@ impl WorldSessionAccess for LocalHostAccess {
                 })
             })
             .transpose()?;
-        let world = self
-            .home()?
-            .update_world_catalog_metadata(world_id, title, description.map(str::to_string), cover)
-            .map_err(map_host_access_error)?;
+        let home = self.home()?;
+        let client = self
+            .world_data
+            .state
+            .lock()
+            .map_err(|_| HostAccessError::Unavailable)?
+            .worlds
+            .get(&world_id)
+            .map(|world| world.client.clone());
+        let world = if let Some(client) = client {
+            let metadata = home
+                .validate_world_metadata(title, description.map(str::to_string), cover)
+                .map_err(map_host_access_error)?;
+            let manifest = client
+                .set_manifest_metadata(
+                    serde_json::to_value(metadata).map_err(|_| HostAccessError::Unavailable)?,
+                )
+                .map_err(|_| HostAccessError::Unavailable)?;
+            let metadata = crate::world_metadata::WorldMetadata::from_manifest(&manifest)
+                .map_err(map_host_access_error)?;
+            WorldSummary {
+                id: world_id,
+                title: metadata.title().to_string(),
+                description: metadata.description().map(str::to_string),
+                cover: metadata.cover().cloned(),
+            }
+        } else {
+            home.update_world_metadata(world_id, title, description.map(str::to_string), cover)
+                .map_err(map_host_access_error)?
+        };
         self.world_sessions.summary(world)
     }
 
@@ -906,113 +999,6 @@ impl WorldSessionAccess for LocalHostAccess {
             .load_world_state(world_id)
             .map_err(map_host_access_error)?;
         self.world_sessions.request(world_id, active)
-    }
-}
-
-impl WorldCommandAccess for LocalHostAccess {
-    fn submit_world_command(
-        &self,
-        request: WorldCommandRequest,
-    ) -> WorldCommandAccessResult<AcceptedWorldCommand> {
-        let world_id = request
-            .world_id
-            .parse::<WorldId>()
-            .map_err(|_| WorldCommandAccessError::InvalidWorldId)?;
-        let schema = request
-            .schema
-            .parse::<SchemaKey>()
-            .map_err(|_| WorldCommandAccessError::InvalidSchema)?;
-        let actor = match request.actor {
-            WorldCommandActor::Principal => ActorRef::Principal(self.local_principal),
-            WorldCommandActor::Entity(entity_id) => ActorRef::Entity(
-                entity_id
-                    .parse::<EntityId>()
-                    .map_err(|_| WorldCommandAccessError::InvalidActor)?,
-            ),
-        };
-        let payload = serde_json::from_slice(&request.payload_json)
-            .map_err(|_| WorldCommandAccessError::InvalidPayload)?;
-        self.home()
-            .map_err(|_| WorldCommandAccessError::Unavailable)?
-            .load_world_state(world_id)
-            .map_err(map_world_command_host_error)?;
-        if !self
-            .world_sessions
-            .accepts_deferred_world_access(world_id)
-            .map_err(|_| WorldCommandAccessError::Unavailable)?
-        {
-            return Err(WorldCommandAccessError::WorldNotActive);
-        }
-
-        let mut command = WorldCommand::new(schema, self.local_principal, actor, payload);
-        if let Some(expected_position) = request.expected_position {
-            command = command.expecting_position(expected_position);
-        }
-        self.world_commands.request(world_id, command)
-    }
-}
-
-impl WorldProjectionAccess for LocalHostAccess {
-    fn request_projection(
-        &self,
-        owner: &ComponentRef,
-        request: WorldProjectionRequest,
-    ) -> WorldProjectionAccessResult<AcceptedWorldProjectionRead> {
-        let world_id = request
-            .world_id
-            .parse::<WorldId>()
-            .map_err(|_| WorldProjectionAccessError::InvalidWorldId)?;
-        let projection_schema = request
-            .schema
-            .parse::<SchemaKey>()
-            .map_err(|_| WorldProjectionAccessError::InvalidSchema)?;
-        if request.input_json.len() > MAX_WORLD_PROJECTION_INPUT_BYTES {
-            return Err(WorldProjectionAccessError::InvalidInput);
-        }
-        let input = serde_json::from_slice(&request.input_json)
-            .map_err(|_| WorldProjectionAccessError::InvalidInput)?;
-        self.home()
-            .map_err(|_| WorldProjectionAccessError::Unavailable)?
-            .load_world_state(world_id)
-            .map_err(map_world_projection_host_error)?;
-        if !self
-            .world_sessions
-            .accepts_deferred_world_access(world_id)
-            .map_err(|_| WorldProjectionAccessError::Unavailable)?
-        {
-            return Err(WorldProjectionAccessError::WorldNotActive);
-        }
-        self.world_projections.request(
-            owner.clone(),
-            world_id,
-            projection_schema,
-            self.local_principal,
-            input,
-        )
-    }
-
-    fn projection_status(
-        &self,
-        owner: &ComponentRef,
-        operation_id: &str,
-    ) -> WorldProjectionAccessResult<WorldProjectionReadStatus> {
-        self.world_projections.status(owner, operation_id)
-    }
-}
-
-fn map_world_projection_host_error(error: HostError) -> WorldProjectionAccessError {
-    match error {
-        HostError::WorldNotFound(_) => WorldProjectionAccessError::NotFound,
-        HostError::Io(_) | HostError::Storage(_) => WorldProjectionAccessError::Unavailable,
-        _ => WorldProjectionAccessError::Rejected,
-    }
-}
-
-fn map_world_command_host_error(error: HostError) -> WorldCommandAccessError {
-    match error {
-        HostError::WorldNotFound(_) => WorldCommandAccessError::NotFound,
-        HostError::Io(_) | HostError::Storage(_) => WorldCommandAccessError::Unavailable,
-        _ => WorldCommandAccessError::Rejected,
     }
 }
 
@@ -1066,6 +1052,22 @@ impl PreferenceAccess for LocalHostAccess {
             )
             .map_err(map_host_access_error)
     }
+
+    fn compare_exchange_published(
+        &self,
+        owner: &ComponentRef,
+        digest: &ArtifactDigest,
+        key: &str,
+        expected: Option<&str>,
+        value: Option<&str>,
+    ) -> HostAccessResult<bool> {
+        self.home()?
+            .compare_exchange_published_preference(owner, digest, key, expected, value)
+            .map_err(|error| match error {
+                HostError::PreferenceQuotaExceeded => HostAccessError::PreferenceQuotaExceeded,
+                _ => HostAccessError::Unavailable,
+            })
+    }
 }
 
 fn inspect_runtime_artifact(
@@ -1100,6 +1102,102 @@ fn inspect_runtime_artifact(
 }
 
 impl RuntimePolicyAccess for LocalHostAccess {
+    fn live_component_policy(
+        &self,
+        scope: &str,
+        instance: &str,
+        component: &str,
+    ) -> HostAccessResult<String> {
+        let home = self.home()?;
+        let scope_id = RuntimeScopeId::new(scope);
+        let _lock = home
+            .lock_composition_scope(&scope_id)
+            .map_err(map_host_access_error)?;
+        let profile = home
+            .load_composition_for_scope_locked(&scope_id)
+            .map_err(map_host_access_error)?;
+        let snapshot = self
+            .policy_control()?
+            .snapshot(scope, instance, component)?;
+        if !profile.activations.iter().any(|a| {
+            a.enabled
+                && a.scope_id == scope_id
+                && a.instance_id.as_str() == instance
+                && a.artifact.to_string() == snapshot.target.artifact
+        }) {
+            return Err(HostAccessError::Rejected);
+        }
+        let mut value =
+            serde_json::to_value(&snapshot).map_err(|_| HostAccessError::Unavailable)?;
+        value["persisted"] = serde_json::json!({
+            "granted":profile.runtime_permissions.iter().filter(|g|g.scope_id==scope_id && g.instance_id.as_str()==instance && g.component_id.as_str()==component).map(|g|g.permission.to_string()).collect::<Vec<_>>(),
+            "httpOrigins":profile.http_loopback_origins.iter().filter(|g|g.scope_id==scope_id && g.instance_id.as_str()==instance && g.component_id.as_str()==component).map(|g|g.origin.clone()).collect::<Vec<_>>(),
+            "secretRead":profile.secret_read_grants.iter().filter(|g|g.scope_id==scope_id && g.instance_id.as_str()==instance && g.component_id.as_str()==component).map(|g|g.path.to_string()).collect::<Vec<_>>()
+        });
+        serde_json::to_string(&value).map_err(|_| HostAccessError::Unavailable)
+    }
+    fn apply_live_change(&self, raw: &str) -> HostAccessResult<()> {
+        if raw.len() > 64 * 1024 {
+            return Err(HostAccessError::Rejected);
+        }
+        let change: LivePolicyChange =
+            serde_json::from_str(raw).map_err(|_| HostAccessError::Rejected)?;
+        self.apply_policy(&change)
+    }
+
+    fn list_http_origins(&self, scope_id: &str) -> HostAccessResult<Vec<RuntimeHttpOriginGrant>> {
+        self.home()?
+            .list_http_loopback_origins(&RuntimeScopeId::new(scope_id))
+            .map(|origins| {
+                origins
+                    .into_iter()
+                    .map(|grant| RuntimeHttpOriginGrant {
+                        scope_id: grant.scope_id.to_string(),
+                        instance_id: grant.instance_id.to_string(),
+                        component_id: grant.component_id.to_string(),
+                        origin: grant.origin,
+                    })
+                    .collect()
+            })
+            .map_err(map_host_access_error)
+    }
+
+    fn grant_http_origin(
+        &self,
+        scope_id: &str,
+        instance_id: &str,
+        component_id: &str,
+        origin: &str,
+    ) -> HostAccessResult<()> {
+        self.apply_current_policy(
+            scope_id,
+            instance_id,
+            component_id,
+            LivePolicyDelta {
+                allow_http_origins: vec![origin.into()],
+                ..Default::default()
+            },
+        )
+    }
+
+    fn revoke_http_origin(
+        &self,
+        scope_id: &str,
+        instance_id: &str,
+        component_id: &str,
+        origin: &str,
+    ) -> HostAccessResult<()> {
+        self.apply_current_policy(
+            scope_id,
+            instance_id,
+            component_id,
+            LivePolicyDelta {
+                deny_http_origins: vec![origin.into()],
+                ..Default::default()
+            },
+        )
+    }
+
     fn inspect_artifact(&self, digest: &str) -> HostAccessResult<RuntimeArtifactPolicy> {
         inspect_runtime_artifact(self, digest)
     }
@@ -1131,13 +1229,15 @@ impl RuntimePolicyAccess for LocalHostAccess {
         let permission: RuntimePermission = permission
             .parse()
             .map_err(|_| HostAccessError::InvalidPermission)?;
-        self.home()?
-            .grant_runtime_permission(
-                RuntimeScopeId::new(scope_id),
-                ComponentRef::new(instance_id, component_id),
-                permission,
-            )
-            .map_err(map_host_access_error)
+        self.apply_current_policy(
+            scope_id,
+            instance_id,
+            component_id,
+            LivePolicyDelta {
+                grant_runtime: vec![permission],
+                ..Default::default()
+            },
+        )
     }
 
     fn revoke(
@@ -1150,13 +1250,15 @@ impl RuntimePolicyAccess for LocalHostAccess {
         let permission: RuntimePermission = permission
             .parse()
             .map_err(|_| HostAccessError::InvalidPermission)?;
-        self.home()?
-            .revoke_runtime_permission(
-                &RuntimeScopeId::new(scope_id),
-                &ComponentRef::new(instance_id, component_id),
-                permission,
-            )
-            .map_err(map_host_access_error)
+        self.apply_current_policy(
+            scope_id,
+            instance_id,
+            component_id,
+            LivePolicyDelta {
+                revoke_runtime: vec![permission],
+                ..Default::default()
+            },
+        )
     }
 }
 
@@ -1358,22 +1460,20 @@ fn map_asset_import_error(error: rintawa_artifacts::AssetError) -> HostAccessErr
 fn map_asset_store_read_error(error: rintawa_artifacts::AssetError) -> HostAccessError {
     match error {
         rintawa_artifacts::AssetError::InvalidDigest(_) => HostAccessError::InvalidDigest,
-        rintawa_artifacts::AssetError::InvalidMediaType { .. } => HostAccessError::InvalidAsset,
-        rintawa_artifacts::AssetError::StoredAssetNotFound(_) => HostAccessError::NotFound,
-        rintawa_artifacts::AssetError::Io(_)
-        | rintawa_artifacts::AssetError::UnsupportedSource(_)
-        | rintawa_artifacts::AssetError::AssetTooLarge { .. }
+        rintawa_artifacts::AssetError::InvalidMediaType { .. }
         | rintawa_artifacts::AssetError::StoreCorruption(_)
         | rintawa_artifacts::AssetError::SizeMismatch { .. }
-        | rintawa_artifacts::AssetError::InvalidStoreEntry { .. } => HostAccessError::Unavailable,
+        | rintawa_artifacts::AssetError::InvalidStoreEntry { .. }
+        | rintawa_artifacts::AssetError::AssetTooLarge { .. } => HostAccessError::InvalidAsset,
+        rintawa_artifacts::AssetError::StoredAssetNotFound(_) => HostAccessError::NotFound,
+        rintawa_artifacts::AssetError::Io(_)
+        | rintawa_artifacts::AssetError::UnsupportedSource(_) => HostAccessError::Unavailable,
     }
 }
 
 fn map_host_access_error(error: HostError) -> HostAccessError {
     match error {
-        HostError::ActivationNotFound(_)
-        | HostError::WorldNotFound(_)
-        | HostError::UserContentNotFound(_) => HostAccessError::NotFound,
+        HostError::ActivationNotFound(_) | HostError::WorldNotFound(_) => HostAccessError::NotFound,
         HostError::UnsupportedContent(_) => HostAccessError::UnsupportedContent,
         HostError::Io(_)
         | HostError::ProfileDecode(_)
@@ -1386,62 +1486,135 @@ fn map_host_access_error(error: HostError) -> HostAccessError {
     }
 }
 
-/// Authoritative command result plus best-effort live event delivery status.
-#[derive(Debug)]
-pub struct WorldCommandDispatchOutcome {
-    authoritative: WorldCommandOutcome,
-    live_delivery: HostResult<usize>,
-}
-
-impl WorldCommandDispatchOutcome {
-    /// Returns the durable authoritative command outcome.
-    pub const fn authoritative(&self) -> &WorldCommandOutcome {
-        &self.authoritative
-    }
-
-    /// Returns successful live subscriber callbacks, or the post-commit delivery failure.
-    ///
-    /// A delivery error never means that the authoritative command was rolled back.
-    pub fn live_delivery(&self) -> Result<usize, &HostError> {
-        self.live_delivery.as_ref().copied()
-    }
-
-    /// Consumes the result into authoritative and ephemeral delivery parts.
-    pub fn into_parts(self) -> (WorldCommandOutcome, HostResult<usize>) {
-        (self.authoritative, self.live_delivery)
-    }
-}
-
 struct ActiveWorldRuntimeParts {
     runtime: WorldRuntime,
-    outbox: SqliteWorldStorage,
-    effect_handlers: BTreeMap<SchemaKey, ServiceWorldEffectHandler>,
-    projections: BTreeMap<SchemaKey, ServiceWorldProjection>,
+    command_owners: BTreeMap<SchemaKey, ComponentRef>,
+}
+
+/// Host-bound adapter from an active WASM component to one authoritative command schema.
+///
+/// The extension cannot choose this schema, owner, World or principal. The runtime
+/// validates the command before this adapter runs and validates its transaction
+/// again before committing.
+struct WasmWorldSystem {
+    command_schema: SchemaKey,
+    endpoint: WasmWorldSystemEndpoint,
+}
+
+impl WorldSystem for WasmWorldSystem {
+    fn command_schema(&self) -> &SchemaKey {
+        &self.command_schema
+    }
+
+    fn evaluate(
+        &self,
+        snapshot: &WorldSnapshot,
+        command: &WorldCommand,
+    ) -> SystemResult<rintawa_world::WorldTransaction> {
+        self.endpoint.evaluate(snapshot.clone(), command)
+    }
 }
 
 struct ActiveWorld {
     runtime: WorldRuntime,
-    outbox: SqliteWorldStorage,
-    effect_handlers: BTreeMap<SchemaKey, ServiceWorldEffectHandler>,
-    projections: BTreeMap<SchemaKey, ServiceWorldProjection>,
-    signals: RuntimeSignalQueue,
     registered_instances: Vec<ExtensionInstanceId>,
     started_instances: Vec<ExtensionInstanceId>,
+    // Keep lifecycle ownership until the worker itself has been dropped as well.
+    _lifecycle: Option<std::fs::File>,
 }
 
 /// Running host composition containing baseline extensions and active worlds.
 pub struct HostRuntime {
+    baseline_artifacts: BTreeMap<String, ArtifactDigest>,
     // Active worlds are declared before the Engine so implicit field drop also
     // tears down command execution before provider component state disappears.
     active_worlds: BTreeMap<WorldId, ActiveWorld>,
+    pending_world_cleanup: BTreeMap<WorldId, ActivatedComposition>,
+    shutting_down: bool,
     engine: ExtensionEngine,
     started_instances: Vec<ExtensionInstanceId>,
     host_shell_provider: Option<ComponentRef>,
-    ui_layer_provider: Option<ComponentRef>,
     host_access: Option<Arc<LocalHostAccess>>,
+    world_data: WorldDataRuntimeControl,
+}
+
+impl Drop for HostRuntime {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(access) = &self.host_access {
+            access.secret_operations.shutdown();
+        }
+        // A caller may drop without an explicit successful shutdown. Keep leases
+        // until both worker drain and Engine/proxy resource teardown have finished.
+        let guards = self
+            .active_worlds
+            .values_mut()
+            .filter_map(|world| world._lifecycle.take())
+            .chain(
+                self.pending_world_cleanup
+                    .values_mut()
+                    .filter_map(|world| world._lifecycle.take()),
+            )
+            .collect::<Vec<_>>();
+        drop(std::mem::take(&mut self.active_worlds));
+        drop(std::mem::take(&mut self.pending_world_cleanup));
+        drop(std::mem::take(&mut self.engine));
+        drop(guards);
+    }
 }
 
 impl HostRuntime {
+    /// Captures a native administrative target without admitting a browser request.
+    pub fn secret_consumer_target(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ComponentRef,
+    ) -> HostAccessResult<rintawa_extension_engine::LivePolicyTarget> {
+        Ok(self
+            .engine
+            .live_policy_control()
+            .snapshot(
+                scope.as_str(),
+                owner.instance_id.as_str(),
+                owner.component_id.as_str(),
+            )?
+            .target)
+    }
+
+    /// Binds a shared entry and grants its exact slot, persisted and live together.
+    /// The target must have been shown in a trusted native consent surface.
+    #[cfg(target_os = "linux")]
+    pub fn bind_shared_secret(
+        &self,
+        target: &rintawa_extension_engine::LivePolicyTarget,
+        slot: rintawa_sdk::secrets::SecretPath,
+        entry: uuid::Uuid,
+    ) -> HostAccessResult<()> {
+        let access = self
+            .host_access
+            .as_ref()
+            .ok_or(HostAccessError::Unavailable)?;
+        access.bind_secret_selection(target, slot, entry, None, None)
+    }
+
+    /// Disconnects a live consumer without deleting the shared value.
+    pub fn disconnect_shared_secret(
+        &self,
+        target: rintawa_extension_engine::LivePolicyTarget,
+        slot: rintawa_sdk::secrets::SecretPath,
+    ) -> HostAccessResult<()> {
+        self.host_access
+            .as_ref()
+            .ok_or(HostAccessError::Unavailable)?
+            .apply_policy(&LivePolicyChange {
+                target,
+                delta: LivePolicyDelta {
+                    deny_secret_read: vec![slot],
+                    ..Default::default()
+                },
+            })
+    }
+
     /// Loads and starts every enabled activation in the baseline profile.
     ///
     /// Bootstrap is staged to a fixed point. Artifacts whose required execution
@@ -1451,66 +1624,64 @@ impl HostRuntime {
     /// every artifact is registered, the remaining instances use the ordinary
     /// deterministic full-topology activation plan.
     pub fn start(home: &HostHome) -> HostResult<Self> {
+        home.recover_world_staging()?;
         let profile = home.load_profile()?;
-        let user_content_writes = UserContentWriteRuntimeControl::default();
         let user_resources = UserResourceRuntimeControl::default();
         let world_sessions = WorldSessionRuntimeControl::default();
-        let world_commands = WorldCommandRuntimeControl::default();
-        let world_projections = WorldProjectionRuntimeControl::default();
-        let access = Arc::new(LocalHostAccess::new(
+        let world_data = WorldDataRuntimeControl::default();
+        let secrets = crate::shared_secrets::ManagedSecrets::selected(home)?;
+        let access = LocalHostAccess::new(
             home.root(),
-            home.local_principal(),
-            user_content_writes,
             user_resources,
             world_sessions,
-            world_commands,
-            world_projections,
-        ));
+            world_data.clone(),
+        );
+        #[cfg(target_os = "linux")]
+        let access = LocalHostAccess {
+            secrets: Some(secrets.clone()),
+            ..access
+        };
+        let access = Arc::new(access);
         let artifact_store_access: Arc<dyn ArtifactStoreAccess> = access.clone();
         let asset_store_access: Arc<dyn AssetStoreAccess> = access.clone();
         let user_resource_access: Arc<dyn UserResourceAccess> = access.clone();
-        let user_content_access: Arc<dyn UserContentAccess> = access.clone();
-        let user_content_write_access: Arc<dyn UserContentWriteAccess> = access.clone();
         let world_session_access: Arc<dyn WorldSessionAccess> = access.clone();
-        let world_command_access: Arc<dyn WorldCommandAccess> = access.clone();
-        let world_projection_access: Arc<dyn WorldProjectionAccess> = access.clone();
         let composition_access: Arc<dyn CompositionAccess> = access.clone();
         let preference_access: Arc<dyn PreferenceAccess> = access.clone();
         let runtime_policy_access: Arc<dyn RuntimePolicyAccess> = access.clone();
-        let mut engine = ExtensionEngine::with_host_access(
+        let mut engine = ExtensionEngine::with_host_access_and_secret_manager(
             artifact_store_access,
             asset_store_access,
             world_session_access,
             composition_access,
             preference_access,
             runtime_policy_access,
+            secrets.manager(),
         );
+        *access
+            .live_policy
+            .lock()
+            .map_err(|_| HostError::WorldSessionControlUnavailable)? =
+            Some(engine.live_policy_control());
         let runtime_context_access: Arc<dyn RuntimeContextAccess> = access.clone();
         engine.attach_runtime_context_access(runtime_context_access);
+        #[cfg(target_os = "linux")]
+        engine.attach_secret_access(access.clone());
         engine.attach_user_resource_access(user_resource_access);
-        engine.attach_user_content_access(user_content_access);
-        engine.attach_user_content_write_access(user_content_write_access);
-        engine.attach_world_command_access(world_command_access);
-        engine.attach_world_projection_access(world_projection_access);
+        engine.attach_world_data_access(Arc::new(world_data.clone()));
         let host_scope = RuntimeScopeId::new(HOST_SCOPE);
         let host_shell_contract = host_shell_contract_key();
-        let ui_layer_contract = ui_layer_contract_key();
         engine.define_platform_binding_contract_in_scope(
             host_scope.clone(),
             host_shell_contract.clone(),
             ContractResolutionPolicy::Single,
         )?;
-        engine.define_platform_binding_contract_in_scope(
-            host_scope.clone(),
-            ui_layer_contract.clone(),
-            ContractResolutionPolicy::Single,
-        )?;
 
-        let activated = activate_composition(&mut engine, home, &profile, &host_scope)?;
+        let mut activated = ActivatedComposition::default();
+        activate_composition(&mut engine, home, &profile, &host_scope, &mut activated)?;
         let registered = activated.registered_instances;
         let started = activated.started_instances;
         let mut host_shell_provider = None;
-        let mut ui_layer_provider = None;
 
         let result: HostResult<()> = (|| {
             let has_explicit_shell_selection =
@@ -1531,28 +1702,6 @@ impl HostRuntime {
                 }
             };
 
-            let has_explicit_ui_layer_selection =
-                profile.preferred_providers.iter().any(|selection| {
-                    selection.scope_id == host_scope && selection.contract() == ui_layer_contract
-                });
-            ui_layer_provider = match engine
-                .resolve_active_contract_providers_in_scope(&host_scope, &ui_layer_contract)
-            {
-                Ok(providers) => providers.into_iter().next(),
-                Err(UnresolvedContractReason::NoProvider) if !has_explicit_ui_layer_selection => {
-                    None
-                }
-                Err(reason) => {
-                    return Err(HostError::ContractRoleUnavailable {
-                        scope_id: host_scope.to_string(),
-                        contract: ui_layer_contract.to_string(),
-                        reason,
-                    });
-                }
-            };
-            if let Some(provider) = ui_layer_provider.clone() {
-                engine.attach_registered_ui_layer(provider)?;
-            }
             Ok(())
         })();
 
@@ -1568,12 +1717,24 @@ impl HostRuntime {
         }
 
         Ok(Self {
+            baseline_artifacts: profile
+                .activations
+                .iter()
+                .map(|activation| {
+                    (
+                        activation.instance_id.to_string(),
+                        activation.artifact.clone(),
+                    )
+                })
+                .collect(),
             active_worlds: BTreeMap::new(),
+            shutting_down: false,
+            pending_world_cleanup: BTreeMap::new(),
             engine,
             started_instances: started,
             host_shell_provider,
-            ui_layer_provider,
             host_access: Some(access),
+            world_data,
         })
     }
 
@@ -1584,208 +1745,6 @@ impl HostRuntime {
         self.host_shell_provider.as_ref()
     }
 
-    /// Returns the selected active provider of the portable UI Layer role.
-    ///
-    /// `None` is valid for a headless composition or a shell that does not use
-    /// the portable UI presentation protocol.
-    pub fn ui_layer_provider(&self) -> Option<&ComponentRef> {
-        self.ui_layer_provider.as_ref()
-    }
-
-    /// Resolves and focuses one active World's composition-defined presentation entry point.
-    ///
-    /// Focus is presentation-session state owned by `layer_owner`; it never changes
-    /// authoritative World lifecycle. The selected provider is resolved only inside the
-    /// exact `world:<WorldId>` scope using ordinary Single-provider composition policy.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HostError::WorldNotActive`] when the World is not running,
-    /// [`HostError::ContractRoleUnavailable`] when its presentation Binding cannot resolve,
-    /// [`HostError::WorldPresentationEntryUnavailable`] when the selected owner has no
-    /// currently mounted entry surface, or an Engine/UI error when the layer cannot present
-    /// the focused World scope.
-    pub fn focus_world_for_ui_layer(
-        &self,
-        layer_owner: &ComponentRef,
-        world_id: WorldId,
-    ) -> HostResult<WorldPresentationTarget> {
-        if !self.active_worlds.contains_key(&world_id) {
-            return Err(HostError::WorldNotActive(world_id));
-        }
-
-        let scope_id = world_runtime_scope_id(world_id);
-        let contract = world_presentation_contract_key();
-        let provider = self
-            .engine
-            .resolve_active_contract_providers_in_scope(&scope_id, &contract)
-            .map_err(|reason| HostError::ContractRoleUnavailable {
-                scope_id: scope_id.to_string(),
-                contract: contract.to_string(),
-                reason,
-            })?
-            .into_iter()
-            .next()
-            .ok_or_else(|| HostError::ContractRoleUnavailable {
-                scope_id: scope_id.to_string(),
-                contract: contract.to_string(),
-                reason: UnresolvedContractReason::NoProvider,
-            })?;
-        let descriptor = self
-            .engine
-            .registered_world_presentation_descriptor(&provider)?;
-        let is_entry_mounted = self.engine.portable_ui_surfaces().iter().any(|surface| {
-            surface.owner == provider && surface.contribution.id == descriptor.entry_surface_id
-        });
-        if !is_entry_mounted {
-            return Err(HostError::WorldPresentationEntryUnavailable {
-                world_id,
-                surface_id: descriptor.entry_surface_id.to_string(),
-            });
-        }
-
-        self.engine.set_focused_world_for_ui_layer(
-            layer_owner,
-            world_id,
-            scope_id,
-            descriptor.clone(),
-        )?;
-        Ok(WorldPresentationTarget {
-            world_id,
-            provider,
-            descriptor,
-        })
-    }
-
-    /// Clears the focused World from one UI Layer presentation session.
-    ///
-    /// # Errors
-    ///
-    /// Returns an Engine/UI error when `layer_owner` is not the active UI Layer.
-    pub fn clear_world_focus_for_ui_layer(&self, layer_owner: &ComponentRef) -> HostResult<()> {
-        self.engine
-            .clear_focused_world_for_ui_layer(layer_owner)
-            .map_err(HostError::from)
-    }
-
-    /// Returns the World currently focused by one UI Layer presentation session.
-    ///
-    /// # Errors
-    ///
-    /// Returns an Engine/UI error when `layer_owner` is not the active UI Layer.
-    pub fn focused_world_for_ui_layer(
-        &self,
-        layer_owner: &ComponentRef,
-    ) -> HostResult<Option<WorldId>> {
-        self.engine
-            .focused_world_for_ui_layer(layer_owner)
-            .map_err(HostError::from)
-    }
-
-    /// Imports one extension-validated RTW artifact into the generic user-content library.
-    ///
-    /// The root container and bounded descriptor are validated before CAS publication.
-    /// Handler resolution uses the baseline `host` composition and ordinary `Single`
-    /// provider policy; Core does not interpret feature-specific content semantics.
-    ///
-    /// # Errors
-    ///
-    /// Returns an RTW validation error, content-handler transport/protocol rejection,
-    /// artifact-store failure, or library persistence error.
-    pub fn import_user_content_rtw(
-        &mut self,
-        home: &HostHome,
-        source: impl AsRef<Path>,
-    ) -> HostResult<UserContentEntry> {
-        let source = source.as_ref();
-        let content = self.validate_user_content_rtw(source)?;
-        let imported = home.artifact_store().import(source)?;
-        home.insert_user_content_revision(content, imported.digest().clone())
-    }
-
-    /// Replaces the immutable revision of one logical user-content item.
-    ///
-    /// The logical [`UserContentId`] is preserved and the versioned RTW content type
-    /// cannot change. Validation completes before the new bytes enter the CAS.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HostError::UserContentNotFound`] for an unknown ID,
-    /// [`HostError::UserContentTypeMismatch`] for a type change, or the same
-    /// validation/storage errors as [`Self::import_user_content_rtw`].
-    pub fn replace_user_content_rtw(
-        &mut self,
-        home: &HostHome,
-        id: UserContentId,
-        source: impl AsRef<Path>,
-    ) -> HostResult<UserContentEntry> {
-        let existing = home.indexed_user_content(id)?;
-        let source = source.as_ref();
-        let content = self.validate_user_content_rtw(source)?;
-        if content != existing.content {
-            return Err(HostError::UserContentTypeMismatch {
-                id,
-                expected: existing.content.to_string(),
-                actual: content.to_string(),
-            });
-        }
-        let imported = home.artifact_store().import(source)?;
-        home.replace_user_content_revision(id, content, imported.digest().clone())
-    }
-
-    fn validate_user_content_rtw(&mut self, source: &Path) -> HostResult<ContentType> {
-        let mut archive = RtwArchive::open(source, RtwLimits::default())?;
-        let content = archive.manifest().content.clone();
-        let entry = archive.manifest().entry.clone();
-        let maximum_entry_bytes =
-            u64::try_from(MAX_CONTENT_HANDLER_ENTRY_BYTES).unwrap_or(u64::MAX);
-        let descriptor = archive.read_with_limit(&entry, maximum_entry_bytes)?;
-        let contract = content_handler_service_contract_key(content.id(), content.major());
-        let host_scope = RuntimeScopeId::new(HOST_SCOPE);
-        self.engine.define_platform_service_contract_in_scope(
-            host_scope.clone(),
-            contract.clone(),
-            ContractResolutionPolicy::Single,
-        )?;
-        let request = ContentHandlerRequest::new(content.to_string(), descriptor);
-        let request = serde_json::to_vec(&request).map_err(|source| {
-            HostError::ContentHandlerRequestEncode {
-                content: content.to_string(),
-                source,
-            }
-        })?;
-        let response = self
-            .engine
-            .platform_service_caller(host_scope)
-            .call(&contract, &request)
-            .map_err(|source| HostError::ContentHandlerCall {
-                content: content.to_string(),
-                source,
-            })?;
-        let response: ContentHandlerResponse =
-            serde_json::from_slice(&response).map_err(|source| {
-                HostError::ContentHandlerResponseDecode {
-                    content: content.to_string(),
-                    source,
-                }
-            })?;
-        match response {
-            ContentHandlerResponse::Accepted => Ok(content),
-            ContentHandlerResponse::Rejected { diagnostic } => {
-                if diagnostic.len() > MAX_CONTENT_HANDLER_DIAGNOSTIC_BYTES {
-                    return Err(HostError::ContentHandlerDiagnosticTooLarge {
-                        content: content.to_string(),
-                        maximum_bytes: MAX_CONTENT_HANDLER_DIAGNOSTIC_BYTES,
-                    });
-                }
-                Err(HostError::UserContentRejected {
-                    content: content.to_string(),
-                    diagnostic,
-                })
-            }
-        }
-    }
-
     /// Returns whether one authoritative world currently owns a running worker.
     pub fn is_world_active(&self, world_id: WorldId) -> bool {
         self.active_worlds.contains_key(&world_id)
@@ -1793,14 +1752,13 @@ impl HostRuntime {
 
     /// Opens one persistent world and starts its authoritative command worker.
     ///
-    /// Every persisted command schema is bound to a platform service owned by the
-    /// extension that owns that schema. Provider availability remains dynamic:
-    /// activating the world does not require every System provider to be online.
+    /// Property definitions come from the exact artifacts installed in this world's
+    /// composition overlay and are persisted in the world vocabulary.
     ///
     /// # Errors
     ///
     /// Returns WorldAlreadyActive for duplicate activation, world/storage errors,
-    /// contract reservation errors, or World Runtime startup errors.
+    /// or World Runtime startup errors.
     pub fn activate_world(&mut self, home: &HostHome, world_id: WorldId) -> HostResult<()> {
         let result = self.activate_world_inner(home, world_id);
         let status_result = self.record_world_session_result(world_id, &result);
@@ -1811,91 +1769,63 @@ impl HostRuntime {
     }
 
     fn activate_world_inner(&mut self, home: &HostHome, world_id: WorldId) -> HostResult<()> {
+        if self.shutting_down {
+            return Err(HostError::HostStopping);
+        }
+        // Cleanup from a previous failed activation must finish before reloading IDs.
+        if self.pending_world_cleanup.contains_key(&world_id) {
+            self.deactivate_world_inner(world_id)?;
+        }
         if self.active_worlds.contains_key(&world_id) {
             return Err(HostError::WorldAlreadyActive(world_id));
         }
 
+        if self.active_worlds.len() + self.pending_world_cleanup.len() >= 8 {
+            return Err(HostError::ActiveWorldLimitExceeded);
+        }
+        let lifecycle = home.lock_world_lifecycle(world_id)?;
         let profile = home.load_world_composition(world_id)?;
+        for (target, owner) in
+            home.resolve_execution_requirements(&profile.execution_requirements)?
+        {
+            let requirement = profile
+                .execution_requirements
+                .iter()
+                .find(|requirement| requirement.target == target)
+                .ok_or_else(|| {
+                    HostError::InvalidTemplate("missing execution prerequisite".into())
+                })?;
+            if self.baseline_artifacts.get(owner.instance_id.as_str())
+                != Some(&requirement.artifact)
+                || self.engine.execution_target_owner(&target).as_ref() != Some(&owner)
+            {
+                return Err(HostError::InvalidTemplate(format!(
+                    "exact Host provider unavailable for {target}"
+                )));
+            }
+        }
         let scope_id = world_runtime_scope_id(world_id);
-        self.engine.define_platform_binding_contract_in_scope(
-            scope_id.clone(),
-            world_presentation_contract_key(),
-            ContractResolutionPolicy::Single,
-        )?;
-        let overlay = match activate_composition(&mut self.engine, home, &profile, &scope_id) {
-            Ok(overlay) => overlay,
-            Err(error) => {
-                clear_world_scope_topology(&mut self.engine, &scope_id);
-                return Err(error);
-            }
+        let mut overlay = ActivatedComposition {
+            _lifecycle: Some(lifecycle),
+            ..ActivatedComposition::default()
         };
-        let runtime_result: HostResult<ActiveWorldRuntimeParts> = (|| {
-            let storage = home.open_world_storage(world_id)?;
-            register_world_schema_contributions(
-                &self.engine,
-                &storage,
-                &overlay.registered_instances,
-            )?;
-            let session = storage.load_session()?;
-            let mut builder = WorldRuntimeBuilder::new(storage);
-            for definition in session
-                .schemas()
-                .iter()
-                .filter(|definition| definition.kind() == SchemaKind::Command)
-            {
-                builder.register_system(self.bind_world_system(
-                    world_id,
-                    definition.key().clone(),
-                    definition.owner().clone(),
-                )?)?;
+        if let Err(error) =
+            activate_composition(&mut self.engine, home, &profile, &scope_id, &mut overlay)
+        {
+            if !overlay.registered_instances.is_empty() {
+                self.pending_world_cleanup.insert(world_id, overlay);
             }
-            let mut effect_handlers = BTreeMap::new();
-            for definition in session
-                .schemas()
-                .iter()
-                .filter(|definition| definition.kind() == SchemaKind::Effect)
-            {
-                effect_handlers.insert(
-                    definition.key().clone(),
-                    self.bind_world_effect_handler(
-                        world_id,
-                        definition.key().clone(),
-                        definition.owner().clone(),
-                    )?,
-                );
-            }
-            let mut projections = BTreeMap::new();
-            for definition in session
-                .schemas()
-                .iter()
-                .filter(|definition| definition.kind() == SchemaKind::Projection)
-            {
-                projections.insert(
-                    definition.key().clone(),
-                    self.bind_world_projection(
-                        world_id,
-                        definition.key().clone(),
-                        definition.owner().clone(),
-                    )?,
-                );
-            }
-            let outbox = home.open_world_storage(world_id)?;
-            Ok(ActiveWorldRuntimeParts {
-                runtime: builder.start()?,
-                outbox,
-                effect_handlers,
-                projections,
-            })
-        })();
-
-        let runtime_parts = match runtime_result {
-            Ok(runtime) => runtime,
+            clear_world_scope_topology(&mut self.engine, &scope_id);
+            return Err(error);
+        }
+        let prepared = prepare_world_runtime(self, home, world_id, &overlay.registered_instances);
+        let runtime_parts = match prepared {
+            Ok(parts) => parts,
             Err(error) => {
-                let cleanup_failures = cleanup_instances(
-                    &mut self.engine,
-                    &overlay.started_instances,
-                    &overlay.registered_instances,
-                );
+                let cleanup_failures = overlay.cleanup(&mut self.engine);
+                if !overlay.registered_instances.is_empty() {
+                    self.pending_world_cleanup.insert(world_id, overlay);
+                }
                 clear_world_scope_topology(&mut self.engine, &scope_id);
                 if cleanup_failures.is_empty() {
                     return Err(error);
@@ -1907,18 +1837,24 @@ impl HostRuntime {
             }
         };
 
+        let ingress = self.world_data.activate(
+            world_id,
+            runtime_parts.runtime.client(),
+            runtime_parts.command_owners.clone(),
+        );
         self.active_worlds.insert(
             world_id,
             ActiveWorld {
+                _lifecycle: overlay._lifecycle.take(),
                 runtime: runtime_parts.runtime,
-                outbox: runtime_parts.outbox,
-                effect_handlers: runtime_parts.effect_handlers,
-                projections: runtime_parts.projections,
-                signals: RuntimeSignalQueue::default(),
                 registered_instances: overlay.registered_instances,
                 started_instances: overlay.started_instances,
             },
         );
+        if let Err(error) = ingress {
+            self.deactivate_world_inner(world_id)?;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -1926,8 +1862,8 @@ impl HostRuntime {
     ///
     /// # Errors
     ///
-    /// Returns WorldNotActive when the world is not running, or the runtime
-    /// shutdown failure after the world has been removed from the active set.
+    /// Returns WorldNotActive, a busy drain, or cleanup failures. Incomplete Worlds
+    /// retain ownership/admission slots for retry; new operations are refused.
     pub fn deactivate_world(&mut self, world_id: WorldId) -> HostResult<()> {
         let result = self.deactivate_world_inner(world_id);
         let status_result = self.record_world_session_result(world_id, &result);
@@ -1938,427 +1874,96 @@ impl HostRuntime {
     }
 
     fn deactivate_world_inner(&mut self, world_id: WorldId) -> HostResult<()> {
-        let active = self
-            .active_worlds
-            .remove(&world_id)
-            .ok_or(HostError::WorldNotActive(world_id))?;
-        let (world_failures, cleanup_failures) =
-            cleanup_active_world(&mut self.engine, world_id, active);
-        if world_failures.is_empty() && cleanup_failures.is_empty() {
-            Ok(())
-        } else {
-            Err(HostError::ShutdownFailed(Box::new(HostShutdownFailures {
-                world_failures,
-                cleanup_failures,
-            })))
+        self.deactivate_world_with_timeout(world_id, std::time::Duration::from_secs(5))
+    }
+    fn deactivate_world_with_timeout(
+        &mut self,
+        world_id: WorldId,
+        timeout: std::time::Duration,
+    ) -> HostResult<()> {
+        if let Some(overlay) = self.pending_world_cleanup.get_mut(&world_id) {
+            self.engine
+                .close_scope_admission(&world_runtime_scope_id(world_id));
+            let cleanup_failures = overlay.cleanup(&mut self.engine);
+            if !cleanup_failures.is_empty() {
+                return Err(HostError::ShutdownFailed(Box::new(HostShutdownFailures {
+                    world_failures: Vec::new(),
+                    cleanup_failures,
+                })));
+            }
+            self.pending_world_cleanup.remove(&world_id);
+            clear_world_scope_topology(&mut self.engine, &world_runtime_scope_id(world_id));
+            return Ok(());
         }
-    }
-
-    /// Executes one command in an active world and then performs live event delivery.
-    ///
-    /// The outer result covers authoritative command execution only. Once a commit
-    /// succeeds, live runtime-event delivery is reported separately inside
-    /// WorldCommandDispatchOutcome so an ephemeral delivery failure cannot make a
-    /// committed command appear rolled back. Idempotent replay is never redelivered.
-    ///
-    /// # Errors
-    ///
-    /// Returns WorldNotActive or an authoritative World Runtime failure.
-    pub fn submit_world_command(
-        &mut self,
-        world_id: WorldId,
-        command: WorldCommand,
-    ) -> HostResult<WorldCommandDispatchOutcome> {
-        let authoritative = {
-            let active = self
-                .active_worlds
-                .get(&world_id)
-                .ok_or(HostError::WorldNotActive(world_id))?;
-            active.runtime.submit(command)?.wait_outcome()?
-        };
-
-        let live_delivery = if authoritative.receipt().disposition() == CommitDisposition::Committed
-        {
-            self.dispatch_world_events(authoritative.committed_events())
-        } else {
-            Ok(0)
-        };
-
-        Ok(WorldCommandDispatchOutcome {
-            authoritative,
-            live_delivery,
-        })
-    }
-
-    /// Builds one schema-addressed, Principal-specific view of an active World.
-    ///
-    /// The projection provider receives only bounded owner-filtered reads from one
-    /// pinned snapshot. It never receives SQLite handles or the raw WorldSnapshot,
-    /// and the final value is validated against the registered Projection schema.
-    ///
-    /// # Errors
-    ///
-    /// Returns WorldNotActive, WorldProjectionUnavailable, a snapshot/storage error,
-    /// or a typed projection protocol/policy failure.
-    pub fn project_world(
-        &self,
-        world_id: WorldId,
-        principal: PrincipalId,
-        projection_schema: &SchemaKey,
-        input: serde_json::Value,
-    ) -> HostResult<WorldProjectionView> {
-        let active = self
-            .active_worlds
-            .get(&world_id)
-            .ok_or(HostError::WorldNotActive(world_id))?;
-        let projection = active
-            .projections
-            .get(projection_schema)
-            .ok_or_else(|| HostError::WorldProjectionUnavailable(projection_schema.clone()))?;
-        let snapshot = active.runtime.snapshot()?;
-        Ok(projection.project(&snapshot, principal, input)?)
-    }
-
-    /// Binds one exact command schema to an extension-provided World System service.
-    ///
-    /// The service contract is platform-owned and scoped to the authoritative world.
-    /// Provider resolution is pinned to the extension that owns the command schema,
-    /// so another package in the same world scope cannot hijack the System role.
-    /// The returned System still evaluates through the ordinary World Runtime, so
-    /// transaction validation, authority checks, optimistic position checks, and
-    /// commit ordering remain authoritative host responsibilities.
-    ///
-    /// # Errors
-    ///
-    /// Returns an Extension Engine contract-definition error when the same key was
-    /// already reserved incompatibly or defined by an extension.
-    fn bind_world_system(
-        &mut self,
-        world_id: WorldId,
-        command_schema: SchemaKey,
-        schema_owner: ExtensionId,
-    ) -> HostResult<ServiceWorldSystem> {
-        let scope_id = world_runtime_scope_id(world_id);
-        let contract = world_system_service_contract_key(&command_schema);
-        self.engine.define_platform_service_contract_in_scope(
-            scope_id.clone(),
-            contract,
-            ContractResolutionPolicy::Single,
-        )?;
-        let caller = self
-            .engine
-            .platform_service_caller_for_extension(scope_id, schema_owner);
-        Ok(ServiceWorldSystem::new(
-            world_id,
-            command_schema,
-            move |contract: &ContractKey, request: &[u8]| caller.call(contract, request),
-        ))
-    }
-
-    /// Binds one exact effect schema to an extension-provided durable handler service.
-    ///
-    /// The contract is platform-owned and owner-pinned to the extension that owns
-    /// the immutable effect schema, preventing another package in the same world
-    /// scope from hijacking post-commit external work.
-    fn bind_world_effect_handler(
-        &mut self,
-        world_id: WorldId,
-        effect_schema: SchemaKey,
-        schema_owner: ExtensionId,
-    ) -> HostResult<ServiceWorldEffectHandler> {
-        let scope_id = world_runtime_scope_id(world_id);
-        let contract = world_effect_service_contract_key(&effect_schema);
-        self.engine.define_platform_service_contract_in_scope(
-            scope_id.clone(),
-            contract,
-            ContractResolutionPolicy::Single,
-        )?;
-        let caller = self
-            .engine
-            .platform_service_caller_for_extension(scope_id, schema_owner);
-        Ok(ServiceWorldEffectHandler::new(
-            world_id,
-            effect_schema,
-            move |contract: &ContractKey, request: &[u8]| caller.call(contract, request),
-        ))
-    }
-
-    /// Binds one exact Projection schema to its extension-owned filtering service.
-    ///
-    /// Provider resolution is pinned to the immutable schema owner in the exact
-    /// world scope. The service receives a Host-fixed Principal and bounded read
-    /// continuations; raw world storage remains behind the authoritative Host.
-    fn bind_world_projection(
-        &mut self,
-        world_id: WorldId,
-        projection_schema: SchemaKey,
-        schema_owner: ExtensionId,
-    ) -> HostResult<ServiceWorldProjection> {
-        let scope_id = world_runtime_scope_id(world_id);
-        let contract = world_projection_service_contract_key(&projection_schema);
-        self.engine.define_platform_service_contract_in_scope(
-            scope_id.clone(),
-            contract,
-            ContractResolutionPolicy::Single,
-        )?;
-        let caller = self
-            .engine
-            .platform_service_caller_for_extension(scope_id, schema_owner.clone());
-        Ok(ServiceWorldProjection::new(
-            world_id,
-            projection_schema,
-            schema_owner,
-            move |contract: &ContractKey, request: &[u8]| caller.call(contract, request),
-        ))
-    }
-
-    /// Delivers committed durable world events to one active runtime scope.
-    ///
-    /// Routing uses each event's exact versioned schema as the runtime topic.
-    /// The callback payload is the serialized full `StoredWorldEvent` envelope,
-    /// not only its feature payload, so subscribers retain authoritative world,
-    /// position, actor/principal, causation, and correlation metadata.
-    ///
-    /// This method does not reinterpret or mutate the durable event. Delivery is
-    /// ephemeral and may be retried from persistent world storage by a higher
-    /// world-session supervisor.
-    ///
-    /// # Errors
-    ///
-    /// Returns an encoding error or Extension Engine delivery error.
-    pub fn dispatch_world_events(&mut self, events: &[StoredWorldEvent]) -> HostResult<usize> {
-        let Some(first) = events.first() else {
-            return Ok(0);
-        };
-        if events.iter().any(|event| event.world_id != first.world_id) {
-            return Err(HostError::MixedWorldEventBatch);
-        }
-
-        let scope_id = world_runtime_scope_id(first.world_id);
-        let mut delivered = 0_usize;
-        for event in events {
-            let payload = serde_json::to_vec(event)?;
-            delivered += self.engine.dispatch_runtime_event_in_scope(
-                &scope_id,
-                &event.schema.to_string(),
-                &payload,
-            )?;
-        }
-        Ok(delivered)
-    }
-
-    /// Enqueues one bounded ephemeral signal for an active world's runtime scope.
-    ///
-    /// Signals are intentionally in-memory only. They are discarded on world
-    /// deactivation or process exit and never become authoritative history.
-    ///
-    /// # Errors
-    ///
-    /// Returns WorldNotActive, InvalidRuntimeSignalTopic, RuntimeSignalQueueFull,
-    /// RuntimeSignalMessageTooLarge, or an envelope serialization error.
-    pub fn enqueue_runtime_signal(&mut self, signal: RuntimeSignal) -> HostResult<()> {
-        let world_id = signal.world_id();
         let active = self
             .active_worlds
             .get_mut(&world_id)
             .ok_or(HostError::WorldNotActive(world_id))?;
-        active.signals.enqueue(signal)
+        self.world_data.deactivate(world_id);
+        self.engine
+            .close_scope_admission(&world_runtime_scope_id(world_id));
+        active.runtime.shutdown_timeout(timeout)?;
+        let cleanup_failures = cleanup_instances(
+            &mut self.engine,
+            &active.started_instances,
+            &active.registered_instances,
+        );
+        // Failed cleanup retains the entry and the exact pending instances for retry.
+        active
+            .started_instances
+            .retain(|id| self.engine.extension_instance_state(id).is_some());
+        active
+            .registered_instances
+            .retain(|id| self.engine.extension_instance_state(id).is_some());
+        if !cleanup_failures.is_empty() {
+            return Err(HostError::ShutdownFailed(Box::new(HostShutdownFailures {
+                world_failures: Vec::new(),
+                cleanup_failures,
+            })));
+        }
+        self.active_worlds.remove(&world_id);
+        clear_world_scope_topology(&mut self.engine, &world_runtime_scope_id(world_id));
+        Ok(())
     }
 
-    /// Drains queued runtime signals for one world in FIFO order.
+    /// Executes one authoritative command in an active world.
     ///
-    /// A dequeued signal is not retried after a callback-infrastructure failure:
-    /// RuntimeSignal is deliberately best-effort and non-durable. Work requiring
-    /// retry or restart recovery must use the durable Effect/Job outbox instead.
+    /// Returns the single-writer result only after the SQLite transaction commits.
+    /// Failures are returned to the caller rather than logged as deferred work.
     ///
     /// # Errors
     ///
-    /// Returns WorldNotActive or an Extension Engine delivery failure.
-    pub fn pump_runtime_signals(&mut self, world_id: WorldId) -> HostResult<usize> {
-        if !self.active_worlds.contains_key(&world_id) {
-            return Err(HostError::WorldNotActive(world_id));
-        }
-        let scope_id = world_runtime_scope_id(world_id);
-        let mut delivered = 0_usize;
-        loop {
-            let queued = self
-                .active_worlds
-                .get_mut(&world_id)
-                .and_then(|active| active.signals.pop_front());
-            let Some(queued) = queued else {
-                break;
-            };
-            delivered += self.engine.dispatch_runtime_signal_in_scope(
-                &scope_id,
-                queued.topic(),
-                queued.encoded(),
-            )?;
-        }
-        Ok(delivered)
-    }
-
-    fn pump_all_runtime_signals(&mut self) -> HostResult<usize> {
-        let world_ids = self.active_worlds.keys().copied().collect::<Vec<_>>();
-        let mut delivered = 0_usize;
-        for world_id in world_ids {
-            delivered += self.pump_runtime_signals(world_id)?;
-        }
-        Ok(delivered)
-    }
-
-    /// Processes a bounded batch of due durable effect jobs for one active world.
-    ///
-    /// Provider/transport failures and invalid responses do not lose the durable
-    /// job: they are returned to pending state with host-owned exponential backoff.
-    /// A successful optional follow-up command goes through the ordinary authoritative
-    /// World Runtime before the fencing attempt is marked complete.
-    ///
-    /// # Errors
-    ///
-    /// Returns WorldNotActive or a storage/fencing failure. Ordinary handler and
-    /// command failures are durably retried rather than returned as host failures.
-    pub fn pump_effect_outbox(&mut self, world_id: WorldId) -> HostResult<usize> {
-        self.pump_effect_outbox_with_clock(world_id, current_unix_time_millis)
-    }
-
-    #[cfg(test)]
-    fn pump_effect_outbox_at(
+    /// Returns WorldNotActive or a world runtime command/commit error.
+    pub fn submit_world_command(
         &mut self,
         world_id: WorldId,
-        now: UnixTimeMillis,
-    ) -> HostResult<usize> {
-        self.pump_effect_outbox_with_clock(world_id, || now)
-    }
-
-    fn pump_effect_outbox_with_clock<F>(
-        &mut self,
-        world_id: WorldId,
-        mut clock: F,
-    ) -> HostResult<usize>
-    where
-        F: FnMut() -> UnixTimeMillis,
-    {
-        if !self.active_worlds.contains_key(&world_id) {
-            return Err(HostError::WorldNotActive(world_id));
-        }
-        let mut handled = 0_usize;
-
-        for _ in 0..MAX_EFFECT_JOBS_PER_PUMP {
-            let now = clock();
-            let lease_expires_at =
-                UnixTimeMillis::new(now.get().saturating_add(EFFECT_JOB_LEASE_MILLIS));
-            let claim = {
-                let active = self
-                    .active_worlds
-                    .get(&world_id)
-                    .ok_or(HostError::WorldNotActive(world_id))?;
-                active.outbox.claim_next_effect(now, lease_expires_at)?
-            };
-            let Some(claim) = claim else {
-                break;
-            };
-            let job_id = claim.job().id;
-            let attempt = claim.attempt();
-            let response = {
-                let active = self
-                    .active_worlds
-                    .get(&world_id)
-                    .ok_or(HostError::WorldNotActive(world_id))?;
-                match active.effect_handlers.get(&claim.job().schema) {
-                    Some(handler) => handler.execute(&claim),
-                    None => {
-                        self.retry_effect_claim(
-                            world_id,
-                            job_id,
-                            attempt,
-                            now,
-                            "effect schema is not bound to a handler contract",
-                        )?;
-                        handled += 1;
-                        continue;
-                    }
-                }
-            };
-
-            match response {
-                Ok(WorldEffectServiceResponse::Complete { command }) => {
-                    if let Some(command) = command
-                        && let Err(error) = self.submit_world_command(world_id, command)
-                    {
-                        let diagnostic = bounded_effect_diagnostic(&format!(
-                            "effect follow-up command failed: {error}"
-                        ));
-                        self.retry_effect_claim(world_id, job_id, attempt, now, &diagnostic)?;
-                        handled += 1;
-                        continue;
-                    }
-                    let active = self
-                        .active_worlds
-                        .get(&world_id)
-                        .ok_or(HostError::WorldNotActive(world_id))?;
-                    active.outbox.complete_effect(job_id, attempt)?;
-                }
-                Ok(WorldEffectServiceResponse::Retry { reason }) => {
-                    self.retry_effect_claim(world_id, job_id, attempt, now, &reason)?;
-                }
-                Ok(WorldEffectServiceResponse::Cancel { reason }) => {
-                    let active = self
-                        .active_worlds
-                        .get(&world_id)
-                        .ok_or(HostError::WorldNotActive(world_id))?;
-                    active
-                        .outbox
-                        .cancel_claimed_effect(job_id, attempt, &reason)?;
-                }
-                Err(error) => {
-                    let diagnostic = bounded_effect_diagnostic(&error.to_string());
-                    self.retry_effect_claim(world_id, job_id, attempt, now, &diagnostic)?;
-                }
-            }
-            handled += 1;
-        }
-        Ok(handled)
-    }
-
-    fn retry_effect_claim(
-        &self,
-        world_id: WorldId,
-        job_id: rintawa_sdk::world::EffectJobId,
-        attempt: u32,
-        now: UnixTimeMillis,
-        diagnostic: &str,
-    ) -> HostResult<()> {
+        command: WorldCommand,
+    ) -> HostResult<WorldCommandOutcome> {
         let active = self
             .active_worlds
             .get(&world_id)
             .ok_or(HostError::WorldNotActive(world_id))?;
-        let available_at = effect_retry_at(now, attempt);
-        active
-            .outbox
-            .retry_effect(job_id, attempt, available_at, diagnostic)?;
-        Ok(())
+        Ok(active.runtime.submit(command)?.wait()?)
     }
 
-    fn pump_all_effect_outboxes(&mut self) -> HostResult<usize> {
-        let world_ids = self.active_worlds.keys().copied().collect::<Vec<_>>();
-        let mut handled = 0_usize;
-        for world_id in world_ids {
-            handled += self.pump_effect_outbox(world_id)?;
+    /// Submit a command from a native, previously authenticated human session.
+    ///
+    /// The Principal comes from trusted Host ingress, never an extension payload or
+    /// a claimed UI action. Guest submissions cannot call this native method.
+    ///
+    /// # Errors
+    ///
+    /// Refuses Principal impersonation and normal World/runtime failures.
+    pub fn submit_interactive_world_command(
+        &mut self,
+        world_id: WorldId,
+        authenticated_principal: PrincipalId,
+        command: WorldCommand,
+    ) -> HostResult<WorldCommandOutcome> {
+        if command.interactive_principal() != Some(authenticated_principal) {
+            return Err(HostError::InteractiveWorldCommandPrincipalMismatch);
         }
-        Ok(handled)
-    }
-
-    fn next_effect_wakeup_delay(&self, now: UnixTimeMillis) -> HostResult<Option<Duration>> {
-        let mut earliest = None;
-        for active in self.active_worlds.values() {
-            let Some(wakeup) = active.outbox.next_effect_wakeup()? else {
-                continue;
-            };
-            let millis = wakeup.get().saturating_sub(now.get()).max(0);
-            let delay = Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX));
-            earliest = Some(earliest.map_or(delay, |current: Duration| current.min(delay)));
-        }
-        Ok(earliest)
+        self.submit_world_command(world_id, command)
     }
 
     fn record_world_session_result(
@@ -2390,7 +1995,9 @@ impl HostRuntime {
             .map_err(|_| HostError::WorldSessionControlUnavailable)?;
         let mut handled = 0_usize;
         for (world_id, desired_active) in requests {
-            if desired_active == self.is_world_active(world_id) {
+            if desired_active == self.is_world_active(world_id)
+                && !self.pending_world_cleanup.contains_key(&world_id)
+            {
                 access
                     .world_sessions
                     .record_outcome(world_id, desired_active, None)?;
@@ -2411,180 +2018,73 @@ impl HostRuntime {
         Ok(handled)
     }
 
-    fn pump_world_focus_requests(&mut self) -> HostResult<usize> {
-        let requests = self.engine.drain_world_focus_requests()?;
-        let mut handled = 0_usize;
-        for request in requests {
-            if let Err(error) =
-                self.focus_world_for_ui_layer(&request.layer_owner, request.world_id)
-            {
-                let diagnostic = error.to_string();
-                if let Err(record_error) = self.engine.record_world_focus_failure(
-                    &request.layer_owner,
-                    request.world_id,
-                    &diagnostic,
-                ) {
-                    warn!(
-                        world_id = %request.world_id,
-                        error = %record_error,
-                        "deferred World focus result could not be recorded for stale UI Layer session"
-                    );
-                }
-                warn!(
-                    world_id = %request.world_id,
-                    error = %error,
-                    "deferred World focus request failed"
-                );
-            }
-            handled = handled.saturating_add(1);
-        }
-        Ok(handled)
-    }
-
-    fn pump_user_content_write_requests(&mut self) -> HostResult<usize> {
-        let Some(access) = self.host_access.clone() else {
-            return Ok(0);
-        };
-        let requests = access.user_content_writes.drain_pending()?;
-        if requests.is_empty() {
-            return Ok(0);
-        }
-        let home = HostHome::open(&access.home_root)?;
-        let mut handled = 0_usize;
-        for request in requests {
-            let result = (|| -> HostResult<UserContentEntry> {
-                let mut temporary = NamedTempFile::new_in(home.root())?;
-                temporary.write_all(&request.rtw)?;
-                temporary.as_file_mut().flush()?;
-                match request.kind {
-                    DeferredUserContentWriteKind::Import => {
-                        self.import_user_content_rtw(&home, temporary.path())
-                    }
-                    DeferredUserContentWriteKind::Replace(id) => {
-                        self.replace_user_content_rtw(&home, id, temporary.path())
-                    }
-                }
-            })();
-            let status = match result {
-                Ok(entry) => UserContentWriteStatus::Succeeded(to_user_content_summary(entry)),
-                Err(error) => UserContentWriteStatus::Failed(
-                    bounded_user_content_write_diagnostic(&error.to_string()),
-                ),
-            };
-            access
-                .user_content_writes
-                .record_outcome(&request.operation_id, status)?;
-            handled = handled.saturating_add(1);
-        }
-        Ok(handled)
-    }
-
-    fn pump_world_command_requests(&mut self) -> HostResult<usize> {
-        let Some(access) = self.host_access.clone() else {
-            return Ok(0);
-        };
-        let requests = access.world_commands.drain_pending()?;
-        let mut handled = 0_usize;
-        for request in requests {
-            let world_id = request.world_id;
-            let command_id = request.command.id();
-            match self.submit_world_command(world_id, request.command) {
-                Ok(outcome) => {
-                    if let Err(error) = outcome.live_delivery() {
-                        warn!(
-                            %world_id,
-                            %command_id,
-                            %error,
-                            "deferred world command committed but live delivery failed"
-                        );
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        %world_id,
-                        %command_id,
-                        %error,
-                        "deferred world command failed"
-                    );
-                }
-            }
-            handled = handled.saturating_add(1);
-        }
-        Ok(handled)
-    }
-
-    fn pump_world_projection_requests(&mut self) -> HostResult<usize> {
-        let Some(access) = self.host_access.clone() else {
-            return Ok(0);
-        };
-        let requests = access.world_projections.drain_pending()?;
-        let mut handled = 0_usize;
-        for request in requests {
-            let status = match self.project_world(
-                request.world_id,
-                request.principal,
-                &request.projection_schema,
-                request.input,
-            ) {
-                Ok(view) => match serde_json::to_vec(view.value()) {
-                    Ok(value_json) if value_json.len() <= MAX_WORLD_PROJECTION_VIEW_BYTES => {
-                        WorldProjectionReadStatus::Succeeded(WorldProjectionReadView {
-                            world_id: view.world_id().to_string(),
-                            snapshot_position: view.snapshot_position(),
-                            schema: view.schema().to_string(),
-                            value_json,
-                        })
-                    }
-                    Ok(_) => WorldProjectionReadStatus::Failed(String::from(
-                        "projection view exceeds host retention bound",
-                    )),
-                    Err(_) => WorldProjectionReadStatus::Failed(String::from(
-                        "projection view serialization failed",
-                    )),
-                },
-                Err(error) => WorldProjectionReadStatus::Failed(
-                    bounded_world_projection_diagnostic(&error.to_string()),
-                ),
-            };
-            access
-                .world_projections
-                .record_outcome(&request.operation_id, status)?;
-            handled = handled.saturating_add(1);
-        }
-        Ok(handled)
-    }
-
     /// Executes one cooperative runtime pump for active baseline and world components.
     ///
     /// The returned duration is the earliest requested next wake-up. `None` means
     /// no active component currently owns scheduled cooperative work.
     pub fn poll_runtime(&mut self) -> HostResult<Option<Duration>> {
+        if self.shutting_down {
+            return Ok(None);
+        }
         self.pump_world_session_requests()?;
-        self.pump_world_focus_requests()?;
-        self.pump_user_content_write_requests()?;
-        self.pump_world_command_requests()?;
-        self.pump_world_projection_requests()?;
-        self.pump_all_runtime_signals()?;
-        self.pump_all_effect_outboxes()?;
         let engine_delay = self.engine.poll_runtime()?;
         self.pump_world_session_requests()?;
-        self.pump_world_focus_requests()?;
-        self.pump_user_content_write_requests()?;
-        self.pump_world_command_requests()?;
-        self.pump_world_projection_requests()?;
-        let effect_delay = self.next_effect_wakeup_delay(current_unix_time_millis())?;
-        Ok(min_optional_duration(engine_delay, effect_delay))
+        Ok(engine_delay)
     }
 
-    /// Stops every active world, then unregisters baseline runtime instances.
-    pub fn shutdown(mut self) -> HostResult<()> {
-        let (world_failures, mut cleanup_failures) =
-            shutdown_worlds(&mut self.active_worlds, &mut self.engine);
-        cleanup_failures.extend(cleanup_instances(
-            &mut self.engine,
-            &self.started_instances,
-            &self.started_instances,
-        ));
+    /// Closes admission, then gracefully drains Worlds and stops baseline instances.
+    /// Waits at most five seconds for World work; incomplete state remains owned
+    /// by this Host for retry. Arbitrary native callbacks/OS I/O are not terminated.
+    pub fn shutdown(&mut self) -> HostResult<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(access) = &self.host_access {
+            access.secret_operations.shutdown();
+        }
+        self.shutting_down = true;
+        let mut world_failures = Vec::new();
+        let mut cleanup_failures = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        self.engine
+            .close_scope_admission(&RuntimeScopeId::new(HOST_SCOPE));
+        for (world_id, active) in &self.active_worlds {
+            self.world_data.deactivate(*world_id);
+            self.engine
+                .close_scope_admission(&world_runtime_scope_id(*world_id));
+            active.runtime.close_admission()?;
+        }
+        let mut ids: Vec<_> = self
+            .active_worlds
+            .keys()
+            .chain(self.pending_world_cleanup.keys())
+            .copied()
+            .collect();
+        ids.sort_unstable();
+        for world_id in ids.into_iter().rev() {
+            match self.deactivate_world_with_timeout(
+                world_id,
+                deadline.saturating_duration_since(std::time::Instant::now()),
+            ) {
+                Ok(()) => {}
+                Err(HostError::WorldRuntime(error)) => {
+                    world_failures.push(WorldRuntimeCleanupFailure { world_id, error })
+                }
+                Err(HostError::ShutdownFailed(failures)) => {
+                    world_failures.extend(failures.world_failures);
+                    cleanup_failures.extend(failures.cleanup_failures);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // Baseline providers remain available while any World still drains.
+        if self.active_worlds.is_empty() && self.pending_world_cleanup.is_empty() {
+            cleanup_failures.extend(cleanup_instances(
+                &mut self.engine,
+                &self.started_instances,
+                &self.started_instances,
+            ));
+            self.started_instances
+                .retain(|id| self.engine.extension_instance_state(id).is_some());
+        }
         if world_failures.is_empty() && cleanup_failures.is_empty() {
             Ok(())
         } else {
@@ -2596,26 +2096,74 @@ impl HostRuntime {
     }
 }
 
-fn bounded_user_content_write_diagnostic(value: &str) -> String {
-    if value.len() <= MAX_USER_CONTENT_WRITE_DIAGNOSTIC_BYTES {
-        return value.to_string();
+/// Builds the single-writer command runtime for one world from installed artifacts.
+///
+/// Property definitions come from the exact installed world artifacts and are
+/// persisted in the world vocabulary. Command schemas are transient runtime API
+/// descriptions and each is bound to exactly one active WASM System callback.
+///
+/// # Errors
+///
+/// Returns world/storage errors or schema definition conflicts.
+fn prepare_world_runtime(
+    host: &mut HostRuntime,
+    home: &HostHome,
+    world_id: WorldId,
+    instance_ids: &[ExtensionInstanceId],
+) -> HostResult<ActiveWorldRuntimeParts> {
+    let storage = home.open_world_storage(world_id)?;
+    let schemas = installed_world_schemas(&host.engine, instance_ids)?;
+    let property_definitions: Vec<_> = schemas
+        .iter()
+        .filter(|schema| schema.kind == SchemaKind::Property)
+        .map(|schema| {
+            (
+                schema.declarer.instance_id.clone(),
+                PropertyDefinition::new(
+                    schema.key.clone(),
+                    schema.owner.clone(),
+                    schema.definition.clone(),
+                ),
+            )
+        })
+        .collect();
+    let mut builder = WorldRuntimeBuilder::new(storage);
+    let command_owners = schemas
+        .iter()
+        .filter(|schema| schema.kind == SchemaKind::Command)
+        .map(|schema| (schema.key.clone(), schema.declarer.clone()))
+        .collect();
+    for schema in schemas
+        .iter()
+        .filter(|schema| schema.kind != SchemaKind::Property)
+    {
+        builder.register_runtime_schema(
+            schema.declarer.instance_id.clone(),
+            RuntimeSchemaDefinition::new(
+                schema.key.clone(),
+                schema.kind,
+                schema.owner.clone(),
+                schema.definition.clone(),
+            ),
+        )?;
     }
-    let mut end = MAX_USER_CONTENT_WRITE_DIAGNOSTIC_BYTES.min(value.len());
-    while !value.is_char_boundary(end) {
-        end = end.saturating_sub(1);
+    for schema in schemas
+        .iter()
+        .filter(|schema| schema.kind == SchemaKind::Command)
+    {
+        let endpoint = host.engine.world_system_endpoint(&schema.declarer)?;
+        builder.register_system(WasmWorldSystem {
+            command_schema: schema.key.clone(),
+            endpoint,
+        })?;
     }
-    value[..end].to_string()
-}
+    let runtime = builder.start()?;
+    runtime.register_property_definitions(&property_definitions)?;
 
-fn bounded_world_projection_diagnostic(value: &str) -> String {
-    if value.len() <= MAX_WORLD_PROJECTION_STATUS_DIAGNOSTIC_BYTES {
-        return value.to_string();
-    }
-    let mut end = MAX_WORLD_PROJECTION_STATUS_DIAGNOSTIC_BYTES.min(value.len());
-    while !value.is_char_boundary(end) {
-        end = end.saturating_sub(1);
-    }
-    value[..end].to_string()
+    Ok(ActiveWorldRuntimeParts {
+        runtime,
+        command_owners,
+    })
 }
 
 fn bounded_world_session_diagnostic(value: &str) -> String {
@@ -2629,45 +2177,23 @@ fn bounded_world_session_diagnostic(value: &str) -> String {
     value[..end].to_string()
 }
 
-fn current_unix_time_millis() -> UnixTimeMillis {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO);
-    let millis = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
-    UnixTimeMillis::new(millis)
-}
-
-fn effect_retry_at(now: UnixTimeMillis, attempt: u32) -> UnixTimeMillis {
-    let exponent = attempt.saturating_sub(1).min(16);
-    let multiplier = 1_i64.checked_shl(exponent).unwrap_or(i64::MAX);
-    let delay = EFFECT_RETRY_BASE_MILLIS
-        .saturating_mul(multiplier)
-        .min(EFFECT_RETRY_MAX_MILLIS);
-    UnixTimeMillis::new(now.get().saturating_add(delay))
-}
-
-fn bounded_effect_diagnostic(reason: &str) -> String {
-    if reason.len() <= MAX_WORLD_EFFECT_DIAGNOSTIC_BYTES {
-        return reason.to_string();
-    }
-    let mut end = MAX_WORLD_EFFECT_DIAGNOSTIC_BYTES;
-    while !reason.is_char_boundary(end) {
-        end -= 1;
-    }
-    reason[..end].to_string()
-}
-
-fn min_optional_duration(left: Option<Duration>, right: Option<Duration>) -> Option<Duration> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
-    }
-}
-
+#[derive(Default)]
 struct ActivatedComposition {
+    _lifecycle: Option<std::fs::File>,
     registered_instances: Vec<ExtensionInstanceId>,
     started_instances: Vec<ExtensionInstanceId>,
+}
+
+impl ActivatedComposition {
+    fn cleanup(&mut self, engine: &mut ExtensionEngine) -> Vec<HostCleanupFailure> {
+        let failures =
+            cleanup_instances(engine, &self.started_instances, &self.registered_instances);
+        self.started_instances
+            .retain(|id| engine.extension_instance_state(id).is_some());
+        self.registered_instances
+            .retain(|id| engine.extension_instance_state(id).is_some());
+        failures
+    }
 }
 
 fn activate_composition(
@@ -2675,12 +2201,14 @@ fn activate_composition(
     home: &HostHome,
     profile: &CompositionProfile,
     scope_id: &RuntimeScopeId,
-) -> HostResult<ActivatedComposition> {
+    ownership: &mut ActivatedComposition,
+) -> HostResult<()> {
     profile.validate_scope(scope_id)?;
     engine.clear_preferred_contract_provider_policies_in_scope(scope_id);
+    engine.clear_authoritative_transport_providers_in_scope(scope_id);
     let loader = RtwExtensionLoader::new();
-    let mut registered = Vec::new();
-    let mut started = Vec::new();
+    let registered = &mut ownership.registered_instances;
+    let started = &mut ownership.started_instances;
 
     let result: HostResult<()> = (|| {
         let activations: Vec<_> = profile
@@ -2697,6 +2225,13 @@ fn activate_composition(
             }
         }
 
+        for selection in &profile.authoritative_providers {
+            engine.set_authoritative_transport_provider_in_scope(
+                &selection.scope_id,
+                &selection.point,
+                &selection.provider(),
+            )?;
+        }
         for selection in &profile.preferred_providers {
             engine.set_preferred_contract_provider_policy_in_scope(
                 selection.scope_id.clone(),
@@ -2739,6 +2274,21 @@ fn activate_composition(
                                 grant.permission,
                             )?;
                         }
+                        for grant in profile.http_loopback_origins.iter().filter(|grant| {
+                            grant.scope_id == activation.scope_id
+                                && grant.instance_id == activation.instance_id
+                        }) {
+                            engine.approve_requested_http_loopback_origin_for_instance(
+                                &activation.instance_id,
+                                &grant.component_id,
+                                &grant.origin,
+                            )?;
+                        }
+                        crate::secret_config::apply_secret_read_grants(
+                            engine,
+                            profile,
+                            &activation,
+                        )?;
                         made_progress = true;
                     }
                     RtwExtensionLoadOutcome::Deferred(waiting) => {
@@ -2843,8 +2393,9 @@ fn activate_composition(
     })();
 
     if let Err(error) = result {
-        let cleanup_failures = cleanup_instances(engine, &started, &registered);
+        let cleanup_failures = ownership.cleanup(engine);
         engine.clear_preferred_contract_provider_policies_in_scope(scope_id);
+        engine.clear_authoritative_transport_providers_in_scope(scope_id);
         if cleanup_failures.is_empty() {
             return Err(error);
         }
@@ -2854,21 +2405,49 @@ fn activate_composition(
         })));
     }
 
-    Ok(ActivatedComposition {
-        registered_instances: registered,
-        started_instances: started,
-    })
+    Ok(())
 }
 
-fn register_world_schema_contributions(
+/// One immutable world schema declared by an exact installed extension artifact.
+struct InstalledWorldSchema {
+    key: SchemaKey,
+    kind: SchemaKind,
+    owner: ExtensionId,
+    declarer: ComponentRef,
+    definition: serde_json::Value,
+}
+
+/// Collects the world schemas declared by the exact installed world artifacts.
+///
+/// Ownership comes from the installed artifact manifest and exact instance.
+/// Components in that instance share property authority; command admission
+/// requires the exact declaring component. All versions of a property name
+/// must share the same instance, checked before any durable publication.
+///
+/// # Errors
+///
+/// Returns an Engine error for an unknown runtime instance, or
+/// [`HostError::InvalidWorldSchemaJson`] when a declaration is not valid JSON.
+fn installed_world_schemas(
     engine: &ExtensionEngine,
-    storage: &SqliteWorldStorage,
     instance_ids: &[ExtensionInstanceId],
-) -> HostResult<()> {
-    let mut definitions = Vec::new();
+) -> HostResult<Vec<InstalledWorldSchema>> {
+    let mut schemas = Vec::new();
+    let mut property_owners = BTreeMap::new();
     for instance_id in instance_ids {
         for registered in engine.registered_world_schemas(instance_id)? {
             let contribution = registered.contribution();
+            if contribution.kind() == SchemaKind::Property
+                && let Some(previous) =
+                    property_owners.insert(contribution.key().id().clone(), instance_id.clone())
+                && previous != *instance_id
+            {
+                return Err(HostError::AmbiguousWorldSchemaDeclaration {
+                    schema: contribution.key().clone(),
+                    first: previous.to_string(),
+                    second: instance_id.to_string(),
+                });
+            }
             let definition =
                 serde_json::from_str(contribution.definition_json()).map_err(|source| {
                     HostError::InvalidWorldSchemaJson {
@@ -2876,62 +2455,56 @@ fn register_world_schema_contributions(
                         source,
                     }
                 })?;
-            definitions.push(SchemaDefinition::new(
-                contribution.key().clone(),
-                contribution.kind(),
-                registered.extension_id().clone(),
+            schemas.push(InstalledWorldSchema {
+                key: contribution.key().clone(),
+                kind: contribution.kind(),
+                owner: registered.extension_id().clone(),
+                declarer: ComponentRef::new(instance_id.clone(), registered.component_id().clone()),
                 definition,
-            ));
+            });
         }
     }
 
-    definitions.sort_by(|left, right| {
-        left.key()
-            .cmp(right.key())
-            .then_with(|| left.owner().as_str().cmp(right.owner().as_str()))
+    schemas.sort_by(|left, right| {
+        left.key
+            .cmp(&right.key)
+            .then_with(|| left.owner.as_str().cmp(right.owner.as_str()))
+            .then_with(|| {
+                left.declarer
+                    .instance_id
+                    .as_str()
+                    .cmp(right.declarer.instance_id.as_str())
+            })
+            .then_with(|| {
+                left.declarer
+                    .component_id
+                    .as_str()
+                    .cmp(right.declarer.component_id.as_str())
+            })
     });
-    storage.register_schemas(&definitions)?;
-    Ok(())
-}
-
-fn cleanup_active_world(
-    engine: &mut ExtensionEngine,
-    world_id: WorldId,
-    active: ActiveWorld,
-) -> (Vec<WorldRuntimeCleanupFailure>, Vec<HostCleanupFailure>) {
-    let mut world_failures = Vec::new();
-    if let Err(error) = active.runtime.shutdown() {
-        world_failures.push(WorldRuntimeCleanupFailure { world_id, error });
+    for adjacent in schemas.windows(2) {
+        if adjacent[0].key == adjacent[1].key && adjacent[0].declarer != adjacent[1].declarer {
+            let principal =
+                |owner: &ComponentRef| format!("{}/{}", owner.instance_id, owner.component_id);
+            return Err(HostError::AmbiguousWorldSchemaDeclaration {
+                schema: adjacent[0].key.clone(),
+                first: principal(&adjacent[0].declarer),
+                second: principal(&adjacent[1].declarer),
+            });
+        }
     }
-    let cleanup_failures = cleanup_instances(
-        engine,
-        &active.started_instances,
-        &active.registered_instances,
-    );
-    clear_world_scope_topology(engine, &world_runtime_scope_id(world_id));
-    (world_failures, cleanup_failures)
+    schemas.dedup_by(|left, right| {
+        left.key == right.key
+            && left.kind == right.kind
+            && left.declarer == right.declarer
+            && left.definition == right.definition
+    });
+    Ok(schemas)
 }
-
 fn clear_world_scope_topology(engine: &mut ExtensionEngine, scope_id: &RuntimeScopeId) {
-    engine.clear_focused_world_scope_for_all_ui_layers(scope_id);
     engine.clear_preferred_contract_provider_policies_in_scope(scope_id);
+    engine.clear_authoritative_transport_providers_in_scope(scope_id);
     engine.clear_platform_contract_definitions_in_scope(scope_id);
-}
-
-fn shutdown_worlds(
-    active_worlds: &mut BTreeMap<WorldId, ActiveWorld>,
-    engine: &mut ExtensionEngine,
-) -> (Vec<WorldRuntimeCleanupFailure>, Vec<HostCleanupFailure>) {
-    let worlds = std::mem::take(active_worlds);
-    let mut world_failures = Vec::new();
-    let mut cleanup_failures = Vec::new();
-    for (world_id, active) in worlds.into_iter().rev() {
-        let (mut world_errors, mut extension_errors) =
-            cleanup_active_world(engine, world_id, active);
-        world_failures.append(&mut world_errors);
-        cleanup_failures.append(&mut extension_errors);
-    }
-    (world_failures, cleanup_failures)
 }
 
 fn cleanup_instances(
@@ -2962,6 +2535,7 @@ fn cleanup_instances(
                 operation: HostCleanupOperation::Stop,
                 error,
             });
+            continue;
         }
         record_unregister_failure(engine, instance_id, &mut failures);
     }
@@ -3044,14 +2618,22 @@ fn bootstrap_batch_error(
 
 #[cfg(test)]
 mod tests {
+    fn test_principal(
+        engine: &rintawa_extension_engine::ExtensionEngine,
+        owner: &rintawa_sdk::contracts::ComponentRef,
+    ) -> rintawa_sdk::contracts::ComponentPrincipal {
+        engine
+            .active_component_principal(owner)
+            .unwrap_or_else(|_| rintawa_sdk::contracts::ComponentPrincipal {
+                instance_id: owner.instance_id.clone(),
+                component_id: owner.component_id.clone(),
+                activation: 0,
+            })
+    }
+
     use super::*;
-    use rintawa_sdk::ui::{
-        UI_CAPABILITY_TEXT, UiCapabilityId, UiLayerDescriptor, UiNode, UiNodeId, UiNodeKind,
-        UiPlacementHint, UiSurfaceContribution, UiSurfaceId, UiSurfaceSnapshot, UiTextNode,
-        WorldPresentationDescriptor,
-    };
     use rintawa_sdk::{
-        context::{ComponentContext, RegistrationContext},
+        context::RegistrationContext,
         contracts::{
             ContractConsumer, ContractDefinition, ContractKey, ContractProvider, ContractVersion,
         },
@@ -3059,24 +2641,13 @@ mod tests {
         errors::{ExtensionError, ExtensionResult},
         manifest::ExtensionManifest,
         prelude::{Component, ComponentId, ContractResolutionPolicy, ExtensionId},
-        runtime_effects::RuntimeEffect,
-        world::{
-            CommandId, CorrelationId, EffectJobId, PrincipalId, SchemaKey, UnixTimeMillis,
-            WorldEventId, WorldId,
-        },
-        world_system::{WorldSystemEventProposal, WorldSystemTransaction},
+        world::{ItemId, PrincipalId, SchemaKey, WorldId},
     };
-    use rintawa_storage::SqliteWorldStorage;
     use rintawa_world::{
-        ActorRef, CausationRef, CommandProvenance, EffectJobDraft, SchemaDefinition, SchemaKind,
-        WorldCommand, WorldEventDraft, WorldTransaction,
+        PropertyDefinition, RuntimeSchemaDefinition, SchemaKind, StateChange, WorldCommand,
+        WorldError, WorldTransaction,
     };
-    use rintawa_world_runtime::{
-        WorldEffectServiceRequest, WorldEffectServiceResponse, WorldProjectionServiceRequest,
-        WorldProjectionServiceResponse, WorldRuntimeBuilder, WorldSystem,
-        WorldSystemServiceRequest, WorldSystemServiceResponse, world_effect_service_contract_key,
-        world_projection_service_contract_key, world_system_service_contract_key,
-    };
+    use rintawa_world_runtime::{WorldRuntimeBuilder, WorldRuntimeError, WorldSystem};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -3085,12 +2656,9 @@ mod tests {
         let root = tempfile::tempdir()?;
         let access = LocalHostAccess::new(
             root.path(),
-            PrincipalId::new(),
-            UserContentWriteRuntimeControl::default(),
             UserResourceRuntimeControl::default(),
             WorldSessionRuntimeControl::default(),
-            WorldCommandRuntimeControl::default(),
-            WorldProjectionRuntimeControl::default(),
+            WorldDataRuntimeControl::default(),
         );
         let world_id = WorldId::new();
         assert_eq!(
@@ -3130,6 +2698,10 @@ mod tests {
     }
 
     impl Component for ContractComponent {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn id(&self) -> &ComponentId {
             &self.id
         }
@@ -3158,10 +2730,12 @@ mod tests {
         }
     }
 
+    /// Records every evaluated command and writes one item plus one property.
     struct RecordingWorldSystem {
         command_schema: SchemaKey,
-        event_schema: SchemaKey,
+        property_schema: SchemaKey,
         observed: Arc<Mutex<Vec<WorldCommand>>>,
+        created: Arc<Mutex<Vec<ItemId>>>,
     }
 
     impl WorldSystem for RecordingWorldSystem {
@@ -3182,77 +2756,24 @@ mod tests {
                     ))
                 })?
                 .push(command.clone());
-            let mut transaction = WorldTransaction::new();
-            transaction.push_event(WorldEventDraft::new(
-                self.event_schema.clone(),
-                command.payload().clone(),
-            ));
-            Ok(transaction)
-        }
-    }
-
-    struct ContentHandlerProvider {
-        id: ComponentId,
-        contract: ContractKey,
-        observed: Arc<Mutex<Vec<ContentHandlerRequest>>>,
-    }
-
-    impl Component for ContentHandlerProvider {
-        fn id(&self) -> &ComponentId {
-            &self.id
-        }
-
-        fn register(&mut self, ctx: &mut dyn RegistrationContext) -> ExtensionResult<()> {
-            ctx.provide_contract(ContractProvider::new(self.contract.clone()))
-        }
-
-        fn handle_service(
-            &mut self,
-            _ctx: &mut dyn ComponentContext,
-            contract: &ContractKey,
-            request: &[u8],
-        ) -> ExtensionResult<Vec<u8>> {
-            if contract != &self.contract {
-                return Err(ExtensionError::ServiceHandlerUnavailable(
-                    contract.to_string(),
-                ));
-            }
-            let request: ContentHandlerRequest = serde_json::from_slice(request)
-                .map_err(|error| ExtensionError::Message(error.to_string()))?;
-            self.observed
+            let item = ItemId::new();
+            self.created
                 .lock()
                 .map_err(|_| {
-                    ExtensionError::Message(String::from("content observer lock poisoned"))
+                    rintawa_world_runtime::SystemError::Failed(String::from(
+                        "test item observer lock poisoned",
+                    ))
                 })?
-                .push(request.clone());
-            let response = if request.descriptor == b"reject" {
-                ContentHandlerResponse::Rejected {
-                    diagnostic: String::from("descriptor rejected by test handler"),
-                }
-            } else {
-                ContentHandlerResponse::Accepted
-            };
-            serde_json::to_vec(&response)
-                .map_err(|error| ExtensionError::Message(error.to_string()))
+                .push(item);
+            let mut transaction = WorldTransaction::new();
+            transaction.push_change(StateChange::CreateObject { id: item });
+            transaction.push_change(StateChange::SetProperty {
+                item,
+                key: self.property_schema.clone(),
+                data: command.payload().clone(),
+            });
+            Ok(transaction)
         }
-    }
-
-    fn write_test_content_rtw(
-        root: &Path,
-        name: &str,
-        content: &str,
-        descriptor: &[u8],
-    ) -> anyhow::Result<PathBuf> {
-        let source = root.join(format!("{name}-source"));
-        std::fs::create_dir(&source)?;
-        std::fs::write(
-            source.join("rtw.toml"),
-            format!("format = 1\ncontent = \"{content}\"\nentry = \"content.bin\"\n"),
-        )?;
-        std::fs::write(source.join("content.bin"), descriptor)?;
-        let output = root.join(format!("{name}.rtw"));
-        rintawa_artifacts::pack_directory(&source, &output, RtwLimits::default())?;
-        Ok(output)
     }
 
     struct WorldSchemaComponent {
@@ -3261,6 +2782,10 @@ mod tests {
     }
 
     impl Component for WorldSchemaComponent {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn id(&self) -> &ComponentId {
             &self.id
         }
@@ -3273,373 +2798,15 @@ mod tests {
         }
     }
 
-    struct WorldSystemProvider {
-        id: ComponentId,
-        contract: ContractKey,
-        event_schema: SchemaKey,
-    }
-
-    impl Component for WorldSystemProvider {
-        fn id(&self) -> &ComponentId {
-            &self.id
-        }
-
-        fn register(&mut self, ctx: &mut dyn RegistrationContext) -> ExtensionResult<()> {
-            ctx.provide_contract(ContractProvider::new(self.contract.clone()))
-        }
-
-        fn handle_service(
-            &mut self,
-            _ctx: &mut dyn ComponentContext,
-            contract: &ContractKey,
-            request: &[u8],
-        ) -> ExtensionResult<Vec<u8>> {
-            if contract != &self.contract {
-                return Err(ExtensionError::ServiceHandlerUnavailable(
-                    contract.to_string(),
-                ));
-            }
-            let request: WorldSystemServiceRequest = serde_json::from_slice(request)
-                .map_err(|error| ExtensionError::Message(error.to_string()))?;
-            let mut transaction = WorldSystemTransaction::new();
-            transaction.push_event(WorldSystemEventProposal {
-                schema: self.event_schema.clone(),
-                payload: request.command().payload.clone(),
-            });
-            serde_json::to_vec(&WorldSystemServiceResponse::Transaction { transaction })
-                .map_err(|error| ExtensionError::Message(error.to_string()))
-        }
-    }
-
-    struct WorldEffectProvider {
-        id: ComponentId,
-        contract: ContractKey,
-        result_command_schema: SchemaKey,
-        remaining_retries: usize,
-        should_cancel: bool,
-        observed: Arc<Mutex<Vec<WorldEffectServiceRequest>>>,
-    }
-
-    impl Component for WorldEffectProvider {
-        fn id(&self) -> &ComponentId {
-            &self.id
-        }
-
-        fn register(&mut self, ctx: &mut dyn RegistrationContext) -> ExtensionResult<()> {
-            ctx.provide_contract(ContractProvider::new(self.contract.clone()))
-        }
-
-        fn handle_service(
-            &mut self,
-            _ctx: &mut dyn ComponentContext,
-            contract: &ContractKey,
-            request: &[u8],
-        ) -> ExtensionResult<Vec<u8>> {
-            if contract != &self.contract {
-                return Err(ExtensionError::ServiceHandlerUnavailable(
-                    contract.to_string(),
-                ));
-            }
-            let request: WorldEffectServiceRequest = serde_json::from_slice(request)
-                .map_err(|error| ExtensionError::Message(error.to_string()))?;
-            self.observed
-                .lock()
-                .map_err(|_| {
-                    ExtensionError::Message(String::from("effect observer lock poisoned"))
-                })?
-                .push(request.clone());
-
-            let response = if self.should_cancel {
-                WorldEffectServiceResponse::Cancel {
-                    reason: String::from("test cancellation"),
-                }
-            } else if self.remaining_retries > 0 {
-                self.remaining_retries -= 1;
-                WorldEffectServiceResponse::Retry {
-                    reason: String::from("temporary provider failure"),
-                }
-            } else {
-                let job = request.job();
-                let command = WorldCommand::with_ids(
-                    request.completion_command_id(),
-                    job.provenance.correlation_id,
-                    self.result_command_schema.clone(),
-                    job.provenance.principal,
-                    job.provenance.actor,
-                    serde_json::json!({ "effect_job_id": job.id.to_string() }),
-                )
-                .caused_by(CausationRef::Effect(job.id));
-                WorldEffectServiceResponse::Complete {
-                    command: Some(command),
-                }
-            };
-            serde_json::to_vec(&response)
-                .map_err(|error| ExtensionError::Message(error.to_string()))
-        }
-    }
-
-    struct WorldProjectionProvider {
-        id: ComponentId,
-        contract: ContractKey,
-        reject: bool,
-        observed: Arc<Mutex<Vec<WorldProjectionServiceRequest>>>,
-    }
-
-    impl Component for WorldProjectionProvider {
-        fn id(&self) -> &ComponentId {
-            &self.id
-        }
-
-        fn register(&mut self, ctx: &mut dyn RegistrationContext) -> ExtensionResult<()> {
-            ctx.provide_contract(ContractProvider::new(self.contract.clone()))
-        }
-
-        fn handle_service(
-            &mut self,
-            _ctx: &mut dyn ComponentContext,
-            contract: &ContractKey,
-            request: &[u8],
-        ) -> ExtensionResult<Vec<u8>> {
-            if contract != &self.contract {
-                return Err(ExtensionError::ServiceHandlerUnavailable(
-                    contract.to_string(),
-                ));
-            }
-            let request: WorldProjectionServiceRequest = serde_json::from_slice(request)
-                .map_err(|error| ExtensionError::Message(error.to_string()))?;
-            self.observed
-                .lock()
-                .map_err(|_| {
-                    ExtensionError::Message(String::from("projection observer lock poisoned"))
-                })?
-                .push(request.clone());
-            if self.reject {
-                return Err(ExtensionError::Message(String::from(
-                    "hijacker projection provider invoked",
-                )));
-            }
-            serde_json::to_vec(&WorldProjectionServiceResponse::Complete {
-                value: serde_json::json!({
-                    "provider": "owner",
-                    "principal": request.principal().to_string(),
-                }),
-            })
-            .map_err(|error| ExtensionError::Message(error.to_string()))
-        }
-    }
-
-    fn enqueue_test_effect(
-        storage: &SqliteWorldStorage,
-        command_schema: &SchemaKey,
-        effect_schema: &SchemaKey,
-        principal: PrincipalId,
-    ) -> anyhow::Result<(EffectJobId, CorrelationId)> {
-        let command = WorldCommand::new(
-            command_schema.clone(),
-            principal,
-            ActorRef::Principal(principal),
-            serde_json::json!({ "kind": "enqueue-effect" }),
-        );
-        let correlation_id = command.correlation_id();
-        let effect = EffectJobDraft::new(
-            effect_schema.clone(),
-            serde_json::json!({ "input": "generate" }),
-        );
-        let effect_id = effect.id();
-        let mut transaction = WorldTransaction::new();
-        transaction.push_effect(effect);
-        let snapshot = storage.snapshot_for_command(&command)?;
-        let position = snapshot.position();
-        drop(snapshot);
-        storage.commit(&command, &transaction, position)?;
-        Ok((effect_id, correlation_id))
-    }
-
-    struct TestEffectRoutes<'a> {
-        result_owner: &'a ExtensionId,
-        result_schema: &'a SchemaKey,
-        event_schema: &'a SchemaKey,
-        effect_owner: &'a ExtensionId,
-        effect_schema: &'a SchemaKey,
-        remaining_retries: usize,
-        observed: Arc<Mutex<Vec<WorldEffectServiceRequest>>>,
-    }
-
-    fn register_test_effect_routes(
-        host: &mut HostRuntime,
-        world_id: WorldId,
-        routes: TestEffectRoutes<'_>,
-    ) -> anyhow::Result<()> {
-        let scope = world_runtime_scope_id(world_id);
-        let system_instance = ExtensionInstanceId::new("effect-result-system");
-        host.engine.register_extension_instance(
-            system_instance.clone(),
-            scope.clone(),
-            test_manifest(routes.result_owner.as_str()),
-            vec![Box::new(WorldSystemProvider {
-                id: ComponentId::new("runtime"),
-                contract: world_system_service_contract_key(routes.result_schema),
-                event_schema: routes.event_schema.clone(),
-            })],
-        )?;
-        host.engine.start_extension_instance(&system_instance)?;
-
-        let effect_contract = world_effect_service_contract_key(routes.effect_schema);
-        let hijacker_instance = ExtensionInstanceId::new("a-effect-hijacker");
-        host.engine.register_extension_instance(
-            hijacker_instance.clone(),
-            scope.clone(),
-            test_manifest("rintawa.effect-hijacker"),
-            vec![Box::new(WorldEffectProvider {
-                id: ComponentId::new("runtime"),
-                contract: effect_contract.clone(),
-                result_command_schema: routes.result_schema.clone(),
-                remaining_retries: 0,
-                should_cancel: true,
-                observed: Arc::new(Mutex::new(Vec::new())),
-            })],
-        )?;
-        host.engine.start_extension_instance(&hijacker_instance)?;
-
-        let provider_instance = ExtensionInstanceId::new("z-effect-provider");
-        host.engine.register_extension_instance(
-            provider_instance.clone(),
-            scope,
-            test_manifest(routes.effect_owner.as_str()),
-            vec![Box::new(WorldEffectProvider {
-                id: ComponentId::new("runtime"),
-                contract: effect_contract,
-                result_command_schema: routes.result_schema.clone(),
-                remaining_retries: routes.remaining_retries,
-                should_cancel: false,
-                observed: routes.observed,
-            })],
-        )?;
-        host.engine.start_extension_instance(&provider_instance)?;
-
-        let active = host
-            .active_worlds
-            .get_mut(&world_id)
-            .ok_or(HostError::WorldNotActive(world_id))?;
-        active.registered_instances.extend([
-            system_instance.clone(),
-            hijacker_instance.clone(),
-            provider_instance.clone(),
-        ]);
-        active
-            .started_instances
-            .extend([system_instance, hijacker_instance, provider_instance]);
-        Ok(())
-    }
-
-    struct RejectingWorldSystemProvider {
-        id: ComponentId,
-        contract: ContractKey,
-    }
-
-    impl Component for RejectingWorldSystemProvider {
-        fn id(&self) -> &ComponentId {
-            &self.id
-        }
-
-        fn register(&mut self, ctx: &mut dyn RegistrationContext) -> ExtensionResult<()> {
-            ctx.provide_contract(ContractProvider::new(self.contract.clone()))
-        }
-
-        fn handle_service(
-            &mut self,
-            _ctx: &mut dyn ComponentContext,
-            contract: &ContractKey,
-            _request: &[u8],
-        ) -> ExtensionResult<Vec<u8>> {
-            if contract != &self.contract {
-                return Err(ExtensionError::ServiceHandlerUnavailable(
-                    contract.to_string(),
-                ));
-            }
-            serde_json::to_vec(&WorldSystemServiceResponse::Rejected {
-                reason: String::from("hijacker selected"),
-            })
-            .map_err(|error| ExtensionError::Message(error.to_string()))
-        }
-    }
-
-    struct RuntimeSignalSubscriber {
-        id: ComponentId,
-        topic: String,
-        observed: Arc<Mutex<Vec<RuntimeSignal>>>,
-    }
-
-    impl Component for RuntimeSignalSubscriber {
-        fn id(&self) -> &ComponentId {
-            &self.id
-        }
-
-        fn start(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
-            ctx.register_runtime_effect(RuntimeEffect::signal_subscription(self.topic.clone()))?;
-            Ok(())
-        }
-
-        fn handle_event(
-            &mut self,
-            _ctx: &mut dyn ComponentContext,
-            _topic: &str,
-            payload: &[u8],
-        ) -> ExtensionResult<()> {
-            let signal: RuntimeSignal = serde_json::from_slice(payload)
-                .map_err(|error| ExtensionError::Message(error.to_string()))?;
-            self.observed
-                .lock()
-                .map_err(|_| {
-                    ExtensionError::Message(String::from("signal observer lock poisoned"))
-                })?
-                .push(signal);
-            Ok(())
-        }
-    }
-
-    struct WorldEventSubscriber {
-        id: ComponentId,
-        topic: String,
-        observed: Arc<Mutex<Vec<(String, StoredWorldEvent)>>>,
-    }
-
-    impl Component for WorldEventSubscriber {
-        fn id(&self) -> &ComponentId {
-            &self.id
-        }
-
-        fn start(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
-            ctx.register_runtime_effect(RuntimeEffect::event_subscription(self.topic.clone()))?;
-            Ok(())
-        }
-
-        fn handle_event(
-            &mut self,
-            _ctx: &mut dyn ComponentContext,
-            topic: &str,
-            payload: &[u8],
-        ) -> ExtensionResult<()> {
-            let event: StoredWorldEvent = serde_json::from_slice(payload)
-                .map_err(|error| ExtensionError::Message(error.to_string()))?;
-            self.observed
-                .lock()
-                .map_err(|_| ExtensionError::Message(String::from("event observer lock poisoned")))?
-                .push((topic.to_string(), event));
-            Ok(())
-        }
-    }
-
     #[test]
-    fn test_should_publish_registered_extension_world_schemas_atomically() -> anyhow::Result<()> {
+    fn test_should_register_installed_world_property_and_runtime_schemas() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
-        let world_id = WorldId::new();
-        let storage = SqliteWorldStorage::create(root.path().join("world.sqlite"), world_id)?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let world_id = home.create_world()?.id;
         let scope = world_runtime_scope_id(world_id);
         let owner = ExtensionId::new("rintawa.schema-owner");
         let instance = ExtensionInstanceId::new("schema-owner-instance");
-        let first: SchemaKey = "rintawa.test.extension-event@1".parse()?;
-        let second: SchemaKey = "rintawa.test.extension-facet@1".parse()?;
+        let property: SchemaKey = "rintawa.test.mood@1".parse()?;
         let mut engine = ExtensionEngine::new();
 
         engine.register_extension_instance(
@@ -3648,36 +2815,687 @@ mod tests {
             test_manifest(owner.as_str()),
             vec![Box::new(WorldSchemaComponent {
                 id: ComponentId::new("schemas"),
-                schemas: vec![
-                    WorldSchemaContribution::new(
-                        first.clone(),
-                        SchemaKind::Event,
-                        r#"{"type":"object"}"#,
-                    ),
-                    WorldSchemaContribution::new(
-                        second.clone(),
-                        SchemaKind::Facet,
-                        r#"{"type":"string"}"#,
-                    ),
-                ],
+                schemas: vec![WorldSchemaContribution::new(
+                    property.clone(),
+                    SchemaKind::Property,
+                    r#"{"type":"object"}"#,
+                )],
             })],
         )?;
 
-        register_world_schema_contributions(&engine, &storage, std::slice::from_ref(&instance))?;
-        let session = storage.load_session()?;
-        let first_definition = session
-            .schemas()
-            .get(&first)
-            .expect("event schema must persist");
-        assert_eq!(first_definition.owner(), &owner);
-        assert_eq!(first_definition.kind(), SchemaKind::Event);
+        let mut host = HostRuntime {
+            baseline_artifacts: BTreeMap::new(),
+            active_worlds: BTreeMap::new(),
+            shutting_down: false,
+            pending_world_cleanup: BTreeMap::new(),
+            engine,
+            started_instances: Vec::new(),
+            host_shell_provider: None,
+            host_access: None,
+            world_data: WorldDataRuntimeControl::default(),
+        };
+        let parts =
+            prepare_world_runtime(&mut host, &home, world_id, std::slice::from_ref(&instance))?;
+
+        let session = home.load_world_state(world_id)?;
+        let registered = session
+            .properties()
+            .get(&property)
+            .expect("property definition must persist in the world vocabulary");
+        // The owner is Host composition metadata and is not persisted in the
+        // world vocabulary; only the exact name, version and schema document are.
         assert_eq!(
-            session.schemas().get(&second).map(SchemaDefinition::kind),
-            Some(SchemaKind::Facet)
+            registered.schema(),
+            &serde_json::json!({ "type": "object" })
+        );
+        assert_eq!(session.properties().len(), 1);
+
+        // Exact re-registration is idempotent across world restarts.
+        let repeated = PropertyDefinition::new(
+            property.clone(),
+            owner.clone(),
+            serde_json::json!({ "type": "object" }),
+        );
+        parts
+            .runtime
+            .register_property_definitions(&[(instance, repeated)])?;
+        assert_eq!(home.load_world_state(world_id)?.properties().len(), 1);
+
+        parts.runtime.shutdown()?;
+        host.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_execute_wasm_world_system_commit_rollback_and_owner_denial() -> anyhow::Result<()>
+    {
+        const WORLD_SYSTEM_FIXTURE: &[u8] =
+            include_bytes!("../../extension-engine/tests/fixtures/world-system/component.wasm");
+
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let world_id = home.create_world()?.id;
+        let scope = world_runtime_scope_id(world_id);
+        let item = ItemId::new();
+        let mut seed = WorldTransaction::new();
+        seed.push_change(StateChange::CreateObject { id: item });
+        home.open_world_storage(world_id)?.apply(&seed)?;
+
+        let owner_instance = ExtensionInstanceId::new("wasm-world-system");
+        let foreign_instance = ExtensionInstanceId::new("foreign-property-owner");
+        let world_data = WorldDataRuntimeControl::default();
+        let mut engine = ExtensionEngine::new();
+        engine.attach_world_data_access(Arc::new(world_data.clone()));
+        let wasm_component = engine
+            .wasm_runtime_engine()?
+            .load_component_from_bytes(ComponentId::new("wasm-system"), WORLD_SYSTEM_FIXTURE)?;
+        engine.register_extension_instance(
+            owner_instance.clone(),
+            scope.clone(),
+            test_manifest("fixture.world-system"),
+            vec![Box::new(wasm_component)],
+        )?;
+        engine.register_extension_instance(
+            foreign_instance.clone(),
+            scope,
+            test_manifest("fixture.foreign-owner"),
+            vec![Box::new(WorldSchemaComponent {
+                id: ComponentId::new("foreign-schemas"),
+                schemas: vec![WorldSchemaContribution::new(
+                    "fixture.foreign-property@1".parse()?,
+                    SchemaKind::Property,
+                    r#"{"type":"integer"}"#,
+                )],
+            })],
+        )?;
+        engine.start_extension_instance(&owner_instance)?;
+        engine.start_extension_instance(&foreign_instance)?;
+
+        let mut host = HostRuntime {
+            baseline_artifacts: BTreeMap::new(),
+            active_worlds: BTreeMap::new(),
+            shutting_down: false,
+            pending_world_cleanup: BTreeMap::new(),
+            engine,
+            started_instances: Vec::new(),
+            host_shell_provider: None,
+            host_access: None,
+            world_data,
+        };
+        let parts = prepare_world_runtime(
+            &mut host,
+            &home,
+            world_id,
+            &[owner_instance.clone(), foreign_instance],
+        )?;
+        assert!(matches!(
+            host.world_data.load_item(
+                &RuntimeScopeId::new(HOST_SCOPE),
+                &ExtensionInstanceId::new("world-system-instance"),
+                item,
+            ),
+            Err(HostAccessError::Unavailable)
+        ));
+        host.world_data.activate(
+            world_id,
+            parts.runtime.client(),
+            parts.command_owners.clone(),
+        )?;
+        let commit: SchemaKey = "fixture.commit@1".parse()?;
+        let reject: SchemaKey = "fixture.reject@1".parse()?;
+        let foreign: SchemaKey = "fixture.foreign@1".parse()?;
+        let payload = serde_json::json!({ "item": item.to_string() });
+        assert!(matches!(
+            host.world_data.submit(
+                &world_runtime_scope_id(world_id),
+                &ComponentRef::new("foreign-property-owner", "foreign-schemas"),
+                commit.clone(),
+                payload.clone(),
+            ),
+            Err(HostAccessError::Rejected)
+        ));
+        parts
+            .runtime
+            .submit(WorldCommand::system(commit, payload.clone()))?
+            .wait()?;
+        assert_eq!(
+            parts
+                .runtime
+                .snapshot()?
+                .load_property(item, &"fixture.value@1".parse()?)?
+                .expect("WASM transaction must commit")
+                .data(),
+            &serde_json::json!(7)
+        );
+        assert!(
+            parts
+                .runtime
+                .submit(WorldCommand::system(reject, payload.clone()))?
+                .wait()
+                .is_err()
+        );
+        let foreign_error = parts
+            .runtime
+            .submit(WorldCommand::system(foreign, payload))?
+            .wait()
+            .expect_err("foreign property write must be denied");
+        assert!(matches!(
+            foreign_error,
+            WorldRuntimeError::InvalidTransaction {
+                source: WorldError::PropertyAccessDenied { .. },
+                ..
+            }
+        ));
+        assert!(
+            parts
+                .runtime
+                .snapshot()?
+                .load_property(item, &"fixture.foreign-property@1".parse()?)?
+                .is_none()
         );
 
-        register_world_schema_contributions(&engine, &storage, &[instance])?;
-        assert_eq!(storage.load_session()?.schemas().len(), 2);
+        host.engine.stop_extension_instance(&owner_instance)?;
+        assert!(
+            parts
+                .runtime
+                .submit(WorldCommand::system(
+                    "fixture.commit@1".parse()?,
+                    serde_json::json!({ "item": item.to_string() }),
+                ))?
+                .wait()
+                .is_err()
+        );
+        parts.runtime.shutdown()?;
+        host.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_enforce_domain_caller_rules_on_all_entries_and_rollback_a_denied_second_action()
+    -> anyhow::Result<()> {
+        use rintawa_sdk::contracts::ComponentPrincipal;
+        use rintawa_world_runtime::{SystemError, WorldRuntimeClient};
+        use zenoh::Wait;
+        struct RestrictedMove {
+            command: SchemaKey,
+            property: SchemaKey,
+            allowed: ComponentPrincipal,
+            item: ItemId,
+        }
+        impl WorldSystem for RestrictedMove {
+            fn command_schema(&self) -> &SchemaKey {
+                &self.command
+            }
+            fn evaluate(
+                &self,
+                _: &WorldSnapshot,
+                command: &WorldCommand,
+            ) -> SystemResult<WorldTransaction> {
+                let caller: ComponentPrincipal =
+                    serde_json::from_value(command.payload()["caller"].clone())
+                        .map_err(|error| SystemError::Failed(error.to_string()))?;
+                let items: Vec<ItemId> = serde_json::from_value(command.payload()["items"].clone())
+                    .map_err(|error| SystemError::Failed(error.to_string()))?;
+                let marker: ItemId = serde_json::from_value(command.payload()["marker"].clone())
+                    .map_err(|error| SystemError::Failed(error.to_string()))?;
+                let mut transaction = WorldTransaction::new();
+                transaction.push_change(StateChange::CreateObject { id: marker });
+                for item in items {
+                    if caller != self.allowed || item != self.item {
+                        return Err(SystemError::Rejected(String::from(
+                            "caller cannot move this item",
+                        )));
+                    }
+                    transaction.push_change(StateChange::SetProperty {
+                        item,
+                        key: self.property.clone(),
+                        data: command.payload()["value"].clone(),
+                    });
+                }
+                Ok(transaction)
+            }
+        }
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let world = home.create_world()?.id;
+        let scope = world_runtime_scope_id(world);
+        let storage = home.open_world_storage(world)?;
+        let x = ItemId::new();
+        let y = ItemId::new();
+        let property: SchemaKey = "fixture.position@1".parse()?;
+        let command: SchemaKey = "fixture.move@1".parse()?;
+        let definition = PropertyDefinition::new(
+            property.clone(),
+            ExtensionId::new("domain.owner"),
+            serde_json::json!({"type":"integer"}),
+        );
+        storage.register_definition(&definition)?;
+        let mut seed = WorldTransaction::new();
+        for id in [x, y] {
+            seed.push_change(StateChange::CreateObject { id });
+            seed.push_change(StateChange::SetProperty {
+                item: id,
+                key: property.clone(),
+                data: serde_json::json!(0),
+            });
+        }
+        storage.apply(&seed)?;
+        let mut engine = ExtensionEngine::new();
+        let owner = ComponentRef::new("domain", "runtime");
+        for (point, selected) in [
+            ("chat/send-controls/v1", ComponentRef::new("a", "runtime")),
+            ("fixture/caller", ComponentRef::new("b", "runtime")),
+            ("fixture/move", owner.clone()),
+            ("fixture/move-alternate", owner.clone()),
+        ] {
+            engine.set_authoritative_transport_provider_in_scope(&scope, point, &selected)?;
+        }
+        for instance in ["a", "b"] {
+            let component = engine.wasm_runtime_engine()?.load_component_from_bytes(
+                ComponentId::new("runtime"),
+                include_bytes!("../../extension-engine/tests/fixtures/transport/provider.wasm"),
+            )?;
+            engine.register_extension_instance(
+                ExtensionInstanceId::new(instance),
+                scope.clone(),
+                test_manifest("same.logical.client"),
+                vec![Box::new(component)],
+            )?;
+            engine.start_extension_instance(&ExtensionInstanceId::new(instance))?;
+        }
+        engine.register_extension_instance(
+            owner.instance_id.clone(),
+            scope,
+            test_manifest("domain.owner"),
+            vec![Box::new(WorldSchemaComponent {
+                id: owner.component_id.clone(),
+                schemas: Vec::new(),
+            })],
+        )?;
+        engine.start_extension_instance(&owner.instance_id)?;
+        let allowed = engine.active_component_principal(&ComponentRef::new("a", "runtime"))?;
+        let domain = engine.active_component_principal(&owner)?;
+        let mut builder = WorldRuntimeBuilder::new(storage);
+        builder.register_runtime_schema(
+            owner.instance_id.clone(),
+            RuntimeSchemaDefinition::new(
+                command.clone(),
+                SchemaKind::Command,
+                ExtensionId::new("domain.owner"),
+                serde_json::json!({"type":"object"}),
+            ),
+        )?;
+        builder.register_system(RestrictedMove {
+            command: command.clone(),
+            property: property.clone(),
+            allowed: allowed.clone(),
+            item: x,
+        })?;
+        let runtime = builder.start()?;
+        runtime.register_property_definitions(&[(owner.instance_id.clone(), definition)])?;
+        for point in ["fixture/move", "fixture/move-alternate"] {
+            let client: WorldRuntimeClient = runtime.client();
+            let schema = command.clone();
+            engine.declare_transport_contribution(&domain, point, move |query, caller| {
+                let bytes = query.payload().expect("domain payload").to_bytes();
+                let mut payload: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("domain JSON");
+                // Domain entry owns the attestation; a claimed caller is overwritten.
+                payload["caller"] = serde_json::to_value(caller).expect("attested caller");
+                let committed = client
+                    .submit(WorldCommand::system(schema.clone(), payload))
+                    .and_then(|ticket| ticket.wait())
+                    .is_ok();
+                query
+                    .reply(
+                        query.key_expr().as_str(),
+                        if committed {
+                            b"ok".to_vec()
+                        } else {
+                            b"denied".to_vec()
+                        },
+                    )
+                    .wait()
+                    .expect("domain result");
+            })?;
+        }
+        for (frontend, items, value, expected) in [
+            ("chat/send-controls/v1", vec![x], 7, "ok"),
+            ("chat/send-controls/v1", vec![y], 8, "denied"),
+            ("fixture/caller", vec![x], 8, "denied"),
+            ("chat/send-controls/v1", vec![x, y], 9, "denied"),
+        ] {
+            for endpoint in ["fixture/move", "fixture/move-alternate"] {
+                let marker = ItemId::new();
+                let request = serde_json::json!({"caller":allowed,"items":items,"marker":marker,"value":value});
+                let payload = format!("forward:{endpoint}\n{request}");
+                assert_eq!(
+                    engine.query_transport_contributions(&domain, frontend, payload.as_bytes())?,
+                    vec![expected.as_bytes().to_vec()]
+                );
+                assert_eq!(
+                    runtime.snapshot()?.load_item(marker)?.is_some(),
+                    expected == "ok"
+                );
+            }
+        }
+        assert_eq!(
+            runtime
+                .snapshot()?
+                .load_property(x, &property)?
+                .expect("X")
+                .data(),
+            &serde_json::json!(7)
+        );
+        assert_eq!(
+            runtime
+                .snapshot()?
+                .load_property(y, &property)?
+                .expect("Y")
+                .data(),
+            &serde_json::json!(0)
+        );
+        engine.stop_extension_instance(&allowed.instance_id)?;
+        engine.start_extension_instance(&allowed.instance_id)?;
+        let request =
+            serde_json::json!({"caller":allowed,"items":[x],"marker":ItemId::new(),"value":99});
+        assert_eq!(
+            engine.query_transport_contributions(
+                &domain,
+                "chat/send-controls/v1",
+                format!("forward:fixture/move\n{request}").as_bytes()
+            )?,
+            vec![b"denied".to_vec()]
+        );
+        runtime.shutdown()?;
+        for instance in ["a", "b", "domain"] {
+            engine.stop_extension_instance(&ExtensionInstanceId::new(instance))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_isolate_same_id_wasm_property_readers_and_rebuild_bindings() -> anyhow::Result<()>
+    {
+        const READER: &[u8] =
+            include_bytes!("../../extension-engine/tests/fixtures/transport/provider.wasm");
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let first_world = home.create_world()?.id;
+        let second_world = home.create_world()?.id;
+        let first_scope = world_runtime_scope_id(first_world);
+        let second_scope = world_runtime_scope_id(second_world);
+        let property: SchemaKey = "fixture.private@1".parse()?;
+        let item = ItemId::new();
+        let owner = ExtensionInstanceId::new("reader-owner");
+        let sibling = ExtensionInstanceId::new("reader-same-logical-id");
+        let foreign_world = ExtensionInstanceId::new("reader-other-world");
+        let world_data = WorldDataRuntimeControl::default();
+        let mut engine = ExtensionEngine::new();
+        engine.attach_world_data_access(Arc::new(world_data.clone()));
+        for (instance, scope, declares) in [
+            (&owner, &first_scope, true),
+            (&sibling, &first_scope, false),
+            (&foreign_world, &second_scope, false),
+        ] {
+            let reader = engine
+                .wasm_runtime_engine()?
+                .load_component_from_bytes(ComponentId::new("reader"), READER)?;
+            let mut components: Vec<Box<dyn Component>> = vec![Box::new(reader)];
+            if declares {
+                // Another component in the exact same instance shares property authority.
+                components.push(Box::new(WorldSchemaComponent {
+                    id: ComponentId::new("schema-owner"),
+                    schemas: vec![WorldSchemaContribution::new(
+                        property.clone(),
+                        SchemaKind::Property,
+                        r#"{"type":"integer"}"#,
+                    )],
+                }));
+            }
+            engine.register_extension_instance(
+                instance.clone(),
+                scope.clone(),
+                test_manifest("fixture.same-package"),
+                components,
+            )?;
+            engine.start_extension_instance(instance)?;
+        }
+        let mut host = HostRuntime {
+            baseline_artifacts: BTreeMap::new(),
+            active_worlds: BTreeMap::new(),
+            shutting_down: false,
+            pending_world_cleanup: BTreeMap::new(),
+            engine,
+            started_instances: vec![owner.clone(), sibling.clone(), foreign_world.clone()],
+            host_shell_provider: None,
+            host_access: None,
+            world_data,
+        };
+        let mut seed = WorldTransaction::new();
+        seed.push_change(StateChange::CreateObject { id: item });
+        seed.push_change(StateChange::SetProperty {
+            item,
+            key: property.clone(),
+            data: serde_json::json!(73),
+        });
+        {
+            let storage = home.open_world_storage(first_world)?;
+            storage.register_definition(&PropertyDefinition::new(
+                property.clone(),
+                ExtensionId::new("fixture.same-package"),
+                serde_json::json!({"type":"integer"}),
+            ))?;
+            storage.apply(&seed)?;
+        }
+        let first = prepare_world_runtime(
+            &mut host,
+            &home,
+            first_world,
+            &[owner.clone(), sibling.clone()],
+        )?;
+        let second = prepare_world_runtime(
+            &mut host,
+            &home,
+            second_world,
+            std::slice::from_ref(&foreign_world),
+        )?;
+        host.world_data
+            .activate(first_world, first.runtime.client(), first.command_owners)?;
+        host.world_data
+            .activate(second_world, second.runtime.client(), second.command_owners)?;
+        let point = "chat/send-controls/v1";
+        let request = format!("world-property:{item}");
+        let caller = ComponentRef::new(owner.clone(), "reader");
+        let replies = host.engine.query_transport_contributions(
+            &test_principal(&host.engine, &caller),
+            point,
+            request.as_bytes(),
+        )?;
+        assert_eq!(replies.len(), 2);
+        assert_eq!(
+            replies
+                .iter()
+                .filter(|reply| reply.as_slice() == b"denied")
+                .count(),
+            1
+        );
+        let value = replies
+            .iter()
+            .find(|reply| reply.as_slice() != b"denied")
+            .expect("owner read");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(value)?["data"],
+            73
+        );
+        let mut pages = host.engine.query_transport_contributions(
+            &test_principal(&host.engine, &caller),
+            point,
+            b"world-find",
+        )?;
+        pages.sort();
+        assert_eq!(pages, vec![b"denied".to_vec(), b"found:1".to_vec()]);
+        assert_eq!(
+            host.engine.query_transport_contributions(
+                &test_principal(
+                    &host.engine,
+                    &ComponentRef::new(foreign_world.clone(), "reader")
+                ),
+                point,
+                request.as_bytes()
+            )?,
+            vec![b"denied".to_vec()]
+        );
+        let old_client = first.runtime.client();
+        host.world_data.deactivate(first_world);
+        first.runtime.shutdown()?;
+        assert!(old_client.snapshot_for_instance(owner.clone()).is_err());
+        // Reopening the same DB without its declarations never restores authority
+        // from the stored vocabulary, even for the still-running original reader.
+        let restarted = prepare_world_runtime(&mut host, &home, first_world, &[sibling])?;
+        host.world_data.activate(
+            first_world,
+            restarted.runtime.client(),
+            restarted.command_owners,
+        )?;
+        assert_eq!(
+            host.engine.query_transport_contributions(
+                &test_principal(&host.engine, &caller),
+                point,
+                request.as_bytes()
+            )?,
+            vec![b"denied".to_vec(); 2]
+        );
+        restarted.runtime.shutdown()?;
+        second.runtime.shutdown()?;
+        host.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_allow_same_extension_id_with_disjoint_world_property_names() -> anyhow::Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let world_id = home.create_world()?.id;
+        let scope = world_runtime_scope_id(world_id);
+        let mut engine = ExtensionEngine::new();
+        let mut instances = Vec::new();
+
+        for (instance_id, schema_name) in [
+            ("first-version", "rintawa.test.first-property@1"),
+            ("second-version", "rintawa.test.second-property@1"),
+        ] {
+            let instance = ExtensionInstanceId::new(instance_id);
+            let schema: SchemaKey = schema_name.parse()?;
+            engine.register_extension_instance(
+                instance.clone(),
+                scope.clone(),
+                test_manifest("rintawa.same-logical-extension"),
+                vec![Box::new(WorldSchemaComponent {
+                    id: ComponentId::new("schemas"),
+                    schemas: vec![WorldSchemaContribution::new(
+                        schema,
+                        SchemaKind::Property,
+                        r#"{"type":"object"}"#,
+                    )],
+                })],
+            )?;
+            instances.push(instance);
+        }
+
+        let mut host = HostRuntime {
+            baseline_artifacts: BTreeMap::new(),
+            active_worlds: BTreeMap::new(),
+            shutting_down: false,
+            pending_world_cleanup: BTreeMap::new(),
+            engine,
+            started_instances: Vec::new(),
+            host_shell_provider: None,
+            host_access: None,
+            world_data: WorldDataRuntimeControl::default(),
+        };
+        let parts = prepare_world_runtime(&mut host, &home, world_id, &instances)?;
+        assert_eq!(home.load_world_state(world_id)?.properties().len(), 2);
+        let first = parts
+            .runtime
+            .client()
+            .snapshot_for_instance(instances[0].clone())?;
+        let second = parts
+            .runtime
+            .client()
+            .snapshot_for_instance(instances[1].clone())?;
+        let item = rintawa_sdk::world::ItemId::new();
+        assert!(
+            first
+                .load_property(item, &"rintawa.test.first-property@1".parse()?)
+                .is_ok()
+        );
+        assert!(
+            first
+                .load_property(item, &"rintawa.test.second-property@1".parse()?)
+                .is_err()
+        );
+        assert!(
+            second
+                .load_property(item, &"rintawa.test.first-property@1".parse()?)
+                .is_err()
+        );
+        parts.runtime.shutdown()?;
+        host.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_reject_duplicate_world_schema_from_distinct_component_principals()
+    -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let world_id = home.create_world()?.id;
+        let scope = world_runtime_scope_id(world_id);
+        let property: SchemaKey = "rintawa.test.duplicate-property@1".parse()?;
+        let mut engine = ExtensionEngine::new();
+        let mut instances = Vec::new();
+
+        for (instance_id, extension_id) in [
+            ("different-owner-first", "rintawa.first-extension"),
+            ("different-owner-second", "rintawa.second-extension"),
+        ] {
+            let instance = ExtensionInstanceId::new(instance_id);
+            engine.register_extension_instance(
+                instance.clone(),
+                scope.clone(),
+                test_manifest(extension_id),
+                vec![Box::new(WorldSchemaComponent {
+                    id: ComponentId::new("schemas"),
+                    schemas: vec![WorldSchemaContribution::new(
+                        property.clone(),
+                        SchemaKind::Property,
+                        r#"{"type":"object"}"#,
+                    )],
+                })],
+            )?;
+            instances.push(instance);
+        }
+
+        let mut host = HostRuntime {
+            baseline_artifacts: BTreeMap::new(),
+            active_worlds: BTreeMap::new(),
+            shutting_down: false,
+            pending_world_cleanup: BTreeMap::new(),
+            engine,
+            started_instances: Vec::new(),
+            host_shell_provider: None,
+            host_access: None,
+            world_data: WorldDataRuntimeControl::default(),
+        };
+        assert!(matches!(
+            prepare_world_runtime(&mut host, &home, world_id, &instances),
+            Err(HostError::AmbiguousWorldSchemaDeclaration { schema, .. })
+                if schema == property
+        ));
+        assert!(home.load_world_state(world_id)?.properties().is_empty());
+        host.shutdown()?;
         Ok(())
     }
 
@@ -3685,8 +3503,8 @@ mod tests {
     fn test_should_reject_malformed_extension_schema_without_partial_publication()
     -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
-        let world_id = WorldId::new();
-        let storage = SqliteWorldStorage::create(root.path().join("world.sqlite"), world_id)?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let world_id = home.create_world()?.id;
         let scope = world_runtime_scope_id(world_id);
         let owner = ExtensionId::new("rintawa.bad-schema-owner");
         let instance = ExtensionInstanceId::new("bad-schema-owner-instance");
@@ -3703,20 +3521,154 @@ mod tests {
                 schemas: vec![
                     WorldSchemaContribution::new(
                         valid.clone(),
-                        SchemaKind::Event,
+                        SchemaKind::Property,
                         r#"{"type":"object"}"#,
                     ),
-                    WorldSchemaContribution::new(invalid.clone(), SchemaKind::Facet, "{"),
+                    WorldSchemaContribution::new(invalid.clone(), SchemaKind::Command, "{"),
                 ],
             })],
         )?;
 
+        let mut host = HostRuntime {
+            baseline_artifacts: BTreeMap::new(),
+            active_worlds: BTreeMap::new(),
+            shutting_down: false,
+            pending_world_cleanup: BTreeMap::new(),
+            engine,
+            started_instances: Vec::new(),
+            host_shell_provider: None,
+            host_access: None,
+            world_data: WorldDataRuntimeControl::default(),
+        };
         assert!(matches!(
-            register_world_schema_contributions(&engine, &storage, &[instance]),
+            prepare_world_runtime(&mut host, &home, world_id, &[instance]),
             Err(HostError::InvalidWorldSchemaJson { schema, .. }) if schema == invalid
         ));
-        assert!(storage.load_session()?.schemas().is_empty());
+        assert!(home.load_world_state(world_id)?.properties().is_empty());
+        assert!(host.active_worlds.is_empty());
+        host.shutdown()?;
         Ok(())
+    }
+
+    fn resource_owner(instance: &str, activation: u64) -> ComponentPrincipal {
+        ComponentPrincipal {
+            instance_id: ExtensionInstanceId::new(instance),
+            component_id: ComponentId::new("backend"),
+            activation,
+        }
+    }
+
+    #[test]
+    fn test_user_resource_take_checks_ownership_and_preserves_allocation() {
+        let broker = UserResourceRuntimeControl::default();
+        let owner = resource_owner("a", 1);
+        let other = resource_owner("a", 2);
+        let source = broker.import(b"contents", "text/plain", None).unwrap();
+        let spare = broker.import(b"other", "text/plain", None).unwrap();
+        let original = Arc::clone(&broker.state.lock().unwrap().resources[&source.id].bytes);
+        let mut spoofed = source.clone();
+        spoofed.size += 1;
+        assert_eq!(
+            broker.take(&spoofed, &owner, "fresh"),
+            Err(HostAccessError::Rejected)
+        );
+        assert_eq!(
+            broker.take(&source, &owner, &spare.id),
+            Err(HostAccessError::Rejected)
+        );
+        assert_eq!(
+            broker.take(&source, &owner, ""),
+            Err(HostAccessError::Rejected)
+        );
+        let claimed = broker.take(&source, &owner, "fresh").unwrap();
+        {
+            let state = broker.state.lock().unwrap();
+            assert_eq!(state.resources.len(), 2);
+            assert_eq!(state.total_bytes, 13);
+            assert!(Arc::ptr_eq(&original, &state.resources[&claimed.id].bytes));
+        }
+        assert_eq!(broker.read(&source, 20), Err(HostAccessError::NotFound));
+        assert_eq!(
+            broker.take(&source, &owner, "next"),
+            Err(HostAccessError::NotFound)
+        );
+        assert_eq!(
+            broker.take(&claimed, &owner, "next"),
+            Err(HostAccessError::Rejected)
+        );
+        assert_eq!(broker.read(&claimed, 20), Err(HostAccessError::Rejected));
+        assert_eq!(
+            broker.read_for(&claimed, 20, Some(&other)),
+            Err(HostAccessError::Rejected)
+        );
+        assert_eq!(
+            broker.release_for(&claimed, Some(&other)),
+            Err(HostAccessError::Rejected)
+        );
+        assert_eq!(
+            broker.read_for(&claimed, 20, Some(&owner)).unwrap(),
+            b"contents"
+        );
+        broker.release_for(&claimed, Some(&owner)).unwrap();
+        assert_eq!(broker.read(&spare, 20).unwrap(), b"other");
+    }
+
+    #[test]
+    fn test_user_resource_cleanup_preserves_other_owners_and_recovers_poison_and_quota() {
+        let broker = UserResourceRuntimeControl::default();
+        let a = resource_owner("a", 1);
+        let next_a = resource_owner("a", 2);
+        let b = resource_owner("b", 1);
+        let mut a_refs = Vec::new();
+        for i in 0..MAX_USER_RESOURCES - 2 {
+            let source = broker.import(b"x", "text/plain", None).unwrap();
+            a_refs.push(broker.take(&source, &a, &format!("a-{i}")).unwrap());
+        }
+        let source = broker.import(b"b", "text/plain", None).unwrap();
+        let owned_b = broker.take(&source, &b, "b").unwrap();
+        let unclaimed = broker.import(b"u", "text/plain", None).unwrap();
+        assert_eq!(
+            broker.import(b"x", "text/plain", None),
+            Err(HostAccessError::QueueFull)
+        );
+        broker.release_owned(&next_a);
+        assert!(broker.read_for(&a_refs[0], 1, Some(&a)).is_ok());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut state = broker.state.lock().unwrap();
+            state.total_bytes = usize::MAX;
+            panic!("poison test");
+        }));
+        broker.release_owned(&a);
+        assert_eq!(broker.state.lock().unwrap().total_bytes, 2);
+        assert_eq!(broker.read_for(&owned_b, 1, Some(&b)).unwrap(), b"b");
+        assert_eq!(broker.read(&unclaimed, 1).unwrap(), b"u");
+        let replacement = broker.import(b"new", "text/plain", None).unwrap();
+        let replacement = broker.take(&replacement, &next_a, "replacement").unwrap();
+        broker.release_owned(&a);
+        assert!(broker.read_for(&replacement, 3, Some(&next_a)).is_ok());
+    }
+
+    #[test]
+    fn test_user_resource_cleanup_returns_owned_byte_quota() {
+        let broker = UserResourceRuntimeControl::default();
+        let owner = resource_owner("a", 1);
+        let bytes = vec![0; MAX_USER_RESOURCE_BYTES];
+        let source = broker
+            .import(&bytes, "application/octet-stream", None)
+            .unwrap();
+        broker.take(&source, &owner, "owned").unwrap();
+        let unclaimed = broker
+            .import(&bytes, "application/octet-stream", None)
+            .unwrap();
+        assert_eq!(
+            broker.import(b"x", "text/plain", None),
+            Err(HostAccessError::QueueFull)
+        );
+        broker.release_owned(&owner);
+        broker
+            .import(&bytes, "application/octet-stream", None)
+            .unwrap();
+        assert!(broker.read(&unclaimed, MAX_USER_RESOURCE_BYTES).is_ok());
     }
 
     #[test]
@@ -3765,6 +3717,46 @@ mod tests {
             control.read(&reference, 1024),
             Err(HostAccessError::NotFound)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_enforce_user_resource_byte_limits_and_recover_quota() -> anyhow::Result<()> {
+        const MIB: usize = 1024 * 1024;
+        let control = UserResourceRuntimeControl::default();
+        let bytes = vec![0_u8; 16 * MIB + 1];
+        let medium = control
+            .import(&bytes[..8 * MIB + 1], "application/octet-stream", None)
+            .map_err(|error| anyhow::anyhow!("medium import failed: {error:?}"))?;
+        control
+            .release(&medium)
+            .map_err(|error| anyhow::anyhow!("resource release failed: {error:?}"))?;
+        assert_eq!(
+            control.import(&bytes, "application/octet-stream", None),
+            Err(HostAccessError::Rejected)
+        );
+        let first = control
+            .import(&bytes[..16 * MIB], "application/octet-stream", None)
+            .map_err(|error| anyhow::anyhow!("first import failed: {error:?}"))?;
+        let second = control
+            .import(&bytes[..16 * MIB], "application/octet-stream", None)
+            .map_err(|error| anyhow::anyhow!("second import failed: {error:?}"))?;
+        assert_eq!(
+            control.import(&bytes[..1], "application/octet-stream", None),
+            Err(HostAccessError::QueueFull)
+        );
+        control
+            .release(&first)
+            .map_err(|error| anyhow::anyhow!("resource release failed: {error:?}"))?;
+        let replacement = control
+            .import(&bytes[..16 * MIB], "application/octet-stream", None)
+            .map_err(|error| anyhow::anyhow!("replacement import failed: {error:?}"))?;
+        control
+            .release(&second)
+            .map_err(|error| anyhow::anyhow!("resource release failed: {error:?}"))?;
+        control
+            .release(&replacement)
+            .map_err(|error| anyhow::anyhow!("resource release failed: {error:?}"))?;
         Ok(())
     }
 
@@ -3825,12 +3817,9 @@ mod tests {
         let home = HostHome::open(root.path().join("home"))?;
         let access = LocalHostAccess::new(
             home.root(),
-            home.local_principal(),
-            UserContentWriteRuntimeControl::default(),
             UserResourceRuntimeControl::default(),
             WorldSessionRuntimeControl::default(),
-            WorldCommandRuntimeControl::default(),
-            WorldProjectionRuntimeControl::default(),
+            WorldDataRuntimeControl::default(),
         );
         let imported = AssetStoreAccess::import_asset(&access, b"portrait", "Image/PNG")
             .map_err(|error| anyhow::anyhow!("asset host access failed: {error:?}"))?;
@@ -3854,87 +3843,6 @@ mod tests {
         assert_eq!(
             AssetStoreAccess::import_asset(&access, b"portrait", "invalid media type"),
             Err(HostAccessError::InvalidAsset)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_not_publish_user_content_without_active_handler() -> anyhow::Result<()> {
-        let root = tempfile::TempDir::new()?;
-        let home = HostHome::open(root.path().join("home"))?;
-        let mut host = HostRuntime::start(&home)?;
-        let content = ContentType::parse("rintawa.unhandled-content@1")?;
-        let source = write_test_content_rtw(
-            root.path(),
-            "unhandled-content",
-            &content.to_string(),
-            b"valid-container",
-        )?;
-        let digest = ArtifactDigest::sha256(&std::fs::read(&source)?);
-
-        assert!(matches!(
-            host.import_user_content_rtw(&home, &source),
-            Err(HostError::ContentHandlerCall { .. })
-        ));
-        assert!(home.list_user_content()?.is_empty());
-        assert!(home.artifact_store().open_artifact(&digest).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_bound_and_isolate_deferred_user_content_write_queue() -> anyhow::Result<()> {
-        let control = UserContentWriteRuntimeControl::default();
-        let owner_a = ComponentRef::new("instance-a", "runtime");
-        let owner_b = ComponentRef::new("instance-b", "runtime");
-        let accepted = control
-            .request(
-                owner_a.clone(),
-                DeferredUserContentWriteKind::Import,
-                b"rtw".to_vec(),
-            )
-            .map_err(|error| anyhow::anyhow!("queue request failed: {error:?}"))?;
-        assert_eq!(
-            control.status(&owner_a, &accepted.operation_id),
-            Ok(UserContentWriteStatus::Pending)
-        );
-        assert_eq!(
-            control.status(&owner_b, &accepted.operation_id),
-            Err(HostAccessError::NotFound)
-        );
-        let drained = control.drain_pending()?;
-        assert_eq!(drained.len(), 1);
-        control.record_outcome(
-            &accepted.operation_id,
-            UserContentWriteStatus::Failed(String::from("rejected")),
-        )?;
-        assert_eq!(
-            control.status(&owner_a, &accepted.operation_id),
-            Ok(UserContentWriteStatus::Failed(String::from("rejected")))
-        );
-
-        for index in 0..MAX_PENDING_USER_CONTENT_WRITES {
-            control
-                .request(
-                    owner_a.clone(),
-                    DeferredUserContentWriteKind::Import,
-                    vec![u8::try_from(index).unwrap_or(0)],
-                )
-                .map_err(|error| anyhow::anyhow!("queue fill failed: {error:?}"))?;
-        }
-        assert_eq!(
-            control.request(
-                owner_a.clone(),
-                DeferredUserContentWriteKind::Import,
-                b"overflow".to_vec(),
-            ),
-            Err(HostAccessError::QueueFull)
-        );
-        let _ = control.drain_pending()?;
-
-        let oversized = vec![0_u8; MAX_PENDING_USER_CONTENT_WRITE_BYTES + 1];
-        assert_eq!(
-            control.request(owner_a, DeferredUserContentWriteKind::Import, oversized),
-            Err(HostAccessError::QueueFull)
         );
         Ok(())
     }
@@ -3974,7 +3882,6 @@ mod tests {
             title: String::from("Test World"),
             description: None,
             cover: None,
-            commit_position: 0,
         };
 
         control
@@ -4009,7 +3916,6 @@ mod tests {
                 title: String::from("Test World"),
                 description: None,
                 cover: None,
-                commit_position: 3,
             })
             .expect("world-session status must remain readable");
         assert!(!observed.active);
@@ -4056,7 +3962,6 @@ mod tests {
         let created = WorldSessionAccess::create_world(access.as_ref())
             .expect("world-session access must create an empty world");
         let world_id: WorldId = created.world_id.parse()?;
-        assert_eq!(created.commit_position, 0);
         assert!(!created.active);
         assert_eq!(created.pending_active, None);
         assert!(!host.is_world_active(world_id));
@@ -4127,935 +4032,129 @@ mod tests {
     }
 
     #[test]
-    fn test_should_expose_persisted_user_content_through_generic_read_access() -> anyhow::Result<()>
-    {
-        let root = tempfile::TempDir::new()?;
-        let home = HostHome::open(root.path().join("home"))?;
-        let mut host = HostRuntime::start(&home)?;
-        let content = ContentType::parse("rintawa.test-content@1")?;
-        let contract = content_handler_service_contract_key(content.id(), content.major());
-        let provider_instance = ExtensionInstanceId::new("content-handler-provider");
-
-        host.engine.register_extension_instance(
-            provider_instance.clone(),
-            RuntimeScopeId::new(HOST_SCOPE),
-            test_manifest("rintawa.test-content-handler"),
-            vec![Box::new(ContentHandlerProvider {
-                id: ComponentId::new("runtime"),
-                contract,
-                observed: Arc::new(Mutex::new(Vec::new())),
-            })],
-        )?;
-        host.engine.start_extension_instance(&provider_instance)?;
-
-        let descriptor = br#"{"name":"Example"}"#;
-        let source = write_test_content_rtw(
-            root.path(),
-            "generic-read-content",
-            &content.to_string(),
-            descriptor,
-        )?;
-        let imported = host.import_user_content_rtw(&home, source)?;
-        let access = host
-            .host_access
-            .as_ref()
-            .expect("production HostRuntime must retain host access")
-            .clone();
-
-        assert_eq!(
-            UserContentAccess::list_user_content(access.as_ref(), Some("not-versioned")),
-            Err(HostAccessError::InvalidContentType)
-        );
-        assert!(
-            UserContentAccess::list_user_content(access.as_ref(), Some("rintawa.other-content@1"))
-                .expect("valid content filter should remain readable")
-                .is_empty()
-        );
-
-        let listed =
-            UserContentAccess::list_user_content(access.as_ref(), Some("rintawa.test-content@1"))
-                .expect("persisted user content should remain readable");
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id, imported.id.to_string());
-        assert_eq!(listed[0].content, content.to_string());
-        assert_eq!(listed[0].revision, imported.revision.to_string());
-
-        assert_eq!(
-            UserContentAccess::read_user_content(access.as_ref(), "not-an-id"),
-            Err(HostAccessError::InvalidUserContentId)
-        );
-        let document =
-            UserContentAccess::read_user_content(access.as_ref(), &imported.id.to_string())
-                .expect("persisted user-content descriptor should remain readable");
-        assert_eq!(document.metadata, listed[0]);
-        assert_eq!(document.descriptor, descriptor);
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_defer_validate_and_publish_user_content_writes() -> anyhow::Result<()> {
-        let root = tempfile::TempDir::new()?;
-        let home = HostHome::open(root.path().join("home"))?;
-        let mut host = HostRuntime::start(&home)?;
-        let content = ContentType::parse("rintawa.test-content@1")?;
-        let contract = content_handler_service_contract_key(content.id(), content.major());
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let provider_instance = ExtensionInstanceId::new("deferred-content-handler");
-        host.engine.register_extension_instance(
-            provider_instance.clone(),
-            RuntimeScopeId::new(HOST_SCOPE),
-            test_manifest("rintawa.test-content-handler"),
-            vec![Box::new(ContentHandlerProvider {
-                id: ComponentId::new("runtime"),
-                contract,
-                observed: Arc::clone(&observed),
-            })],
-        )?;
-        host.engine.start_extension_instance(&provider_instance)?;
-
-        let access = host
-            .host_access
-            .as_ref()
-            .expect("production HostRuntime must retain host access")
-            .clone();
-        let owner = ComponentRef::new("writer-instance", "runtime");
-        let other_owner = ComponentRef::new("other-instance", "runtime");
-        assert_eq!(
-            UserContentWriteAccess::request_replace(access.as_ref(), &owner, "not-an-id", b"rtw",),
-            Err(HostAccessError::InvalidUserContentId)
-        );
-        let first_path = write_test_content_rtw(
-            root.path(),
-            "deferred-content-1",
-            &content.to_string(),
-            b"revision-one",
-        )?;
-        let first_bytes = std::fs::read(&first_path)?;
-        let accepted =
-            UserContentWriteAccess::request_import(access.as_ref(), &owner, &first_bytes)
-                .map_err(|error| anyhow::anyhow!("deferred import request failed: {error:?}"))?;
-
-        assert!(home.list_user_content()?.is_empty());
-        assert_eq!(
-            UserContentWriteAccess::write_status(access.as_ref(), &owner, &accepted.operation_id,),
-            Ok(UserContentWriteStatus::Pending)
-        );
-        assert_eq!(
-            UserContentWriteAccess::write_status(
-                access.as_ref(),
-                &other_owner,
-                &accepted.operation_id,
-            ),
-            Err(HostAccessError::NotFound)
-        );
-
-        host.poll_runtime()?;
-        let first = match UserContentWriteAccess::write_status(
-            access.as_ref(),
-            &owner,
-            &accepted.operation_id,
-        ) {
-            Ok(UserContentWriteStatus::Succeeded(entry)) => entry,
-            other => return Err(anyhow::anyhow!("unexpected import status: {other:?}")),
-        };
-        let first_id: UserContentId = first.id.parse()?;
-        assert_eq!(home.list_user_content()?.len(), 1);
-
-        let second_path = write_test_content_rtw(
-            root.path(),
-            "deferred-content-2",
-            &content.to_string(),
-            b"revision-two",
-        )?;
-        let replace = UserContentWriteAccess::request_replace(
-            access.as_ref(),
-            &owner,
-            &first.id,
-            &std::fs::read(second_path)?,
-        )
-        .map_err(|error| anyhow::anyhow!("deferred replace request failed: {error:?}"))?;
-        host.poll_runtime()?;
-        let second = match UserContentWriteAccess::write_status(
-            access.as_ref(),
-            &owner,
-            &replace.operation_id,
-        ) {
-            Ok(UserContentWriteStatus::Succeeded(entry)) => entry,
-            other => return Err(anyhow::anyhow!("unexpected replace status: {other:?}")),
-        };
-        assert_eq!(second.id, first.id);
-        assert_ne!(second.revision, first.revision);
-        assert_eq!(home.list_user_content()?[0].id, first_id);
-
-        let rejected_path = write_test_content_rtw(
-            root.path(),
-            "deferred-content-rejected",
-            &content.to_string(),
-            b"reject",
-        )?;
-        let rejected = UserContentWriteAccess::request_import(
-            access.as_ref(),
-            &owner,
-            &std::fs::read(rejected_path)?,
-        )
-        .map_err(|error| anyhow::anyhow!("deferred rejected request failed: {error:?}"))?;
-        host.poll_runtime()?;
-        assert!(matches!(
-            UserContentWriteAccess::write_status(
-                access.as_ref(),
-                &owner,
-                &rejected.operation_id,
-            ),
-            Ok(UserContentWriteStatus::Failed(diagnostic))
-                if diagnostic.contains("descriptor rejected by test handler")
-        ));
-        assert_eq!(home.list_user_content()?.len(), 1);
-        assert_eq!(
-            observed
-                .lock()
-                .map_err(|_| anyhow::anyhow!("content observer lock poisoned"))?
-                .len(),
-            3
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_validate_and_revision_user_content_through_extension_handler()
-    -> anyhow::Result<()> {
-        let root = tempfile::TempDir::new()?;
-        let home = HostHome::open(root.path().join("home"))?;
-        let mut host = HostRuntime::start(&home)?;
-        let content = ContentType::parse("rintawa.test-content@1")?;
-        let contract = content_handler_service_contract_key(content.id(), content.major());
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let provider_instance = ExtensionInstanceId::new("content-handler-provider");
-
-        host.engine.register_extension_instance(
-            provider_instance.clone(),
-            RuntimeScopeId::new(HOST_SCOPE),
-            test_manifest("rintawa.test-content-handler"),
-            vec![Box::new(ContentHandlerProvider {
-                id: ComponentId::new("runtime"),
-                contract,
-                observed: Arc::clone(&observed),
-            })],
-        )?;
-        host.engine.start_extension_instance(&provider_instance)?;
-
-        let oversized_descriptor = vec![b'x'; MAX_CONTENT_HANDLER_ENTRY_BYTES + 1];
-        let oversized = write_test_content_rtw(
-            root.path(),
-            "oversized-content",
-            &content.to_string(),
-            &oversized_descriptor,
-        )?;
-        let oversized_digest = ArtifactDigest::sha256(&std::fs::read(&oversized)?);
-        assert!(matches!(
-            host.import_user_content_rtw(&home, &oversized),
-            Err(HostError::Artifact(_))
-        ));
-        assert!(
-            home.artifact_store()
-                .open_artifact(&oversized_digest)
-                .is_err()
-        );
-        assert!(
-            observed
-                .lock()
-                .map_err(|_| anyhow::anyhow!("content observer lock poisoned"))?
-                .is_empty()
-        );
-
-        let rejected = write_test_content_rtw(
-            root.path(),
-            "rejected-content",
-            &content.to_string(),
-            b"reject",
-        )?;
-        let rejected_digest = ArtifactDigest::sha256(&std::fs::read(&rejected)?);
-        assert!(matches!(
-            host.import_user_content_rtw(&home, &rejected),
-            Err(HostError::UserContentRejected { .. })
-        ));
-        assert!(home.list_user_content()?.is_empty());
-        assert!(
-            home.artifact_store()
-                .open_artifact(&rejected_digest)
-                .is_err()
-        );
-
-        let first_path = write_test_content_rtw(
-            root.path(),
-            "accepted-content-1",
-            &content.to_string(),
-            b"revision-one",
-        )?;
-        let first = host.import_user_content_rtw(&home, &first_path)?;
-        home.artifact_store().verify(&first.revision)?;
-        let stored_first = home
-            .artifact_store()
-            .root()
-            .join("sha256")
-            .join(format!("{}.rtw", first.revision.hex()));
-        std::fs::write(stored_first, b"corrupted")?;
-        assert!(matches!(
-            home.list_user_content(),
-            Err(HostError::Artifact(_))
-        ));
-
-        let second_path = write_test_content_rtw(
-            root.path(),
-            "accepted-content-2",
-            &content.to_string(),
-            b"revision-two",
-        )?;
-        let second = host.replace_user_content_rtw(&home, first.id, &second_path)?;
-        home.artifact_store().verify(&second.revision)?;
-
-        assert_eq!(second.id, first.id);
-        assert_eq!(second.content, content);
-        assert_ne!(second.revision, first.revision);
-        assert_eq!(home.list_user_content()?, vec![second]);
-
-        let observed = observed
-            .lock()
-            .map_err(|_| anyhow::anyhow!("content observer lock poisoned"))?;
-        assert_eq!(observed.len(), 3);
-        assert!(
-            observed
-                .iter()
-                .all(|request| request.content == content.to_string())
-        );
-        assert_eq!(observed[0].descriptor, b"reject");
-        assert_eq!(observed[1].descriptor, b"revision-one");
-        assert_eq!(observed[2].descriptor, b"revision-two");
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_bound_and_isolate_deferred_world_projection_queue() -> anyhow::Result<()> {
-        let control = WorldProjectionRuntimeControl::default();
-        let owner_a = ComponentRef::new("instance-a", "runtime");
-        let owner_b = ComponentRef::new("instance-b", "runtime");
-        let schema: SchemaKey = "example.view@1".parse()?;
-        let world_id = WorldId::new();
-        let principal = PrincipalId::new();
-        let accepted = control
-            .request(
-                owner_a.clone(),
-                world_id,
-                schema.clone(),
-                principal,
-                serde_json::json!({ "kind": "test" }),
-            )
-            .map_err(|error| anyhow::anyhow!("projection queue request failed: {error:?}"))?;
-        assert_eq!(
-            control.status(&owner_a, &accepted.operation_id),
-            Ok(WorldProjectionReadStatus::Pending)
-        );
-        assert_eq!(
-            control.status(&owner_b, &accepted.operation_id),
-            Err(WorldProjectionAccessError::NotFound)
-        );
-        let drained = control.drain_pending()?;
-        assert_eq!(drained.len(), 1);
-        control.record_outcome(
-            &accepted.operation_id,
-            WorldProjectionReadStatus::Failed(String::from("rejected")),
-        )?;
-        assert_eq!(
-            control.status(&owner_a, &accepted.operation_id),
-            Ok(WorldProjectionReadStatus::Failed(String::from("rejected")))
-        );
-
-        for _ in 0..MAX_PENDING_WORLD_PROJECTION_REQUESTS {
-            control
-                .request(
-                    owner_a.clone(),
-                    world_id,
-                    schema.clone(),
-                    principal,
-                    serde_json::Value::Null,
-                )
-                .map_err(|error| anyhow::anyhow!("projection queue fill failed: {error:?}"))?;
-        }
-        assert_eq!(
-            control.request(
-                owner_a,
-                world_id,
-                schema,
-                principal,
-                serde_json::Value::Null,
-            ),
-            Err(WorldProjectionAccessError::QueueFull)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_defer_world_projection_with_host_authenticated_principal() -> anyhow::Result<()>
-    {
+    fn test_should_return_native_world_command_result_only_after_commit() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let home = HostHome::open(root.path().join("home"))?;
         let world = home.create_world()?;
-        let world_id = world.id;
-        let projection_schema: SchemaKey = "rintawa.test.deferred-view@1".parse()?;
-        let owner = ExtensionId::new("rintawa.test-deferred-projection");
-        let storage = home.open_world_storage(world_id)?;
-        storage.register_schema(&SchemaDefinition::new(
-            projection_schema.clone(),
-            SchemaKind::Projection,
-            owner.clone(),
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "provider": { "const": "owner" },
-                    "principal": { "type": "string" }
-                },
-                "required": ["provider", "principal"],
-                "additionalProperties": false
-            }),
-        ))?;
-        let outbox = home.open_world_storage(world_id)?;
-
-        let world_sessions = WorldSessionRuntimeControl::default();
-        world_sessions.record_outcome(world_id, true, None)?;
-        let world_projections = WorldProjectionRuntimeControl::default();
-        let access = Arc::new(LocalHostAccess::new(
-            home.root(),
-            home.local_principal(),
-            UserContentWriteRuntimeControl::default(),
-            UserResourceRuntimeControl::default(),
-            world_sessions,
-            WorldCommandRuntimeControl::default(),
-            world_projections,
-        ));
-        let mut host = HostRuntime {
-            active_worlds: BTreeMap::new(),
-            engine: ExtensionEngine::new(),
-            started_instances: Vec::new(),
-            host_shell_provider: None,
-            ui_layer_provider: None,
-            host_access: Some(access.clone()),
-        };
-        let projection =
-            host.bind_world_projection(world_id, projection_schema.clone(), owner.clone())?;
-        let contract = world_projection_service_contract_key(&projection_schema);
-        let scope = world_runtime_scope_id(world_id);
+        let command_schema: SchemaKey = "test.native-command@1".parse()?;
+        let property_schema: SchemaKey = "test.native-property@1".parse()?;
+        let owner = ExtensionId::new("test.native-system");
         let observed = Arc::new(Mutex::new(Vec::new()));
-        let provider_instance = ExtensionInstanceId::new("deferred-projection-owner");
-        host.engine.register_extension_instance(
-            provider_instance.clone(),
-            scope,
-            test_manifest(owner.as_str()),
-            vec![Box::new(WorldProjectionProvider {
-                id: ComponentId::new("runtime"),
-                contract,
-                reject: false,
-                observed: Arc::clone(&observed),
-            })],
+        let created = Arc::new(Mutex::new(Vec::new()));
+        let mut builder = WorldRuntimeBuilder::new(home.open_world_storage(world.id)?);
+        builder.register_runtime_schema(
+            ExtensionInstanceId::new(owner.as_str()),
+            RuntimeSchemaDefinition::new(
+                command_schema.clone(),
+                SchemaKind::Command,
+                owner.clone(),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"kind": {"type": "string"}},
+                    "required": ["kind"]
+                }),
+            ),
         )?;
-        host.engine.start_extension_instance(&provider_instance)?;
-
-        let runtime = WorldRuntimeBuilder::new(storage).start()?;
-        host.active_worlds.insert(
-            world_id,
-            ActiveWorld {
-                runtime,
-                outbox,
-                effect_handlers: BTreeMap::new(),
-                projections: BTreeMap::from([(projection_schema.clone(), projection)]),
-                signals: RuntimeSignalQueue::default(),
-                registered_instances: vec![provider_instance.clone()],
-                started_instances: vec![provider_instance],
-            },
-        );
-
-        let requester = ComponentRef::new("consumer-instance", "runtime");
-        let other = ComponentRef::new("other-instance", "runtime");
-        let accepted = WorldProjectionAccess::request_projection(
-            access.as_ref(),
-            &requester,
-            WorldProjectionRequest {
-                world_id: world_id.to_string(),
-                schema: projection_schema.to_string(),
-                input_json: br#"{"kind":"test"}"#.to_vec(),
-            },
-        )
-        .map_err(|error| anyhow::anyhow!("projection access failed: {error:?}"))?;
-        assert_eq!(
-            WorldProjectionAccess::projection_status(
-                access.as_ref(),
-                &requester,
-                &accepted.operation_id,
-            ),
-            Ok(WorldProjectionReadStatus::Pending)
-        );
-        assert_eq!(
-            WorldProjectionAccess::projection_status(
-                access.as_ref(),
-                &other,
-                &accepted.operation_id,
-            ),
-            Err(WorldProjectionAccessError::NotFound)
-        );
-
-        host.poll_runtime()?;
-        let status = WorldProjectionAccess::projection_status(
-            access.as_ref(),
-            &requester,
-            &accepted.operation_id,
-        )
-        .map_err(|error| anyhow::anyhow!("projection status failed: {error:?}"))?;
-        let WorldProjectionReadStatus::Succeeded(view) = status else {
-            return Err(anyhow::anyhow!("projection did not succeed: {status:?}"));
-        };
-        assert_eq!(view.world_id, world_id.to_string());
-        assert_eq!(view.schema, projection_schema.to_string());
-        let value: serde_json::Value = serde_json::from_slice(&view.value_json)?;
-        assert_eq!(value["provider"], "owner");
-        assert_eq!(value["principal"], home.local_principal().to_string());
-        let observed = observed
-            .lock()
-            .map_err(|_| anyhow::anyhow!("projection observer lock poisoned"))?;
-        assert_eq!(observed.len(), 1);
-        assert_eq!(observed[0].principal(), home.local_principal());
-        drop(observed);
-
-        host.deactivate_world(world_id)?;
-        host.shutdown()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_bind_deferred_world_command_to_stable_local_principal() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let home = HostHome::open(root.path().join("home"))?;
-        let principal = home.local_principal();
-        assert_eq!(HostHome::open(home.root())?.local_principal(), principal);
-
-        let world = home.create_world()?;
-        let world_sessions = WorldSessionRuntimeControl::default();
-        let world_commands = WorldCommandRuntimeControl::default();
-        let access = LocalHostAccess::new(
-            home.root(),
-            principal,
-            UserContentWriteRuntimeControl::default(),
-            UserResourceRuntimeControl::default(),
-            world_sessions.clone(),
-            world_commands.clone(),
-            WorldProjectionRuntimeControl::default(),
-        );
-        assert_eq!(
-            WorldCommandAccess::submit_world_command(
-                &access,
-                WorldCommandRequest {
-                    world_id: world.id.to_string(),
-                    schema: String::from("example.command@1"),
-                    actor: WorldCommandActor::Principal,
-                    expected_position: Some(0),
-                    payload_json: br#"{"value":1}"#.to_vec(),
-                },
-            ),
-            Err(WorldCommandAccessError::WorldNotActive)
-        );
-
-        world_sessions
-            .request(world.id, true)
-            .map_err(|error| anyhow::anyhow!("world-session request failed: {error:?}"))?;
-        let accepted = WorldCommandAccess::submit_world_command(
-            &access,
-            WorldCommandRequest {
-                world_id: world.id.to_string(),
-                schema: String::from("example.command@1"),
-                actor: WorldCommandActor::Principal,
-                expected_position: Some(0),
-                payload_json: br#"{"value":1}"#.to_vec(),
-            },
-        )
-        .map_err(|error| anyhow::anyhow!("world-command submission failed: {error:?}"))?;
-        let queued = world_commands.drain_pending()?;
-        assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].command.principal(), principal);
-        assert_eq!(queued[0].command.actor(), ActorRef::Principal(principal));
-        assert_eq!(queued[0].command.expected_position(), Some(0));
-        assert_eq!(accepted.command_id, queued[0].command.id().to_string());
-        assert_eq!(
-            accepted.correlation_id,
-            queued[0].command.correlation_id().to_string()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_pump_deferred_world_command_through_authoritative_runtime() -> anyhow::Result<()>
-    {
-        let root = tempfile::tempdir()?;
-        let home = HostHome::open(root.path().join("home"))?;
-        let world = home.create_world()?;
-        let command_schema: SchemaKey = "example.deferred-command@1".parse()?;
-        let event_schema: SchemaKey = "example.deferred-event@1".parse()?;
-        let owner = ExtensionId::new("example.deferred-system");
-        let storage = home.open_world_storage(world.id)?;
-        storage.register_schema(&SchemaDefinition::new(
-            command_schema.clone(),
-            SchemaKind::Command,
-            owner.clone(),
-            serde_json::json!({ "type": "object" }),
-        ))?;
-        storage.register_schema(&SchemaDefinition::new(
-            event_schema.clone(),
-            SchemaKind::Event,
-            owner,
-            serde_json::json!({ "type": "object" }),
-        ))?;
-        let outbox = home.open_world_storage(world.id)?;
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let mut builder = WorldRuntimeBuilder::new(storage);
         builder.register_system(RecordingWorldSystem {
             command_schema: command_schema.clone(),
-            event_schema: event_schema.clone(),
+            property_schema: property_schema.clone(),
             observed: Arc::clone(&observed),
+            created: Arc::clone(&created),
         })?;
         let runtime = builder.start()?;
+        runtime.register_property_definitions(&[(
+            ExtensionInstanceId::new(owner.as_str()),
+            PropertyDefinition::new(
+                property_schema.clone(),
+                owner,
+                serde_json::json!({"type": "object"}),
+            ),
+        )])?;
 
         let mut host = HostRuntime::start(&home)?;
         host.active_worlds.insert(
             world.id,
             ActiveWorld {
+                _lifecycle: None,
                 runtime,
-                outbox,
-                effect_handlers: BTreeMap::new(),
-                projections: BTreeMap::new(),
-                signals: RuntimeSignalQueue::default(),
                 registered_instances: Vec::new(),
                 started_instances: Vec::new(),
             },
         );
-        host.record_world_session_result(world.id, &Ok(()))?;
-        let access = host
-            .host_access
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("production host access must be attached"))?;
-        let accepted = WorldCommandAccess::submit_world_command(
-            access.as_ref(),
-            WorldCommandRequest {
-                world_id: world.id.to_string(),
-                schema: command_schema.to_string(),
-                actor: WorldCommandActor::Principal,
-                expected_position: Some(0),
-                payload_json: br#"{"kind":"deferred"}"#.to_vec(),
-            },
-        )
-        .map_err(|error| anyhow::anyhow!("world-command submission failed: {error:?}"))?;
-        assert_eq!(host.pump_world_command_requests()?, 1);
-
-        let commands = observed
-            .lock()
-            .map_err(|_| anyhow::anyhow!("test command observer lock poisoned"))?;
-        assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].principal(), home.local_principal());
-        assert_eq!(
-            commands[0].actor(),
-            ActorRef::Principal(home.local_principal())
-        );
-        assert_eq!(commands[0].id().to_string(), accepted.command_id);
-        drop(commands);
-        let inspection = home.open_world_storage(world.id)?;
-        assert_eq!(inspection.load_session()?.commit_position(), 1);
-        let events = inspection.events_after(0, 8)?;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].schema, event_schema);
-        assert_eq!(events[0].payload, serde_json::json!({ "kind": "deferred" }));
-        host.shutdown()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_execute_extension_world_system_through_platform_service() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let world_id = WorldId::new();
-        let storage = SqliteWorldStorage::create(root.path().join("world.sqlite"), world_id)?;
-        let command_schema: SchemaKey = "rintawa.test.service-command@1".parse()?;
-        let event_schema: SchemaKey = "rintawa.test.service-event@1".parse()?;
-        let owner = ExtensionId::new("rintawa.test-system");
-        storage.register_schema(&SchemaDefinition::new(
-            command_schema.clone(),
-            SchemaKind::Command,
-            owner.clone(),
-            serde_json::json!({ "type": "object" }),
-        ))?;
-        storage.register_schema(&SchemaDefinition::new(
-            event_schema.clone(),
-            SchemaKind::Event,
-            owner.clone(),
-            serde_json::json!({ "type": "object" }),
-        ))?;
-
-        let mut host = HostRuntime {
-            active_worlds: BTreeMap::new(),
-            engine: ExtensionEngine::new(),
-            started_instances: Vec::new(),
-            host_shell_provider: None,
-            ui_layer_provider: None,
-            host_access: None,
-        };
-        let system = host.bind_world_system(world_id, command_schema.clone(), owner)?;
-        let contract = world_system_service_contract_key(&command_schema);
-        let scope = world_runtime_scope_id(world_id);
-
-        let hijacker_instance = ExtensionInstanceId::new("a-hijacker");
-        host.engine.register_extension_instance(
-            hijacker_instance.clone(),
-            scope.clone(),
-            test_manifest("rintawa.hijacker"),
-            vec![Box::new(RejectingWorldSystemProvider {
-                id: ComponentId::new("runtime"),
-                contract: contract.clone(),
-            })],
-        )?;
-        host.engine.start_extension_instance(&hijacker_instance)?;
-        host.started_instances.push(hijacker_instance);
-
-        let provider_instance = ExtensionInstanceId::new("z-world-system-provider");
-        host.engine.register_extension_instance(
-            provider_instance.clone(),
-            scope,
-            test_manifest("rintawa.test-system"),
-            vec![Box::new(WorldSystemProvider {
-                id: ComponentId::new("runtime"),
-                contract,
-                event_schema: event_schema.clone(),
-            })],
-        )?;
-        host.engine.start_extension_instance(&provider_instance)?;
-        host.started_instances.push(provider_instance);
-
-        let mut builder = WorldRuntimeBuilder::new(storage);
-        builder.register_system(system)?;
-        let world_runtime = builder.start()?;
         let principal = PrincipalId::new();
-        let outcome = world_runtime
-            .submit(WorldCommand::new(
-                command_schema,
+        assert!(matches!(
+            host.submit_interactive_world_command(
+                world.id,
                 principal,
-                ActorRef::Principal(principal),
-                serde_json::json!({ "kind": "extension-system" }),
-            ))?
-            .wait_outcome()?;
-
-        assert_eq!(outcome.receipt().position(), 1);
-        assert_eq!(outcome.committed_events().len(), 1);
-        assert_eq!(outcome.committed_events()[0].schema, event_schema);
-        assert_eq!(
-            outcome.committed_events()[0].payload,
-            serde_json::json!({ "kind": "extension-system" })
-        );
-
-        world_runtime.shutdown()?;
-        host.shutdown()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_route_world_projection_only_to_schema_owner() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let path = root.path().join("world.sqlite");
-        let world_id = WorldId::new();
-        let storage = SqliteWorldStorage::create(&path, world_id)?;
-        let projection_schema: SchemaKey = "rintawa.test.owner-view@1".parse()?;
-        let owner = ExtensionId::new("rintawa.test-projection");
-        storage.register_schema(&SchemaDefinition::new(
-            projection_schema.clone(),
-            SchemaKind::Projection,
-            owner.clone(),
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "provider": { "const": "owner" },
-                    "principal": { "type": "string" }
-                },
-                "required": ["provider", "principal"],
-                "additionalProperties": false
-            }),
-        ))?;
-        let outbox = SqliteWorldStorage::open(&path)?;
-
-        let mut host = HostRuntime {
-            active_worlds: BTreeMap::new(),
-            engine: ExtensionEngine::new(),
-            started_instances: Vec::new(),
-            host_shell_provider: None,
-            ui_layer_provider: None,
-            host_access: None,
-        };
-        let projection =
-            host.bind_world_projection(world_id, projection_schema.clone(), owner.clone())?;
-        let contract = world_projection_service_contract_key(&projection_schema);
-        let scope = world_runtime_scope_id(world_id);
-        let hijacker_observed = Arc::new(Mutex::new(Vec::new()));
-        let owner_observed = Arc::new(Mutex::new(Vec::new()));
-
-        let hijacker_instance = ExtensionInstanceId::new("a-projection-hijacker");
-        host.engine.register_extension_instance(
-            hijacker_instance.clone(),
-            scope.clone(),
-            test_manifest("rintawa.projection-hijacker"),
-            vec![Box::new(WorldProjectionProvider {
-                id: ComponentId::new("runtime"),
-                contract: contract.clone(),
-                reject: true,
-                observed: Arc::clone(&hijacker_observed),
-            })],
-        )?;
-        host.engine.start_extension_instance(&hijacker_instance)?;
-
-        let owner_instance = ExtensionInstanceId::new("z-projection-owner");
-        host.engine.register_extension_instance(
-            owner_instance.clone(),
-            scope,
-            test_manifest(owner.as_str()),
-            vec![Box::new(WorldProjectionProvider {
-                id: ComponentId::new("runtime"),
-                contract,
-                reject: false,
-                observed: Arc::clone(&owner_observed),
-            })],
-        )?;
-        host.engine.start_extension_instance(&owner_instance)?;
-
-        let runtime = WorldRuntimeBuilder::new(storage).start()?;
-        host.active_worlds.insert(
-            world_id,
-            ActiveWorld {
-                runtime,
-                outbox,
-                effect_handlers: BTreeMap::new(),
-                projections: BTreeMap::from([(projection_schema.clone(), projection)]),
-                signals: RuntimeSignalQueue::default(),
-                registered_instances: vec![hijacker_instance.clone(), owner_instance.clone()],
-                started_instances: vec![hijacker_instance, owner_instance],
-            },
-        );
-
-        let principal = PrincipalId::new();
-        let view = host.project_world(
-            world_id,
+                WorldCommand::system(
+                    command_schema.clone(),
+                    serde_json::json!({"kind": "committed"}),
+                ),
+            ),
+            Err(HostError::InteractiveWorldCommandPrincipalMismatch)
+        ));
+        let good = WorldCommand::interactive(
+            command_schema.clone(),
             principal,
-            &projection_schema,
-            serde_json::json!({ "kind": "test" }),
-        )?;
-        assert_eq!(view.principal(), principal);
-        assert_eq!(view.value()["provider"], "owner");
-        assert_eq!(view.value()["principal"], principal.to_string());
+            serde_json::json!({"kind": "committed"}),
+        );
+        assert!(matches!(
+            host.submit_interactive_world_command(world.id, PrincipalId::new(), good.clone()),
+            Err(HostError::InteractiveWorldCommandPrincipalMismatch)
+        ));
         assert!(
-            hijacker_observed
+            created
                 .lock()
-                .map_err(|_| anyhow::anyhow!("hijacker observer lock poisoned"))?
+                .map_err(|_| anyhow::anyhow!("creation lock poisoned"))?
                 .is_empty()
         );
-        assert_eq!(
-            owner_observed
+        let expected_command_id = good.id();
+        let committed = host.submit_interactive_world_command(world.id, principal, good)?;
+        assert_eq!(committed.command_id(), expected_command_id);
+        let item = {
+            let items = created
                 .lock()
-                .map_err(|_| anyhow::anyhow!("owner observer lock poisoned"))?
+                .map_err(|_| anyhow::anyhow!("creation lock poisoned"))?;
+            assert_eq!(items.len(), 1);
+            items[0]
+        };
+        assert!(
+            host.active_worlds[&world.id]
+                .runtime
+                .snapshot()?
+                .load_item(item)?
+                .is_some()
+        );
+        let persisted = host.active_worlds[&world.id]
+            .runtime
+            .snapshot()?
+            .load_property(item, &property_schema)?;
+        assert_eq!(
+            persisted
+                .ok_or_else(|| anyhow::anyhow!("committed property is missing"))?
+                .data(),
+            &serde_json::json!({"kind": "committed"})
+        );
+
+        let malformed =
+            WorldCommand::interactive(command_schema, principal, serde_json::json!({"kind": 99}));
+        assert!(host.submit_world_command(world.id, malformed).is_err());
+        assert_eq!(
+            created
+                .lock()
+                .map_err(|_| anyhow::anyhow!("creation lock poisoned"))?
                 .len(),
             1
         );
-
-        host.deactivate_world(world_id)?;
+        assert_eq!(
+            observed
+                .lock()
+                .map_err(|_| anyhow::anyhow!("observer lock poisoned"))?
+                .len(),
+            1
+        );
         host.shutdown()?;
         Ok(())
-    }
-
-    struct TestWorldPresentationComponent {
-        id: ComponentId,
-        surface_id: UiSurfaceId,
-        should_mount_entry: bool,
-    }
-
-    impl Component for TestWorldPresentationComponent {
-        fn id(&self) -> &ComponentId {
-            &self.id
-        }
-
-        fn register(&mut self, ctx: &mut dyn RegistrationContext) -> ExtensionResult<()> {
-            ctx.provide_contract(ContractProvider::new(world_presentation_contract_key()))?;
-            ctx.register_ui_surface(UiSurfaceContribution::new(
-                self.surface_id.clone(),
-                UiPlacementHint::Primary,
-            ))?;
-            ctx.register_world_presentation(WorldPresentationDescriptor::new(
-                self.surface_id.clone(),
-            ))
-        }
-
-        fn start(&mut self, ctx: &mut dyn ComponentContext) -> ExtensionResult<()> {
-            if !self.should_mount_entry {
-                return Ok(());
-            }
-            ctx.mount_ui_surface(UiSurfaceSnapshot {
-                surface_id: self.surface_id.clone(),
-                revision: 1,
-                root: UiNodeId::new("root"),
-                nodes: vec![UiNode::new(
-                    "root",
-                    UiNodeKind::Text(UiTextNode {
-                        text: String::from("World presentation entry"),
-                    }),
-                )],
-            })
-            .map_err(|error| ExtensionError::Message(error.to_string()))
-        }
-    }
-
-    fn register_test_host_ui_layer(host: &mut HostRuntime) -> anyhow::Result<ComponentRef> {
-        let instance_id = ExtensionInstanceId::new("test-host-ui-layer");
-        host.engine.register_extension_instance(
-            instance_id.clone(),
-            RuntimeScopeId::new(HOST_SCOPE),
-            test_manifest("rintawa.test-host-ui-layer"),
-            vec![Box::new(ContractComponent::new("runtime"))],
-        )?;
-        host.engine.start_extension_instance(&instance_id)?;
-        let owner = ComponentRef::new(instance_id.clone(), ComponentId::new("runtime"));
-        host.engine.attach_ui_layer(
-            owner.clone(),
-            UiLayerDescriptor::new(vec![UiCapabilityId::new(UI_CAPABILITY_TEXT)]),
-        )?;
-        host.started_instances.push(instance_id);
-        Ok(owner)
-    }
-
-    fn register_test_world_presentation(
-        host: &mut HostRuntime,
-        world_id: WorldId,
-        instance_id: &str,
-        surface_id: &str,
-        should_mount_entry: bool,
-    ) -> anyhow::Result<ComponentRef> {
-        let instance_id = ExtensionInstanceId::new(instance_id);
-        let scope_id = world_runtime_scope_id(world_id);
-        host.engine.register_extension_instance(
-            instance_id.clone(),
-            scope_id,
-            test_manifest(instance_id.as_str()),
-            vec![Box::new(TestWorldPresentationComponent {
-                id: ComponentId::new("runtime"),
-                surface_id: UiSurfaceId::new(surface_id),
-                should_mount_entry,
-            })],
-        )?;
-        host.engine.start_extension_instance(&instance_id)?;
-        let owner = ComponentRef::new(instance_id.clone(), ComponentId::new("runtime"));
-        let active = host
-            .active_worlds
-            .get_mut(&world_id)
-            .ok_or(HostError::WorldNotActive(world_id))?;
-        active.registered_instances.push(instance_id.clone());
-        active.started_instances.push(instance_id);
-        Ok(owner)
     }
 
     #[test]
@@ -5087,196 +4186,12 @@ mod tests {
     }
 
     #[test]
-    fn test_should_focus_composition_selected_world_presentation_without_changing_lifecycle()
-    -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let home = HostHome::open(root.path().join("home"))?;
-        let world_a = home.create_world()?.id;
-        let world_b = home.create_world()?.id;
-        let mut host = HostRuntime::start(&home)?;
-        host.activate_world(&home, world_a)?;
-        host.activate_world(&home, world_b)?;
-        let layer_owner = register_test_host_ui_layer(&mut host)?;
-
-        let _default_a = register_test_world_presentation(
-            &mut host,
-            world_a,
-            "world-a-default-presentation",
-            "world-a.default",
-            true,
-        )?;
-        let preferred_a = register_test_world_presentation(
-            &mut host,
-            world_a,
-            "world-a-preferred-presentation",
-            "world-a.preferred",
-            true,
-        )?;
-        host.engine.set_preferred_contract_provider_in_scope(
-            &world_runtime_scope_id(world_a),
-            world_presentation_contract_key(),
-            preferred_a.clone(),
-        )?;
-        let provider_b = register_test_world_presentation(
-            &mut host,
-            world_b,
-            "world-b-presentation",
-            "world-b.main",
-            true,
-        )?;
-
-        let target_a = host.focus_world_for_ui_layer(&layer_owner, world_a)?;
-        assert_eq!(target_a.world_id, world_a);
-        assert_eq!(target_a.provider, preferred_a);
-        assert_eq!(
-            target_a.descriptor.entry_surface_id.as_str(),
-            "world-a.preferred"
-        );
-        assert_eq!(
-            host.focused_world_for_ui_layer(&layer_owner)?,
-            Some(world_a)
-        );
-        assert!(host.is_world_active(world_a));
-        assert!(host.is_world_active(world_b));
-        let visible_a = host.engine.portable_ui_surfaces_for_layer(&layer_owner)?;
-        assert!(
-            visible_a
-                .iter()
-                .any(|surface| surface.contribution.id.as_str() == "world-a.preferred")
-        );
-        assert!(
-            visible_a
-                .iter()
-                .all(|surface| surface.contribution.id.as_str() != "world-b.main")
-        );
-
-        let target_b = host.focus_world_for_ui_layer(&layer_owner, world_b)?;
-        assert_eq!(target_b.provider, provider_b);
-        assert_eq!(
-            host.focused_world_for_ui_layer(&layer_owner)?,
-            Some(world_b)
-        );
-        assert!(host.is_world_active(world_a));
-        assert!(host.is_world_active(world_b));
-        let visible_b = host.engine.portable_ui_surfaces_for_layer(&layer_owner)?;
-        assert!(
-            visible_b
-                .iter()
-                .any(|surface| surface.contribution.id.as_str() == "world-b.main")
-        );
-        assert!(
-            visible_b
-                .iter()
-                .all(|surface| { !surface.contribution.id.as_str().starts_with("world-a.") })
-        );
-
-        host.deactivate_world(world_b)?;
-        assert_eq!(host.focused_world_for_ui_layer(&layer_owner)?, None);
-        assert!(host.is_world_active(world_a));
-        assert!(!host.is_world_active(world_b));
-
-        host.shutdown()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_fail_closed_for_missing_or_unmounted_world_presentation() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let home = HostHome::open(root.path().join("home"))?;
-        let headless_world = home.create_world()?.id;
-        let unmounted_world = home.create_world()?.id;
-        let mut host = HostRuntime::start(&home)?;
-        host.activate_world(&home, headless_world)?;
-        host.activate_world(&home, unmounted_world)?;
-        let layer_owner = register_test_host_ui_layer(&mut host)?;
-
-        assert!(matches!(
-            host.focus_world_for_ui_layer(&layer_owner, headless_world),
-            Err(HostError::ContractRoleUnavailable {
-                reason: UnresolvedContractReason::NoProvider,
-                ..
-            })
-        ));
-        assert!(host.is_world_active(headless_world));
-        assert_eq!(host.focused_world_for_ui_layer(&layer_owner)?, None);
-
-        register_test_world_presentation(
-            &mut host,
-            unmounted_world,
-            "world-unmounted-presentation",
-            "world-unmounted.main",
-            false,
-        )?;
-        assert!(matches!(
-            host.focus_world_for_ui_layer(&layer_owner, unmounted_world),
-            Err(HostError::WorldPresentationEntryUnavailable { world_id, .. })
-                if world_id == unmounted_world
-        ));
-        assert!(host.is_world_active(unmounted_world));
-        assert_eq!(host.focused_world_for_ui_layer(&layer_owner)?, None);
-
-        host.shutdown()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_apply_deferred_world_activation_before_deferred_focus() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let home = HostHome::open(root.path().join("home"))?;
-        let world_id = home.create_world()?.id;
-        let mut host = HostRuntime::start(&home)?;
-        let layer_owner = register_test_host_ui_layer(&mut host)?;
-        let access = host
-            .host_access
-            .as_ref()
-            .expect("started HostRuntime should expose local host access")
-            .clone();
-
-        access
-            .world_sessions
-            .request(world_id, true)
-            .map_err(|error| anyhow::anyhow!("world activation request failed: {error:?}"))?;
-        host.engine
-            .request_world_focus_for_ui_layer(&layer_owner, world_id)?;
-        host.poll_runtime()?;
-
-        assert!(host.is_world_active(world_id));
-        let presentation = host.engine.ui_layer_presentation_state(&layer_owner)?;
-        assert!(presentation.focused_world.is_none());
-        assert!(presentation.pending_world_id.is_none());
-        let diagnostic = presentation
-            .last_focus_error
-            .expect("headless World focus should report a contained presentation error");
-        assert!(!diagnostic.contains("not active"));
-        assert!(diagnostic.contains("presentation") || diagnostic.contains("contract"));
-
-        host.shutdown()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_supervise_world_commit_delivery_replay_and_deactivation() -> anyhow::Result<()> {
+    fn test_should_supervise_world_activation_and_deactivation() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let home = HostHome::open(root.path().join("home"))?;
         let created = home.create_world()?;
         let world_id = created.id;
         let command_schema: SchemaKey = "rintawa.test.supervised-command@1".parse()?;
-        let event_schema: SchemaKey = "rintawa.test.supervised-event@1".parse()?;
-        let owner = ExtensionId::new("rintawa.supervised-system");
-        let storage = home.open_world_storage(world_id)?;
-        storage.register_schema(&SchemaDefinition::new(
-            command_schema.clone(),
-            SchemaKind::Command,
-            owner.clone(),
-            serde_json::json!({ "type": "object" }),
-        ))?;
-        storage.register_schema(&SchemaDefinition::new(
-            event_schema.clone(),
-            SchemaKind::Event,
-            owner.clone(),
-            serde_json::json!({ "type": "object" }),
-        ))?;
-        drop(storage);
 
         let mut host = HostRuntime::start(&home)?;
         host.activate_world(&home, world_id)?;
@@ -5286,83 +4201,15 @@ mod tests {
             Err(HostError::WorldAlreadyActive(id)) if id == world_id
         ));
 
-        let scope = world_runtime_scope_id(world_id);
-        let contract = world_system_service_contract_key(&command_schema);
-        let provider_instance = ExtensionInstanceId::new("supervised-system-provider");
-        host.engine.register_extension_instance(
-            provider_instance.clone(),
-            scope.clone(),
-            test_manifest(owner.as_str()),
-            vec![Box::new(WorldSystemProvider {
-                id: ComponentId::new("runtime"),
-                contract,
-                event_schema: event_schema.clone(),
-            })],
-        )?;
-        host.engine.start_extension_instance(&provider_instance)?;
-        host.started_instances.push(provider_instance);
-
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let subscriber_instance = ExtensionInstanceId::new("supervised-event-subscriber");
-        host.engine.register_extension_instance(
-            subscriber_instance.clone(),
-            scope,
-            test_manifest("rintawa.supervised-subscriber"),
-            vec![Box::new(WorldEventSubscriber {
-                id: ComponentId::new("runtime"),
-                topic: event_schema.to_string(),
-                observed: Arc::clone(&observed),
-            })],
-        )?;
-        host.engine.start_extension_instance(&subscriber_instance)?;
-        host.started_instances.push(subscriber_instance);
-
-        let principal = PrincipalId::new();
-        let command = WorldCommand::new(
-            command_schema.clone(),
-            principal,
-            ActorRef::Principal(principal),
-            serde_json::json!({ "kind": "supervised" }),
-        );
-        let first = host.submit_world_command(world_id, command.clone())?;
-        assert_eq!(
-            first.authoritative().receipt().disposition(),
-            CommitDisposition::Committed
-        );
-        assert_eq!(first.authoritative().receipt().position(), 1);
-        assert!(matches!(first.live_delivery(), Ok(1)));
-        assert_eq!(
-            observed
-                .lock()
-                .map_err(|_| anyhow::anyhow!("event observer lock poisoned"))?
-                .len(),
-            1
-        );
-
-        let replay = host.submit_world_command(world_id, command)?;
-        assert_eq!(
-            replay.authoritative().receipt().disposition(),
-            CommitDisposition::AlreadyCommitted
-        );
-        assert!(matches!(replay.live_delivery(), Ok(0)));
-        assert_eq!(
-            observed
-                .lock()
-                .map_err(|_| anyhow::anyhow!("event observer lock poisoned"))?
-                .len(),
-            1
-        );
+        host.poll_runtime()?;
+        assert!(host.is_world_active(world_id));
 
         host.deactivate_world(world_id)?;
         assert!(!host.is_world_active(world_id));
-        let next = WorldCommand::new(
-            command_schema,
-            principal,
-            ActorRef::Principal(principal),
-            serde_json::json!({ "kind": "after-stop" }),
-        );
+        let command =
+            WorldCommand::system(command_schema, serde_json::json!({ "kind": "after-stop" }));
         assert!(matches!(
-            host.submit_world_command(world_id, next),
+            host.submit_world_command(world_id, command),
             Err(HostError::WorldNotActive(id)) if id == world_id
         ));
         assert!(matches!(
@@ -5370,419 +4217,12 @@ mod tests {
             Err(HostError::WorldNotActive(id)) if id == world_id
         ));
 
-        host.shutdown()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_retry_then_complete_owner_pinned_effect_job() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let home = HostHome::open(root.path().join("home"))?;
-        let world_id = home.create_world()?.id;
-        let seed_schema: SchemaKey = "rintawa.test.effect-seed@1".parse()?;
-        let result_schema: SchemaKey = "rintawa.test.effect-result@1".parse()?;
-        let event_schema: SchemaKey = "rintawa.test.effect-result-event@1".parse()?;
-        let effect_schema: SchemaKey = "rintawa.test.external-effect@1".parse()?;
-        let result_owner = ExtensionId::new("rintawa.effect-result-system");
-        let effect_owner = ExtensionId::new("rintawa.effect-provider");
-        let storage = home.open_world_storage(world_id)?;
-        storage.register_schemas(&[
-            SchemaDefinition::new(
-                seed_schema.clone(),
-                SchemaKind::Command,
-                ExtensionId::new("rintawa.effect-seed"),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                result_schema.clone(),
-                SchemaKind::Command,
-                result_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                event_schema.clone(),
-                SchemaKind::Event,
-                result_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                effect_schema.clone(),
-                SchemaKind::Effect,
-                effect_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-        ])?;
-        let principal = PrincipalId::new();
-        let (effect_id, correlation_id) =
-            enqueue_test_effect(&storage, &seed_schema, &effect_schema, principal)?;
-        drop(storage);
-
-        let mut host = HostRuntime::start(&home)?;
+        // A stopped world reopens from its durable four-table state.
         host.activate_world(&home, world_id)?;
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        register_test_effect_routes(
-            &mut host,
-            world_id,
-            TestEffectRoutes {
-                result_owner: &result_owner,
-                result_schema: &result_schema,
-                event_schema: &event_schema,
-                effect_owner: &effect_owner,
-                effect_schema: &effect_schema,
-                remaining_retries: 1,
-                observed: Arc::clone(&observed),
-            },
-        )?;
+        assert!(host.is_world_active(world_id));
+        assert_eq!(host.active_worlds.len(), 1);
 
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(100))?,
-            1
-        );
-        let inspection = home.open_world_storage(world_id)?;
-        assert_eq!(
-            inspection.next_effect_wakeup()?,
-            Some(UnixTimeMillis::new(1_100))
-        );
-        assert_eq!(inspection.load_session()?.commit_position(), 1);
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(1_099))?,
-            0
-        );
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(1_100))?,
-            1
-        );
-        assert_eq!(inspection.load_session()?.commit_position(), 2);
-        assert!(
-            inspection
-                .claim_next_effect(UnixTimeMillis::new(2_000), UnixTimeMillis::new(3_000))?
-                .is_none()
-        );
-        let events = inspection.events_after(0, 16)?;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].schema, event_schema);
-        assert_eq!(
-            events[0].provenance.causation,
-            Some(CausationRef::Effect(effect_id))
-        );
-        assert_eq!(events[0].provenance.correlation_id, correlation_id);
-        assert_eq!(
-            observed
-                .lock()
-                .map_err(|_| anyhow::anyhow!("effect observer lock poisoned"))?
-                .len(),
-            2
-        );
-
-        host.deactivate_world(world_id)?;
         host.shutdown()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_recover_effect_after_follow_up_commit_without_duplicate_world_commit()
-    -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let home = HostHome::open(root.path().join("home"))?;
-        let world_id = home.create_world()?.id;
-        let seed_schema: SchemaKey = "rintawa.test.crash-seed@1".parse()?;
-        let result_schema: SchemaKey = "rintawa.test.crash-result@1".parse()?;
-        let event_schema: SchemaKey = "rintawa.test.crash-result-event@1".parse()?;
-        let effect_schema: SchemaKey = "rintawa.test.crash-effect@1".parse()?;
-        let result_owner = ExtensionId::new("rintawa.crash-result-system");
-        let effect_owner = ExtensionId::new("rintawa.crash-effect-provider");
-        let storage = home.open_world_storage(world_id)?;
-        storage.register_schemas(&[
-            SchemaDefinition::new(
-                seed_schema.clone(),
-                SchemaKind::Command,
-                ExtensionId::new("rintawa.crash-seed"),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                result_schema.clone(),
-                SchemaKind::Command,
-                result_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                event_schema.clone(),
-                SchemaKind::Event,
-                result_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-            SchemaDefinition::new(
-                effect_schema.clone(),
-                SchemaKind::Effect,
-                effect_owner.clone(),
-                serde_json::json!({ "type": "object" }),
-            ),
-        ])?;
-        let principal = PrincipalId::new();
-        let (effect_id, _) =
-            enqueue_test_effect(&storage, &seed_schema, &effect_schema, principal)?;
-        drop(storage);
-
-        let mut host = HostRuntime::start(&home)?;
-        host.activate_world(&home, world_id)?;
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        register_test_effect_routes(
-            &mut host,
-            world_id,
-            TestEffectRoutes {
-                result_owner: &result_owner,
-                result_schema: &result_schema,
-                event_schema: &event_schema,
-                effect_owner: &effect_owner,
-                effect_schema: &effect_schema,
-                remaining_retries: 0,
-                observed: Arc::clone(&observed),
-            },
-        )?;
-
-        let claim = host.active_worlds[&world_id]
-            .outbox
-            .claim_next_effect(UnixTimeMillis::new(100), UnixTimeMillis::new(200))?
-            .expect("effect must be claimable");
-        assert_eq!(claim.attempt(), 1);
-        let response =
-            host.active_worlds[&world_id].effect_handlers[&effect_schema].execute(&claim)?;
-        let WorldEffectServiceResponse::Complete {
-            command: Some(command),
-        } = response
-        else {
-            anyhow::bail!("effect provider must complete with a command");
-        };
-        let first = host.submit_world_command(world_id, command)?;
-        assert_eq!(
-            first.authoritative().receipt().disposition(),
-            CommitDisposition::Committed
-        );
-        assert_eq!(first.authoritative().receipt().position(), 2);
-
-        // Simulate a process crash after the command commit but before complete_effect.
-        assert_eq!(
-            host.pump_effect_outbox_at(world_id, UnixTimeMillis::new(200))?,
-            1
-        );
-        let inspection = home.open_world_storage(world_id)?;
-        assert_eq!(inspection.load_session()?.commit_position(), 2);
-        assert_eq!(inspection.events_after(0, 16)?.len(), 1);
-        assert!(
-            inspection
-                .claim_next_effect(UnixTimeMillis::new(300), UnixTimeMillis::new(400))?
-                .is_none()
-        );
-        let requests = observed
-            .lock()
-            .map_err(|_| anyhow::anyhow!("effect observer lock poisoned"))?;
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].job().id, effect_id);
-        assert_eq!(requests[0].job().attempt_count, 1);
-        assert_eq!(requests[1].job().attempt_count, 2);
-        drop(requests);
-
-        host.deactivate_world(world_id)?;
-        host.shutdown()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_queue_and_dispatch_ephemeral_runtime_signals_with_backpressure()
-    -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let world_id = WorldId::new();
-        let storage = SqliteWorldStorage::create(root.path().join("world.sqlite"), world_id)?;
-        let outbox = SqliteWorldStorage::open(root.path().join("world.sqlite"))?;
-        let world_runtime = WorldRuntimeBuilder::new(storage).start()?;
-        let scope = world_runtime_scope_id(world_id);
-        let instance = ExtensionInstanceId::new("runtime-signal-subscriber");
-        let topic = String::from("rintawa.operation.chunk@1");
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let mut engine = ExtensionEngine::new();
-
-        engine.register_extension_instance(
-            instance.clone(),
-            scope.clone(),
-            test_manifest("runtime-signal-subscriber"),
-            vec![Box::new(RuntimeSignalSubscriber {
-                id: ComponentId::new("runtime"),
-                topic: topic.clone(),
-                observed: Arc::clone(&observed),
-            })],
-        )?;
-        engine.start_extension_instance(&instance)?;
-
-        let mut host = HostRuntime {
-            active_worlds: BTreeMap::from([(
-                world_id,
-                ActiveWorld {
-                    runtime: world_runtime,
-                    outbox,
-                    effect_handlers: BTreeMap::new(),
-                    projections: BTreeMap::new(),
-                    signals: RuntimeSignalQueue::default(),
-                    registered_instances: vec![instance.clone()],
-                    started_instances: vec![instance],
-                },
-            )]),
-            engine,
-            started_instances: Vec::new(),
-            host_shell_provider: None,
-            ui_layer_provider: None,
-            host_access: None,
-        };
-
-        let correlation = CorrelationId::new();
-        host.enqueue_runtime_signal(
-            RuntimeSignal::new(world_id, topic.clone(), b"first".to_vec())
-                .with_correlation_id(correlation),
-        )?;
-        host.enqueue_runtime_signal(RuntimeSignal::new(
-            world_id,
-            topic.clone(),
-            b"second".to_vec(),
-        ))?;
-        assert_eq!(host.active_worlds[&world_id].signals.len(), 2);
-        assert_eq!(host.pump_runtime_signals(world_id)?, 2);
-        let values = observed
-            .lock()
-            .map_err(|_| anyhow::anyhow!("signal observer lock poisoned"))?
-            .clone();
-        assert_eq!(values.len(), 2);
-        assert_eq!(values[0].payload(), b"first");
-        assert_eq!(values[0].correlation_id(), Some(correlation));
-        assert_eq!(values[1].payload(), b"second");
-        assert_eq!(values[1].correlation_id(), None);
-
-        host.enqueue_runtime_signal(RuntimeSignal::new(
-            world_id,
-            topic.clone(),
-            b"from-poll".to_vec(),
-        ))?;
-        host.poll_runtime()?;
-        assert_eq!(
-            observed
-                .lock()
-                .map_err(|_| anyhow::anyhow!("signal observer lock poisoned"))?
-                .len(),
-            3
-        );
-
-        assert!(matches!(
-            host.enqueue_runtime_signal(RuntimeSignal::new(world_id, "   ", Vec::new())),
-            Err(HostError::InvalidRuntimeSignalTopic)
-        ));
-        assert!(matches!(
-            host.enqueue_runtime_signal(RuntimeSignal::new(
-                world_id,
-                topic.clone(),
-                vec![0_u8; crate::MAX_RUNTIME_SIGNAL_MESSAGE_BYTES],
-            )),
-            Err(HostError::RuntimeSignalMessageTooLarge { .. })
-        ));
-
-        for index in 0..crate::DEFAULT_RUNTIME_SIGNAL_QUEUE_CAPACITY {
-            host.enqueue_runtime_signal(RuntimeSignal::new(
-                world_id,
-                topic.clone(),
-                index.to_le_bytes().to_vec(),
-            ))?;
-        }
-        assert!(matches!(
-            host.enqueue_runtime_signal(RuntimeSignal::new(world_id, topic, b"overflow".to_vec())),
-            Err(HostError::RuntimeSignalQueueFull(id)) if id == world_id
-        ));
-
-        host.deactivate_world(world_id)?;
-        assert!(matches!(
-            host.enqueue_runtime_signal(RuntimeSignal::new(
-                world_id,
-                "rintawa.operation.chunk@1",
-                b"after-stop".to_vec(),
-            )),
-            Err(HostError::WorldNotActive(id)) if id == world_id
-        ));
-        host.shutdown()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_deliver_full_durable_world_event_envelope() -> anyhow::Result<()> {
-        let world_id = WorldId::new();
-        let scope = world_runtime_scope_id(world_id);
-        let instance = ExtensionInstanceId::new("world-event-subscriber");
-        let schema: rintawa_sdk::world::SchemaKey = "rintawa.test.event@1".parse()?;
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let mut engine = ExtensionEngine::new();
-
-        engine.register_extension_instance(
-            instance.clone(),
-            scope.clone(),
-            test_manifest("world-event-subscriber"),
-            vec![Box::new(WorldEventSubscriber {
-                id: ComponentId::new("runtime"),
-                topic: schema.to_string(),
-                observed: Arc::clone(&observed),
-            })],
-        )?;
-        engine.start_extension_instance(&instance)?;
-
-        let principal = PrincipalId::new();
-        let event = StoredWorldEvent {
-            world_id,
-            id: WorldEventId::new(),
-            commit_position: 7,
-            event_index: 0,
-            provenance: CommandProvenance {
-                command_id: CommandId::new(),
-                command_schema: "rintawa.test.command@1".parse()?,
-                principal,
-                actor: ActorRef::Principal(principal),
-                causation: None,
-                correlation_id: CorrelationId::new(),
-                effective_at: Some(UnixTimeMillis::new(1234)),
-                recorded_at: UnixTimeMillis::new(5678),
-            },
-            schema: schema.clone(),
-            payload: serde_json::json!({ "message": "hello" }),
-        };
-
-        let mut runtime = HostRuntime {
-            active_worlds: BTreeMap::new(),
-            engine,
-            started_instances: vec![instance],
-            host_shell_provider: None,
-            ui_layer_provider: None,
-            host_access: None,
-        };
-
-        let mut foreign_event = event.clone();
-        foreign_event.world_id = WorldId::new();
-        assert!(matches!(
-            runtime.dispatch_world_events(&[event.clone(), foreign_event]),
-            Err(HostError::MixedWorldEventBatch)
-        ));
-        assert!(
-            observed
-                .lock()
-                .map_err(|_| anyhow::anyhow!("event observer lock poisoned"))?
-                .is_empty()
-        );
-
-        assert_eq!(
-            runtime.dispatch_world_events(std::slice::from_ref(&event))?,
-            1
-        );
-        let deliveries = observed
-            .lock()
-            .map_err(|_| anyhow::anyhow!("event observer lock poisoned"))?;
-        assert_eq!(deliveries.len(), 1);
-        assert_eq!(deliveries[0].0, schema.to_string());
-        assert_eq!(deliveries[0].1, event);
-        drop(deliveries);
-
-        runtime.shutdown()?;
         Ok(())
     }
 
@@ -5865,6 +4305,10 @@ mod tests {
     }
 
     impl Component for FailingStopComponent {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn id(&self) -> &ComponentId {
             &self.id
         }
@@ -5914,6 +4358,55 @@ mod tests {
         assert_eq!(failures[0].operation, HostCleanupOperation::Stop);
         assert_eq!(failures[1].instance_id, first);
         assert_eq!(failures[1].operation, HostCleanupOperation::Stop);
+        Ok(())
+    }
+    #[test]
+    fn test_should_update_active_world_metadata_through_its_writer_queue() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path())?;
+        let world = home.create_world()?;
+        {
+            let storage = home.open_world_storage(world.id)?;
+            storage.update_manifest(&rintawa_world::WorldManifest::new(
+                serde_json::json!({"custom": 31, "metadata":{"title":"original"}}),
+            ))?;
+        }
+        let mut host = HostRuntime::start(&home)?;
+        host.activate_world(&home, world.id)?;
+        assert!(matches!(
+            home.update_world_metadata(world.id, "bypass", None, None),
+            Err(HostError::Storage(
+                rintawa_storage::StorageError::WriterBusy(_)
+            ))
+        ));
+        assert!(matches!(
+            home.delete_world(world.id),
+            Err(HostError::WorldLifecycleBusy(id)) if id == world.id
+        ));
+        let access = host.host_access.as_ref().unwrap().clone();
+        let id = world.id.to_string();
+        let other = access.clone();
+        let other_id = id.clone();
+        let updater = std::thread::spawn(move || {
+            WorldSessionAccess::set_metadata(&*other, &other_id, "one", Some("first"), None)
+        });
+        let second = WorldSessionAccess::set_metadata(&*access, &id, "two", None, None)
+            .map_err(|error| anyhow::anyhow!("metadata error: {error:?}"))?;
+        assert_eq!(second.title, "two");
+        updater
+            .join()
+            .unwrap()
+            .map_err(|error| anyhow::anyhow!("metadata error: {error:?}"))?;
+        let state = home.load_world_state(world.id)?;
+        assert_eq!(state.manifest().as_value()["custom"], 31);
+        let metadata = crate::world_metadata::WorldMetadata::from_manifest(state.manifest())?;
+        assert!(
+            metadata.title() == "one" && metadata.description() == Some("first")
+                || metadata.title() == "two" && metadata.description().is_none()
+        );
+        host.deactivate_world(world.id)?;
+        home.update_world_metadata(world.id, "inactive", None, None)?;
+        host.shutdown()?;
         Ok(())
     }
 }

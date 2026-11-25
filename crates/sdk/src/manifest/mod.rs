@@ -164,11 +164,26 @@ pub struct ComponentDescriptor {
     /// Permissions requested by this component.
     #[serde(default)]
     pub permissions: ComponentPermissions,
+
+    /// One owner preference explicitly published by an ordinary baseline WASM backend.
+    /// Reading it requires an exact matching artifact and a separate World-side grant.
+    #[serde(
+        default,
+        rename = "published-preference",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub published_preference: Option<String>,
 }
 
 /// Semantic validation errors for an extension manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ManifestValidationError {
+    /// A publication must name one bounded key on an ordinary WASM runtime component.
+    #[error("invalid published preference on component `{component_id}`")]
+    InvalidPublishedPreference {
+        /// Component containing the invalid declaration.
+        component_id: ComponentId,
+    },
     /// Two or more components use the same component identifier.
     #[error("duplicate component ID `{component_id}` in extension `{extension_id}`")]
     DuplicateComponentId {
@@ -232,6 +247,16 @@ impl ExtensionManifest {
     pub fn validate(&self) -> Result<(), ManifestValidationError> {
         let mut component_ids = HashSet::with_capacity(self.components.len());
         for component in &self.components {
+            if component.published_preference.as_ref().is_some_and(|key| {
+                key.is_empty()
+                    || key.len() > 128
+                    || component.target.as_str() != WASM_COMPONENT_TARGET_V1
+                    || component.kind != ComponentKind::Runtime
+            }) {
+                return Err(ManifestValidationError::InvalidPublishedPreference {
+                    component_id: component.id.clone(),
+                });
+            }
             if !component_ids.insert(component.id.as_str()) {
                 return Err(ManifestValidationError::DuplicateComponentId {
                     extension_id: self.id.clone(),
@@ -321,6 +346,7 @@ mod tests {
                 target: ComponentTarget::new("example.runtime.test@1"),
                 entry: Some(String::from("runtime.wasm")),
                 required: true,
+                published_preference: None,
                 permissions: ComponentPermissions {
                     secret_read: vec![SecretPathPattern::parse("ai.api_keys.*")?],
                     runtime: vec![
@@ -475,5 +501,46 @@ mod tests {
         )?;
         assert_eq!(manifest.validate(), Ok(()));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    #[test]
+    fn published_preference_is_opt_in_and_bound_to_runtime_wasm() {
+        let text = r#"id="fixture.shared"
+name="Shared"
+version="0.1.0"
+sdk="^0.0"
+[[components]]
+id="backend"
+kind="runtime"
+target="rintawa.runtime.wasm-component@1"
+published-preference="fixture.shared.v1"
+[components.permissions]
+runtime=["published-preference-read", "published-preference-write"]
+"#;
+        let mut m: ExtensionManifest = toml::from_str(text).unwrap();
+        m.validate().unwrap();
+        assert_eq!(
+            m.components[0].permissions.runtime,
+            vec![
+                RuntimePermission::PublishedPreferenceRead,
+                RuntimePermission::PublishedPreferenceWrite,
+            ]
+        );
+        let encoded = toml::to_string(&m).unwrap();
+        assert_eq!(toml::from_str::<ExtensionManifest>(&encoded).unwrap(), m);
+        for key in [String::new(), "x".repeat(129)] {
+            m.components[0].published_preference = Some(key);
+            assert!(m.validate().is_err());
+        }
+        m.components[0].published_preference = Some("shared".into());
+        m.components[0].kind = ComponentKind::Ui;
+        assert!(m.validate().is_err());
+        m.components[0].kind = ComponentKind::Runtime;
+        m.components[0].target = ComponentTarget::new("fixture.other@1");
+        assert!(m.validate().is_err());
     }
 }

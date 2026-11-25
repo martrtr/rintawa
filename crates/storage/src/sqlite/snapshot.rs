@@ -1,31 +1,29 @@
 //! Consistent read-only SQLite snapshot for one authoritative world.
 
-use rintawa_sdk::world::{EntityId, PrincipalId, RelationId, SchemaKey, WorldId};
-use rintawa_world::{EntityRecord, FacetRecord, FacetTarget, RelationRecord, SchemaDefinition};
+use rintawa_sdk::world::{ItemId, SchemaKey, WorldId};
+use rintawa_world::{ItemRecord, PropertyRecord, RelationDirection};
 use rusqlite::Connection;
 
 use crate::StorageResult;
 
-use crate::sqlite::{codec, query};
+use crate::sqlite::query;
 
 /// Consistent read-only view pinned to one SQLite WAL snapshot.
 ///
 /// The owning connection keeps a read transaction open for the lifetime of this
-/// value. Writers may continue committing in WAL mode, but all reads through
-/// this snapshot observe the same historical state.
+/// value. Writers may continue committing in WAL mode, but every read through
+/// this snapshot observes the same historical state.
 #[derive(Debug)]
 pub struct SqliteWorldSnapshot {
     connection: Connection,
     world_id: WorldId,
-    position: u64,
 }
 
 impl SqliteWorldSnapshot {
-    pub(super) const fn new(connection: Connection, world_id: WorldId, position: u64) -> Self {
+    pub(super) const fn new(connection: Connection, world_id: WorldId) -> Self {
         Self {
             connection,
             world_id,
-            position,
         }
     }
 
@@ -34,69 +32,140 @@ impl SqliteWorldSnapshot {
         self.world_id
     }
 
-    /// Returns the commit position pinned by this read transaction.
-    pub const fn position(&self) -> u64 {
-        self.position
-    }
-
-    /// Loads one entity from the pinned snapshot.
+    /// Loads one item from the pinned snapshot.
     ///
     /// # Errors
     ///
     /// Returns a storage error when persisted state cannot be decoded.
-    pub fn load_entity(&self, entity_id: EntityId) -> StorageResult<Option<EntityRecord>> {
-        query::load_entity(&self.connection, entity_id)
+    pub fn load_item(&self, id: ItemId) -> StorageResult<Option<ItemRecord>> {
+        query::load_item(&self.connection, id)
     }
 
-    /// Loads one relation from the pinned snapshot.
+    /// Loads one property value from the pinned snapshot.
     ///
     /// # Errors
     ///
-    /// Returns a storage error when persisted state cannot be decoded.
-    pub fn load_relation(&self, relation_id: RelationId) -> StorageResult<Option<RelationRecord>> {
-        query::load_relation(&self.connection, relation_id)
-    }
-
-    /// Loads one facet from the pinned snapshot.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage error when persisted state cannot be decoded.
-    pub fn load_facet(
+    /// Returns a storage error when persisted state cannot be decoded, including a
+    /// value written under a different property version.
+    pub fn load_property(
         &self,
-        target: FacetTarget,
-        schema: &SchemaKey,
-    ) -> StorageResult<Option<FacetRecord>> {
-        query::load_facet(&self.connection, target, schema)
+        item: ItemId,
+        key: &SchemaKey,
+    ) -> StorageResult<Option<PropertyRecord>> {
+        query::load_property(&self.connection, item, key)
     }
 
-    /// Loads one immutable world-schema definition from the pinned snapshot.
+    /// Loads every current property of one item.
     ///
     /// # Errors
     ///
-    /// Returns a storage error when persisted schema metadata cannot be decoded.
-    pub fn load_schema(&self, key: &SchemaKey) -> StorageResult<Option<SchemaDefinition>> {
-        codec::load_schema(&self.connection, key)
+    /// Returns a storage error when persisted state cannot be decoded.
+    pub fn properties_of(&self, item: ItemId) -> StorageResult<Vec<PropertyRecord>> {
+        query::list_properties(&self.connection, item)
     }
 
-    /// Returns whether one principal may issue an exact command as an entity actor
-    /// at this snapshot position.
+    /// Loads an item batch and selected properties through the same pinned snapshot.
+    ///
+    /// Both the item batch and property-key list are bounded by storage policy.
+    /// Missing items or absent properties are omitted from the returned vectors.
     ///
     /// # Errors
     ///
-    /// Returns a storage error when durable authority state cannot be queried.
-    pub fn principal_can_control(
+    /// Returns an error when a batch limit is exceeded or persisted state is invalid.
+    pub fn read(
         &self,
-        principal: PrincipalId,
-        actor_entity: EntityId,
-        command_schema: &SchemaKey,
-    ) -> StorageResult<bool> {
-        query::principal_can_control(
+        items: &[ItemId],
+        properties: &[SchemaKey],
+    ) -> StorageResult<(Vec<ItemRecord>, Vec<PropertyRecord>)> {
+        Ok((
+            query::load_items(&self.connection, items)?,
+            query::load_properties_for_items(&self.connection, items, properties)?,
+        ))
+    }
+
+    /// Finds a bounded page of values for one exact property definition.
+    ///
+    /// Results are ordered by item UUID; pass the last returned item as the next
+    /// exclusive cursor. A page is capped at 256 records and 8 MiB of JSON.
+    /// This is an unrestricted native storage operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or malformed page-size error.
+    pub fn find_properties(
+        &self,
+        key: &SchemaKey,
+        after: Option<ItemId>,
+        limit: usize,
+    ) -> StorageResult<Vec<PropertyRecord>> {
+        query::find_properties(&self.connection, key, after, limit)
+    }
+
+    /// Reads relations adjacent to any of the given objects in one SQL query.
+    ///
+    /// Relations are returned once, in ID order, even when both endpoints are
+    /// present in the input batch. Both batch and result size are bounded.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid page/batch limits or a storage error.
+    pub fn relations_touching_any(
+        &self,
+        targets: &[ItemId],
+        after: Option<ItemId>,
+        limit: usize,
+    ) -> StorageResult<Vec<ItemRecord>> {
+        query::relations_touching_any(&self.connection, targets, after, limit)
+    }
+
+    /// Finds a bounded directional relation page from the pinned snapshot.
+    ///
+    /// When `property` is supplied, only relation-items carrying that exact
+    /// property name and version are returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid batch/page limits or a storage error.
+    pub fn find_relations(
+        &self,
+        targets: &[ItemId],
+        direction: RelationDirection,
+        property: Option<&SchemaKey>,
+        after: Option<ItemId>,
+        limit: usize,
+    ) -> StorageResult<Vec<ItemRecord>> {
+        query::find_relations(&self.connection, targets, direction, property, after, limit)
+    }
+
+    /// Finds a bounded relation page in descending ID order, strictly before a cursor.
+    /// An absent cursor starts at the greatest relation ID in this pinned snapshot.
+    ///
+    /// # Errors
+    /// Returns invalid batch/page limits or a storage error.
+    pub fn find_relations_before(
+        &self,
+        targets: &[ItemId],
+        direction: RelationDirection,
+        property: Option<&SchemaKey>,
+        before: Option<ItemId>,
+        limit: usize,
+    ) -> StorageResult<Vec<ItemRecord>> {
+        query::find_relations_before(
             &self.connection,
-            principal,
-            actor_entity,
-            command_schema,
-            self.position,
+            targets,
+            direction,
+            property,
+            before,
+            limit,
         )
+    }
+
+    /// Loads every relation whose subject or object is the given item.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when persisted state cannot be decoded.
+    pub fn relations_pointing_at(&self, item: ItemId) -> StorageResult<Vec<ItemRecord>> {
+        query::relations_pointing_at(&self.connection, item)
     }
 }

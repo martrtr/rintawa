@@ -17,6 +17,10 @@ impl MockChatComponent {
 }
 
 impl Component for MockChatComponent {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn id(&self) -> &ComponentId {
         &self.id
     }
@@ -97,5 +101,72 @@ fn test_sdk_and_engine_integration_lifecycle() -> EngineResult<()> {
     engine.unregister_extension(&manifest.id)?;
     assert_eq!(engine.extension_state(&manifest.id), None);
 
+    Ok(())
+}
+
+struct AdmissionComponent {
+    id: ComponentId,
+    starts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+impl Component for AdmissionComponent {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn id(&self) -> &ComponentId {
+        &self.id
+    }
+    fn register(&mut self, _: &mut dyn RegistrationContext) -> ExtensionResult<()> {
+        Ok(())
+    }
+    fn start(&mut self, _: &mut dyn ComponentContext) -> ExtensionResult<()> {
+        self.starts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    fn stop(&mut self, _: &mut dyn ComponentContext) -> ExtensionResult<()> {
+        Ok(())
+    }
+}
+#[test]
+fn test_component_admission_refuses_before_partial_start_and_releases_slots() -> EngineResult<()> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let starts = Arc::new(AtomicUsize::new(0));
+    let mut engine = ExtensionEngine::new();
+    let manifest = |name: &str| ExtensionManifest {
+        id: ExtensionId::new(name),
+        name: name.into(),
+        version: "0.0.1".into(),
+        sdk: "^0.0".into(),
+        components: vec![],
+    };
+    let components = (0..128)
+        .map(|index| {
+            Box::new(AdmissionComponent {
+                id: ComponentId::new(format!("component-{index}")),
+                starts: starts.clone(),
+            }) as Box<dyn Component>
+        })
+        .collect();
+    engine.register_extension(manifest("full"), components)?;
+    engine.start_extension(&ExtensionId::new("full"))?;
+    engine.register_extension(
+        manifest("overflow"),
+        vec![Box::new(AdmissionComponent {
+            id: ComponentId::new("overflow"),
+            starts: starts.clone(),
+        })],
+    )?;
+    assert!(
+        engine
+            .start_extension(&ExtensionId::new("overflow"))
+            .is_err()
+    );
+    assert_eq!(starts.load(Ordering::SeqCst), 128);
+    engine.stop_extension(&ExtensionId::new("full"))?;
+    engine.start_extension(&ExtensionId::new("overflow"))?;
+    assert_eq!(starts.load(Ordering::SeqCst), 129);
     Ok(())
 }

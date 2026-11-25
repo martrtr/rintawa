@@ -27,6 +27,10 @@ struct TestHostedComponent {
 }
 
 impl Component for TestHostedComponent {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn id(&self) -> &ComponentId {
         &self.id
     }
@@ -146,6 +150,8 @@ id = "runtime"
 kind = "runtime"
 target = "rintawa.runtime.wasm-component@1"
 entry = "provider.wasm"
+[components.permissions]
+runtime = ["background-task"]
 "#,
     )?;
     fs::write(source.join("provider.wasm"), TEST_TARGET_PROVIDER_COMPONENT)?;
@@ -570,24 +576,7 @@ entry = "payload.bin"
         engine.extension_instance_state(&dependent_instance),
         Some(ExtensionState::Active)
     );
-    assert_eq!(
-        engine.dispatch_runtime_event_in_scope(
-            &world_scope,
-            "test.delegated-event@1",
-            b"delegated payload",
-        )?,
-        1
-    );
-
     engine.unregister_extension_instance(&dependent_instance)?;
-    assert_eq!(
-        engine.dispatch_runtime_event_in_scope(
-            &world_scope,
-            "test.delegated-event@1",
-            b"delegated payload",
-        )?,
-        0
-    );
     engine.stop_extension_instance(&provider_instance)?;
     assert_eq!(engine.execution_target_owner("test.wasm-target@1"), None);
     engine.unregister_extension_instance(&provider_instance)?;
@@ -930,3 +919,165 @@ fn test_should_reject_duplicate_execution_target_from_another_owner() -> EngineR
     assert_eq!(engine.execution_target_owner("test.runtime@1"), Some(first));
     Ok(())
 }
+
+#[test]
+fn test_should_bind_hosted_tasks_to_dependent_worlds_and_revoke_shared_store_on_trap()
+-> anyhow::Result<()> {
+    use rintawa_extension_engine::{HostAccessResult, RuntimeContextAccess};
+    use rintawa_sdk::{
+        contracts::ComponentPrincipal, runtime_permissions::RuntimePermission, world::WorldId,
+    };
+    use std::{collections::HashMap, time::Duration};
+    struct Worlds(HashMap<RuntimeScopeId, WorldId>);
+    impl RuntimeContextAccess for Worlds {
+        fn world_id_for_scope(&self, scope: &RuntimeScopeId) -> HostAccessResult<Option<WorldId>> {
+            Ok(self.0.get(scope).copied())
+        }
+    }
+    fn trace(
+        engine: &mut ExtensionEngine,
+        principal: &ComponentPrincipal,
+        handle: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        for _ in 0..100 {
+            engine.poll_runtime()?;
+            let mut values = engine.poll_transport_notifications(principal, handle)?;
+            if !values.is_empty() {
+                return Ok(values.remove(0));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        anyhow::bail!("missing hosted task trace")
+    }
+    let temp = tempfile::tempdir()?;
+    let mut engine = ExtensionEngine::new();
+    let scope_a = RuntimeScopeId::new("world-a");
+    let scope_b = RuntimeScopeId::new("world-b");
+    let world_a = WorldId::new();
+    let world_b = WorldId::new();
+    engine.attach_runtime_context_access(Arc::new(Worlds(HashMap::from([
+        (scope_a.clone(), world_a),
+        (scope_b.clone(), world_b),
+    ]))));
+    let provider = load_wasm_target_provider(&mut engine, temp.path(), "shared-provider")?;
+    engine.grant_requested_runtime_permission_for_instance(
+        &provider,
+        &ComponentId::new("runtime"),
+        RuntimePermission::BackgroundTask,
+    )?;
+    engine.start_extension_instance(&provider)?;
+    let root =
+        engine.active_component_principal(&ComponentRef::new(provider.clone(), "runtime"))?;
+    let root_subscription = engine.subscribe_transport_notifications(&root, "fixture/context")?;
+    let independent = register_active_target_owner(&mut engine, "independent-backend", "runtime")?;
+    let mut dependents = Vec::new();
+    for (name, scope, component) in [
+        ("client-a", scope_a.clone(), "hosted"),
+        ("client-b", scope_b, "hosted"),
+        ("trap-client", scope_a, "trap"),
+    ] {
+        let source = temp.path().join(name);
+        let manifest = format!(
+            r#"id = "hosted.fixture"
+name = "Hosted fixture"
+version = "0.1.0"
+sdk = "^0.0"
+[[components]]
+id = "{component}"
+kind = "runtime"
+target = "test.wasm-target@1"
+entry = "payload.bin"
+[components.permissions]
+runtime = ["background-task", "user-resource-import"]
+"#
+        );
+        write_rtw_source(&source, "rintawa.extension@1", manifest.as_bytes())?;
+        fs::write(source.join("payload.bin"), b"hosted payload")?;
+        let artifacts = temp.path().join(format!("{name}-artifacts"));
+        fs::create_dir_all(&artifacts)?;
+        let (store, digest) = import_source(&source, &artifacts)?;
+        let instance = ExtensionInstanceId::new(name);
+        RtwExtensionLoader::new().load_stored_extension(
+            &mut engine,
+            &store,
+            &digest,
+            instance.clone(),
+            scope,
+        )?;
+        for permission in [
+            RuntimePermission::BackgroundTask,
+            RuntimePermission::UserResourceImport,
+        ] {
+            engine.grant_requested_runtime_permission_for_instance(
+                &instance,
+                &ComponentId::new(component),
+                permission,
+            )?;
+        }
+        dependents.push((instance, component));
+    }
+    let mut clients = Vec::new();
+    for (instance, component) in dependents.iter().take(2) {
+        engine.start_extension_instance(instance)?;
+        let principal =
+            engine.active_component_principal(&ComponentRef::new(instance.clone(), *component))?;
+        let subscription =
+            engine.subscribe_transport_notifications(&principal, "fixture/context")?;
+        clients.push((principal, subscription));
+    }
+    for ((principal, subscription), world) in clients.iter().zip([world_a, world_b]) {
+        let value = String::from_utf8(trace(&mut engine, principal, *subscription)?)?;
+        assert_eq!(
+            value,
+            format!(
+                "world-{}|{}|hosted|{}|{}",
+                if principal.instance_id.as_str() == "client-a" {
+                    "a"
+                } else {
+                    "b"
+                },
+                principal.instance_id,
+                principal.activation,
+                world
+            )
+        );
+    }
+    let root_trace = String::from_utf8(trace(&mut engine, &root, root_subscription)?)?;
+    assert_eq!(
+        root_trace,
+        format!("baseline|shared-provider|runtime|{}|", root.activation)
+    );
+    engine.stop_extension_instance(&dependents[0].0)?;
+    assert!(
+        engine
+            .poll_transport_notifications(&clients[0].0, clients[0].1)
+            .is_err()
+    );
+    assert!(!trace(&mut engine, &clients[1].0, clients[1].1)?.is_empty());
+    engine.start_extension_instance(&dependents[2].0)?;
+    for _ in 0..100 {
+        engine.poll_runtime()?;
+        if engine
+            .active_component_principal(&clients[1].0.component())
+            .is_err()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        engine
+            .active_component_principal(&clients[1].0.component())
+            .is_err()
+    );
+    assert!(
+        engine
+            .active_component_principal(&root.component())
+            .is_err()
+    );
+    assert!(engine.active_component_principal(&independent).is_ok());
+    Ok(())
+}
+
+#[path = "artifact_loader_test/nonblocking_tests.rs"]
+mod nonblocking_tests;

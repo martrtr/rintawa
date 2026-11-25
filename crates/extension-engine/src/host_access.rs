@@ -1,4 +1,4 @@
-//! Generic host-owned local artifact, asset, user-content, and composition access.
+//! Generic host-owned local artifact, asset, and composition access.
 //!
 //! These traits deliberately contain no repository, update, marketplace, package-manager,
 //! or network-source semantics. The production host can expose them to any explicitly
@@ -6,7 +6,12 @@
 
 use std::sync::Arc;
 
-use rintawa_sdk::contracts::ComponentRef;
+use rintawa_sdk::{
+    contracts::{ComponentPrincipal, ComponentRef},
+    types::{ExtensionInstanceId, RuntimeScopeId},
+    world::{ItemId, SchemaKey},
+};
+use rintawa_world_runtime::WorldCommandTicket;
 
 /// One immutable raw asset imported into the local asset store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,8 +46,6 @@ pub struct WorldSessionSummary {
     pub description: Option<String>,
     /// Optional immutable cover asset reference.
     pub cover: Option<WorldSessionAssetRef>,
-    /// Last committed authoritative world position.
-    pub commit_position: u64,
     /// Whether the world currently owns a running authoritative runtime.
     pub active: bool,
     /// Requested active state awaiting the next host runtime pump, when any.
@@ -58,26 +61,6 @@ pub struct ImportedArtifact {
     pub digest: String,
     /// Versioned RTW content type.
     pub content: String,
-}
-
-/// One logical item in the persistent generic user-content library.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UserContentSummary {
-    /// Stable host-local logical content identity.
-    pub id: String,
-    /// Exact versioned RTW content type.
-    pub content: String,
-    /// Exact immutable RTW revision digest.
-    pub revision: String,
-}
-
-/// One generic user-content item plus its bounded root descriptor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UserContentDocument {
-    /// Logical item metadata.
-    pub metadata: UserContentSummary,
-    /// Exact bounded bytes stored at the RTW root entry path.
-    pub descriptor: Vec<u8>,
 }
 
 /// One exact activation selected by the host composition.
@@ -114,10 +97,6 @@ pub enum HostAccessError {
     InvalidDigest,
     /// A world identifier is malformed.
     InvalidWorldId,
-    /// A user-content logical identifier is malformed.
-    InvalidUserContentId,
-    /// A user-content type filter is malformed.
-    InvalidContentType,
     /// A bounded host-owned request queue has no remaining capacity.
     QueueFull,
     /// The requested selection does not exist.
@@ -132,6 +111,10 @@ pub enum HostAccessError {
     PreferenceQuotaExceeded,
     /// Host policy or persistent state rejected the operation.
     Rejected,
+    /// A bounded read has invalid arguments or an exact-version mismatch.
+    InvalidRequest,
+    /// A read exceeds the serialized result byte limit.
+    MessageTooLarge,
     /// The capability is not attached to this host runtime.
     Unavailable,
 }
@@ -148,6 +131,54 @@ pub trait RuntimeContextAccess: Send + Sync {
     ) -> HostAccessResult<Option<rintawa_sdk::world::WorldId>>;
 }
 
+/// Host-mediated access to one active authoritative World runtime.
+///
+/// Callers supply only their Host-attested exact instance identity and runtime scope;
+/// World identity and command principal are assigned by the Host implementation.
+pub trait WorldDataAccess: Send + Sync {
+    /// Captures one owner-scoped snapshot for a bounded guest batch/graph operation.
+    fn snapshot(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ExtensionInstanceId,
+    ) -> HostAccessResult<rintawa_world_runtime::WorldSnapshot>;
+    /// Loads one item from the current World snapshot.
+    fn load_item(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ExtensionInstanceId,
+        item: ItemId,
+    ) -> HostAccessResult<Option<String>>;
+
+    /// Loads one owner-authorized property from the current World snapshot.
+    fn load_property(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ExtensionInstanceId,
+        item: ItemId,
+        key: &SchemaKey,
+    ) -> HostAccessResult<Option<String>>;
+
+    /// Finds one bounded owner-authorized property page from a current snapshot.
+    fn find_properties(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ExtensionInstanceId,
+        key: &SchemaKey,
+        after: Option<ItemId>,
+        limit: usize,
+    ) -> HostAccessResult<Vec<String>>;
+
+    /// Enqueues a command owned by the exact attested component without waiting for the commit.
+    fn submit(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ComponentRef,
+        schema: SchemaKey,
+        payload: serde_json::Value,
+    ) -> HostAccessResult<WorldCommandTicket>;
+}
+
 /// Generic immutable RTW artifact-store operations.
 pub trait ArtifactStoreAccess: Send + Sync {
     /// Validates and imports exact RTW bytes without selecting them for activation.
@@ -156,6 +187,13 @@ pub trait ArtifactStoreAccess: Send + Sync {
 
 /// Generic immutable raw-asset store operations.
 pub trait AssetStoreAccess: Send + Sync {
+    /// Opens a verified CAS reader at offset zero without copying the entire asset.
+    fn open_asset(
+        &self,
+        digest: &str,
+        size: u64,
+        media_type: &str,
+    ) -> HostAccessResult<std::fs::File>;
     /// Imports exact bytes and returns their immutable digest/size/media reference.
     fn import_asset(&self, bytes: &[u8], media_type: &str) -> HostAccessResult<ImportedAsset>;
 
@@ -200,72 +238,79 @@ pub trait UserResourceAccess: Send + Sync {
         &self,
         reference: &UserResourceRef,
         maximum_bytes: usize,
+        principal: &ComponentPrincipal,
     ) -> HostAccessResult<Vec<u8>>;
 
     /// Explicitly releases one exact ephemeral resource. Missing/mismatched refs fail closed.
-    fn release_resource(&self, reference: &UserResourceRef) -> HostAccessResult<()>;
-}
-
-/// Generic read-only access to the persistent user-content library.
-pub trait UserContentAccess: Send + Sync {
-    /// Lists logical items, optionally restricted to one exact versioned content type.
-    fn list_user_content(&self, content: Option<&str>)
-    -> HostAccessResult<Vec<UserContentSummary>>;
-
-    /// Reads one bounded root content descriptor by logical identity.
-    fn read_user_content(&self, id: &str) -> HostAccessResult<UserContentDocument>;
-}
-
-/// Host-generated identity for one accepted deferred user-content write.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AcceptedUserContentWrite {
-    /// Opaque operation identity scoped to the exact requesting component.
-    pub operation_id: String,
-}
-
-/// Current state of one deferred user-content write operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UserContentWriteStatus {
-    /// The request is accepted but has not finished handler validation/publication.
-    Pending,
-    /// The request published one exact immutable revision into the logical library.
-    Succeeded(UserContentSummary),
-    /// Validation, handler policy, or persistence rejected the request.
-    Failed(String),
-}
-
-/// Generic deferred mutation access to the persistent user-content library.
-///
-/// Requests are owner-scoped and must execute only after the current guest callback
-/// unwinds so extension-provided content handlers are never re-entered synchronously.
-pub trait UserContentWriteAccess: Send + Sync {
-    /// Queues one new RTW content revision for handler validation and publication.
-    fn request_import(
+    fn release_resource(
         &self,
-        owner: &ComponentRef,
-        rtw: &[u8],
-    ) -> HostAccessResult<AcceptedUserContentWrite>;
+        reference: &UserResourceRef,
+        principal: &ComponentPrincipal,
+    ) -> HostAccessResult<()>;
 
-    /// Queues replacement of one logical item while preserving its content type.
-    fn request_replace(
+    /// Atomically retires an unclaimed ref and binds its replacement to an activation.
+    /// `replacement_id` is OS entropy generated by the Engine before entering locks,
+    /// never supplied by guest payloads. This transition must perform only bounded
+    /// metadata work, without I/O, callbacks, reentry, or copying file data.
+    fn take_resource(
         &self,
-        owner: &ComponentRef,
-        id: &str,
-        rtw: &[u8],
-    ) -> HostAccessResult<AcceptedUserContentWrite>;
+        reference: &UserResourceRef,
+        principal: &ComponentPrincipal,
+        replacement_id: &str,
+    ) -> HostAccessResult<UserResourceRef>;
 
-    /// Reads status only when the operation belongs to the exact requesting component.
-    fn write_status(
-        &self,
-        owner: &ComponentRef,
-        operation_id: &str,
-    ) -> HostAccessResult<UserContentWriteStatus>;
+    /// Infallibly disposes of this precise retired activation's acquisitions.
+    /// Implementations must recover poisoned metadata locks, finish bounded cleanup,
+    /// and never call guests, perform I/O, or reenter execution/policy locks.
+    fn release_owned_resources(&self, principal: &ComponentPrincipal);
 }
 
 /// Generic persistent-world catalog and lifecycle request operations.
 pub trait WorldSessionAccess: Send + Sync {
     /// Lists persistent worlds together with current/pending runtime lifecycle state.
     fn list_worlds(&self) -> HostAccessResult<Vec<WorldSessionSummary>>;
+
+    /// Bounded inert JSON catalog of installed immutable templates.
+    fn list_templates(&self) -> HostAccessResult<String> {
+        Err(HostAccessError::Unavailable)
+    }
+    /// Exact inert template descriptor JSON for permission review.
+    fn template_info(&self, _digest: &str) -> HostAccessResult<String> {
+        Err(HostAccessError::Unavailable)
+    }
+    /// Atomically creates an independent World from an installed exact template.
+    fn create_from_template(
+        &self,
+        _digest: &str,
+        _title: &str,
+        _approve_runtime_permissions: bool,
+    ) -> HostAccessResult<WorldSessionSummary> {
+        Err(HostAccessError::Unavailable)
+    }
+    /// Atomically creates a World with local approvals for exact template components.
+    fn create_from_template_with_permissions(
+        &self,
+        _request: &str,
+    ) -> HostAccessResult<WorldSessionSummary> {
+        Err(HostAccessError::Rejected)
+    }
+    /// Stable entry component, without implicit activation or permission changes.
+    fn entry(&self, _world_id: &str) -> HostAccessResult<Option<ComponentRef>> {
+        Err(HostAccessError::Unavailable)
+    }
+
+    /// Private staging plus its live ownership lock, reclaimed on next Host startup after a crash.
+    fn package_staging(&self) -> Result<(tempfile::TempDir, std::fs::File), String> {
+        Err("package staging unavailable".into())
+    }
+    /// Validates/stores an Engine-generated private package file, outside guest execution.
+    fn install_package_file(&self, _path: &std::path::Path) -> Result<String, String> {
+        Err("package installation unavailable".into())
+    }
+    /// Exports a stopped World to an Engine-generated private destination.
+    fn export_world_file(&self, _world_id: &str, _path: &std::path::Path) -> Result<(), String> {
+        Err("World export unavailable".into())
+    }
 
     /// Creates one empty persistent authoritative world.
     fn create_world(&self) -> HostAccessResult<WorldSessionSummary>;
@@ -284,163 +329,6 @@ pub trait WorldSessionAccess: Send + Sync {
 
     /// Requests the desired active state to be applied after guest execution unwinds.
     fn set_active(&self, world_id: &str, active: bool) -> HostAccessResult<()>;
-}
-
-/// Actor selected for one host-authenticated authoritative world command.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorldCommandActor {
-    /// The host-authenticated outside principal acts directly.
-    Principal,
-    /// The authenticated principal acts through one world entity subject to ControlGrant policy.
-    Entity(String),
-}
-
-/// One bounded command request accepted from an ordinary extension component.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorldCommandRequest {
-    /// Target authoritative world in canonical textual form.
-    pub world_id: String,
-    /// Exact versioned command schema.
-    pub schema: String,
-    /// Role on whose behalf the authenticated principal requests the command.
-    pub actor: WorldCommandActor,
-    /// Optional optimistic-concurrency world position.
-    pub expected_position: Option<u64>,
-    /// Extension-owned JSON command payload bytes.
-    pub payload_json: Vec<u8>,
-}
-
-/// Stable identities allocated by the host for one accepted deferred world command.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AcceptedWorldCommand {
-    /// Host-generated idempotency identity of the command.
-    pub command_id: String,
-    /// Host-generated correlation identity of the new operation chain.
-    pub correlation_id: String,
-}
-
-/// Failure returned by generic authoritative world-command submission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorldCommandAccessError {
-    /// Target WorldId is malformed.
-    InvalidWorldId,
-    /// Versioned command schema is malformed.
-    InvalidSchema,
-    /// Entity actor identity is malformed.
-    InvalidActor,
-    /// Command payload is not valid JSON.
-    InvalidPayload,
-    /// Target persistent world does not exist.
-    NotFound,
-    /// Target world is neither active nor accepted for deferred activation.
-    WorldNotActive,
-    /// Host-owned deferred command queue has no remaining capacity.
-    QueueFull,
-    /// Host policy or persistent state rejected the request.
-    Rejected,
-    /// Command submission is unavailable in the current host.
-    Unavailable,
-}
-
-/// Result used by generic authoritative world-command submission.
-pub type WorldCommandAccessResult<T> = Result<T, WorldCommandAccessError>;
-
-/// Generic deferred submission boundary for authoritative world commands.
-///
-/// The guest never supplies a PrincipalId. Implementations bind the command to the
-/// already authenticated host principal before it reaches authoritative validation.
-pub trait WorldCommandAccess: Send + Sync {
-    /// Validates and queues one command for execution after the current guest callback unwinds.
-    fn submit_world_command(
-        &self,
-        request: WorldCommandRequest,
-    ) -> WorldCommandAccessResult<AcceptedWorldCommand>;
-}
-
-/// One bounded policy-filtered projection request accepted from an ordinary extension.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorldProjectionRequest {
-    /// Target authoritative World in canonical textual form.
-    pub world_id: String,
-    /// Exact versioned Projection schema.
-    pub schema: String,
-    /// Extension-owned JSON input bytes.
-    pub input_json: Vec<u8>,
-}
-
-/// Host-generated identity for one accepted deferred projection read.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AcceptedWorldProjectionRead {
-    /// Opaque operation identity scoped to the exact requesting component.
-    pub operation_id: String,
-}
-
-/// One immutable policy-filtered view returned by an authoritative World Projection.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorldProjectionReadView {
-    /// Authoritative World represented by the view.
-    pub world_id: String,
-    /// Exact pinned World position used to construct the view.
-    pub snapshot_position: u64,
-    /// Exact versioned Projection schema.
-    pub schema: String,
-    /// Schema-validated feature-owned JSON view bytes.
-    pub value_json: Vec<u8>,
-}
-
-/// Current state of one owner-scoped deferred projection read.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorldProjectionReadStatus {
-    /// The request is accepted but has not yet been evaluated by the Host.
-    Pending,
-    /// Projection policy completed with one validated immutable view.
-    Succeeded(WorldProjectionReadView),
-    /// Projection evaluation failed after admission.
-    Failed(String),
-}
-
-/// Failure returned while validating or inspecting a deferred projection read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorldProjectionAccessError {
-    /// Target WorldId is malformed.
-    InvalidWorldId,
-    /// Versioned Projection schema is malformed.
-    InvalidSchema,
-    /// Projection input is not valid JSON or exceeds the protocol bound.
-    InvalidInput,
-    /// Target persistent World does not exist.
-    NotFound,
-    /// Target World is neither active nor accepted for deferred activation.
-    WorldNotActive,
-    /// Host-owned deferred projection queue has no remaining capacity.
-    QueueFull,
-    /// Host policy rejected the operation or owner-scoped status lookup.
-    Rejected,
-    /// Projection access is unavailable in the current Host.
-    Unavailable,
-}
-
-/// Result used by generic deferred policy-filtered World Projection reads.
-pub type WorldProjectionAccessResult<T> = Result<T, WorldProjectionAccessError>;
-
-/// Generic deferred read boundary for Principal-filtered authoritative World Projections.
-///
-/// The guest never supplies a PrincipalId. Implementations bind evaluation to the already
-/// authenticated Host principal and keep operation status scoped to the exact component owner.
-pub trait WorldProjectionAccess: Send + Sync {
-    /// Validates and queues one projection request after the current guest callback unwinds.
-    fn request_projection(
-        &self,
-        owner: &ComponentRef,
-        request: WorldProjectionRequest,
-    ) -> WorldProjectionAccessResult<AcceptedWorldProjectionRead>;
-
-    /// Reads status only when the operation belongs to the exact requesting component.
-    fn projection_status(
-        &self,
-        owner: &ComponentRef,
-        operation_id: &str,
-    ) -> WorldProjectionAccessResult<WorldProjectionReadStatus>;
 }
 
 /// Owner-scoped non-authoritative preference storage for ordinary extensions.
@@ -475,6 +363,19 @@ pub trait PreferenceAccess: Send + Sync {
         component_id: &str,
         key: &str,
     ) -> HostAccessResult<()>;
+
+    /// Exchanges the exact baseline publisher's raw preference value atomically.
+    /// The persisted owner must still select `digest`. Returns `false` for a value mismatch.
+    fn compare_exchange_published(
+        &self,
+        _owner: &ComponentRef,
+        _digest: &rintawa_artifacts::ArtifactDigest,
+        _key: &str,
+        _expected: Option<&str>,
+        _value: Option<&str>,
+    ) -> HostAccessResult<bool> {
+        Err(HostAccessError::Unavailable)
+    }
 }
 
 /// Requested runtime permissions for one component in an exact artifact.
@@ -514,8 +415,35 @@ pub struct RuntimePolicyComponent {
     pub granted: Vec<String>,
 }
 
+/// One exact HTTP loopback origin granted to a component in one runtime scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeHttpOriginGrant {
+    /// Scope of the exact owning runtime instance.
+    pub scope_id: String,
+    /// Concrete extension instance authorized by the Host.
+    pub instance_id: String,
+    /// Component within the authorized instance.
+    pub component_id: String,
+    /// Canonical HTTP origin including its exact port.
+    pub origin: String,
+}
+
 /// Generic administrative access to runtime permission policy.
 pub trait RuntimePolicyAccess: Send + Sync {
+    /// Inspect an exact active target before displaying an administrative decision.
+    fn live_component_policy(
+        &self,
+        _scope: &str,
+        _instance: &str,
+        _component: &str,
+    ) -> HostAccessResult<String> {
+        Err(HostAccessError::Rejected)
+    }
+    /// Persist and publish one strict, bounded JSON LivePolicyChange for that target.
+    fn apply_live_change(&self, _change: &str) -> HostAccessResult<()> {
+        Err(HostAccessError::Rejected)
+    }
+
     /// Inspects requested runtime permissions in one exact imported artifact.
     fn inspect_artifact(&self, digest: &str) -> HostAccessResult<RuntimeArtifactPolicy>;
 
@@ -529,6 +457,35 @@ pub trait RuntimePolicyAccess: Send + Sync {
         &self,
         _scope_id: &str,
     ) -> HostAccessResult<Vec<RuntimePolicyComponent>> {
+        Err(HostAccessError::Rejected)
+    }
+
+    /// Lists approved local HTTP origins in one exact composition scope.
+    ///
+    /// Host adapters without this capability fail closed.
+    fn list_http_origins(&self, _scope_id: &str) -> HostAccessResult<Vec<RuntimeHttpOriginGrant>> {
+        Err(HostAccessError::Rejected)
+    }
+
+    /// Approves one exact local origin for one manifest-authorized principal.
+    fn grant_http_origin(
+        &self,
+        _scope_id: &str,
+        _instance_id: &str,
+        _component_id: &str,
+        _origin: &str,
+    ) -> HostAccessResult<()> {
+        Err(HostAccessError::Rejected)
+    }
+
+    /// Revokes one exact local origin independently of other granted ports.
+    fn revoke_http_origin(
+        &self,
+        _scope_id: &str,
+        _instance_id: &str,
+        _component_id: &str,
+        _origin: &str,
+    ) -> HostAccessResult<()> {
         Err(HostAccessError::Rejected)
     }
 
@@ -646,6 +603,9 @@ impl ArtifactStoreAccess for UnavailableArtifactStoreAccess {
 struct UnavailableAssetStoreAccess;
 
 impl AssetStoreAccess for UnavailableAssetStoreAccess {
+    fn open_asset(&self, _: &str, _: u64, _: &str) -> HostAccessResult<std::fs::File> {
+        Err(HostAccessError::Unavailable)
+    }
     fn import_asset(&self, _bytes: &[u8], _media_type: &str) -> HostAccessResult<ImportedAsset> {
         Err(HostAccessError::Unavailable)
     }
@@ -678,56 +638,29 @@ impl UserResourceAccess for UnavailableUserResourceAccess {
         &self,
         _reference: &UserResourceRef,
         _maximum_bytes: usize,
+        _principal: &ComponentPrincipal,
     ) -> HostAccessResult<Vec<u8>> {
         Err(HostAccessError::Unavailable)
     }
 
-    fn release_resource(&self, _reference: &UserResourceRef) -> HostAccessResult<()> {
-        Err(HostAccessError::Unavailable)
-    }
-}
-
-struct UnavailableUserContentAccess;
-
-impl UserContentAccess for UnavailableUserContentAccess {
-    fn list_user_content(
+    fn release_resource(
         &self,
-        _content: Option<&str>,
-    ) -> HostAccessResult<Vec<UserContentSummary>> {
+        _reference: &UserResourceRef,
+        _principal: &ComponentPrincipal,
+    ) -> HostAccessResult<()> {
         Err(HostAccessError::Unavailable)
     }
 
-    fn read_user_content(&self, _id: &str) -> HostAccessResult<UserContentDocument> {
-        Err(HostAccessError::Unavailable)
-    }
-}
-
-struct UnavailableUserContentWriteAccess;
-
-impl UserContentWriteAccess for UnavailableUserContentWriteAccess {
-    fn request_import(
+    fn take_resource(
         &self,
-        _owner: &ComponentRef,
-        _rtw: &[u8],
-    ) -> HostAccessResult<AcceptedUserContentWrite> {
+        _: &UserResourceRef,
+        _: &ComponentPrincipal,
+        _: &str,
+    ) -> HostAccessResult<UserResourceRef> {
         Err(HostAccessError::Unavailable)
     }
-
-    fn request_replace(
-        &self,
-        _owner: &ComponentRef,
-        _id: &str,
-        _rtw: &[u8],
-    ) -> HostAccessResult<AcceptedUserContentWrite> {
-        Err(HostAccessError::Unavailable)
-    }
-
-    fn write_status(
-        &self,
-        _owner: &ComponentRef,
-        _operation_id: &str,
-    ) -> HostAccessResult<UserContentWriteStatus> {
-        Err(HostAccessError::Unavailable)
+    fn release_owned_resources(&self, _: &ComponentPrincipal) {
+        // This unavailable adapter cannot create or acquire a resource.
     }
 }
 
@@ -759,39 +692,6 @@ impl WorldSessionAccess for UnavailableWorldSessionAccess {
 
     fn set_active(&self, _world_id: &str, _active: bool) -> HostAccessResult<()> {
         Err(HostAccessError::Unavailable)
-    }
-}
-
-#[derive(Default)]
-struct UnavailableWorldCommandAccess;
-
-impl WorldCommandAccess for UnavailableWorldCommandAccess {
-    fn submit_world_command(
-        &self,
-        _request: WorldCommandRequest,
-    ) -> WorldCommandAccessResult<AcceptedWorldCommand> {
-        Err(WorldCommandAccessError::Unavailable)
-    }
-}
-
-#[derive(Default)]
-struct UnavailableWorldProjectionAccess;
-
-impl WorldProjectionAccess for UnavailableWorldProjectionAccess {
-    fn request_projection(
-        &self,
-        _owner: &ComponentRef,
-        _request: WorldProjectionRequest,
-    ) -> WorldProjectionAccessResult<AcceptedWorldProjectionRead> {
-        Err(WorldProjectionAccessError::Unavailable)
-    }
-
-    fn projection_status(
-        &self,
-        _owner: &ComponentRef,
-        _operation_id: &str,
-    ) -> WorldProjectionAccessResult<WorldProjectionReadStatus> {
-        Err(WorldProjectionAccessError::Unavailable)
     }
 }
 
@@ -876,6 +776,56 @@ impl RuntimeContextAccess for UnavailableRuntimeContextAccess {
 }
 
 #[derive(Default)]
+struct UnavailableWorldDataAccess;
+
+impl WorldDataAccess for UnavailableWorldDataAccess {
+    fn snapshot(
+        &self,
+        _: &RuntimeScopeId,
+        _: &ExtensionInstanceId,
+    ) -> HostAccessResult<rintawa_world_runtime::WorldSnapshot> {
+        Err(HostAccessError::Unavailable)
+    }
+    fn load_item(
+        &self,
+        _: &RuntimeScopeId,
+        _: &ExtensionInstanceId,
+        _: ItemId,
+    ) -> HostAccessResult<Option<String>> {
+        Err(HostAccessError::Unavailable)
+    }
+    fn load_property(
+        &self,
+        _: &RuntimeScopeId,
+        _: &ExtensionInstanceId,
+        _: ItemId,
+        _: &SchemaKey,
+    ) -> HostAccessResult<Option<String>> {
+        Err(HostAccessError::Unavailable)
+    }
+
+    fn find_properties(
+        &self,
+        _: &RuntimeScopeId,
+        _: &ExtensionInstanceId,
+        _: &SchemaKey,
+        _: Option<ItemId>,
+        _: usize,
+    ) -> HostAccessResult<Vec<String>> {
+        Err(HostAccessError::Unavailable)
+    }
+    fn submit(
+        &self,
+        _: &RuntimeScopeId,
+        _: &ComponentRef,
+        _: SchemaKey,
+        _: serde_json::Value,
+    ) -> HostAccessResult<WorldCommandTicket> {
+        Err(HostAccessError::Unavailable)
+    }
+}
+
+#[derive(Default)]
 struct UnavailableCompositionAccess;
 
 impl CompositionAccess for UnavailableCompositionAccess {
@@ -906,15 +856,13 @@ impl CompositionAccess for UnavailableCompositionAccess {
 
 #[derive(Clone)]
 pub(crate) struct HostAccessServices {
+    pub(crate) secret_access: Option<Arc<dyn SecretAccess>>,
     pub(crate) runtime_context: Arc<dyn RuntimeContextAccess>,
+    pub(crate) world_data: Arc<dyn WorldDataAccess>,
     pub(crate) artifact_store: Arc<dyn ArtifactStoreAccess>,
     pub(crate) asset_store: Arc<dyn AssetStoreAccess>,
     pub(crate) user_resources: Arc<dyn UserResourceAccess>,
-    pub(crate) user_content: Arc<dyn UserContentAccess>,
-    pub(crate) user_content_write: Arc<dyn UserContentWriteAccess>,
     pub(crate) world_sessions: Arc<dyn WorldSessionAccess>,
-    pub(crate) world_commands: Arc<dyn WorldCommandAccess>,
-    pub(crate) world_projections: Arc<dyn WorldProjectionAccess>,
     pub(crate) composition: Arc<dyn CompositionAccess>,
     pub(crate) preferences: Arc<dyn PreferenceAccess>,
     pub(crate) runtime_policy: Arc<dyn RuntimePolicyAccess>,
@@ -930,15 +878,13 @@ impl HostAccessServices {
         runtime_policy: Arc<dyn RuntimePolicyAccess>,
     ) -> Self {
         Self {
+            secret_access: None,
             runtime_context: Arc::new(UnavailableRuntimeContextAccess),
+            world_data: Arc::new(UnavailableWorldDataAccess),
             artifact_store,
             asset_store,
             user_resources: Arc::new(UnavailableUserResourceAccess),
-            user_content: Arc::new(UnavailableUserContentAccess),
-            user_content_write: Arc::new(UnavailableUserContentWriteAccess),
             world_sessions,
-            world_commands: Arc::new(UnavailableWorldCommandAccess),
-            world_projections: Arc::new(UnavailableWorldProjectionAccess),
             composition,
             preferences,
             runtime_policy,
@@ -953,6 +899,11 @@ impl HostAccessServices {
         self
     }
 
+    pub(crate) fn with_world_data_access(mut self, world_data: Arc<dyn WorldDataAccess>) -> Self {
+        self.world_data = world_data;
+        self
+    }
+
     pub(crate) fn with_user_resource_access(
         mut self,
         user_resources: Arc<dyn UserResourceAccess>,
@@ -960,53 +911,40 @@ impl HostAccessServices {
         self.user_resources = user_resources;
         self
     }
-
-    pub(crate) fn with_user_content_access(
-        mut self,
-        user_content: Arc<dyn UserContentAccess>,
-    ) -> Self {
-        self.user_content = user_content;
-        self
-    }
-
-    pub(crate) fn with_user_content_write_access(
-        mut self,
-        user_content_write: Arc<dyn UserContentWriteAccess>,
-    ) -> Self {
-        self.user_content_write = user_content_write;
-        self
-    }
-
-    pub(crate) fn with_world_command_access(
-        mut self,
-        world_commands: Arc<dyn WorldCommandAccess>,
-    ) -> Self {
-        self.world_commands = world_commands;
-        self
-    }
-
-    pub(crate) fn with_world_projection_access(
-        mut self,
-        world_projections: Arc<dyn WorldProjectionAccess>,
-    ) -> Self {
-        self.world_projections = world_projections;
-        self
-    }
-
     pub(crate) fn unavailable() -> Self {
         Self {
+            secret_access: None,
             runtime_context: Arc::new(UnavailableRuntimeContextAccess),
+            world_data: Arc::new(UnavailableWorldDataAccess),
             artifact_store: Arc::new(UnavailableArtifactStoreAccess),
             asset_store: Arc::new(UnavailableAssetStoreAccess),
             user_resources: Arc::new(UnavailableUserResourceAccess),
-            user_content: Arc::new(UnavailableUserContentAccess),
-            user_content_write: Arc::new(UnavailableUserContentWriteAccess),
             world_sessions: Arc::new(UnavailableWorldSessionAccess),
-            world_commands: Arc::new(UnavailableWorldCommandAccess),
-            world_projections: Arc::new(UnavailableWorldProjectionAccess),
             composition: Arc::new(UnavailableCompositionAccess),
             preferences: Arc::new(UnavailablePreferenceAccess),
             runtime_policy: Arc::new(UnavailableRuntimePolicyAccess),
         }
     }
+}
+
+/// Native Host boundary for activation-owned asynchronous secret operations.
+/// Identity and cancellation are supplied exclusively by the executing WASM Host.
+pub trait SecretAccess: Send + Sync {
+    /// Admit an operation or an already verified requester intent, with bounded retention.
+    fn begin(
+        self: Arc<Self>,
+        owner: &crate::LivePolicyTarget,
+        request: &str,
+        prompt: Option<crate::SecretPromptAuthority>,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> HostAccessResult<u64>;
+    /// Poll a retained operation; the caller's permission is checked by the WASM adapter.
+    fn status(&self, owner: &crate::LivePolicyTarget, handle: u64) -> HostAccessResult<String>;
+    /// Cancel/release only an owned handle, even after permission revocation.
+    fn close(
+        &self,
+        owner: &crate::LivePolicyTarget,
+        handle: u64,
+        release: bool,
+    ) -> HostAccessResult<()>;
 }

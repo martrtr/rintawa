@@ -1,1288 +1,1364 @@
-//! Tests for SQLite world storage, recovery, and durable outbox behavior.
+//! Integration tests for the four-table world storage.
 
-use std::{
-    collections::BTreeSet,
-    sync::{Arc, Barrier},
-};
-
-use anyhow::Result;
 use rintawa_sdk::{
     types::ExtensionId,
-    world::{
-        CommandId, CorrelationId, EffectJobId, EntityId, PrincipalId, RelationId, SchemaKey,
-        UnixTimeMillis, WorldId,
-    },
+    world::{ItemId, SchemaKey, WorldId},
 };
 use rintawa_world::{
-    ActorRef, CommitDisposition, CommitReceipt, ControlGrant, ControlScope, EffectJobDraft,
-    EntityRecord, FacetRecord, FacetTarget, RelationRecord, SchemaDefinition, SchemaKind,
-    SchemaRegistration, WorldCommand, WorldError, WorldEventDraft, WorldMutation, WorldTransaction,
+    DefinitionRegistration, ItemKind, PropertyDefinition, RelationDirection, StateChange,
+    WorldTransaction,
 };
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use tempfile::TempDir;
 
-use super::*;
+use crate::{SqliteWorldStorage, sqlite::query};
 
-#[derive(Debug, Clone)]
-struct TestSchemas {
-    entity: SchemaKey,
-    relation: SchemaKey,
-    facet: SchemaKey,
-    command: SchemaKey,
-    other_command: SchemaKey,
-    event: SchemaKey,
-    effect: SchemaKey,
+fn schema(key: &str) -> SchemaKey {
+    key.parse().expect("test property name must be valid")
 }
 
-fn schema(key: &str, kind: SchemaKind, definition: serde_json::Value) -> Result<SchemaDefinition> {
-    Ok(SchemaDefinition::new(
-        key.parse()?,
-        kind,
-        ExtensionId::new("rintawa.test"),
-        definition,
-    ))
-}
-
-fn register_test_schemas(storage: &SqliteWorldStorage) -> Result<TestSchemas> {
-    let command_schema = serde_json::json!({
-        "type": "object",
-        "properties": { "action": { "type": "string" } },
-        "required": ["action"],
-        "additionalProperties": false
-    });
-    let definitions = [
-        schema(
-            "rintawa.test.entity@1",
-            SchemaKind::Entity,
-            serde_json::json!({}),
-        )?,
-        schema(
-            "rintawa.test.relation@1",
-            SchemaKind::Relation,
-            serde_json::json!({}),
-        )?,
-        schema(
-            "rintawa.test.facet@1",
-            SchemaKind::Facet,
-            serde_json::json!({
-                "type": "object",
-                "properties": { "name": { "type": "string" } },
-                "required": ["name"],
-                "additionalProperties": false
-            }),
-        )?,
-        schema(
-            "rintawa.test.command@1",
-            SchemaKind::Command,
-            command_schema.clone(),
-        )?,
-        schema(
-            "rintawa.test.other-command@1",
-            SchemaKind::Command,
-            command_schema,
-        )?,
-        schema(
-            "rintawa.test.event@1",
-            SchemaKind::Event,
-            serde_json::json!({
-                "type": "object",
-                "properties": { "message": { "type": "string" } },
-                "required": ["message"],
-                "additionalProperties": false
-            }),
-        )?,
-        schema(
-            "rintawa.test.effect@1",
-            SchemaKind::Effect,
-            serde_json::json!({
-                "type": "object",
-                "properties": { "input": { "type": "string" } },
-                "required": ["input"],
-                "additionalProperties": false
-            }),
-        )?,
-    ];
-
-    for definition in &definitions {
-        assert_eq!(
-            storage.register_schema(definition)?,
-            SchemaRegistration::Registered
-        );
-    }
-
-    Ok(TestSchemas {
-        entity: definitions[0].key().clone(),
-        relation: definitions[1].key().clone(),
-        facet: definitions[2].key().clone(),
-        command: definitions[3].key().clone(),
-        other_command: definitions[4].key().clone(),
-        event: definitions[5].key().clone(),
-        effect: definitions[6].key().clone(),
-    })
-}
-
-fn create_storage() -> Result<(TempDir, SqliteWorldStorage)> {
-    let root = TempDir::new()?;
-    let path = root.path().join("world.sqlite");
-    let storage = SqliteWorldStorage::create(&path, WorldId::new())?;
-    Ok((root, storage))
-}
-
-fn direct_command(schema: &SchemaKey, principal: PrincipalId, action: &str) -> WorldCommand {
-    WorldCommand::new(
-        schema.clone(),
-        principal,
-        ActorRef::Principal(principal),
-        serde_json::json!({ "action": action }),
+fn definition(key: &str, schema_json: serde_json::Value) -> PropertyDefinition {
+    PropertyDefinition::new(
+        schema(key),
+        ExtensionId::new("example.extension"),
+        schema_json,
     )
 }
 
-fn command_with_id(
-    id: CommandId,
-    correlation_id: CorrelationId,
-    schema: &SchemaKey,
-    principal: PrincipalId,
-    actor: ActorRef,
-    action: &str,
-) -> WorldCommand {
-    WorldCommand::with_ids(
-        id,
-        correlation_id,
-        schema.clone(),
-        principal,
-        actor,
-        serde_json::json!({ "action": action }),
+fn object_schema() -> PropertyDefinition {
+    definition(
+        "character.identity@1",
+        serde_json::json!({
+            "type": "object",
+            "properties": { "name": { "type": "string" } },
+            "required": ["name"],
+            "additionalProperties": false
+        }),
     )
 }
 
-fn populated_transaction(
-    schemas: &TestSchemas,
-) -> (
-    WorldTransaction,
-    EntityId,
-    EntityId,
-    RelationId,
-    rintawa_sdk::world::WorldEventId,
-    rintawa_sdk::world::EffectJobId,
-) {
-    let first = EntityId::new();
-    let second = EntityId::new();
-    let relation_id = RelationId::new();
-    let event = WorldEventDraft::new(
-        schemas.event.clone(),
-        serde_json::json!({ "message": "created" }),
-    );
-    let effect = EffectJobDraft::new(
-        schemas.effect.clone(),
-        serde_json::json!({ "input": "generate" }),
-    );
-    let event_id = event.id();
-    let effect_id = effect.id();
-
-    let mut transaction = WorldTransaction::new();
-    transaction.push_mutation(WorldMutation::CreateEntity {
-        entity: EntityRecord::new(first, schemas.entity.clone()),
-    });
-    transaction.push_mutation(WorldMutation::CreateEntity {
-        entity: EntityRecord::new(second, schemas.entity.clone()),
-    });
-    transaction.push_mutation(WorldMutation::CreateRelation {
-        relation: RelationRecord::new(relation_id, schemas.relation.clone(), first, second),
-    });
-    transaction.push_mutation(WorldMutation::SetFacet {
-        facet: FacetRecord::new(
-            FacetTarget::Entity(first),
-            schemas.facet.clone(),
-            serde_json::json!({ "name": "Alice" }),
-        ),
-    });
-    transaction.push_event(event);
-    transaction.push_effect(effect);
-
-    (transaction, first, second, relation_id, event_id, effect_id)
+fn temp_world() -> (TempDir, SqliteWorldStorage) {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("world.sqlite");
+    let storage = SqliteWorldStorage::create(&path, WorldId::new()).expect("create world");
+    (directory, storage)
 }
 
-fn commit_current(
-    storage: &SqliteWorldStorage,
-    command: &WorldCommand,
-    transaction: &WorldTransaction,
-) -> Result<CommitReceipt> {
-    let snapshot = storage.snapshot_for_command(command)?;
-    let evaluated_position = snapshot.position();
-    Ok(storage.commit(command, transaction, evaluated_position)?)
-}
-
-fn commit_entity(
-    storage: &SqliteWorldStorage,
-    schemas: &TestSchemas,
-    principal: PrincipalId,
-) -> Result<EntityId> {
-    let entity_id = EntityId::new();
-    let command = direct_command(&schemas.command, principal, "create-entity");
-    let mut transaction = WorldTransaction::new();
-    transaction.push_mutation(WorldMutation::CreateEntity {
-        entity: EntityRecord::new(entity_id, schemas.entity.clone()),
-    });
-    commit_current(storage, &command, &transaction)?;
-    Ok(entity_id)
-}
-
-fn enqueue_effect(
-    storage: &SqliteWorldStorage,
-    schemas: &TestSchemas,
-    principal: PrincipalId,
-    input: &str,
-) -> Result<EffectJobId> {
-    let command = direct_command(&schemas.command, principal, "enqueue-effect");
-    let effect = EffectJobDraft::new(
-        schemas.effect.clone(),
-        serde_json::json!({ "input": input }),
-    );
-    let effect_id = effect.id();
-    let mut transaction = WorldTransaction::new();
-    transaction.push_effect(effect);
-    commit_current(storage, &command, &transaction)?;
-    Ok(effect_id)
+fn table_names(connection: &Connection) -> Vec<String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .expect("prepare");
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("collect")
 }
 
 #[test]
-fn test_should_create_reopen_and_restore_world() -> Result<()> {
-    let (root, storage) = create_storage()?;
-    let world_id = storage.world_id();
-    let path = root.path().join("world.sqlite");
-
-    assert_eq!(storage.load_session()?.commit_position(), 0);
-    drop(storage);
-
-    let reopened = SqliteWorldStorage::open(&path)?;
-    assert_eq!(reopened.world_id(), world_id);
-    assert_eq!(reopened.load_session()?.commit_position(), 0);
-    Ok(())
-}
-
-#[test]
-fn test_should_enable_wal_and_separate_read_connection() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-
-    let writer = storage.writer()?;
-    let writer_mode: String = writer.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
-    drop(writer);
-
-    let reader = storage.reader()?;
-    let reader_mode: String = reader.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
-
-    assert!(writer_mode.eq_ignore_ascii_case("wal"));
-    assert!(reader_mode.eq_ignore_ascii_case("wal"));
-    Ok(())
-}
-
-#[test]
-fn test_should_persist_schema_registry_idempotently() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-    let definition = schema(
-        "rintawa.test.facet@1",
-        SchemaKind::Facet,
-        serde_json::json!({ "type": "string" }),
-    )?;
+fn test_should_create_exactly_four_domain_tables() -> anyhow::Result<()> {
+    let (directory, storage) = temp_world();
+    let connection = Connection::open(directory.path().join("world.sqlite"))?;
 
     assert_eq!(
-        storage.register_schema(&definition)?,
-        SchemaRegistration::Registered
-    );
-    assert_eq!(
-        storage.register_schema(&definition)?,
-        SchemaRegistration::AlreadyPresent
-    );
-    assert_eq!(
-        storage.load_session()?.schemas().get(definition.key()),
-        Some(&definition)
-    );
-    Ok(())
-}
-
-#[test]
-fn test_should_register_schema_batch_atomically() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-    let existing = schema(
-        "rintawa.test.existing@1",
-        SchemaKind::Facet,
-        serde_json::json!({ "type": "string" }),
-    )?;
-    storage.register_schema(&existing)?;
-
-    let staged = schema(
-        "rintawa.test.staged@1",
-        SchemaKind::Event,
-        serde_json::json!({ "type": "object" }),
-    )?;
-    let conflicting = SchemaDefinition::new(
-        existing.key().clone(),
-        SchemaKind::Facet,
-        ExtensionId::new("rintawa.other-owner"),
-        existing.definition().clone(),
-    );
-
-    assert!(matches!(
-        storage.register_schemas(&[staged.clone(), conflicting]),
-        Err(StorageError::World(WorldError::SchemaConflict { .. }))
-    ));
-    let session = storage.load_session()?;
-    assert!(session.schemas().get(staged.key()).is_none());
-    assert_eq!(session.schemas().get(existing.key()), Some(&existing));
-
-    assert_eq!(
-        storage.register_schemas(&[existing.clone(), staged.clone()])?,
+        table_names(&connection),
         vec![
-            SchemaRegistration::AlreadyPresent,
-            SchemaRegistration::Registered,
+            "items".to_string(),
+            "properties".to_string(),
+            "property_registry".to_string(),
+            "world".to_string()
         ]
     );
-    assert_eq!(
-        storage.load_session()?.schemas().get(staged.key()),
-        Some(&staged)
-    );
+    let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    assert_eq!(version, 1);
+    assert_eq!(storage.world_id(), storage.load_session()?.id());
     Ok(())
 }
 
 #[test]
-fn test_should_commit_state_event_and_effect_atomically_across_restart() -> Result<()> {
-    let (root, storage) = create_storage()?;
-    let path = root.path().join("world.sqlite");
-    let schemas = register_test_schemas(&storage)?;
-    let principal = PrincipalId::new();
-    let command = direct_command(&schemas.command, principal, "populate").expecting_position(0);
-    let command_id = command.id();
-    let (transaction, first, second, relation_id, event_id, effect_id) =
-        populated_transaction(&schemas);
-
-    let receipt = commit_current(&storage, &command, &transaction)?;
-    assert_eq!(receipt.disposition(), CommitDisposition::Committed);
-    assert_eq!(receipt.position(), 1);
-    assert_eq!(receipt.event_ids(), &[event_id]);
-    assert_eq!(receipt.effect_job_ids(), &[effect_id]);
-    assert_eq!(
-        storage.load_entity(first)?,
-        Some(EntityRecord::new(first, schemas.entity.clone()))
-    );
-    assert!(storage.load_entity(second)?.is_some());
-    assert!(storage.load_relation(relation_id)?.is_some());
-    assert_eq!(
-        storage
-            .load_facet(FacetTarget::Entity(first), &schemas.facet)?
-            .map(|facet| facet.payload().clone()),
-        Some(serde_json::json!({ "name": "Alice" }))
-    );
-
-    let mutations = storage.mutations_after(0, 10)?;
-    assert_eq!(mutations.len(), 4);
-    assert_eq!(
-        mutations[0].format_version,
-        rintawa_world::WORLD_MUTATION_FORMAT_VERSION
-    );
-
-    let events = storage.events_after(0, 10)?;
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].id, event_id);
-    assert_eq!(events[0].world_id, storage.world_id());
-    assert_eq!(events[0].provenance.command_id, command_id);
-    assert_eq!(events[0].provenance.principal, principal);
-    assert_eq!(events[0].provenance.actor, ActorRef::Principal(principal));
-    assert_eq!(
-        events[0].provenance.correlation_id,
-        command.correlation_id()
-    );
-
-    let effects = storage.pending_effects(10)?;
-    assert_eq!(effects.len(), 1);
-    assert_eq!(effects[0].id, effect_id);
-    assert_eq!(effects[0].world_id, storage.world_id());
-    assert_eq!(effects[0].provenance.command_id, command_id);
-    assert_eq!(
-        effects[0].provenance.correlation_id,
-        command.correlation_id()
-    );
-    drop(storage);
-
-    let reopened = SqliteWorldStorage::open(&path)?;
-    assert_eq!(reopened.load_session()?.commit_position(), 1);
-    assert!(reopened.load_entity(first)?.is_some());
-    assert_eq!(reopened.mutations_after(0, 10)?.len(), 4);
-    assert_eq!(reopened.events_after(0, 10)?[0].id, event_id);
-    assert_eq!(reopened.pending_effects(10)?[0].id, effect_id);
-    Ok(())
-}
-
-#[test]
-fn test_should_reject_unknown_core_mutation_format() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-    let schemas = register_test_schemas(&storage)?;
-    let principal = PrincipalId::new();
-    let command = direct_command(&schemas.command, principal, "populate");
-    let (transaction, _, _, _, _, _) = populated_transaction(&schemas);
-    commit_current(&storage, &command, &transaction)?;
+fn test_should_round_trip_items_and_properties_after_reopen() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("world.sqlite");
+    let world_id = WorldId::new();
+    let alice = ItemId::new();
+    let forest = ItemId::new();
+    let link = ItemId::new();
 
     {
-        let writer = storage.writer()?;
-        writer.execute(
-            "UPDATE world_mutations
-             SET format_version = ?1
-             WHERE commit_position = 1 AND mutation_index = 0",
-            [i64::from(rintawa_world::WORLD_MUTATION_FORMAT_VERSION + 1)],
-        )?;
+        let storage = SqliteWorldStorage::create(&path, world_id)?;
+        storage.register_definitions(&[object_schema()])?;
+        let mut transaction = WorldTransaction::new();
+        transaction.push_change(StateChange::CreateObject { id: alice });
+        transaction.push_change(StateChange::CreateObject { id: forest });
+        transaction.push_change(StateChange::CreateRelation {
+            id: link,
+            subject: alice,
+            object: forest,
+        });
+        transaction.push_change(StateChange::SetProperty {
+            item: alice,
+            key: schema("character.identity@1"),
+            data: serde_json::json!({ "name": "Alice" }),
+        });
+        storage.apply(&transaction)?;
     }
-
-    let error = storage.mutations_after(0, 10).unwrap_err();
-    assert!(matches!(
-        error,
-        StorageError::UnsupportedMutationFormat {
-            found,
-            supported
-        } if found == rintawa_world::WORLD_MUTATION_FORMAT_VERSION + 1
-            && supported == rintawa_world::WORLD_MUTATION_FORMAT_VERSION
-    ));
-    Ok(())
-}
-
-#[test]
-fn test_should_skip_system_regeneration_for_identical_command_retry() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-    let schemas = register_test_schemas(&storage)?;
-    let principal = PrincipalId::new();
-    let command = direct_command(&schemas.command, principal, "populate");
-    let (transaction, _, _, _, event_id, effect_id) = populated_transaction(&schemas);
-
-    let first = commit_current(&storage, &command, &transaction)?;
-    let pre_system = storage.committed_receipt(&command)?;
-    let replay = pre_system.expect("committed command must have receipt");
-
-    assert_eq!(first.disposition(), CommitDisposition::Committed);
-    assert_eq!(replay.disposition(), CommitDisposition::AlreadyCommitted);
-    assert_eq!(replay.position(), first.position());
-    assert_eq!(replay.event_ids(), &[event_id]);
-    assert_eq!(replay.effect_job_ids(), &[effect_id]);
-    assert_eq!(storage.events_after(0, 10)?.len(), 1);
-    assert_eq!(storage.pending_effects(10)?.len(), 1);
-    Ok(())
-}
-
-#[test]
-fn test_should_replay_same_command_even_if_system_output_would_change() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-    let schemas = register_test_schemas(&storage)?;
-    let principal = PrincipalId::new();
-    let command = direct_command(&schemas.command, principal, "nondeterministic");
-    let (first_transaction, _, _, _, first_event_id, _) = populated_transaction(&schemas);
-    let first = commit_current(&storage, &command, &first_transaction)?;
-
-    let mut regenerated = WorldTransaction::new();
-    let regenerated_event = WorldEventDraft::new(
-        schemas.event.clone(),
-        serde_json::json!({ "message": "different generated output" }),
-    );
-    let regenerated_event_id = regenerated_event.id();
-    regenerated.push_event(regenerated_event);
-
-    let replay = storage.commit(&command, &regenerated, u64::MAX)?;
-
-    assert_eq!(replay.disposition(), CommitDisposition::AlreadyCommitted);
-    assert_eq!(replay.position(), first.position());
-    assert_eq!(replay.event_ids(), &[first_event_id]);
-    assert_ne!(first_event_id, regenerated_event_id);
-    assert_eq!(storage.events_after(0, 10)?.len(), 1);
-    Ok(())
-}
-
-#[test]
-fn test_should_reject_command_id_reuse_with_other_input() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-    let schemas = register_test_schemas(&storage)?;
-    let principal = PrincipalId::new();
-    let command = direct_command(&schemas.command, principal, "first");
-    let command_id = command.id();
-    let correlation_id = command.correlation_id();
-    let (transaction, _, _, _, _, _) = populated_transaction(&schemas);
-    commit_current(&storage, &command, &transaction)?;
-
-    let conflicting = command_with_id(
-        command_id,
-        correlation_id,
-        &schemas.command,
-        principal,
-        ActorRef::Principal(principal),
-        "different",
-    );
-
-    let error = storage
-        .committed_receipt(&conflicting)
-        .expect_err("same command id with different input must conflict");
-    assert!(matches!(
-        error,
-        StorageError::World(WorldError::CommandIdConflict(id)) if id == command_id
-    ));
-    assert_eq!(storage.load_session()?.commit_position(), 1);
-    assert_eq!(storage.events_after(0, 10)?.len(), 1);
-    Ok(())
-}
-
-#[test]
-fn test_should_roll_back_all_state_when_later_mutation_fails() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-    let schemas = register_test_schemas(&storage)?;
-    let principal = PrincipalId::new();
-    let command = direct_command(&schemas.command, principal, "rollback");
-    let created = EntityId::new();
-    let missing = EntityId::new();
-    let relation_id = RelationId::new();
-
-    let mut transaction = WorldTransaction::new();
-    transaction.push_mutation(WorldMutation::CreateEntity {
-        entity: EntityRecord::new(created, schemas.entity.clone()),
-    });
-    transaction.push_mutation(WorldMutation::CreateRelation {
-        relation: RelationRecord::new(relation_id, schemas.relation.clone(), created, missing),
-    });
-    transaction.push_event(WorldEventDraft::new(
-        schemas.event.clone(),
-        serde_json::json!({ "message": "must rollback" }),
-    ));
-
-    let snapshot = storage.snapshot_for_command(&command)?;
-    let evaluated_position = snapshot.position();
-    let error = storage
-        .commit(&command, &transaction, evaluated_position)
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        StorageError::World(WorldError::RelationEndpointNotFound {
-            relation_id: id,
-            entity_id
-        }) if id == relation_id && entity_id == missing
-    ));
-    assert!(storage.load_entity(created)?.is_none());
-    assert!(storage.mutations_after(0, 10)?.is_empty());
-    assert!(storage.events_after(0, 10)?.is_empty());
-    assert_eq!(storage.load_session()?.commit_position(), 0);
-    Ok(())
-}
-
-#[test]
-fn test_should_reject_invalid_payload_before_committing_state() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-    let schemas = register_test_schemas(&storage)?;
-    let principal = PrincipalId::new();
-    let command = direct_command(&schemas.command, principal, "invalid-facet");
-    let entity_id = EntityId::new();
-
-    let mut transaction = WorldTransaction::new();
-    transaction.push_mutation(WorldMutation::CreateEntity {
-        entity: EntityRecord::new(entity_id, schemas.entity.clone()),
-    });
-    transaction.push_mutation(WorldMutation::SetFacet {
-        facet: FacetRecord::new(
-            FacetTarget::Entity(entity_id),
-            schemas.facet.clone(),
-            serde_json::json!({ "name": 42 }),
-        ),
-    });
-
-    let snapshot = storage.snapshot_for_command(&command)?;
-    let evaluated_position = snapshot.position();
-    let error = storage
-        .commit(&command, &transaction, evaluated_position)
-        .unwrap_err();
-    let rendered = error.to_string();
-    assert!(matches!(
-        error,
-        StorageError::World(WorldError::PayloadValidationFailed { .. })
-    ));
-    assert!(!rendered.contains("42"));
-    assert!(storage.load_entity(entity_id)?.is_none());
-    assert_eq!(storage.load_session()?.commit_position(), 0);
-    Ok(())
-}
-
-#[test]
-fn test_should_reject_stale_position_without_creating_event() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-    let schemas = register_test_schemas(&storage)?;
-    let principal = PrincipalId::new();
-    let first_command = direct_command(&schemas.command, principal, "first").expecting_position(0);
-    let (first, _, _, _, _, _) = populated_transaction(&schemas);
-    commit_current(&storage, &first_command, &first)?;
-
-    let stale_command = direct_command(&schemas.command, principal, "stale").expecting_position(0);
-
-    let error = storage.snapshot_for_command(&stale_command).unwrap_err();
-    assert!(matches!(
-        error,
-        StorageError::World(WorldError::StaleWorldPosition {
-            expected: 0,
-            actual: 1
-        })
-    ));
-    assert_eq!(storage.events_after(0, 10)?.len(), 1);
-    assert_eq!(storage.load_session()?.commit_position(), 1);
-    Ok(())
-}
-
-#[test]
-fn test_should_keep_reads_consistent_inside_pinned_snapshot() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-    let schemas = register_test_schemas(&storage)?;
-    let principal = PrincipalId::new();
-    let entity_id = EntityId::new();
-
-    let create_command = direct_command(&schemas.command, principal, "create");
-    let mut create_transaction = WorldTransaction::new();
-    create_transaction.push_mutation(WorldMutation::CreateEntity {
-        entity: EntityRecord::new(entity_id, schemas.entity.clone()),
-    });
-    create_transaction.push_mutation(WorldMutation::SetFacet {
-        facet: FacetRecord::new(
-            FacetTarget::Entity(entity_id),
-            schemas.facet.clone(),
-            serde_json::json!({ "name": "before" }),
-        ),
-    });
-    commit_current(&storage, &create_command, &create_transaction)?;
-
-    let pinned = storage.snapshot()?;
-    assert_eq!(pinned.position(), 1);
-    assert_eq!(
-        pinned
-            .load_facet(FacetTarget::Entity(entity_id), &schemas.facet)?
-            .map(|facet| facet.payload().clone()),
-        Some(serde_json::json!({ "name": "before" }))
-    );
-
-    let update_command = direct_command(&schemas.command, principal, "update");
-    let mut update_transaction = WorldTransaction::new();
-    update_transaction.push_mutation(WorldMutation::SetFacet {
-        facet: FacetRecord::new(
-            FacetTarget::Entity(entity_id),
-            schemas.facet.clone(),
-            serde_json::json!({ "name": "after" }),
-        ),
-    });
-    commit_current(&storage, &update_command, &update_transaction)?;
-
-    assert_eq!(
-        pinned
-            .load_facet(FacetTarget::Entity(entity_id), &schemas.facet)?
-            .map(|facet| facet.payload().clone()),
-        Some(serde_json::json!({ "name": "before" }))
-    );
-
-    let fresh = storage.snapshot()?;
-    assert_eq!(fresh.position(), 2);
-    assert_eq!(
-        fresh
-            .load_facet(FacetTarget::Entity(entity_id), &schemas.facet)?
-            .map(|facet| facet.payload().clone()),
-        Some(serde_json::json!({ "name": "after" }))
-    );
-    Ok(())
-}
-
-#[test]
-fn test_should_reject_output_evaluated_against_stale_snapshot() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-    let schemas = register_test_schemas(&storage)?;
-    let principal = PrincipalId::new();
-
-    let delayed_command = direct_command(&schemas.command, principal, "delayed");
-    let delayed_snapshot = storage.snapshot_for_command(&delayed_command)?;
-    let evaluated_position = delayed_snapshot.position();
-    assert_eq!(evaluated_position, 0);
-
-    let mut delayed_transaction = WorldTransaction::new();
-    delayed_transaction.push_event(WorldEventDraft::new(
-        schemas.event.clone(),
-        serde_json::json!({ "message": "stale-output" }),
-    ));
-
-    let advancing_command = direct_command(&schemas.command, principal, "advance");
-    let mut advancing_transaction = WorldTransaction::new();
-    advancing_transaction.push_event(WorldEventDraft::new(
-        schemas.event.clone(),
-        serde_json::json!({ "message": "advance" }),
-    ));
-    commit_current(&storage, &advancing_command, &advancing_transaction)?;
-
-    let error = storage
-        .commit(&delayed_command, &delayed_transaction, evaluated_position)
-        .unwrap_err();
-
-    assert!(matches!(
-        error,
-        StorageError::World(WorldError::WorldChangedSinceEvaluation {
-            evaluated: 0,
-            actual: 1
-        })
-    ));
-    let events = storage.events_after(0, 10)?;
-    assert_eq!(events.len(), 1);
-    assert_eq!(
-        events[0].payload,
-        serde_json::json!({ "message": "advance" })
-    );
-    Ok(())
-}
-
-#[test]
-fn test_should_reject_entity_actor_without_control_grant() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-    let schemas = register_test_schemas(&storage)?;
-    let principal = PrincipalId::new();
-    let actor_entity = commit_entity(&storage, &schemas, principal)?;
-    let command = WorldCommand::new(
-        schemas.command.clone(),
-        principal,
-        ActorRef::Entity(actor_entity),
-        serde_json::json!({ "action": "act" }),
-    );
-    let error = storage.snapshot_for_command(&command).unwrap_err();
-    assert!(matches!(
-        error,
-        StorageError::World(WorldError::ActorUnauthorized { .. })
-    ));
-    assert_eq!(storage.load_session()?.commit_position(), 1);
-    assert!(storage.events_after(0, 10)?.is_empty());
-    Ok(())
-}
-
-#[test]
-fn test_should_reject_manually_constructed_empty_control_scope() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-    let schemas = register_test_schemas(&storage)?;
-    let principal = PrincipalId::new();
-    let command = direct_command(&schemas.command, principal, "invalid-grant");
-
-    let mut transaction = WorldTransaction::new();
-    transaction.push_mutation(WorldMutation::GrantControl {
-        grant: ControlGrant::with_id(
-            rintawa_sdk::world::ControlGrantId::new(),
-            principal,
-            EntityId::new(),
-            ControlScope::ExactSchemas(BTreeSet::new()),
-            None,
-        ),
-    });
-
-    let snapshot = storage.snapshot_for_command(&command)?;
-    let error = storage
-        .commit(&command, &transaction, snapshot.position())
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        StorageError::World(WorldError::EmptyControlScope)
-    ));
-    assert_eq!(storage.load_session()?.commit_position(), 0);
-    Ok(())
-}
-
-#[test]
-fn test_should_authorize_exact_control_grant_and_revoke_it() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-    let schemas = register_test_schemas(&storage)?;
-    let principal = PrincipalId::new();
-    let actor_entity = commit_entity(&storage, &schemas, principal)?;
-
-    let grant = ControlGrant::with_id(
-        rintawa_sdk::world::ControlGrantId::new(),
-        principal,
-        actor_entity,
-        ControlScope::exact([schemas.command.clone()])?,
-        None,
-    );
-    let grant_id = grant.id();
-    let grant_command = direct_command(&schemas.command, principal, "grant");
-    let mut grant_transaction = WorldTransaction::new();
-    grant_transaction.push_mutation(WorldMutation::GrantControl { grant });
-    commit_current(&storage, &grant_command, &grant_transaction)?;
-
-    let actor_command = WorldCommand::new(
-        schemas.command.clone(),
-        principal,
-        ActorRef::Entity(actor_entity),
-        serde_json::json!({ "action": "act" }),
-    );
-    let mut actor_transaction = WorldTransaction::new();
-    actor_transaction.push_event(WorldEventDraft::new(
-        schemas.event.clone(),
-        serde_json::json!({ "message": "authorized" }),
-    ));
-    commit_current(&storage, &actor_command, &actor_transaction)?;
-
-    let wrong_scope_command = WorldCommand::new(
-        schemas.other_command.clone(),
-        principal,
-        ActorRef::Entity(actor_entity),
-        serde_json::json!({ "action": "wrong-scope" }),
-    );
-    let error = storage
-        .snapshot_for_command(&wrong_scope_command)
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        StorageError::World(WorldError::ActorUnauthorized { .. })
-    ));
-
-    let revoke_command = direct_command(&schemas.command, principal, "revoke");
-    let mut revoke_transaction = WorldTransaction::new();
-    revoke_transaction.push_mutation(WorldMutation::RevokeControl { grant_id });
-    commit_current(&storage, &revoke_command, &revoke_transaction)?;
-
-    let after_revoke = WorldCommand::new(
-        schemas.command.clone(),
-        principal,
-        ActorRef::Entity(actor_entity),
-        serde_json::json!({ "action": "after-revoke" }),
-    );
-    let error = storage.snapshot_for_command(&after_revoke).unwrap_err();
-    assert!(matches!(
-        error,
-        StorageError::World(WorldError::ActorUnauthorized { .. })
-    ));
-    assert_eq!(storage.load_session()?.commit_position(), 4);
-    Ok(())
-}
-
-#[test]
-fn test_should_reject_expired_control_grant() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-    let schemas = register_test_schemas(&storage)?;
-    let principal = PrincipalId::new();
-    let actor_entity = commit_entity(&storage, &schemas, principal)?;
-
-    let grant = ControlGrant::with_id(
-        rintawa_sdk::world::ControlGrantId::new(),
-        principal,
-        actor_entity,
-        ControlScope::AnyCommand,
-        Some(2),
-    );
-    let grant_command = direct_command(&schemas.command, principal, "grant");
-    let mut grant_transaction = WorldTransaction::new();
-    grant_transaction.push_mutation(WorldMutation::GrantControl { grant });
-    commit_current(&storage, &grant_command, &grant_transaction)?;
-
-    let actor_command = WorldCommand::new(
-        schemas.command.clone(),
-        principal,
-        ActorRef::Entity(actor_entity),
-        serde_json::json!({ "action": "last-valid" }),
-    );
-    let mut actor_transaction = WorldTransaction::new();
-    actor_transaction.push_event(WorldEventDraft::new(
-        schemas.event.clone(),
-        serde_json::json!({ "message": "valid" }),
-    ));
-    commit_current(&storage, &actor_command, &actor_transaction)?;
-
-    let expired = WorldCommand::new(
-        schemas.command.clone(),
-        principal,
-        ActorRef::Entity(actor_entity),
-        serde_json::json!({ "action": "expired" }),
-    );
-    let error = storage.snapshot_for_command(&expired).unwrap_err();
-    assert!(matches!(
-        error,
-        StorageError::World(WorldError::ActorUnauthorized { .. })
-    ));
-    assert_eq!(storage.load_session()?.commit_position(), 3);
-    Ok(())
-}
-
-#[test]
-fn test_should_reject_mismatched_direct_principal_actor() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-    let schemas = register_test_schemas(&storage)?;
-    let authenticated = PrincipalId::new();
-    let other = PrincipalId::new();
-    let command = WorldCommand::new(
-        schemas.command.clone(),
-        authenticated,
-        ActorRef::Principal(other),
-        serde_json::json!({ "action": "spoof" }),
-    );
-    let error = storage.snapshot_for_command(&command).unwrap_err();
-    assert!(matches!(
-        error,
-        StorageError::World(WorldError::ActorUnauthorized { .. })
-    ));
-    assert_eq!(storage.load_session()?.commit_position(), 0);
-    Ok(())
-}
-
-#[test]
-fn test_should_reclaim_expired_effect_with_fencing_token() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-    let schemas = register_test_schemas(&storage)?;
-    let effect_id = enqueue_effect(&storage, &schemas, PrincipalId::new(), "lease")?;
-
-    assert!(matches!(
-        storage.claim_next_effect(UnixTimeMillis::new(100), UnixTimeMillis::new(100)),
-        Err(StorageError::InvalidEffectLease)
-    ));
-
-    let first = storage
-        .claim_next_effect(UnixTimeMillis::new(100), UnixTimeMillis::new(200))?
-        .expect("pending effect must be claimable");
-    assert_eq!(first.job().id, effect_id);
-    assert_eq!(first.attempt(), 1);
-    assert_eq!(first.lease_expires_at(), UnixTimeMillis::new(200));
-    assert!(
-        storage
-            .claim_next_effect(UnixTimeMillis::new(199), UnixTimeMillis::new(300))?
-            .is_none()
-    );
-
-    let second = storage
-        .claim_next_effect(UnixTimeMillis::new(200), UnixTimeMillis::new(300))?
-        .expect("expired lease must be reclaimable");
-    assert_eq!(second.job().id, effect_id);
-    assert_eq!(second.attempt(), 2);
-
-    assert!(matches!(
-        storage.complete_effect(effect_id, first.attempt()),
-        Err(StorageError::EffectJobClaimLost(id)) if id == effect_id
-    ));
-    storage.complete_effect(effect_id, second.attempt())?;
-    assert!(
-        storage
-            .claim_next_effect(UnixTimeMillis::new(400), UnixTimeMillis::new(500))?
-            .is_none()
-    );
-    assert!(matches!(
-        storage.cancel_effect(effect_id),
-        Err(StorageError::EffectJobTerminal(id)) if id == effect_id
-    ));
-    Ok(())
-}
-
-#[test]
-fn test_should_fence_worker_side_effect_cancellation() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-    let schemas = register_test_schemas(&storage)?;
-    let effect_id = enqueue_effect(&storage, &schemas, PrincipalId::new(), "cancel-fence")?;
-
-    let first = storage
-        .claim_next_effect(UnixTimeMillis::new(10), UnixTimeMillis::new(20))?
-        .expect("effect must be claimable");
-    let second = storage
-        .claim_next_effect(UnixTimeMillis::new(20), UnixTimeMillis::new(30))?
-        .expect("expired claim must be reclaimable");
-
-    assert!(matches!(
-        storage.cancel_claimed_effect(effect_id, first.attempt(), "stale cancel"),
-        Err(StorageError::EffectJobClaimLost(id)) if id == effect_id
-    ));
-    storage.cancel_claimed_effect(effect_id, second.attempt(), "provider rejected request")?;
-    assert!(
-        storage
-            .claim_next_effect(UnixTimeMillis::new(40), UnixTimeMillis::new(50))?
-            .is_none()
-    );
-    Ok(())
-}
-
-#[test]
-fn test_should_reject_effect_attempt_counter_overflow() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-    let schemas = register_test_schemas(&storage)?;
-    let effect_id = enqueue_effect(&storage, &schemas, PrincipalId::new(), "overflow")?;
-
-    {
-        let connection = storage.writer()?;
-        connection.execute(
-            "UPDATE effect_jobs SET attempt_count = ?1 WHERE job_id = ?2",
-            params![i64::from(u32::MAX), effect_id.into_bytes().as_slice()],
-        )?;
-    }
-
-    assert!(matches!(
-        storage.claim_next_effect(UnixTimeMillis::new(1), UnixTimeMillis::new(2)),
-        Err(StorageError::EffectAttemptOverflow(id)) if id == effect_id
-    ));
-    Ok(())
-}
-
-#[test]
-fn test_should_claim_effect_once_across_independent_storage_handles() -> Result<()> {
-    let (root, first_storage) = create_storage()?;
-    let schemas = register_test_schemas(&first_storage)?;
-    let effect_id = enqueue_effect(
-        &first_storage,
-        &schemas,
-        PrincipalId::new(),
-        "concurrent-claim",
-    )?;
-    let second_storage = SqliteWorldStorage::open(root.path().join("world.sqlite"))?;
-    let barrier = Arc::new(Barrier::new(2));
-
-    let first_barrier = Arc::clone(&barrier);
-    let first = std::thread::spawn(move || {
-        first_barrier.wait();
-        first_storage.claim_next_effect(UnixTimeMillis::new(100), UnixTimeMillis::new(200))
-    });
-    let second_barrier = Arc::clone(&barrier);
-    let second = std::thread::spawn(move || {
-        second_barrier.wait();
-        second_storage.claim_next_effect(UnixTimeMillis::new(100), UnixTimeMillis::new(200))
-    });
-
-    let first = first.join().expect("first claim thread must not panic")?;
-    let second = second.join().expect("second claim thread must not panic")?;
-    let claims = [first, second].into_iter().flatten().collect::<Vec<_>>();
-
-    assert_eq!(claims.len(), 1);
-    assert_eq!(claims[0].job().id, effect_id);
-    assert_eq!(claims[0].attempt(), 1);
-    Ok(())
-}
-
-#[test]
-fn test_should_retry_effect_at_due_time_and_cancel_running_claim() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-    let schemas = register_test_schemas(&storage)?;
-    let effect_id = enqueue_effect(&storage, &schemas, PrincipalId::new(), "retry")?;
-
-    let first = storage
-        .claim_next_effect(UnixTimeMillis::new(10), UnixTimeMillis::new(20))?
-        .expect("effect must be claimable");
-    storage.retry_effect(
-        effect_id,
-        first.attempt(),
-        UnixTimeMillis::new(50),
-        "temporary provider failure",
-    )?;
-
-    assert!(
-        storage
-            .claim_next_effect(UnixTimeMillis::new(49), UnixTimeMillis::new(60))?
-            .is_none()
-    );
-    let second = storage
-        .claim_next_effect(UnixTimeMillis::new(50), UnixTimeMillis::new(60))?
-        .expect("retry must become claimable at available_at");
-    assert_eq!(second.attempt(), 2);
-
-    assert!(storage.cancel_effect(effect_id)?);
-    assert!(!storage.cancel_effect(effect_id)?);
-    assert!(matches!(
-        storage.complete_effect(effect_id, second.attempt()),
-        Err(StorageError::EffectJobClaimLost(id)) if id == effect_id
-    ));
-    assert!(
-        storage
-            .claim_next_effect(UnixTimeMillis::new(100), UnixTimeMillis::new(110))?
-            .is_none()
-    );
-    Ok(())
-}
-
-#[test]
-fn test_should_preserve_retry_schedule_and_attempt_across_restart() -> Result<()> {
-    let (root, storage) = create_storage()?;
-    let path = root.path().join("world.sqlite");
-    let schemas = register_test_schemas(&storage)?;
-    let effect_id = enqueue_effect(&storage, &schemas, PrincipalId::new(), "restart-retry")?;
-
-    let first = storage
-        .claim_next_effect(UnixTimeMillis::new(10), UnixTimeMillis::new(20))?
-        .expect("effect must be claimable");
-    storage.retry_effect(
-        effect_id,
-        first.attempt(),
-        UnixTimeMillis::new(50),
-        "sanitized transient failure",
-    )?;
-    drop(storage);
-
-    let reopened = SqliteWorldStorage::open(&path)?;
-    assert!(
-        reopened
-            .claim_next_effect(UnixTimeMillis::new(49), UnixTimeMillis::new(60))?
-            .is_none()
-    );
-    let second = reopened
-        .claim_next_effect(UnixTimeMillis::new(50), UnixTimeMillis::new(60))?
-        .expect("persisted retry must become due after restart");
-    assert_eq!(second.job().id, effect_id);
-    assert_eq!(second.attempt(), 2);
-    reopened.complete_effect(effect_id, second.attempt())?;
-    drop(reopened);
-
-    let reopened = SqliteWorldStorage::open(&path)?;
-    assert!(
-        reopened
-            .claim_next_effect(UnixTimeMillis::new(100), UnixTimeMillis::new(110))?
-            .is_none()
-    );
-    Ok(())
-}
-
-#[test]
-fn test_should_keep_claim_authoritative_when_retry_error_is_rejected() -> Result<()> {
-    let (_root, storage) = create_storage()?;
-    let schemas = register_test_schemas(&storage)?;
-    let effect_id = enqueue_effect(&storage, &schemas, PrincipalId::new(), "bounded-error")?;
-    let claim = storage
-        .claim_next_effect(UnixTimeMillis::new(1), UnixTimeMillis::new(10))?
-        .expect("effect must be claimable");
-
-    let error = "x".repeat(8 * 1024 + 1);
-    assert!(matches!(
-        storage.retry_effect(effect_id, claim.attempt(), UnixTimeMillis::new(20), &error),
-        Err(StorageError::EffectErrorTooLarge { .. })
-    ));
-
-    storage.complete_effect(effect_id, claim.attempt())?;
-    Ok(())
-}
-
-#[test]
-fn test_should_migrate_v2_running_effect_back_to_claimable_pending_state() -> Result<()> {
-    let root = TempDir::new()?;
-    let path = root.path().join("world.sqlite");
-    let world_id = WorldId::new();
-    let command_id = CommandId::new();
-    let principal = PrincipalId::new();
-    let correlation_id = CorrelationId::new();
-    let effect_id = EffectJobId::new();
-
-    let mut connection = Connection::open(&path)?;
-    configure_connection(&connection)?;
-    migration::migrate_to_v1(&mut connection)?;
-    connection.execute(
-        "INSERT INTO world_metadata (
-            singleton, world_id, world_format_version, commit_position
-         ) VALUES (1, ?1, ?2, 1)",
-        params![
-            world_id.into_bytes().as_slice(),
-            i64::from(WORLD_FORMAT_VERSION)
-        ],
-    )?;
-    migration::migrate_to_v2(&mut connection)?;
-    connection.execute(
-        "INSERT INTO world_schemas (
-            schema_id, schema_version, kind, owner_extension_id, definition_json
-         ) VALUES
-            ('rintawa.test.command', 1, 4, 'rintawa.test', '{}'),
-            ('rintawa.test.effect', 1, 6, 'rintawa.test', '{}')",
-        [],
-    )?;
-    connection.execute(
-        "INSERT INTO world_commits (
-            commit_position, command_id, command_schema_id, command_schema_version,
-            principal_id, actor_kind, actor_id, causation_kind, causation_id,
-            correlation_id, expected_position, effective_at_ms, recorded_at_ms,
-            command_payload_json, command_digest
-         ) VALUES (
-            1, ?1, 'rintawa.test.command', 1,
-            ?2, 1, ?2, NULL, NULL,
-            ?3, NULL, NULL, 123, '{}', ?4
-         )",
-        params![
-            command_id.into_bytes().as_slice(),
-            principal.into_bytes().as_slice(),
-            correlation_id.into_bytes().as_slice(),
-            [7_u8; 32].as_slice(),
-        ],
-    )?;
-    connection.execute(
-        "INSERT INTO effect_jobs (
-            job_id, commit_position, job_index,
-            schema_id, schema_version, payload_json,
-            status, attempt_count, last_error
-         ) VALUES (?1, 1, 0, 'rintawa.test.effect', 1, '{}', 1, 4, 'legacy-running')",
-        [effect_id.into_bytes().as_slice()],
-    )?;
-    drop(connection);
-
-    let storage = SqliteWorldStorage::open(&path)?;
-    let reader = storage.reader()?;
-    assert_eq!(
-        migration::storage_version(&reader)?,
-        migration::STORAGE_SCHEMA_VERSION
-    );
-    let migrated: (i64, i64, i64, Option<i64>, Option<String>) = reader.query_row(
-        "SELECT status, attempt_count, available_at_ms, lease_expires_at_ms, last_error
-         FROM effect_jobs WHERE job_id = ?1",
-        [effect_id.into_bytes().as_slice()],
-        |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        },
-    )?;
-    assert_eq!(
-        migrated,
-        (0, 4, 0, None, Some(String::from("legacy-running")))
-    );
-    drop(reader);
-
-    let claim = storage
-        .claim_next_effect(UnixTimeMillis::new(1), UnixTimeMillis::new(10))?
-        .expect("legacy running job must be safely reclaimable after migration");
-    assert_eq!(claim.job().id, effect_id);
-    assert_eq!(claim.attempt(), 5);
-    Ok(())
-}
-
-#[test]
-fn test_should_migrate_storage_v1_to_current_schema() -> Result<()> {
-    let root = TempDir::new()?;
-    let path = root.path().join("world.sqlite");
-    let world_id = WorldId::new();
-
-    let mut connection = Connection::open(&path)?;
-    configure_connection(&connection)?;
-    migration::migrate_to_v1(&mut connection)?;
-    connection.execute(
-        "INSERT INTO world_metadata (
-            singleton, world_id, world_format_version, commit_position
-         ) VALUES (1, ?1, ?2, 0)",
-        params![
-            world_id.into_bytes().as_slice(),
-            i64::from(WORLD_FORMAT_VERSION)
-        ],
-    )?;
-    drop(connection);
 
     let storage = SqliteWorldStorage::open(&path)?;
     assert_eq!(storage.world_id(), world_id);
-    let reader = storage.reader()?;
-    assert_eq!(
-        migration::storage_version(&reader)?,
-        migration::STORAGE_SCHEMA_VERSION
-    );
-    let table_count: i64 = reader.query_row(
-        "SELECT COUNT(*) FROM sqlite_master
-         WHERE type = 'table'
-           AND name IN (
-               'world_commits', 'control_grants', 'control_grant_schemas',
-               'world_mutations', 'world_events', 'effect_jobs'
-           )",
-        [],
-        |row| row.get(0),
-    )?;
-    assert_eq!(table_count, 6);
+    let alice_record = storage.load_item(alice)?.expect("alice exists");
+    assert_eq!(alice_record.kind(), ItemKind::Object);
+    let link_record = storage.load_item(link)?.expect("link exists");
+    assert_eq!(link_record.kind(), ItemKind::Relation);
+    assert_eq!(link_record.subject(), Some(alice));
+    assert_eq!(link_record.object_target(), Some(forest));
+
+    let property = storage
+        .load_property(alice, &schema("character.identity@1"))?
+        .expect("property exists");
+    assert_eq!(property.data()["name"], "Alice");
+    assert_eq!(storage.properties_of(alice)?.len(), 1);
     Ok(())
 }
 
 #[test]
-fn test_should_refuse_to_overwrite_existing_world_file() -> Result<()> {
-    let (root, _storage) = create_storage()?;
-    let path = root.path().join("world.sqlite");
+fn test_should_reject_relation_to_relation_and_missing_item() -> anyhow::Result<()> {
+    let (_directory, storage) = temp_world();
+    let first = ItemId::new();
+    let second = ItemId::new();
+    let link = ItemId::new();
 
-    let error = SqliteWorldStorage::create(&path, WorldId::new()).unwrap_err();
-    assert!(matches!(error, StorageError::AlreadyExists(_)));
+    let mut create = WorldTransaction::new();
+    create.push_change(StateChange::CreateObject { id: first });
+    create.push_change(StateChange::CreateObject { id: second });
+    storage.apply(&create)?;
+
+    let mut dangling = WorldTransaction::new();
+    dangling.push_change(StateChange::CreateRelation {
+        id: ItemId::new(),
+        subject: first,
+        object: ItemId::new(),
+    });
+    assert!(storage.apply(&dangling).is_err());
+
+    let mut relation = WorldTransaction::new();
+    relation.push_change(StateChange::CreateRelation {
+        id: link,
+        subject: first,
+        object: second,
+    });
+    storage.apply(&relation)?;
+
+    let mut chained = WorldTransaction::new();
+    chained.push_change(StateChange::CreateRelation {
+        id: ItemId::new(),
+        subject: first,
+        object: link,
+    });
+    assert!(storage.apply(&chained).is_err());
+    Ok(())
+}
+
+#[test]
+fn test_should_roll_back_all_changes_when_one_fails() -> anyhow::Result<()> {
+    let (_directory, storage) = temp_world();
+    let created = ItemId::new();
+
+    let mut transaction = WorldTransaction::new();
+    transaction.push_change(StateChange::CreateObject { id: created });
+    transaction.push_change(StateChange::CreateRelation {
+        id: ItemId::new(),
+        subject: created,
+        object: ItemId::new(),
+    });
+    assert!(storage.apply(&transaction).is_err());
+    assert!(storage.load_item(created)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn test_should_cascade_properties_and_relations_on_item_delete() -> anyhow::Result<()> {
+    let (_directory, storage) = temp_world();
+    storage.register_definitions(&[object_schema()])?;
+    let alice = ItemId::new();
+    let forest = ItemId::new();
+    let link = ItemId::new();
+
+    let mut create = WorldTransaction::new();
+    create.push_change(StateChange::CreateObject { id: alice });
+    create.push_change(StateChange::CreateObject { id: forest });
+    create.push_change(StateChange::CreateRelation {
+        id: link,
+        subject: alice,
+        object: forest,
+    });
+    create.push_change(StateChange::SetProperty {
+        item: link,
+        key: schema("character.identity@1"),
+        data: serde_json::json!({ "name": "located" }),
+    });
+    storage.apply(&create)?;
+
+    let mut delete = WorldTransaction::new();
+    delete.push_change(StateChange::DeleteItem { id: alice });
+    storage.apply(&delete)?;
+
+    assert!(storage.load_item(link)?.is_none());
+    assert!(storage.properties_of(link)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_should_keep_one_current_version_per_property_name() -> anyhow::Result<()> {
+    let (_directory, storage) = temp_world();
+    let alice = ItemId::new();
+    storage.register_definitions(&[
+        object_schema(),
+        definition(
+            "character.identity@2",
+            serde_json::json!({ "type": "object" }),
+        ),
+    ])?;
+
+    let mut transaction = WorldTransaction::new();
+    transaction.push_change(StateChange::CreateObject { id: alice });
+    transaction.push_change(StateChange::SetProperty {
+        item: alice,
+        key: schema("character.identity@1"),
+        data: serde_json::json!({ "name": "Alice" }),
+    });
+    storage.apply(&transaction)?;
+
+    let mut upgrade = WorldTransaction::new();
+    upgrade.push_change(StateChange::SetProperty {
+        item: alice,
+        key: schema("character.identity@2"),
+        data: serde_json::json!({ "name": "Alice" }),
+    });
+    storage.apply(&upgrade)?;
+
+    let properties = storage.properties_of(alice)?;
+    assert_eq!(properties.len(), 1);
+    assert_eq!(properties[0].key().version().get(), 2);
+    Ok(())
+}
+
+#[test]
+fn test_should_keep_newer_property_when_removing_old_version() -> anyhow::Result<()> {
+    let (_directory, storage) = temp_world();
+    let item = ItemId::new();
+    storage.register_definitions(&[
+        object_schema(),
+        definition(
+            "character.identity@2",
+            serde_json::json!({"type": "object"}),
+        ),
+    ])?;
+    let mut create = WorldTransaction::new();
+    create.push_change(StateChange::CreateObject { id: item });
+    create.push_change(StateChange::SetProperty {
+        item,
+        key: schema("character.identity@2"),
+        data: serde_json::json!({"name": "Current"}),
+    });
+    storage.apply(&create)?;
+
+    let mut stale_remove = WorldTransaction::new();
+    stale_remove.push_change(StateChange::RemoveProperty {
+        item,
+        key: schema("character.identity@1"),
+    });
+    storage.apply(&stale_remove)?;
+    assert!(
+        storage
+            .load_property(item, &schema("character.identity@2"))?
+            .is_some()
+    );
+
+    let mut current_remove = WorldTransaction::new();
+    current_remove.push_change(StateChange::RemoveProperty {
+        item,
+        key: schema("character.identity@2"),
+    });
+    storage.apply(&current_remove)?;
+    assert!(storage.properties_of(item)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_should_register_definitions_idempotently_and_reject_conflicts() -> anyhow::Result<()> {
+    let (_directory, storage) = temp_world();
+    let identity = object_schema();
+
+    assert_eq!(
+        storage.register_definition(&identity)?,
+        DefinitionRegistration::Registered
+    );
+    assert_eq!(
+        storage.register_definition(&identity)?,
+        DefinitionRegistration::AlreadyPresent
+    );
+
+    let conflicting = definition(
+        "character.identity@1",
+        serde_json::json!({ "type": "string" }),
+    );
+    assert!(storage.register_definition(&conflicting).is_err());
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_property_values_through_the_vocabulary() -> anyhow::Result<()> {
+    let (_directory, storage) = temp_world();
+    storage.register_definitions(&[object_schema()])?;
+    let alice = ItemId::new();
+    let registry = storage.property_registry()?;
+
+    let mut transaction = WorldTransaction::new();
+    transaction.push_change(StateChange::CreateObject { id: alice });
+    transaction.push_change(StateChange::SetProperty {
+        item: alice,
+        key: schema("character.identity@1"),
+        data: serde_json::json!({ "name": 7 }),
+    });
+    assert!(transaction.validate(&registry).is_err());
+
+    let mut unknown = WorldTransaction::new();
+    unknown.push_change(StateChange::SetProperty {
+        item: alice,
+        key: schema("absent.property@1"),
+        data: serde_json::json!({}),
+    });
+    assert!(unknown.validate(&registry).is_err());
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_second_world_row() -> anyhow::Result<()> {
+    let (directory, storage) = temp_world();
+    drop(storage);
+    let connection = Connection::open(directory.path().join("world.sqlite"))?;
+    let result = connection.execute(
+        "INSERT INTO world (id, manifest) VALUES (?1, '{}')",
+        [ItemId::new().as_uuid().as_bytes().to_vec()],
+    );
+    assert!(result.is_err());
+    Ok(())
+}
+
+#[test]
+fn test_should_pin_snapshot_reads() -> anyhow::Result<()> {
+    let (_directory, storage) = temp_world();
+    let item = ItemId::new();
+    let mut create = WorldTransaction::new();
+    create.push_change(StateChange::CreateObject { id: item });
+    storage.apply(&create)?;
+
+    let snapshot = storage.snapshot()?;
+    assert!(snapshot.load_item(item)?.is_some());
+
+    let mut delete = WorldTransaction::new();
+    delete.push_change(StateChange::DeleteItem { id: item });
+    storage.apply(&delete)?;
+
+    assert!(snapshot.load_item(item)?.is_some());
+    assert!(storage.load_item(item)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn test_should_read_batched_items_and_properties_and_page_directional_relations()
+-> anyhow::Result<()> {
+    let (_directory, storage) = temp_world();
+    let key = schema("character.identity@1");
+    storage.register_definition(&object_schema())?;
+    let alice = ItemId::new();
+    let forest = ItemId::new();
+    let cave = ItemId::new();
+    let outgoing = ItemId::new();
+    let incoming = ItemId::new();
+    let untagged = ItemId::new();
+
+    let mut transaction = WorldTransaction::new();
+    for id in [alice, forest, cave] {
+        transaction.push_change(StateChange::CreateObject { id });
+    }
+    transaction.push_change(StateChange::CreateRelation {
+        id: outgoing,
+        subject: alice,
+        object: forest,
+    });
+    transaction.push_change(StateChange::CreateRelation {
+        id: incoming,
+        subject: cave,
+        object: alice,
+    });
+    transaction.push_change(StateChange::CreateRelation {
+        id: untagged,
+        subject: alice,
+        object: cave,
+    });
+    transaction.push_change(StateChange::SetProperty {
+        item: alice,
+        key: key.clone(),
+        data: serde_json::json!({ "name": "Alice" }),
+    });
+    transaction.push_change(StateChange::SetProperty {
+        item: outgoing,
+        key: key.clone(),
+        data: serde_json::json!({ "name": "road" }),
+    });
+    storage.apply(&transaction)?;
+
+    let snapshot = storage.snapshot()?;
+    let (items, properties) =
+        snapshot.read(&[alice, forest, ItemId::new()], std::slice::from_ref(&key))?;
+    assert_eq!(items.len(), 2);
+    assert_eq!(properties.len(), 1);
+    assert_eq!(properties[0].item(), alice);
+    assert_eq!(properties[0].data()["name"], "Alice");
+
+    assert_eq!(
+        snapshot.find_relations(&[alice], RelationDirection::Outgoing, Some(&key), None, 8)?,
+        vec![snapshot.load_item(outgoing)?.expect("tagged relation")]
+    );
+    assert_eq!(
+        snapshot.find_relations(&[alice], RelationDirection::Incoming, None, None, 8)?,
+        vec![snapshot.load_item(incoming)?.expect("incoming relation")]
+    );
+    let either = snapshot.find_relations(&[alice], RelationDirection::Either, None, None, 8)?;
+    assert_eq!(either.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn test_reverse_relation_pages_preserve_bounds_filters_and_snapshot() -> anyhow::Result<()> {
+    fn id(value: u128) -> ItemId {
+        ItemId::from_bytes(value.to_be_bytes())
+    }
+    let (_directory, storage) = temp_world();
+    storage.register_definition(&object_schema())?;
+    let key = schema("character.identity@1");
+    let (root, other, unrelated) = (id(100), id(101), id(102));
+    let mut initial = WorldTransaction::new();
+    for item in [root, other, unrelated] {
+        initial.push_change(StateChange::CreateObject { id: item });
+    }
+    for (relation, subject, object, tagged) in [
+        (id(1), root, other, true),
+        (id(2), other, root, true),
+        (id(3), root, other, false),
+        (id(4), unrelated, other, true),
+        (id(u128::MAX), root, other, true),
+    ] {
+        initial.push_change(StateChange::CreateRelation {
+            id: relation,
+            subject,
+            object,
+        });
+        if tagged {
+            initial.push_change(StateChange::SetProperty {
+                item: relation,
+                key: key.clone(),
+                data: serde_json::json!({"name":"edge"}),
+            });
+        }
+    }
+    storage.apply(&initial)?;
+    let snapshot = storage.snapshot()?;
+    let ids = |rows: Vec<rintawa_world::ItemRecord>| {
+        rows.into_iter().map(|row| row.id()).collect::<Vec<_>>()
+    };
+    // No sentinel may accidentally exclude the largest possible identifier.
+    assert_eq!(
+        ids(snapshot.find_relations_before(&[root], RelationDirection::Outgoing, None, None, 2)?),
+        vec![id(u128::MAX), id(3)]
+    );
+    assert_eq!(
+        ids(snapshot.find_relations_before(
+            &[root],
+            RelationDirection::Outgoing,
+            Some(&key),
+            None,
+            8
+        )?),
+        vec![id(u128::MAX), id(1)]
+    );
+    assert_eq!(
+        ids(snapshot.find_relations_before(
+            &[root],
+            RelationDirection::Outgoing,
+            None,
+            Some(id(3)),
+            8
+        )?),
+        vec![id(1)]
+    );
+    assert!(
+        snapshot
+            .find_relations_before(&[root], RelationDirection::Outgoing, None, Some(id(0)), 8)?
+            .is_empty()
+    );
+    assert_eq!(
+        ids(snapshot.find_relations_before(&[root], RelationDirection::Incoming, None, None, 8)?),
+        vec![id(2)]
+    );
+    assert_eq!(
+        ids(snapshot.find_relations_before(
+            &[root, root],
+            RelationDirection::Either,
+            None,
+            None,
+            8
+        )?),
+        vec![id(u128::MAX), id(3), id(2), id(1)]
+    );
+    for limit in [0, 257] {
+        assert!(
+            snapshot
+                .find_relations_before(&[root], RelationDirection::Outgoing, None, None, limit)
+                .is_err()
+        );
+    }
+    assert!(
+        snapshot
+            .find_relations_before(&vec![root; 65], RelationDirection::Outgoing, None, None, 8)
+            .is_err()
+    );
+    let mut append = WorldTransaction::new();
+    append.push_change(StateChange::CreateRelation {
+        id: id(5),
+        subject: root,
+        object: other,
+    });
+    storage.apply(&append)?;
+    assert_eq!(
+        ids(snapshot.find_relations_before(
+            &[root],
+            RelationDirection::Outgoing,
+            None,
+            Some(id(u128::MAX)),
+            8
+        )?),
+        vec![id(3), id(1)]
+    );
+    assert_eq!(
+        ids(storage.snapshot()?.find_relations_before(
+            &[root],
+            RelationDirection::Outgoing,
+            None,
+            Some(id(u128::MAX)),
+            8
+        )?),
+        vec![id(5), id(3), id(1)]
+    );
+    let (_second_directory, second) = temp_world();
+    assert!(
+        second
+            .snapshot()?
+            .find_relations_before(&[root], RelationDirection::Outgoing, None, None, 8)?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_load_manifest_and_registry_from_one_commit() -> anyhow::Result<()> {
+    use std::sync::{Arc, Barrier};
+
+    let (_directory, storage) = temp_world();
+    let path = storage.path().to_owned();
+    let barrier = Arc::new(Barrier::new(2));
+    let writer_barrier = barrier.clone();
+    let writer = std::thread::spawn(move || -> anyhow::Result<()> {
+        let mut connection = Connection::open(path)?;
+        writer_barrier.wait();
+        for generation in 1..=64_u64 {
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "INSERT INTO property_registry (name, version, schema) VALUES (?1, 1, '{}')",
+                [format!("snapshot.commit-{generation}")],
+            )?;
+            transaction.execute(
+                "UPDATE world SET manifest = ?1",
+                [serde_json::json!({"generation": generation}).to_string()],
+            )?;
+            transaction.commit()?;
+            std::thread::yield_now();
+        }
+        Ok(())
+    });
+
+    barrier.wait();
+    for _ in 0..256 {
+        let state = storage.load_session()?;
+        let generation = state.manifest().as_value()["generation"]
+            .as_u64()
+            .unwrap_or(0);
+        if generation > 0 {
+            assert!(
+                state
+                    .properties()
+                    .get(&schema(&format!("snapshot.commit-{generation}@1")))
+                    .is_some()
+            );
+        }
+        assert!(
+            state
+                .properties()
+                .get(&schema(&format!("snapshot.commit-{}@1", generation + 1)))
+                .is_none()
+        );
+        std::thread::yield_now();
+    }
+    writer.join().expect("test writer thread must not panic")?;
+    assert_eq!(
+        storage.load_session()?.manifest().as_value()["generation"],
+        64
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_read_session_without_opening_a_writer() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("world.sqlite");
+    let world_id = WorldId::new();
+    let storage = SqliteWorldStorage::create(&path, world_id)?;
+    let read_only = SqliteWorldStorage::load_session_read_only(&path)?;
+    assert_eq!(read_only.id(), world_id);
+    assert!(read_only.properties().is_empty());
+    drop(storage);
+
+    // A read-only connection must also work after the writable one is closed.
+    assert_eq!(
+        SqliteWorldStorage::load_session_read_only(&path)?.id(),
+        world_id,
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_initialize_custom_manifest_in_first_transaction() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("world.sqlite");
+    let manifest = rintawa_world::WorldManifest::new(
+        serde_json::json!({"metadata": {"title": "Atomic World"}}),
+    );
+    let world = SqliteWorldStorage::create_with_manifest(&path, WorldId::new(), &manifest)?;
+    assert_eq!(world.load_session()?.manifest(), &manifest);
+    drop(world);
+    assert_eq!(
+        SqliteWorldStorage::open(&path)?.load_session()?.manifest(),
+        &manifest
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_missing_property_search_index_without_writing() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("world.sqlite");
+    drop(SqliteWorldStorage::create(&path, WorldId::new())?);
+    Connection::open(&path)?.execute_batch("DROP INDEX properties_by_name_version_item")?;
+    let before = std::fs::read(&path)?;
+    assert!(matches!(
+        SqliteWorldStorage::open(&path),
+        Err(crate::StorageError::CorruptData(_))
+    ));
+    assert_eq!(std::fs::read(&path)?, before);
+    Ok(())
+}
+
+#[test]
+fn test_should_refuse_legacy_world_without_modifying_file() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("legacy.sqlite");
+    let connection = Connection::open(&path)?;
+    connection.execute_batch(
+        "CREATE TABLE world_metadata (world_id BLOB NOT NULL);
+         INSERT INTO world_metadata VALUES (x'010203');
+         PRAGMA user_version = 5;",
+    )?;
+    drop(connection);
+    let before = std::fs::read(&path)?;
+
+    let error = SqliteWorldStorage::open(&path).unwrap_err();
+    assert!(matches!(
+        error,
+        crate::StorageError::UnsupportedStorageSchema {
+            found: 5,
+            supported: 1
+        }
+    ));
+    assert_eq!(std::fs::read(&path)?, before);
+    assert!(
+        !directory
+            .path()
+            .join("legacy.sqlite.pre-four-table.bak")
+            .exists()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_refuse_previous_four_table_version_without_modifying_file() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("world.sqlite");
+    {
+        let _storage = SqliteWorldStorage::create(&path, WorldId::new())?;
+    }
+    let connection = Connection::open(&path)?;
+    connection.pragma_update(None, "user_version", 6_u32)?;
+    drop(connection);
+    let before = std::fs::read(&path)?;
+
+    let error = SqliteWorldStorage::open(&path).unwrap_err();
+    assert!(matches!(
+        error,
+        crate::StorageError::UnsupportedStorageSchema {
+            found: 6,
+            supported: 1
+        }
+    ));
+    assert_eq!(std::fs::read(&path)?, before);
+    Ok(())
+}
+
+#[test]
+fn test_should_refuse_unknown_tables_with_current_version() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("unknown.sqlite");
+    let connection = Connection::open(&path)?;
+    connection.execute_batch(
+        "CREATE TABLE unknown_table (id INTEGER PRIMARY KEY);
+         PRAGMA user_version = 1;",
+    )?;
+    drop(connection);
+    let before = std::fs::read(&path)?;
+
+    let error = SqliteWorldStorage::open(&path).unwrap_err();
+    assert!(matches!(error, crate::StorageError::CorruptData(_)));
+    assert_eq!(std::fs::read(&path)?, before);
+    Ok(())
+}
+
+#[test]
+fn test_should_refuse_missing_integrity_trigger() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("world.sqlite");
+    {
+        let _storage = SqliteWorldStorage::create(&path, WorldId::new())?;
+    }
+    let connection = Connection::open(&path)?;
+    connection.execute_batch("DROP TRIGGER items_relation_endpoints_ins")?;
+    drop(connection);
+    let error = SqliteWorldStorage::open(&path).unwrap_err();
+    assert!(matches!(error, crate::StorageError::CorruptData(_)));
+    Ok(())
+}
+
+#[test]
+fn test_should_serialize_concurrent_property_definition_registrations() -> anyhow::Result<()> {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    use crate::StorageError;
+    use rintawa_world::WorldError;
+
+    let (_directory, storage) = temp_world();
+    let storage = Arc::new(storage);
+    let start = Arc::new(Barrier::new(12));
+    let property = schema("shared.concurrent@1");
+
+    let workers = (0..12)
+        .map(|index| {
+            let storage = Arc::clone(&storage);
+            let start = Arc::clone(&start);
+            let property = property.clone();
+            thread::spawn(move || {
+                let definition_body = serde_json::json!({
+                    "type": if index % 2 == 0 { "string" } else { "integer" }
+                });
+                let definition = PropertyDefinition::new(
+                    property,
+                    ExtensionId::new(format!("example.{index}")),
+                    definition_body.clone(),
+                );
+                start.wait();
+                (definition_body, storage.register_definition(&definition))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut outcomes = Vec::new();
+    for worker in workers {
+        outcomes.push(worker.join().expect("registration worker must not panic"));
+    }
+    let persisted = storage.property_registry()?;
+    let winner = persisted
+        .get(&property)
+        .expect("winning definition must be stored");
+    let winner_body = winner.schema();
+    let mut winners = 0;
+
+    for (body, outcome) in outcomes {
+        if &body == winner_body {
+            match outcome? {
+                DefinitionRegistration::Registered => winners += 1,
+                DefinitionRegistration::AlreadyPresent => {}
+            }
+        } else {
+            assert!(matches!(
+                outcome,
+                Err(StorageError::World(WorldError::DefinitionConflict { .. }))
+            ));
+        }
+    }
+    assert_eq!(winners, 1);
+    assert_eq!(persisted.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn test_should_rollback_entire_property_definition_batch_on_conflict() -> anyhow::Result<()> {
+    use crate::StorageError;
+    use rintawa_world::WorldError;
+
+    let (_directory, storage) = temp_world();
+    let first = definition("batch.first@1", serde_json::json!({ "type": "integer" }));
+    let second = definition("batch.second@1", serde_json::json!({ "type": "boolean" }));
+    let conflicting = definition("batch.first@1", serde_json::json!({ "type": "string" }));
+
+    assert!(matches!(
+        storage.register_definitions(&[first, second, conflicting]),
+        Err(StorageError::World(WorldError::DefinitionConflict { .. }))
+    ));
+    assert!(storage.property_registry()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_should_find_properties_by_exact_version_in_bounded_keyset_pages() -> anyhow::Result<()> {
+    let (directory, storage) = temp_world();
+    let first_key = schema("search.character@1");
+    let second_key = schema("search.character@2");
+    storage.register_definitions(&[
+        definition(
+            "search.character@1",
+            serde_json::json!({ "type": "object" }),
+        ),
+        definition(
+            "search.character@2",
+            serde_json::json!({ "type": "object" }),
+        ),
+    ])?;
+
+    let mut transaction = WorldTransaction::new();
+    let mut first_ids = Vec::new();
+    let mut second_ids = Vec::new();
+    for index in 0..317 {
+        let item = ItemId::new();
+        first_ids.push(item);
+        transaction.push_change(StateChange::CreateObject { id: item });
+        transaction.push_change(StateChange::SetProperty {
+            item,
+            key: first_key.clone(),
+            data: serde_json::json!({ "index": index }),
+        });
+    }
+    for index in 0..11 {
+        let item = ItemId::new();
+        second_ids.push(item);
+        transaction.push_change(StateChange::CreateObject { id: item });
+        transaction.push_change(StateChange::SetProperty {
+            item,
+            key: second_key.clone(),
+            data: serde_json::json!({ "index": index }),
+        });
+    }
+    storage.apply(&transaction)?;
+    first_ids.sort();
+    second_ids.sort();
+
+    let mut after = None;
+    let mut observed = Vec::new();
+    loop {
+        let page = storage.find_properties(&first_key, after, 64)?;
+        assert!(page.len() <= 64);
+        if page.is_empty() {
+            break;
+        }
+        for property in &page {
+            assert_eq!(property.key(), &first_key);
+            assert!(property.data()["index"].is_number());
+            observed.push(property.item());
+        }
+        after = page.last().map(|property| property.item());
+        if page.len() < 64 {
+            break;
+        }
+    }
+    assert_eq!(observed, first_ids);
+    assert!(storage.find_properties(&first_key, after, 64)?.is_empty());
+
+    let other = storage.find_properties(&second_key, None, 64)?;
+    assert_eq!(
+        other
+            .iter()
+            .map(|property| property.item())
+            .collect::<Vec<_>>(),
+        second_ids
+    );
+    assert!(
+        storage
+            .find_properties(&schema("missing.property@1"), None, 20)?
+            .is_empty()
+    );
+
+    let connection = Connection::open(directory.path().join("world.sqlite"))?;
+    let plan: String = connection.query_row(
+        "EXPLAIN QUERY PLAN
+         SELECT item, data FROM properties
+         WHERE name = ?1 AND version = ?2 AND item > COALESCE(?3, X'')
+         ORDER BY item LIMIT ?4",
+        rusqlite::params!["search.character", 1_i64, Option::<Vec<u8>>::None, 64_i64],
+        |row| row.get(3),
+    )?;
+    assert!(plan.contains("properties_by_name_version_item"), "{plan}");
+    Ok(())
+}
+
+#[test]
+fn test_should_keep_search_snapshot_stable_during_later_commits() -> anyhow::Result<()> {
+    let (directory, storage) = temp_world();
+    let key = schema("search.snapshot@1");
+    storage.register_definition(&definition(
+        "search.snapshot@1",
+        serde_json::json!({ "type": "object" }),
+    ))?;
+    let first = ItemId::new();
+    let second = ItemId::new();
+
+    let mut create = WorldTransaction::new();
+    create.push_change(StateChange::CreateObject { id: first });
+    create.push_change(StateChange::SetProperty {
+        item: first,
+        key: key.clone(),
+        data: serde_json::json!({ "version": "before" }),
+    });
+    storage.apply(&create)?;
+
+    let snapshot = storage.snapshot()?;
+    let initial = snapshot.find_properties(&key, None, 20)?;
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0].data()["version"], "before");
+
+    let mut next = WorldTransaction::new();
+    next.push_change(StateChange::CreateObject { id: second });
+    next.push_change(StateChange::SetProperty {
+        item: second,
+        key: key.clone(),
+        data: serde_json::json!({ "version": "after" }),
+    });
+    next.push_change(StateChange::SetProperty {
+        item: first,
+        key: key.clone(),
+        data: serde_json::json!({ "version": "changed" }),
+    });
+    storage.apply(&next)?;
+
+    let pinned = snapshot.find_properties(&key, None, 20)?;
+    assert_eq!(pinned.len(), 1);
+    assert_eq!(pinned[0].data()["version"], "before");
+    let current = storage.find_properties(&key, None, 20)?;
+    assert_eq!(current.len(), 2);
+
+    drop(snapshot);
+    drop(storage);
+    let reopened = SqliteWorldStorage::open(directory.path().join("world.sqlite"))?;
+    assert_eq!(reopened.find_properties(&key, None, 20)?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn test_should_batch_graph_relations_once_with_exclusive_cursor() -> anyhow::Result<()> {
+    let (_directory, storage) = temp_world();
+    let a = ItemId::new();
+    let b = ItemId::new();
+    let c = ItemId::new();
+    let unrelated_a = ItemId::new();
+    let unrelated_b = ItemId::new();
+
+    let mut initial = WorldTransaction::new();
+    for item in [a, b, c, unrelated_a, unrelated_b] {
+        initial.push_change(StateChange::CreateObject { id: item });
+    }
+    let mut relevant = Vec::new();
+    for (subject, object) in [(a, b), (b, a), (a, a), (b, c), (c, a)] {
+        let id = ItemId::new();
+        relevant.push(id);
+        initial.push_change(StateChange::CreateRelation {
+            id,
+            subject,
+            object,
+        });
+    }
+    let irrelevant = ItemId::new();
+    initial.push_change(StateChange::CreateRelation {
+        id: irrelevant,
+        subject: unrelated_a,
+        object: unrelated_b,
+    });
+    storage.apply(&initial)?;
+    relevant.sort();
+
+    let mut cursor = None;
+    let mut observed = Vec::new();
+    loop {
+        let page = storage.relations_touching_any(&[a, b, a], cursor, 2)?;
+        assert!(page.len() <= 2);
+        if page.is_empty() {
+            break;
+        }
+        observed.extend(page.iter().map(|relation| relation.id()));
+        cursor = page.last().map(|relation| relation.id());
+    }
+    assert_eq!(observed, relevant);
+    assert!(!observed.contains(&irrelevant));
+    assert_eq!(
+        storage
+            .snapshot()?
+            .relations_touching_any(&[c], None, 20)?
+            .len(),
+        2
+    );
+    assert!(storage.relations_touching_any(&[], None, 20)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_should_bound_graph_and_property_read_parameters() -> anyhow::Result<()> {
+    use crate::StorageError;
+
+    let (_directory, storage) = temp_world();
+    let key = schema("limits.property@1");
+    for size in [0, 257, usize::MAX] {
+        assert!(matches!(
+            storage.find_properties(&key, None, size),
+            Err(StorageError::InvalidQueryPageSize { requested, maximum: 256 })
+                if requested == size
+        ));
+        assert!(matches!(
+            storage.relations_touching_any(&[], None, size),
+            Err(StorageError::InvalidQueryPageSize { requested, maximum: 256 })
+                if requested == size
+        ));
+    }
+    let too_many = (0..65).map(|_| ItemId::new()).collect::<Vec<_>>();
+    assert!(matches!(
+        storage.relations_touching_any(&too_many, None, 10),
+        Err(StorageError::InvalidQueryBatchSize {
+            requested: 65,
+            maximum: 64
+        })
+    ));
+    let exactly_max = (0..64).map(|_| ItemId::new()).collect::<Vec<_>>();
+    assert!(
+        storage
+            .relations_touching_any(&exactly_max, None, 256)?
+            .is_empty()
+    );
+    assert!(storage.find_properties(&key, None, 256)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_should_report_distinct_cascade_property_keys_from_one_query() -> anyhow::Result<()> {
+    let (_directory, storage) = temp_world();
+    let first = schema("cascade.first@1");
+    let second = schema("cascade.second@1");
+    storage.register_definitions(&[
+        definition("cascade.first@1", serde_json::json!({ "type": "object" })),
+        definition("cascade.second@1", serde_json::json!({ "type": "object" })),
+    ])?;
+
+    let a = ItemId::new();
+    let b = ItemId::new();
+    let c = ItemId::new();
+    let r1 = ItemId::new();
+    let r2 = ItemId::new();
+    let unrelated = ItemId::new();
+    let mut seed = WorldTransaction::new();
+    for item in [a, b, c] {
+        seed.push_change(StateChange::CreateObject { id: item });
+    }
+    seed.push_change(StateChange::CreateRelation {
+        id: r1,
+        subject: a,
+        object: b,
+    });
+    seed.push_change(StateChange::CreateRelation {
+        id: r2,
+        subject: c,
+        object: a,
+    });
+    seed.push_change(StateChange::CreateRelation {
+        id: unrelated,
+        subject: b,
+        object: c,
+    });
+    for item in [a, r1, r2] {
+        seed.push_change(StateChange::SetProperty {
+            item,
+            key: first.clone(),
+            data: serde_json::json!({}),
+        });
+    }
+    seed.push_change(StateChange::SetProperty {
+        item: r2,
+        key: second.clone(),
+        data: serde_json::json!({}),
+    });
+    seed.push_change(StateChange::SetProperty {
+        item: unrelated,
+        key: second.clone(),
+        data: serde_json::json!({ "unrelated": true }),
+    });
+    storage.apply(&seed)?;
+
+    let connection = storage.reader()?;
+    let keys = query::property_keys_deleted_with_item(&connection, a)?;
+    assert_eq!(keys, vec![first.clone(), second.clone()]);
+    let unaffected = query::property_keys_deleted_with_item(&connection, b)?;
+    assert!(unaffected.contains(&first));
+    assert!(unaffected.contains(&second));
+    assert!(query::property_keys_deleted_with_item(&connection, ItemId::new())?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_oversized_indexed_property_page_without_truncation() -> anyhow::Result<()> {
+    use crate::StorageError;
+
+    let (_directory, storage) = temp_world();
+    let key = schema("search.large@1");
+    storage.register_definition(&definition(
+        "search.large@1",
+        serde_json::json!({ "type": "object" }),
+    ))?;
+    let mut seed = WorldTransaction::new();
+    for index in 0..3 {
+        let item = ItemId::new();
+        seed.push_change(StateChange::CreateObject { id: item });
+        seed.push_change(StateChange::SetProperty {
+            item,
+            key: key.clone(),
+            data: serde_json::json!({ "content": "x".repeat(3 * 1024 * 1024), "index": index }),
+        });
+    }
+    storage.apply(&seed)?;
+
+    assert_eq!(storage.find_properties(&key, None, 2)?.len(), 2);
+    assert!(matches!(
+        storage.find_properties(&key, None, 3),
+        Err(StorageError::QueryPageTooLarge { bytes, maximum })
+            if bytes > maximum && maximum == 8 * 1024 * 1024
+    ));
+    let snapshot = storage.snapshot()?;
+    assert!(matches!(
+        snapshot.find_properties(&key, None, 256),
+        Err(StorageError::QueryPageTooLarge { .. })
+    ));
+    // A smaller request is still possible: neither the database nor the
+    // result cursor changes after an oversized page is rejected.
+    let first = storage.find_properties(&key, None, 1)?;
+    assert_eq!(first.len(), 1);
+    let second = storage.find_properties(&key, Some(first[0].item()), 1)?;
+    assert_eq!(second.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn test_should_exclude_other_writers_and_release_on_crash() -> anyhow::Result<()> {
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Command, Stdio},
+    };
+    let (directory, storage) = temp_world();
+    let path = storage.path().to_path_buf();
+    assert!(matches!(
+        SqliteWorldStorage::open(&path),
+        Err(crate::StorageError::WriterBusy(_))
+    ));
+    assert_eq!(
+        SqliteWorldStorage::load_session_read_only(&path)?.id(),
+        storage.world_id()
+    );
+    #[cfg(unix)]
+    {
+        let alias = directory.path().join("alias.sqlite");
+        std::fs::hard_link(&path, &alias)?;
+        assert!(matches!(
+            SqliteWorldStorage::open(&alias),
+            Err(crate::StorageError::WriterBusy(_))
+        ));
+        std::fs::remove_file(alias)?;
+    }
+    let other = SqliteWorldStorage::create(directory.path().join("other.sqlite"), WorldId::new())?;
+    drop(other);
+    drop(storage);
+    let mut child = Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "sqlite::tests::test_writer_process_probe",
+            "--nocapture",
+        ])
+        .env("RINTAWA_WRITER_PROBE_PATH", &path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let output = BufReader::new(child.stdout.take().unwrap());
+    let ready = output
+        .lines()
+        .any(|line| line.is_ok_and(|line| line == "writer-ready"));
+    assert!(ready, "writer child failed before acquiring ownership");
+    assert!(matches!(
+        SqliteWorldStorage::open(&path),
+        Err(crate::StorageError::WriterBusy(_))
+    ));
+    assert!(SqliteWorldStorage::load_session_read_only(&path).is_ok());
+    child.kill()?;
+    child.wait()?;
+    let reopened = SqliteWorldStorage::open(&path)?;
+    drop(reopened);
+    SqliteWorldStorage::open(&path)?;
+    Ok(())
+}
+
+#[test]
+fn test_writer_process_probe() -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+    let Some(path) = std::env::var_os("RINTAWA_WRITER_PROBE_PATH") else {
+        return Ok(());
+    };
+    let _storage = SqliteWorldStorage::open(path)?;
+    println!("writer-ready");
+    std::io::stdout().flush()?;
+    std::io::stdin().read_exact(&mut [0])?;
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_altered_ddl_without_modifying_database() -> anyhow::Result<()> {
+    use crate::sqlite::schema::{FOUR_TABLE_SCHEMA, STORAGE_SCHEMA_VERSION};
+    for (from, to) in [
+        ("CHECK (type IN (1, 2))", "CHECK (type IN (1, 2, 3))"),
+        (
+            "CREATE INDEX items_by_subject ON items(subject)",
+            "CREATE INDEX items_by_subject ON items(object)",
+        ),
+        ("WHEN OLD.type <> NEW.type", "WHEN 0"),
+    ] {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("world.sqlite");
+        let connection = Connection::open(&path)?;
+        assert!(FOUR_TABLE_SCHEMA.contains(from));
+        connection.execute_batch(&FOUR_TABLE_SCHEMA.replace(from, to))?;
+        connection.pragma_update(None, "user_version", STORAGE_SCHEMA_VERSION)?;
+        connection.execute(
+            "INSERT INTO world VALUES (?1, '{}')",
+            [WorldId::new().into_bytes().as_slice()],
+        )?;
+        drop(connection);
+        let before = std::fs::read(&path)?;
+        assert!(matches!(
+            SqliteWorldStorage::open(&path),
+            Err(crate::StorageError::CorruptData(_))
+        ));
+        assert_eq!(std::fs::read(&path)?, before);
+        assert_eq!(std::fs::read_dir(directory.path())?.count(), 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_should_accept_current_schema_after_vacuum_backup() -> anyhow::Result<()> {
+    let (directory, storage) = temp_world();
+    let path = storage.path().to_path_buf();
+    let world = storage.world_id();
+    drop(storage);
+    let backup = directory.path().join("backup.sqlite");
+    let connection = Connection::open(&path)?;
+    connection.execute("VACUUM INTO ?1", [backup.to_str().unwrap()])?;
+    drop(connection);
+    assert_eq!(SqliteWorldStorage::open(path)?.world_id(), world);
+    assert_eq!(SqliteWorldStorage::open(backup)?.world_id(), world);
+    Ok(())
+}
+
+#[test]
+fn test_should_replace_metadata_atomically_and_preserve_other_manifest_fields() -> anyhow::Result<()>
+{
+    let (_directory, storage) = temp_world();
+    storage.update_manifest(&rintawa_world::WorldManifest::new(
+        serde_json::json!({"custom": 7}),
+    ))?;
+    for title in ["one", "two"] {
+        let manifest = storage.set_manifest_metadata(serde_json::json!({"title":title}))?;
+        assert_eq!(manifest.as_value()["metadata"]["title"], title);
+        assert_eq!(manifest.as_value()["custom"], 7);
+    }
+    assert_eq!(
+        storage.load_session()?.manifest().as_value()["metadata"]["title"],
+        "two"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_should_reject_detached_writer_descriptor_after_delete_recreate() -> anyhow::Result<()> {
+    use std::{sync::mpsc, time::Duration};
+    for keep_alias in [false, true] {
+        let (directory, original) = temp_world();
+        let path = original.path().to_path_buf();
+        if keep_alias {
+            std::fs::hard_link(&path, directory.path().join("old-inode.sqlite"))?;
+        }
+        let opener_path = path.clone();
+        let (opened, ready) = mpsc::channel();
+        let (resume, paused) = mpsc::channel();
+        let opener = std::thread::spawn(move || {
+            crate::sqlite::BEFORE_WRITER_LOCK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    opened.send(()).unwrap();
+                    paused.recv_timeout(Duration::from_secs(10)).unwrap();
+                }));
+            });
+            SqliteWorldStorage::open(opener_path)
+        });
+        ready.recv_timeout(Duration::from_secs(5))?;
+        original.delete()?;
+        let replacement = SqliteWorldStorage::create(&path, WorldId::new())?;
+        resume.send(())?;
+        let delayed = opener.join().unwrap();
+        assert!(
+            delayed.is_err(),
+            "a lock on a deleted inode admitted a second writer for the replacement database"
+        );
+        assert_eq!(
+            SqliteWorldStorage::load_session_read_only(&path)?.id(),
+            replacement.world_id()
+        );
+        assert!(matches!(
+            SqliteWorldStorage::open(&path),
+            Err(crate::StorageError::WriterBusy(_))
+        ));
+        drop(replacement);
+        SqliteWorldStorage::open(&path)?;
+    }
+
     Ok(())
 }

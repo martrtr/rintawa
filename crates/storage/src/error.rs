@@ -2,7 +2,6 @@
 
 use std::path::PathBuf;
 
-use rintawa_sdk::world::EffectJobId;
 use thiserror::Error;
 
 /// Errors returned by persistent world storage operations.
@@ -28,6 +27,10 @@ pub enum StorageError {
     #[error("world storage already exists at {0}")]
     AlreadyExists(PathBuf),
 
+    /// Another writable owner holds this database file.
+    #[error("world storage writer is busy at {0}")]
+    WriterBusy(PathBuf),
+
     /// A requested world database does not exist.
     #[error("world storage does not exist at {0}")]
     NotFound(PathBuf),
@@ -45,7 +48,7 @@ pub enum StorageError {
     #[error("database is not an initialized Rintawa world")]
     Uninitialized,
 
-    /// The storage migration schema is newer than this runtime supports.
+    /// The storage schema version is not supported by this runtime.
     #[error("unsupported world storage schema version {found}; supported version is {supported}")]
     UnsupportedStorageSchema {
         /// Version stored in SQLite user_version.
@@ -54,59 +57,59 @@ pub enum StorageError {
         supported: u32,
     },
 
-    /// The world format itself is newer or otherwise incompatible.
-    #[error("unsupported world format version {found}; supported version is {supported}")]
-    UnsupportedWorldFormat {
-        /// World format stored in metadata.
-        found: u32,
-        /// World format supported by the world crate.
-        supported: u32,
-    },
-
-    /// A persisted Core mutation encoding is newer or otherwise unsupported.
-    #[error("unsupported world mutation format version {found}; supported version is {supported}")]
-    UnsupportedMutationFormat {
-        /// Format version stored with the mutation entry.
-        found: u32,
-        /// Mutation format version supported by this runtime.
-        supported: u32,
-    },
+    /// A persisted value or index cannot fit the public world-model type.
+    #[error("world storage value for {0} is out of range")]
+    IndexOutOfRange(&'static str),
 
     /// Persisted bytes violate a world-storage invariant.
     #[error("corrupt world storage: {0}")]
     CorruptData(String),
 
-    /// A persisted sequence/index cannot fit the public world-model type.
-    #[error("world storage index for {0} is out of range")]
-    IndexOutOfRange(&'static str),
+    /// A property value was stored under a different version than requested.
+    #[error("property {name} is stored at version {found}, not the requested version {expected}")]
+    StalePropertyVersion {
+        /// Unversioned property name.
+        name: String,
+        /// Version requested by the caller.
+        expected: u32,
+        /// Version actually stored.
+        found: u32,
+    },
 
-    /// A requested durable effect job does not exist.
-    #[error("effect job {0} does not exist")]
-    EffectJobNotFound(EffectJobId),
+    /// A requested read page exceeds the bounded query policy.
+    #[error("world query page size {requested} must be between 1 and {maximum}")]
+    InvalidQueryPageSize {
+        /// Requested maximum number of results.
+        requested: usize,
+        /// Largest permitted page.
+        maximum: usize,
+    },
 
-    /// An effect worker requested a lease that does not extend beyond the claim time.
-    #[error("effect job lease must expire after the claim time")]
-    InvalidEffectLease,
+    /// A property search page contains more JSON bytes than the read budget.
+    #[error("world property query page has {bytes} JSON bytes; maximum is {maximum}")]
+    QueryPageTooLarge {
+        /// Total encoded JSON bytes encountered in the page.
+        bytes: usize,
+        /// Maximum encoded JSON bytes permitted in one page.
+        maximum: usize,
+    },
 
-    /// A previous effect claim lost authority because the job was reclaimed or cancelled.
-    #[error("effect job claim for {0} is no longer authoritative")]
-    EffectJobClaimLost(EffectJobId),
+    /// A batch query supplied too many target item IDs.
+    #[error("world query batch size {requested} exceeds {maximum}")]
+    InvalidQueryBatchSize {
+        /// Number of supplied item IDs.
+        requested: usize,
+        /// Largest permitted batch.
+        maximum: usize,
+    },
 
-    /// The effect job attempt counter cannot be incremented further.
-    #[error("effect job {0} attempt counter overflowed")]
-    EffectAttemptOverflow(EffectJobId),
-
-    /// A completed effect job cannot transition back to a worker-controlled state.
-    #[error("effect job {0} is already terminal")]
-    EffectJobTerminal(EffectJobId),
-
-    /// Worker diagnostic text exceeds the bounded durable error field.
-    #[error("effect job error is {actual_bytes} bytes, exceeding the {maximum_bytes}-byte limit")]
-    EffectErrorTooLarge {
-        /// Supplied UTF-8 byte length.
-        actual_bytes: usize,
-        /// Maximum persisted error size.
-        maximum_bytes: usize,
+    /// A batched property read requested too many distinct exact keys.
+    #[error("world property read requested {requested} keys; maximum is {maximum}")]
+    InvalidPropertyReadKeyCount {
+        /// Number of requested property keys.
+        requested: usize,
+        /// Largest supported number of property keys.
+        maximum: usize,
     },
 
     /// The storage mutex became poisoned after an internal panic.

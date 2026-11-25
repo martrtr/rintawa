@@ -2,14 +2,17 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    fs::{File, OpenOptions, TryLockError},
     io::Write,
     path::Path,
 };
 
 use rintawa_artifacts::{ArtifactDigest, ContentType};
+use rintawa_extension_engine::{canonical_http_loopback_origin, validate_transport_point};
 use rintawa_sdk::{
     contracts::{ComponentRef, ContractKey, ContractVersion},
     runtime_permissions::RuntimePermission,
+    secrets::SecretPath,
     types::{ComponentId, ContractId, ExtensionInstanceId, RuntimeScopeId},
 };
 use serde::{Deserialize, Serialize};
@@ -19,17 +22,37 @@ use uuid::Uuid;
 use crate::{HostError, HostResult};
 
 /// Current host composition profile schema.
-pub const PROFILE_SCHEMA: u32 = 6;
-const LEGACY_PROFILE_SCHEMA_V1: u32 = 1;
-const LEGACY_PROFILE_SCHEMA_V2: u32 = 2;
-const LEGACY_PROFILE_SCHEMA_V3: u32 = 3;
-const LEGACY_PROFILE_SCHEMA_V4: u32 = 4;
-const LEGACY_PROFILE_SCHEMA_V5: u32 = 5;
+pub const PROFILE_SCHEMA: u32 = 8;
 
+const MAX_HTTP_ORIGINS_PER_COMPONENT: usize = 32;
+const MAX_AUTHORITATIVE_PROVIDERS_PER_PROFILE: usize = 64;
+const MAX_HTTP_ORIGINS_PER_PROFILE: usize = 512;
 const MAX_PREFERENCE_ENTRIES_PER_COMPONENT: usize = 256;
 const MAX_PREFERENCE_KEY_BYTES: usize = 128;
 const MAX_PREFERENCE_VALUE_BYTES: usize = 64 * 1024;
 const MAX_PREFERENCE_TOTAL_BYTES_PER_COMPONENT: usize = 1024 * 1024;
+
+/// Exact prerequisite for a shared Host execution target, without permission inheritance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct HostExecutionRequirement {
+    /// Exact provider RTW bytes.
+    pub artifact: ArtifactDigest,
+    /// Component in the approved baseline activation.
+    pub component_id: ComponentId,
+    /// Exact versioned target supplied by that component.
+    pub target: String,
+}
+
+/// Optional starting component selected by a World template, without runtime authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct CompositionEntry {
+    /// Concrete World instance containing the starting component.
+    pub instance_id: ExtensionInstanceId,
+    /// Exact component, resolved by its presentation host when available.
+    pub component_id: ComponentId,
+}
 
 /// One exact activation selected for a host-owned composition.
 ///
@@ -51,11 +74,6 @@ pub struct ActivationRecord {
     pub scope_id: RuntimeScopeId,
     /// Whether the activation starts automatically in this profile.
     pub enabled: bool,
-    /// Legacy schema-5 marker migrated once into the independent default-World recipe.
-    ///
-    /// New writes keep this false; the field remains decodable for crash-safe migration.
-    #[serde(default)]
-    pub world_default: bool,
 }
 
 /// One explicit provider choice for a versioned contract in one runtime scope.
@@ -103,6 +121,43 @@ impl PreferredProviderSelection {
     }
 }
 
+/// One explicitly selected owner for a shared Zenoh point in a single runtime scope.
+///
+/// A selection is Host policy, not an extension preference or an alias.
+/// Unselected components remain installed and can serve independent points.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct AuthoritativeProviderSelection {
+    /// Runtime scope where the policy applies.
+    pub scope_id: RuntimeScopeId,
+    /// Exact shared Zenoh point (no wildcards).
+    pub point: String,
+    /// Chosen runtime activation.
+    pub provider_instance_id: ExtensionInstanceId,
+    /// Chosen component within the activation.
+    pub provider_component_id: ComponentId,
+}
+
+impl AuthoritativeProviderSelection {
+    /// Constructs a selection with an attested component principal.
+    pub fn new(scope_id: RuntimeScopeId, point: String, provider: ComponentRef) -> Self {
+        Self {
+            scope_id,
+            point,
+            provider_instance_id: provider.instance_id,
+            provider_component_id: provider.component_id,
+        }
+    }
+
+    /// Returns the exact selected component.
+    pub fn provider(&self) -> ComponentRef {
+        ComponentRef::new(
+            self.provider_instance_id.clone(),
+            self.provider_component_id.clone(),
+        )
+    }
+}
+
 /// One explicit host-approved runtime permission for an exact composition component.
 ///
 /// The extension manifest must request the permission separately. This record is
@@ -141,6 +196,37 @@ impl RuntimePermissionGrant {
     }
 }
 
+/// One explicit Host-approved HTTP loopback origin for an exact component.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct HttpLoopbackOriginGrant {
+    /// Runtime scope containing the component.
+    pub scope_id: RuntimeScopeId,
+    /// Exact installed extension instance receiving this approval.
+    pub instance_id: ExtensionInstanceId,
+    /// Component granted access to this local HTTP origin.
+    pub component_id: ComponentId,
+    /// Exact canonical HTTP loopback origin, including the TCP port.
+    pub origin: String,
+}
+
+impl HttpLoopbackOriginGrant {
+    /// Constructs one host-approved, canonical origin policy record.
+    pub fn new(scope_id: RuntimeScopeId, owner: ComponentRef, origin: String) -> Self {
+        Self {
+            scope_id,
+            instance_id: owner.instance_id,
+            component_id: owner.component_id,
+            origin,
+        }
+    }
+
+    /// Returns the exact principal receiving this approval.
+    pub fn owner(&self) -> ComponentRef {
+        ComponentRef::new(self.instance_id.clone(), self.component_id.clone())
+    }
+}
+
 /// One owner-scoped, non-authoritative extension preference.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -165,10 +251,33 @@ impl PreferenceRecord {
     }
 }
 
+/// One local exact secret-path approval, never inherited by copied Worlds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct SecretReadGrant {
+    /// Scope containing the selected activation.
+    pub scope_id: RuntimeScopeId,
+    /// Exact installed instance, not a package ID or template slot.
+    pub instance_id: ExtensionInstanceId,
+    /// Manifest-authorized consuming component.
+    pub component_id: ComponentId,
+    /// One canonical secret path. Wildcards cannot be persisted here.
+    pub path: SecretPath,
+    /// Optional managed entry, absent for legacy direct-path approvals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_id: Option<Uuid>,
+}
+
 /// Persistent exact-artifact composition for one host-owned runtime scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompositionProfile {
+    /// Exact shared Host prerequisites. Empty retains the existing default-recipe policy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub execution_requirements: Vec<HostExecutionRequirement>,
+    /// Template starting component; does not enable it or grant permissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<CompositionEntry>,
     /// Version of this persistence schema.
     pub schema: u32,
     /// Ordered exact activations. Order remains explicit for future composition policy.
@@ -177,46 +286,87 @@ pub struct CompositionProfile {
     /// Explicit provider choices applied before activation planning.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub preferred_providers: Vec<PreferredProviderSelection>,
+    /// Authoritative Zenoh point owners (distinct from legacy contract choices).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authoritative_providers: Vec<AuthoritativeProviderSelection>,
     /// Explicit runtime capabilities approved for exact component principals.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_permissions: Vec<RuntimePermissionGrant>,
+    /// Individually approved local HTTP origins for exact component principals.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub http_loopback_origins: Vec<HttpLoopbackOriginGrant>,
+    /// Local exact secret approvals, excluded from templates and fresh materializations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_read_grants: Vec<SecretReadGrant>,
     /// Owner-scoped non-authoritative extension preferences.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub preferences: Vec<PreferenceRecord>,
 }
 
-/// Backward-compatible public name for the pre-world composition profile.
-pub type BaselineProfile = CompositionProfile;
-
 impl Default for CompositionProfile {
     fn default() -> Self {
         Self {
+            execution_requirements: Vec::new(),
+            entry: None,
             schema: PROFILE_SCHEMA,
             activations: Vec::new(),
             preferred_providers: Vec::new(),
+            authoritative_providers: Vec::new(),
             runtime_permissions: Vec::new(),
+            http_loopback_origins: Vec::new(),
+            secret_read_grants: Vec::new(),
             preferences: Vec::new(),
         }
     }
 }
 
 impl CompositionProfile {
+    // Atomic rename changes the profile inode. Lock a stable adjacent file instead;
+    // never unlink it while other handles/processes might be waiting on it.
+    pub(crate) fn lock(path: &Path) -> HostResult<File> {
+        let file = Self::open_lock(path)?;
+        file.lock()?;
+        Ok(file)
+    }
+
+    pub(crate) fn try_lock(path: &Path) -> HostResult<File> {
+        let file = Self::open_lock(path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(TryLockError::WouldBlock) => {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into())
+            }
+            Err(TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+
+    fn open_lock(path: &Path) -> HostResult<File> {
+        let lock_path = path.with_extension("toml.lock");
+        if let Ok(metadata) = std::fs::symlink_metadata(&lock_path)
+            && (metadata.file_type().is_symlink() || !metadata.is_file())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "profile lock must be a regular file",
+            )
+            .into());
+        }
+        Ok(OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?)
+    }
+
     pub(crate) fn load(path: &Path) -> HostResult<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
         let source = std::fs::read_to_string(path)?;
-        let mut profile: Self = toml::from_str(&source)?;
-        match profile.schema {
-            PROFILE_SCHEMA => {}
-            LEGACY_PROFILE_SCHEMA_V1
-            | LEGACY_PROFILE_SCHEMA_V2
-            | LEGACY_PROFILE_SCHEMA_V3
-            | LEGACY_PROFILE_SCHEMA_V4
-            | LEGACY_PROFILE_SCHEMA_V5 => {
-                profile.schema = PROFILE_SCHEMA;
-            }
-            unsupported => return Err(HostError::UnsupportedProfileSchema(unsupported)),
+        let profile: Self = toml::from_str(&source)?;
+        if profile.schema != PROFILE_SCHEMA {
+            return Err(HostError::UnsupportedProfileSchema(profile.schema));
         }
         profile.validate()?;
         Ok(profile)
@@ -228,7 +378,14 @@ impl CompositionProfile {
             .iter()
             .map(|item| &item.scope_id)
             .chain(self.preferred_providers.iter().map(|item| &item.scope_id))
+            .chain(
+                self.authoritative_providers
+                    .iter()
+                    .map(|item| &item.scope_id),
+            )
             .chain(self.runtime_permissions.iter().map(|item| &item.scope_id))
+            .chain(self.http_loopback_origins.iter().map(|item| &item.scope_id))
+            .chain(self.secret_read_grants.iter().map(|item| &item.scope_id))
             .chain(self.preferences.iter().map(|item| &item.scope_id))
             .find(|scope| *scope != expected);
         if let Some(actual) = actual {
@@ -241,6 +398,7 @@ impl CompositionProfile {
     }
 
     pub(crate) fn save(&self, path: &Path) -> HostResult<()> {
+        self.validate()?;
         let parent = path.parent().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -259,6 +417,26 @@ impl CompositionProfile {
     }
 
     fn validate(&self) -> HostResult<()> {
+        let mut targets = HashSet::new();
+        for requirement in &self.execution_requirements {
+            rintawa_sdk::manifest::validate_component_target(&requirement.target)
+                .map_err(|error| HostError::InvalidTemplate(error.to_string()))?;
+            if !targets.insert(&requirement.target) {
+                return Err(HostError::InvalidTemplate(
+                    "duplicate Host execution requirement".into(),
+                ));
+            }
+        }
+        if let Some(entry) = &self.entry
+            && !self
+                .activations
+                .iter()
+                .any(|activation| activation.instance_id == entry.instance_id)
+        {
+            return Err(HostError::InvalidTemplate(
+                "entry instance is absent from composition".into(),
+            ));
+        }
         let mut selections = HashSet::new();
         for selection in &self.preferred_providers {
             let contract = selection.contract();
@@ -267,6 +445,20 @@ impl CompositionProfile {
                 return Err(HostError::DuplicatePreferredProviderSelection {
                     scope_id: selection.scope_id.to_string(),
                     contract: contract.to_string(),
+                });
+            }
+        }
+        if self.authoritative_providers.len() > MAX_AUTHORITATIVE_PROVIDERS_PER_PROFILE {
+            return Err(HostError::AuthoritativeProviderLimitExceeded);
+        }
+        let mut authoritative_points = HashSet::new();
+        for selection in &self.authoritative_providers {
+            validate_transport_point(&selection.point)
+                .map_err(|_| HostError::InvalidAuthoritativePoint)?;
+            if !authoritative_points.insert((selection.scope_id.clone(), &selection.point)) {
+                return Err(HostError::DuplicateAuthoritativeProviderSelection {
+                    point: selection.point.clone(),
+                    scope_id: selection.scope_id.to_string(),
                 });
             }
         }
@@ -285,6 +477,70 @@ impl CompositionProfile {
                     component_id: grant.component_id.to_string(),
                     permission: grant.permission.to_string(),
                 });
+            }
+        }
+
+        let mut origin_grants = HashSet::new();
+        let mut origins_per_owner = HashMap::new();
+        if self.http_loopback_origins.len() > MAX_HTTP_ORIGINS_PER_PROFILE {
+            return Err(HostError::HttpLoopbackOriginLimitExceeded);
+        }
+        for grant in &self.http_loopback_origins {
+            if canonical_http_loopback_origin(&grant.origin).as_deref()
+                != Some(grant.origin.as_str())
+            {
+                return Err(HostError::InvalidHttpLoopbackOrigin);
+            }
+            let has_http_request = self.runtime_permissions.iter().any(|permission| {
+                permission.scope_id == grant.scope_id
+                    && permission.instance_id == grant.instance_id
+                    && permission.component_id == grant.component_id
+                    && permission.permission == RuntimePermission::HttpRequest
+            });
+            if !has_http_request {
+                return Err(HostError::HttpRequestPermissionRequired);
+            }
+            let key = (
+                grant.scope_id.clone(),
+                grant.instance_id.clone(),
+                grant.component_id.clone(),
+            );
+            let count = origins_per_owner.entry(key.clone()).or_insert(0usize);
+            *count += 1;
+            if *count > MAX_HTTP_ORIGINS_PER_COMPONENT {
+                return Err(HostError::HttpLoopbackOriginLimitExceeded);
+            }
+            if !origin_grants.insert((key, grant.origin.clone())) {
+                return Err(HostError::DuplicateHttpLoopbackOriginGrant);
+            }
+        }
+
+        if self.secret_read_grants.len() > 256 {
+            return Err(HostError::InvalidSecretPolicy(
+                "at most 256 exact approvals per profile".into(),
+            ));
+        }
+        let mut secrets = HashSet::new();
+        for grant in &self.secret_read_grants {
+            if grant.scope_id.as_str() == crate::DEFAULT_WORLD_SCOPE
+                || !self
+                    .activations
+                    .iter()
+                    .any(|a| a.scope_id == grant.scope_id && a.instance_id == grant.instance_id)
+            {
+                return Err(HostError::InvalidSecretPolicy(
+                    "secret approval must name a concrete local activation".into(),
+                ));
+            }
+            if !secrets.insert((
+                &grant.scope_id,
+                &grant.instance_id,
+                &grant.component_id,
+                &grant.path,
+            )) {
+                return Err(HostError::InvalidSecretPolicy(
+                    "duplicate exact secret approval".into(),
+                ));
             }
         }
 
@@ -473,6 +729,59 @@ impl CompositionProfile {
         });
     }
 
+    pub(crate) fn set_authoritative_provider(&mut self, selection: AuthoritativeProviderSelection) {
+        if let Some(existing) = self.authoritative_providers.iter_mut().find(|existing| {
+            existing.scope_id == selection.scope_id && existing.point == selection.point
+        }) {
+            *existing = selection;
+        } else {
+            self.authoritative_providers.push(selection);
+        }
+    }
+
+    pub(crate) fn clear_authoritative_provider(&mut self, scope: &RuntimeScopeId, point: &str) {
+        self.authoritative_providers
+            .retain(|entry| &entry.scope_id != scope || entry.point != point);
+    }
+
+    pub(crate) fn grant_secret_read(&mut self, grant: SecretReadGrant) -> HostResult<()> {
+        if !self.secret_read_grants.iter().any(|existing| {
+            existing.scope_id == grant.scope_id
+                && existing.instance_id == grant.instance_id
+                && existing.component_id == grant.component_id
+                && existing.path == grant.path
+        }) {
+            self.secret_read_grants.push(grant);
+        }
+        self.validate()
+    }
+
+    pub(crate) fn revoke_secret_read(
+        &mut self,
+        scope: &RuntimeScopeId,
+        owner: &ComponentRef,
+        path: &SecretPath,
+    ) {
+        self.secret_read_grants.retain(|g| {
+            &g.scope_id != scope
+                || g.instance_id != owner.instance_id
+                || g.component_id != owner.component_id
+                || &g.path != path
+        });
+    }
+
+    pub(crate) fn bind_secret_read(&mut self, grant: SecretReadGrant) -> HostResult<()> {
+        let mut next = self.clone();
+        next.revoke_secret_read(
+            &grant.scope_id,
+            &ComponentRef::new(grant.instance_id.clone(), grant.component_id.clone()),
+            &grant.path,
+        );
+        next.grant_secret_read(grant)?;
+        *self = next;
+        Ok(())
+    }
+
     pub(crate) fn grant_runtime_permission(&mut self, grant: RuntimePermissionGrant) {
         if !self.runtime_permissions.contains(&grant) {
             self.runtime_permissions.push(grant);
@@ -491,10 +800,37 @@ impl CompositionProfile {
                 || grant.component_id != owner.component_id
                 || grant.permission != permission
         });
+        if permission == RuntimePermission::HttpRequest {
+            self.http_loopback_origins.retain(|grant| {
+                &grant.scope_id != scope_id
+                    || grant.instance_id != owner.instance_id
+                    || grant.component_id != owner.component_id
+            });
+        }
     }
 
-    pub(crate) fn materialize_legacy_world_defaults(&self, scope_id: RuntimeScopeId) -> Self {
-        self.materialize_matching(scope_id, |activation| activation.world_default)
+    pub(crate) fn grant_http_loopback_origin(
+        &mut self,
+        grant: HttpLoopbackOriginGrant,
+    ) -> HostResult<()> {
+        if !self.http_loopback_origins.contains(&grant) {
+            self.http_loopback_origins.push(grant);
+        }
+        self.validate()
+    }
+
+    pub(crate) fn revoke_http_loopback_origin(
+        &mut self,
+        scope_id: &RuntimeScopeId,
+        owner: &ComponentRef,
+        origin: &str,
+    ) {
+        self.http_loopback_origins.retain(|grant| {
+            &grant.scope_id != scope_id
+                || grant.instance_id != owner.instance_id
+                || grant.component_id != owner.component_id
+                || grant.origin != origin
+        });
     }
 
     pub(crate) fn materialize_all(&self, scope_id: RuntimeScopeId) -> Self {
@@ -521,7 +857,6 @@ impl CompositionProfile {
                     instance_id,
                     scope_id: scope_id.clone(),
                     enabled: activation.enabled,
-                    world_default: false,
                 }
             })
             .collect();
@@ -541,6 +876,21 @@ impl CompositionProfile {
                     })
             })
             .collect();
+        let authoritative_providers = self
+            .authoritative_providers
+            .iter()
+            .map(|selection| AuthoritativeProviderSelection {
+                scope_id: scope_id.clone(),
+                point: selection.point.clone(),
+                // Preserve a missing owner as a fail-closed policy instead of
+                // silently restoring unrestricted fan-out in a new world.
+                provider_instance_id: instance_map
+                    .get(&selection.provider_instance_id)
+                    .cloned()
+                    .unwrap_or_else(|| selection.provider_instance_id.clone()),
+                provider_component_id: selection.provider_component_id.clone(),
+            })
+            .collect();
         let runtime_permissions = self
             .runtime_permissions
             .iter()
@@ -552,6 +902,20 @@ impl CompositionProfile {
                         instance_id: instance_id.clone(),
                         component_id: grant.component_id.clone(),
                         permission: grant.permission,
+                    })
+            })
+            .collect();
+        let http_loopback_origins = self
+            .http_loopback_origins
+            .iter()
+            .filter_map(|grant| {
+                instance_map
+                    .get(&grant.instance_id)
+                    .map(|instance_id| HttpLoopbackOriginGrant {
+                        scope_id: scope_id.clone(),
+                        instance_id: instance_id.clone(),
+                        component_id: grant.component_id.clone(),
+                        origin: grant.origin.clone(),
                     })
             })
             .collect();
@@ -571,18 +935,25 @@ impl CompositionProfile {
             })
             .collect();
 
+        let entry = self.entry.as_ref().map(|entry| CompositionEntry {
+            instance_id: instance_map
+                .get(&entry.instance_id)
+                .cloned()
+                .unwrap_or_else(|| entry.instance_id.clone()),
+            component_id: entry.component_id.clone(),
+        });
         Self {
+            execution_requirements: self.execution_requirements.clone(),
+            entry,
             schema: PROFILE_SCHEMA,
             activations,
             preferred_providers,
+            authoritative_providers,
             runtime_permissions,
+            http_loopback_origins,
+            // Secret approvals refer to exact local identities and never seed a copy.
+            secret_read_grants: Vec::new(),
             preferences,
-        }
-    }
-
-    pub(crate) fn clear_legacy_world_defaults(&mut self) {
-        for activation in &mut self.activations {
-            activation.world_default = false;
         }
     }
 
@@ -595,10 +966,8 @@ impl CompositionProfile {
             existing.subject == activation.subject && existing.scope_id == activation.scope_id
         }) {
             let enabled = override_enabled.unwrap_or(existing.enabled);
-            let world_default = existing.world_default;
             *existing = ActivationRecord {
                 enabled,
-                world_default,
                 ..activation
             };
             return enabled;
@@ -628,17 +997,91 @@ impl CompositionProfile {
             .position(|activation| activation.subject == subject)
             .ok_or_else(|| HostError::ActivationNotFound(subject.to_string()))?;
         let removed = self.activations.remove(index);
+        if self
+            .entry
+            .as_ref()
+            .is_some_and(|entry| entry.instance_id == removed.instance_id)
+        {
+            self.entry = None;
+        }
 
         self.runtime_permissions.retain(|grant| {
+            grant.scope_id != removed.scope_id || grant.instance_id != removed.instance_id
+        });
+        self.http_loopback_origins.retain(|grant| {
+            grant.scope_id != removed.scope_id || grant.instance_id != removed.instance_id
+        });
+        self.secret_read_grants.retain(|grant| {
             grant.scope_id != removed.scope_id || grant.instance_id != removed.instance_id
         });
         self.preferred_providers.retain(|selection| {
             selection.scope_id != removed.scope_id
                 || selection.provider_instance_id != removed.instance_id
         });
+        // Keep an explicit selection even if its activation is removed.
+        // Without the selected owner the point remains unavailable until
+        // Host chooses a replacement or explicitly clears this policy.
         self.preferences.retain(|preference| {
             preference.scope_id != removed.scope_id || preference.instance_id != removed.instance_id
         });
+        Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn test_should_preserve_profile_when_temporary_publication_fails() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("profile.toml");
+        let original = CompositionProfile::default();
+        original.save(&path)?;
+        let before = std::fs::read(&path)?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o555))?;
+        // Privileged CI users may bypass directory permissions; this fault is
+        // exercised only where the filesystem can enforce it.
+        if NamedTempFile::new_in(directory.path()).is_ok() {
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755))?;
+            eprintln!("directory write denial cannot be enforced for this user");
+            return Ok(());
+        }
+        let mut changed = original;
+        changed.set_preference(
+            RuntimeScopeId::new("host"),
+            ComponentRef::new("owner", "runtime"),
+            "key".into(),
+            "new".into(),
+        )?;
+        let result = changed.save(&path);
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755))?;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(path)?, before);
+        assert_eq!(std::fs::read_dir(directory.path())?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_not_block_an_independent_profile() -> anyhow::Result<()> {
+        use std::{sync::mpsc, time::Duration};
+        let directory = tempfile::tempdir()?;
+        let first = directory.path().join("first.toml");
+        let second = directory.path().join("second.toml");
+        let guard = CompositionProfile::lock(&first)?;
+        let (done, receiver) = mpsc::channel();
+        let updater = std::thread::spawn(move || {
+            let result = (|| -> HostResult<()> {
+                let _guard = CompositionProfile::lock(&second)?;
+                CompositionProfile::default().save(&second)
+            })();
+            let _ = done.send(result);
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(5));
+        drop(guard);
+        updater.join().unwrap();
+        result??;
         Ok(())
     }
 }

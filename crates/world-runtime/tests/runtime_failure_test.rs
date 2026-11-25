@@ -1,4 +1,7 @@
 //! Integration tests for fail-closed World Runtime behavior.
+//!
+//! A failing or panicking System must never leave partial state behind, and the
+//! single worker must keep serving later commands afterwards.
 
 mod common;
 
@@ -8,18 +11,20 @@ use std::sync::{
 };
 
 use anyhow::Result;
-use rintawa_sdk::world::{PrincipalId, SchemaKey};
+use rintawa_sdk::world::{ItemId, PrincipalId, SchemaKey};
 use rintawa_storage::SqliteWorldStorage;
-use rintawa_world::{CommitDisposition, WorldCommand, WorldEventDraft, WorldTransaction};
+use rintawa_world::{StateChange, WorldCommand, WorldError, WorldTransaction};
 use rintawa_world_runtime::{
-    SystemError, SystemResult, WorldRuntimeBuilder, WorldRuntimeError, WorldSnapshot, WorldSystem,
+    SystemError, SystemResult, WorldRuntimeError, WorldSnapshot, WorldSystem,
 };
 
-use common::{EchoSystem, command, create_storage};
+use common::{
+    RecordingSystem, ScriptedSystem, command, create_storage, payload_item, runtime_builder,
+};
 
+/// System that panics on its first evaluation and succeeds afterwards.
 struct PanicOnceSystem {
     command_schema: SchemaKey,
-    event_schema: SchemaKey,
     invocations: Arc<AtomicUsize>,
 }
 
@@ -34,20 +39,20 @@ impl WorldSystem for PanicOnceSystem {
         command: &WorldCommand,
     ) -> SystemResult<WorldTransaction> {
         if self.invocations.fetch_add(1, Ordering::SeqCst) == 0 {
-            panic!("intentional runtime test panic");
+            panic!("intentional World System test panic");
         }
 
+        let item = payload_item(command, "item")?;
         let mut transaction = WorldTransaction::new();
-        transaction.push_event(WorldEventDraft::new(
-            self.event_schema.clone(),
-            command.payload().clone(),
-        ));
+        transaction.push_change(StateChange::CreateObject { id: item });
         Ok(transaction)
     }
 }
 
+/// System that rejects every command with one fixed domain diagnostic.
 struct RejectingSystem {
     command_schema: SchemaKey,
+    reason: &'static str,
 }
 
 impl WorldSystem for RejectingSystem {
@@ -60,25 +65,26 @@ impl WorldSystem for RejectingSystem {
         _snapshot: &WorldSnapshot,
         _command: &WorldCommand,
     ) -> SystemResult<WorldTransaction> {
-        Err(SystemError::Rejected("test rejection".into()))
+        Err(SystemError::Rejected(self.reason.to_owned()))
     }
 }
 
 #[test]
 fn test_should_reject_duplicate_system_registration() -> Result<()> {
     let (_root, storage, schemas) = create_storage()?;
-    let system = EchoSystem::new(schemas.command.clone(), schemas.event.clone());
-    let mut builder = WorldRuntimeBuilder::new(storage);
+    let mut builder = runtime_builder(storage, &[&schemas.command])?;
+    let system = RecordingSystem::new(schemas.command.clone());
 
     builder.register_system(system.clone())?;
     let error = builder
         .register_system(system)
         .expect_err("duplicate command ownership must be rejected");
-
-    assert!(matches!(
-        error,
-        WorldRuntimeError::DuplicateSystem(schema) if schema == schemas.command
-    ));
+    match error {
+        WorldRuntimeError::DuplicateSystem(schema) => {
+            assert_eq!(schema, schemas.command);
+        }
+        other => panic!("unexpected runtime error: {other:?}"),
+    }
     Ok(())
 }
 
@@ -87,22 +93,25 @@ fn test_should_report_unavailable_system_without_committing() -> Result<()> {
     let (root, storage, schemas) = create_storage()?;
     let path = root.path().join("world.sqlite");
     let principal = PrincipalId::new();
-    let runtime = WorldRuntimeBuilder::new(storage).start()?;
+    let runtime = runtime_builder(storage, &[&schemas.command])?.start()?;
 
+    let item = ItemId::new();
     let ticket = runtime.submit(command(
         &schemas.command,
         principal,
-        serde_json::json!({ "kind": "missing" }),
+        serde_json::json!({ "item": item.to_string() }),
     ))?;
-    let error = ticket.wait().unwrap_err();
-    assert!(matches!(
-        error,
-        WorldRuntimeError::SystemUnavailable(schema) if schema == schemas.command
-    ));
+    let error = ticket.wait().expect_err("missing System must not commit");
+    match error {
+        WorldRuntimeError::SystemUnavailable(schema) => {
+            assert_eq!(schema, schemas.command);
+        }
+        other => panic!("unexpected runtime error: {other:?}"),
+    }
     runtime.shutdown()?;
 
     let storage = SqliteWorldStorage::open(path)?;
-    assert_eq!(storage.load_session()?.commit_position(), 0);
+    assert!(storage.load_item(item)?.is_none());
     Ok(())
 }
 
@@ -111,32 +120,40 @@ fn test_should_isolate_system_panic_and_continue_worker() -> Result<()> {
     let (_root, storage, schemas) = create_storage()?;
     let principal = PrincipalId::new();
     let invocations = Arc::new(AtomicUsize::new(0));
-
-    let mut builder = WorldRuntimeBuilder::new(storage);
-    builder.register_system(PanicOnceSystem {
+    let system = PanicOnceSystem {
         command_schema: schemas.command.clone(),
-        event_schema: schemas.event.clone(),
         invocations: Arc::clone(&invocations),
-    })?;
+    };
+    let mut builder = runtime_builder(storage, &[&schemas.command])?;
+    builder.register_system(system)?;
     let runtime = builder.start()?;
 
+    let panicking_item = ItemId::new();
     let first = runtime.submit(command(
         &schemas.command,
         principal,
-        serde_json::json!({ "kind": "panic" }),
+        serde_json::json!({ "item": panicking_item.to_string() }),
     ))?;
-    let error = first.wait().unwrap_err();
-    assert!(matches!(
-        error,
-        WorldRuntimeError::SystemPanicked(schema) if schema == schemas.command
-    ));
+    let error = first.wait().expect_err("panicking System must fail closed");
+    match error {
+        WorldRuntimeError::SystemPanicked(schema) => {
+            assert_eq!(schema, schemas.command);
+        }
+        other => panic!("unexpected runtime error: {other:?}"),
+    }
+    assert!(runtime.snapshot()?.load_item(panicking_item)?.is_none());
 
-    let second = runtime.submit(command(
+    let recovered_item = ItemId::new();
+    let submitted = command(
         &schemas.command,
         principal,
-        serde_json::json!({ "kind": "after-panic" }),
-    ))?;
-    assert_eq!(second.wait()?.position(), 1);
+        serde_json::json!({ "item": recovered_item.to_string() }),
+    );
+    let command_id = submitted.id();
+    let second = runtime.submit(submitted)?;
+    assert_eq!(second.wait()?.command_id(), command_id);
+    assert!(runtime.snapshot()?.load_item(recovered_item)?.is_some());
+
     runtime.shutdown()?;
     assert_eq!(invocations.load(Ordering::SeqCst), 2);
     Ok(())
@@ -147,66 +164,67 @@ fn test_should_preserve_domain_system_error_without_commit() -> Result<()> {
     let (root, storage, schemas) = create_storage()?;
     let path = root.path().join("world.sqlite");
     let principal = PrincipalId::new();
-
-    let mut builder = WorldRuntimeBuilder::new(storage);
-    builder.register_system(RejectingSystem {
+    let item = ItemId::new();
+    let system = RejectingSystem {
         command_schema: schemas.command.clone(),
-    })?;
+        reason: "test rejection",
+    };
+    let mut builder = runtime_builder(storage, &[&schemas.command])?;
+    builder.register_system(system)?;
     let runtime = builder.start()?;
 
     let ticket = runtime.submit(command(
         &schemas.command,
         principal,
-        serde_json::json!({ "kind": "reject" }),
+        serde_json::json!({ "item": item.to_string() }),
     ))?;
-    let error = ticket.wait().unwrap_err();
-    assert!(matches!(
-        error,
-        WorldRuntimeError::SystemFailed { schema, .. } if schema == schemas.command
-    ));
+    let error = ticket.wait().expect_err("domain rejection must not commit");
+    match error {
+        WorldRuntimeError::SystemFailed { schema, source } => {
+            assert_eq!(schema, schemas.command);
+            match source {
+                SystemError::Rejected(reason) => assert_eq!(reason, "test rejection"),
+                other => panic!("unexpected System error: {other:?}"),
+            }
+        }
+        other => panic!("unexpected runtime error: {other:?}"),
+    }
     runtime.shutdown()?;
 
     let storage = SqliteWorldStorage::open(path)?;
-    assert_eq!(storage.load_session()?.commit_position(), 0);
+    assert!(storage.load_item(item)?.is_none());
     Ok(())
 }
 
 #[test]
-fn test_should_skip_system_on_identical_command_retry() -> Result<()> {
-    let (_root, storage, schemas) = create_storage()?;
+fn test_should_reject_empty_change_set_without_commit() -> Result<()> {
+    let (root, storage, schemas) = create_storage()?;
+    let path = root.path().join("world.sqlite");
     let principal = PrincipalId::new();
-    let system = EchoSystem::new(schemas.command.clone(), schemas.event.clone());
-    let evaluations = Arc::clone(&system.evaluations);
-
-    let mut builder = WorldRuntimeBuilder::new(storage);
+    let system = ScriptedSystem::new(schemas.command.clone(), Vec::new());
+    let mut builder = runtime_builder(storage, &[&schemas.command])?;
     builder.register_system(system)?;
     let runtime = builder.start()?;
 
-    let command = command(
+    let ticket = runtime.submit(command(
         &schemas.command,
         principal,
-        serde_json::json!({ "kind": "retry" }),
-    );
-    let first = runtime.submit(command.clone())?.wait_outcome()?;
-    let replay = runtime.submit(command)?.wait_outcome()?;
-
-    assert_eq!(first.receipt().disposition(), CommitDisposition::Committed);
-    assert_eq!(
-        replay.receipt().disposition(),
-        CommitDisposition::AlreadyCommitted
-    );
-    assert_eq!(replay.receipt().position(), first.receipt().position());
-    assert_eq!(first.committed_events().len(), 1);
-    assert_eq!(replay.committed_events(), first.committed_events());
-    assert_eq!(
-        first.committed_events()[0].id,
-        first.receipt().event_ids()[0]
-    );
-    assert_eq!(
-        first.committed_events()[0].payload,
-        serde_json::json!({ "kind": "retry" })
-    );
-    assert_eq!(evaluations.load(Ordering::SeqCst), 1);
+        serde_json::json!({ "kind": "empty-output" }),
+    ))?;
+    let error = ticket.wait().expect_err("empty change set must not commit");
+    match error {
+        WorldRuntimeError::InvalidTransaction { schema, source } => {
+            assert_eq!(schema, schemas.command);
+            match source {
+                WorldError::EmptyTransaction => {}
+                other => panic!("unexpected world error: {other:?}"),
+            }
+        }
+        other => panic!("unexpected runtime error: {other:?}"),
+    }
     runtime.shutdown()?;
+
+    let storage = SqliteWorldStorage::open(path)?;
+    assert_eq!(storage.load_session()?.properties().len(), 3);
     Ok(())
 }
