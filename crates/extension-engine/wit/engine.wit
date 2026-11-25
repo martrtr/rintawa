@@ -947,6 +947,23 @@ interface target-provider {
 
 }
 
+/// Bounded asynchronous secret administration; values can only be submitted, never read.
+interface secret-administration {
+    enum error { denied, unavailable, invalid-request, not-found, busy, message-too-large }
+    begin: func(request: string) -> result<u64, error>;
+    status: func(handle: u64) -> result<string, error>;
+    cancel: func(handle: u64) -> result<_, error>;
+    release: func(handle: u64) -> result<_, error>;
+}
+/// Caller-attested intent to select a secret for a manifest-covered sibling slot.
+interface secret-prompt {
+    use secret-administration.{error};
+    begin: func(request: string) -> result<u64, error>;
+    status: func(handle: u64) -> result<string, error>;
+    cancel: func(handle: u64) -> result<_, error>;
+    release: func(handle: u64) -> result<_, error>;
+}
+
 /// Guest lifecycle callbacks implemented by the WASM plugin.
 interface guest {
     /// Initial plugin registration callback.
@@ -984,6 +1001,8 @@ world plugin {
     import scoped-runtime-policy;
     import execution-targets;
     import secrets;
+    import secret-administration;
+    import secret-prompt;
     import transport;
     export guest;
 }
@@ -1037,6 +1056,8 @@ world task-runtime-plugin {
     import scoped-runtime-policy;
     import execution-targets;
     import secrets;
+    import secret-administration;
+    import secret-prompt;
     import transport;
     export guest;
     export task-handler;
@@ -1063,6 +1084,8 @@ world runtime-provider-plugin {
     import scoped-runtime-policy;
     import execution-targets;
     import secrets;
+    import secret-administration;
+    import secret-prompt;
     import transport;
     export guest;
     export target-provider;
@@ -1089,6 +1112,8 @@ world runtime-provider-task-plugin {
     import scoped-runtime-policy;
     import execution-targets;
     import secrets;
+    import secret-administration;
+    import secret-prompt;
     import transport;
     export guest;
     export target-provider;

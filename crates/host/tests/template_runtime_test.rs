@@ -172,7 +172,7 @@ fn template_runtime_roundtrip_and_live_provider_digest() -> Result<()> {
         &mut host,
         a.id,
         "rintawa.character.import@1",
-        json!({"itemId":character,"card":card_data(&reference)}),
+        json!({"itemId":character,"card":card_data(&reference),"greeting":{"text":"Hello","error":null}}),
     )?;
     command(
         &mut host,
@@ -261,7 +261,7 @@ fn template_runtime_roundtrip_and_live_provider_digest() -> Result<()> {
         &mut fresh,
         c.id,
         "rintawa.character.import@1",
-        json!({"itemId":extra_character,"card":card_data(&reference)}),
+        json!({"itemId":extra_character,"card":card_data(&reference),"greeting":{"text":"Hello","error":null}}),
     )?;
     fresh.deactivate_world(c.id)?;
     fresh.deactivate_world(d.id)?;

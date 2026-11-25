@@ -1,8 +1,18 @@
 # Native local secret configuration
 
+The accepted [shared secrets contract](shared-secret-storage.md) extends this
+foundation with managed entries, home-local bindings and explicit backend selection.
+The direct-path CLI remains the legacy system-keyring path. Managed local-file
+entries use the shared-entry CLI and exact slot bindings, not duplicated values
+at consumer paths. The owner-accepted [Web UI amendment](secrets-web-ui-amendment.md)
+adds restricted managed-entry administration under explicit baseline `secret-manage`
+and requester-only `secret-prompt`; the restrictions below describe the original
+CLI/direct-path foundation, not a prohibition of that later accepted API.
+
 Status: accepted by the owner, 2026-11-23: CLI stdin into platform credentials and
 local exact secret-read approvals; implement within the boundaries below. This supports the already accepted Narrator/AI
-path; it does not authorize browser/guest secret writes.
+path; it does not itself authorize browser/guest secret writes. The later Web UI
+amendment is the authority for its separate administrative imports.
 
 ## Grounded gap
 
@@ -48,7 +58,8 @@ It cannot reuse the source World's secret merely by copying its portable setting
 
 Missing vault service/locked keyring/read grant/value is an explicit actionable
 failure. Never fall back to storing a key in the exported provider config or URL.
-Guest and browser API permissions are unchanged; no WIT secret-write import.
+This direct-path CLI adds no WIT secret-write import. Managed-entry Web UI
+imports are separately specified and permission-gated by the accepted amendment.
 
 ## Required acceptance
 

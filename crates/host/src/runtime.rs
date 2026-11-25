@@ -49,6 +49,12 @@ mod activation_cleanup_tests;
 mod command_ticket_tests;
 #[cfg(test)]
 mod resource_transfer_tests;
+#[cfg(target_os = "linux")]
+mod secret_bindings;
+#[cfg(target_os = "linux")]
+mod secret_web;
+#[cfg(all(test, target_os = "linux"))]
+mod shared_secret_tests;
 
 /// Maximum one-shot user resources retained by one HostRuntime.
 const MAX_USER_RESOURCES: usize = 32;
@@ -460,6 +466,10 @@ impl UserResourceRuntimeControl {
 }
 
 struct LocalHostAccess {
+    #[cfg(target_os = "linux")]
+    secret_operations: secret_web::Operations,
+    #[cfg(target_os = "linux")]
+    secrets: Option<crate::shared_secrets::ManagedSecrets>,
     live_policy: Mutex<Option<LivePolicyControl>>,
     home_root: PathBuf,
     user_resources: UserResourceRuntimeControl,
@@ -475,6 +485,10 @@ impl LocalHostAccess {
         world_data: WorldDataRuntimeControl,
     ) -> Self {
         Self {
+            #[cfg(target_os = "linux")]
+            secret_operations: secret_web::Operations::default(),
+            #[cfg(target_os = "linux")]
+            secrets: None,
             live_policy: Mutex::new(None),
             home_root: home_root.to_path_buf(),
             user_resources,
@@ -542,6 +556,7 @@ impl LocalHostAccess {
                     instance_id: owner.instance_id.clone(),
                     component_id: owner.component_id.clone(),
                     path: path.clone(),
+                    entry_id: None,
                 })
                 .map_err(map_host_access_error)?;
         }
@@ -1525,6 +1540,10 @@ pub struct HostRuntime {
 
 impl Drop for HostRuntime {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(access) = &self.host_access {
+            access.secret_operations.shutdown();
+        }
         // A caller may drop without an explicit successful shutdown. Keep leases
         // until both worker drain and Engine/proxy resource teardown have finished.
         let guards = self
@@ -1545,6 +1564,57 @@ impl Drop for HostRuntime {
 }
 
 impl HostRuntime {
+    /// Captures a native administrative target without admitting a browser request.
+    pub fn secret_consumer_target(
+        &self,
+        scope: &RuntimeScopeId,
+        owner: &ComponentRef,
+    ) -> HostAccessResult<rintawa_extension_engine::LivePolicyTarget> {
+        Ok(self
+            .engine
+            .live_policy_control()
+            .snapshot(
+                scope.as_str(),
+                owner.instance_id.as_str(),
+                owner.component_id.as_str(),
+            )?
+            .target)
+    }
+
+    /// Binds a shared entry and grants its exact slot, persisted and live together.
+    /// The target must have been shown in a trusted native consent surface.
+    #[cfg(target_os = "linux")]
+    pub fn bind_shared_secret(
+        &self,
+        target: &rintawa_extension_engine::LivePolicyTarget,
+        slot: rintawa_sdk::secrets::SecretPath,
+        entry: uuid::Uuid,
+    ) -> HostAccessResult<()> {
+        let access = self
+            .host_access
+            .as_ref()
+            .ok_or(HostAccessError::Unavailable)?;
+        access.bind_secret_selection(target, slot, entry, None, None)
+    }
+
+    /// Disconnects a live consumer without deleting the shared value.
+    pub fn disconnect_shared_secret(
+        &self,
+        target: rintawa_extension_engine::LivePolicyTarget,
+        slot: rintawa_sdk::secrets::SecretPath,
+    ) -> HostAccessResult<()> {
+        self.host_access
+            .as_ref()
+            .ok_or(HostAccessError::Unavailable)?
+            .apply_policy(&LivePolicyChange {
+                target,
+                delta: LivePolicyDelta {
+                    deny_secret_read: vec![slot],
+                    ..Default::default()
+                },
+            })
+    }
+
     /// Loads and starts every enabled activation in the baseline profile.
     ///
     /// Bootstrap is staged to a fixed point. Artifacts whose required execution
@@ -1559,12 +1629,19 @@ impl HostRuntime {
         let user_resources = UserResourceRuntimeControl::default();
         let world_sessions = WorldSessionRuntimeControl::default();
         let world_data = WorldDataRuntimeControl::default();
-        let access = Arc::new(LocalHostAccess::new(
+        let secrets = crate::shared_secrets::ManagedSecrets::selected(home)?;
+        let access = LocalHostAccess::new(
             home.root(),
             user_resources,
             world_sessions,
             world_data.clone(),
-        ));
+        );
+        #[cfg(target_os = "linux")]
+        let access = LocalHostAccess {
+            secrets: Some(secrets.clone()),
+            ..access
+        };
+        let access = Arc::new(access);
         let artifact_store_access: Arc<dyn ArtifactStoreAccess> = access.clone();
         let asset_store_access: Arc<dyn AssetStoreAccess> = access.clone();
         let user_resource_access: Arc<dyn UserResourceAccess> = access.clone();
@@ -1572,13 +1649,14 @@ impl HostRuntime {
         let composition_access: Arc<dyn CompositionAccess> = access.clone();
         let preference_access: Arc<dyn PreferenceAccess> = access.clone();
         let runtime_policy_access: Arc<dyn RuntimePolicyAccess> = access.clone();
-        let mut engine = ExtensionEngine::with_host_access(
+        let mut engine = ExtensionEngine::with_host_access_and_secret_manager(
             artifact_store_access,
             asset_store_access,
             world_session_access,
             composition_access,
             preference_access,
             runtime_policy_access,
+            secrets.manager(),
         );
         *access
             .live_policy
@@ -1587,6 +1665,8 @@ impl HostRuntime {
             Some(engine.live_policy_control());
         let runtime_context_access: Arc<dyn RuntimeContextAccess> = access.clone();
         engine.attach_runtime_context_access(runtime_context_access);
+        #[cfg(target_os = "linux")]
+        engine.attach_secret_access(access.clone());
         engine.attach_user_resource_access(user_resource_access);
         engine.attach_world_data_access(Arc::new(world_data.clone()));
         let host_scope = RuntimeScopeId::new(HOST_SCOPE);
@@ -1956,6 +2036,10 @@ impl HostRuntime {
     /// Waits at most five seconds for World work; incomplete state remains owned
     /// by this Host for retry. Arbitrary native callbacks/OS I/O are not terminated.
     pub fn shutdown(&mut self) -> HostResult<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(access) = &self.host_access {
+            access.secret_operations.shutdown();
+        }
         self.shutting_down = true;
         let mut world_failures = Vec::new();
         let mut cleanup_failures = Vec::new();

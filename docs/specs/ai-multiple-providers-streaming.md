@@ -109,6 +109,16 @@ raw catalog directly to arbitrary consumers.
 
 ## Consumer admission
 
+**Source-review correction (2026-11-25):** Core Single resolution can automatically
+choose the first eligible provider without an explicit preferred selection.
+Consequently, the selection proposed below does not itself prove user consent.
+Before implementing extra-consumer admission, specify an AI-owned explicit
+scope/instance/component-to-connection allow policy using existing preferences and
+trusted Settings administration. Default-deny extra consumers. Contract registration
+alone must never authorize spending a connection's credentials. The following
+selection mechanism is discovery, not a replacement for that permission check.
+
+
 Keep exact selected Narrator admission. Additionally allow a World's explicitly
 selected single provider of a new `rintawa.inference.consumer@1` contract. This
 is an application-level selection, resolved through existing selected-provider

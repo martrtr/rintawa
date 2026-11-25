@@ -13,6 +13,9 @@ use rintawa_sdk::{
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::atomic::Ordering};
 
+mod secret_prompt;
+pub use secret_prompt::SecretPromptAuthority;
+
 /// Host-attested identity captured before showing an administrative decision.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -91,6 +94,186 @@ impl LivePolicyControl {
         }
     }
 
+    /// Linearizes native administrative admission with lifecycle and permission revocation.
+    /// The resulting storage I/O may finish after cancellation; admission is not rollback.
+    pub fn admit_secret_management(
+        &self,
+        target: &LivePolicyTarget,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> HostAccessResult<()> {
+        let _lifecycle = self
+            .contexts
+            .1
+            .lock()
+            .map_err(|_| HostAccessError::Unavailable)?;
+        let owner = ComponentRef::new(target.instance_id.as_str(), target.component_id.as_str());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let (ctx, verified) = loop {
+            match self.contexts.policy_identity(&owner) {
+                Ok(identity) => break identity,
+                Err(crate::transport::TransportError::Unavailable)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(2))
+                }
+                Err(crate::transport::TransportError::Unavailable) => {
+                    return Err(HostAccessError::Unavailable);
+                }
+                Err(_) => return Err(HostAccessError::Rejected),
+            }
+        };
+        if target.scope_id != "host"
+            || ctx.scope.as_str() != target.scope_id
+            || ctx.principal.activation.to_string() != target.activation
+            || verified.digest.to_string() != target.artifact
+        {
+            return Err(HostAccessError::Rejected);
+        }
+        let grants = self
+            .runtime
+            .grants
+            .read()
+            .map_err(|_| HostAccessError::Unavailable)?;
+        if cancelled.load(Ordering::Acquire)
+            || !grants
+                .get(&owner)
+                .is_some_and(|g| g.contains(&RuntimePermission::SecretManage))
+        {
+            return Err(HostAccessError::Rejected);
+        }
+        Ok(())
+    }
+
+    /// Persist and publish one exact secret binding under the lifecycle fence.
+    /// The caller holds the composition lock and verifies the persisted artifact.
+    pub fn bind_secret(
+        &self,
+        target: &LivePolicyTarget,
+        slot: SecretPath,
+        entry: SecretPath,
+        persist: impl FnOnce() -> HostAccessResult<()>,
+    ) -> HostAccessResult<()> {
+        self.bind_secret_checked(None, target, slot, entry, persist)
+    }
+
+    fn bind_secret_checked(
+        &self,
+        prompt: Option<&SecretPromptAuthority>,
+        target: &LivePolicyTarget,
+        slot: SecretPath,
+        entry: SecretPath,
+        persist: impl FnOnce() -> HostAccessResult<()>,
+    ) -> HostAccessResult<()> {
+        let _lifecycle = self
+            .contexts
+            .1
+            .try_lock()
+            .map_err(|_| HostAccessError::Unavailable)?;
+        let _prompt_grant = if let Some(prompt) = prompt {
+            prompt.validate_locked()?;
+            if prompt.slot() != &slot || prompt.target() != target {
+                return Err(HostAccessError::Rejected);
+            }
+            let granted = self
+                .runtime
+                .grants
+                .try_read()
+                .map_err(|_| HostAccessError::Unavailable)?;
+            if !granted
+                .get(&prompt.requester().principal.component())
+                .is_some_and(|g| g.contains(&RuntimePermission::SecretPrompt))
+            {
+                return Err(HostAccessError::Rejected);
+            }
+            Some(granted)
+        } else {
+            None
+        };
+        let owner = ComponentRef::new(target.instance_id.as_str(), target.component_id.as_str());
+        let (context, verified) = self.contexts.policy_identity(&owner).map_err(|e| match e {
+            crate::transport::TransportError::Unavailable => HostAccessError::Unavailable,
+            _ => HostAccessError::Rejected,
+        })?;
+        if context.scope.as_str() != target.scope_id
+            || context.principal.activation.to_string() != target.activation
+            || verified.digest.to_string() != target.artifact
+            || !verified
+                .permissions
+                .secret_read
+                .iter()
+                .any(|pattern| pattern.matches(&slot))
+        {
+            return Err(HostAccessError::Rejected);
+        }
+        let mut grants = self
+            .secrets
+            .read_grants
+            .try_write()
+            .map_err(|_| HostAccessError::Unavailable)?;
+        persist()?;
+        let grant = grants.entry(owner).or_default();
+        let exact = SecretPathPattern::Exact(slot.clone());
+        if !grant.patterns.contains(&exact) {
+            grant.patterns.push(exact);
+        }
+        grant.bindings.insert(slot, entry);
+        grant.revision = self.secrets.policy_revision.fetch_add(1, Ordering::Relaxed) + 1;
+        Ok(())
+    }
+
+    /// Disconnects an exact native approval while activation changes are fenced.
+    /// The Host holds the composition lock and verifies the displayed persisted row.
+    pub fn disconnect_secret(
+        &self,
+        scope: &str,
+        owner: &ComponentRef,
+        expected_live: Option<&LivePolicyTarget>,
+        slot: &SecretPath,
+        persist: impl FnOnce() -> HostAccessResult<()>,
+    ) -> HostAccessResult<()> {
+        let _lifecycle = self
+            .contexts
+            .1
+            .try_lock()
+            .map_err(|_| HostAccessError::Unavailable)?;
+        match self.contexts.policy_identity(owner) {
+            Ok((context, verified)) => {
+                let target = expected_live.ok_or(HostAccessError::Rejected)?;
+                if context.scope.as_str() != scope
+                    || context.principal.activation.to_string() != target.activation
+                    || context.principal.instance_id.as_str() != target.instance_id
+                    || context.principal.component_id.as_str() != target.component_id
+                    || target.scope_id != scope
+                    || verified.digest.to_string() != target.artifact
+                {
+                    return Err(HostAccessError::Rejected);
+                }
+            }
+            Err(crate::transport::TransportError::Inactive) if expected_live.is_none() => {}
+            Err(_) if expected_live.is_some() => return Err(HostAccessError::Rejected),
+            Err(_) => return Err(HostAccessError::Unavailable),
+        }
+        let mut grants = self
+            .secrets
+            .read_grants
+            .try_write()
+            .map_err(|_| HostAccessError::Unavailable)?;
+        let exact = SecretPathPattern::Exact(slot.clone());
+        if grants
+            .get(owner)
+            .is_some_and(|g| g.patterns.iter().any(|p| p != &exact && p.matches(slot)))
+        {
+            return Err(HostAccessError::Rejected);
+        }
+        persist()?;
+        if let Some(grant) = grants.get_mut(owner) {
+            grant.patterns.retain(|p| p != &exact);
+            grant.bindings.remove(slot);
+            grant.revision = self.secrets.policy_revision.fetch_add(1, Ordering::Relaxed) + 1;
+        }
+        Ok(())
+    }
+
     /// Inspects one active verified component in an exact scope.
     pub fn snapshot(
         &self,
@@ -104,10 +287,10 @@ impl LivePolicyControl {
             .try_lock()
             .map_err(|_| HostAccessError::Unavailable)?;
         let owner = ComponentRef::new(instance, component);
-        let (context, verified) = self
-            .contexts
-            .policy_identity(&owner)
-            .map_err(|_| HostAccessError::Rejected)?;
+        let (context, verified) = self.contexts.policy_identity(&owner).map_err(|e| match e {
+            crate::transport::TransportError::Unavailable => HostAccessError::Unavailable,
+            _ => HostAccessError::Rejected,
+        })?;
         if context.scope.as_str() != scope {
             return Err(HostAccessError::Rejected);
         }
@@ -178,10 +361,10 @@ impl LivePolicyControl {
         let t = &change.target;
         let d = &change.delta;
         let owner = ComponentRef::new(t.instance_id.as_str(), t.component_id.as_str());
-        let (context, verified) = self
-            .contexts
-            .policy_identity(&owner)
-            .map_err(|_| HostAccessError::Rejected)?;
+        let (context, verified) = self.contexts.policy_identity(&owner).map_err(|e| match e {
+            crate::transport::TransportError::Unavailable => HostAccessError::Unavailable,
+            _ => HostAccessError::Rejected,
+        })?;
         if context.scope.as_str() != t.scope_id
             || context.principal.activation.to_string() != t.activation
             || verified.digest.to_string() != t.artifact
@@ -260,6 +443,10 @@ impl LivePolicyControl {
             .get(&owner)
             .map(|g| g.patterns.clone())
             .unwrap_or_default();
+        let mut next_bindings = secrets
+            .get(&owner)
+            .map(|g| g.bindings.clone())
+            .unwrap_or_default();
         for p in &d.allow_secret_read {
             let g = SecretPathPattern::Exact(p.clone());
             if !next_secrets.contains(&g) {
@@ -268,6 +455,7 @@ impl LivePolicyControl {
         }
         for p in &d.deny_secret_read {
             next_secrets.retain(|g| g != &SecretPathPattern::Exact(p.clone()));
+            next_bindings.remove(p);
         }
         if d.deny_secret_read
             .iter()
@@ -289,6 +477,7 @@ impl LivePolicyControl {
                 owner.clone(),
                 SecretGrants {
                     patterns: next_secrets,
+                    bindings: next_bindings,
                     revision,
                 },
             );

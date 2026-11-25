@@ -55,6 +55,7 @@ mod control_plane;
 mod http_request;
 mod network;
 mod package_transfer;
+mod secret_administration;
 mod target_provider;
 mod world_reads;
 
@@ -272,6 +273,7 @@ pub struct WasmHostState {
     secrets: SecretManager,
     transport: Transport,
     host_access: HostAccessServices,
+    secret_operations: HashMap<u64, secret_administration::OwnedOperation>,
     secret_access_active: bool,
     transport_access_active: bool,
     pending_transport_points: Vec<String>,
@@ -447,6 +449,7 @@ impl WasmHostState {
             secrets,
             transport,
             host_access,
+            secret_operations: HashMap::new(),
             secret_access_active: false,
             transport_access_active: false,
             pending_transport_points: Vec::new(),
@@ -925,6 +928,11 @@ impl WasmHostState {
     }
 
     fn revoke_runtime_resources_for_owner(&mut self, owner: &rintawa_sdk::contracts::ComponentRef) {
+        self.secret_operations.retain(|_, op| {
+            op.owner.instance_id != owner.instance_id.as_str()
+                || op.owner.component_id != owner.component_id.as_str()
+        });
+
         self.package_transfers
             .retain(|_, transfer| transfer.context.principal.component() != *owner);
         self.asset_readers

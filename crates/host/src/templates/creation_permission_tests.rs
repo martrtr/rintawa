@@ -24,6 +24,82 @@ fn package(content: &str, entry: &str, files: &[(&str, &[u8])]) -> anyhow::Resul
     )?)
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_secret_values_and_bindings_are_absent_from_world_exports_and_fresh_copies()
+-> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let home = HostHome::open(root.path().join("source"))?;
+    home.select_secret_backend(crate::SecretBackend::LocalFile)?;
+    let request = installed_fixture(&home)?;
+    let created = home.create_world_from_template_with_permissions(&request.to_string())?;
+    let sentinel = "synthetic shared export sentinel";
+    let entry = home.create_shared_secret(
+        "private label",
+        &rintawa_sdk::secrets::SecretValue::new(sentinel),
+    )?;
+    let mut profile = home.load_world_composition(created.world.id)?;
+    for grant in &mut profile.secret_read_grants {
+        grant.entry_id = Some(entry.id);
+    }
+    home.save_world_composition(created.world.id, &profile)?;
+    assert_eq!(home.list_secret_consumers()?.len(), 2);
+    assert!(
+        profile
+            .materialize_all(crate::world_runtime_scope_id(
+                rintawa_sdk::world::WorldId::new()
+            ))
+            .secret_read_grants
+            .is_empty()
+    );
+    let database = std::fs::read(
+        home.root()
+            .join("worlds")
+            .join(created.world.id.to_string())
+            .join("world.sqlite"),
+    )?;
+    assert!(
+        !database
+            .windows(sentinel.len())
+            .any(|bytes| bytes == sentinel.as_bytes())
+    );
+    let output = root.path().join("export.rtw");
+    home.export_world_template(created.world.id, &output)?;
+    let mut archive = rintawa_artifacts::RtwArchive::open(&output, RtwLimits::default())?;
+    let paths = archive
+        .entries()
+        .map(|e| e.path.clone())
+        .collect::<Vec<_>>();
+    for path in paths {
+        assert!(!path.as_str().contains("credentials"));
+        let bytes = archive.read(&path)?;
+        for excluded in [
+            sentinel.to_owned(),
+            "private label".to_owned(),
+            entry.id.to_string(),
+            entry.id.simple().to_string(),
+        ] {
+            assert!(
+                !bytes
+                    .windows(excluded.len())
+                    .any(|part| part == excluded.as_bytes())
+            );
+        }
+    }
+    let clean = HostHome::open(root.path().join("clean"))?;
+    for destination in [&home, &clean] {
+        let installed = destination.install_package(&output)?;
+        let copy = destination.create_world_from_template(&installed.digest, None, true)?;
+        assert!(
+            destination
+                .load_world_composition(copy.world.id)?
+                .secret_read_grants
+                .is_empty()
+        );
+    }
+    Ok(())
+}
+
 fn installed_fixture(home: &HostHome) -> anyhow::Result<Value> {
     let manifest = br#"
 id = "fixture.creation-permissions"

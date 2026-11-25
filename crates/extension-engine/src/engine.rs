@@ -229,7 +229,28 @@ impl ExtensionEngine {
         preference_access: Arc<dyn PreferenceAccess>,
         runtime_policy_access: Arc<dyn RuntimePolicyAccess>,
     ) -> Self {
-        let mut engine = Self::new();
+        Self::with_host_access_and_secret_manager(
+            artifact_store_access,
+            asset_store_access,
+            world_session_access,
+            composition_access,
+            preference_access,
+            runtime_policy_access,
+            SecretManager::default(),
+        )
+    }
+
+    /// Creates an engine with Host capabilities and an explicitly selected vault.
+    pub fn with_host_access_and_secret_manager(
+        artifact_store_access: Arc<dyn ArtifactStoreAccess>,
+        asset_store_access: Arc<dyn AssetStoreAccess>,
+        world_session_access: Arc<dyn WorldSessionAccess>,
+        composition_access: Arc<dyn CompositionAccess>,
+        preference_access: Arc<dyn PreferenceAccess>,
+        runtime_policy_access: Arc<dyn RuntimePolicyAccess>,
+        secrets: SecretManager,
+    ) -> Self {
+        let mut engine = Self::with_secret_manager(secrets);
         engine.host_access = HostAccessServices::new(
             artifact_store_access,
             asset_store_access,
@@ -246,6 +267,11 @@ impl ExtensionEngine {
     /// Embedded hosts that do not call this method remain fail-closed.
     pub fn attach_runtime_context_access(&mut self, access: Arc<dyn RuntimeContextAccess>) {
         self.host_access = self.host_access.clone().with_runtime_context_access(access);
+    }
+
+    /// Attaches the native secret administration boundary; embedded Hosts default to denied.
+    pub fn attach_secret_access(&mut self, access: Arc<dyn crate::SecretAccess>) {
+        self.host_access.secret_access = Some(access);
     }
 
     /// Attaches the Host-owned active World access boundary.

@@ -263,6 +263,9 @@ pub struct SecretReadGrant {
     pub component_id: ComponentId,
     /// One canonical secret path. Wildcards cannot be persisted here.
     pub path: SecretPath,
+    /// Optional managed entry, absent for legacy direct-path approvals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_id: Option<Uuid>,
 }
 
 /// Persistent exact-artifact composition for one host-owned runtime scope.
@@ -742,7 +745,12 @@ impl CompositionProfile {
     }
 
     pub(crate) fn grant_secret_read(&mut self, grant: SecretReadGrant) -> HostResult<()> {
-        if !self.secret_read_grants.contains(&grant) {
+        if !self.secret_read_grants.iter().any(|existing| {
+            existing.scope_id == grant.scope_id
+                && existing.instance_id == grant.instance_id
+                && existing.component_id == grant.component_id
+                && existing.path == grant.path
+        }) {
             self.secret_read_grants.push(grant);
         }
         self.validate()
@@ -760,6 +768,18 @@ impl CompositionProfile {
                 || g.component_id != owner.component_id
                 || &g.path != path
         });
+    }
+
+    pub(crate) fn bind_secret_read(&mut self, grant: SecretReadGrant) -> HostResult<()> {
+        let mut next = self.clone();
+        next.revoke_secret_read(
+            &grant.scope_id,
+            &ComponentRef::new(grant.instance_id.clone(), grant.component_id.clone()),
+            &grant.path,
+        );
+        next.grant_secret_read(grant)?;
+        *self = next;
+        Ok(())
     }
 
     pub(crate) fn grant_runtime_permission(&mut self, grant: RuntimePermissionGrant) {

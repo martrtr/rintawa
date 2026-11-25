@@ -3319,6 +3319,7 @@ dependencies = [
  "rintawa-storage",
  "rintawa-world",
  "rintawa-world-runtime",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "tempfile",

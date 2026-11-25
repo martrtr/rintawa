@@ -118,6 +118,42 @@ enum Commands {
     SecretSet { path: String },
     /// Delete a credential without reading it back.
     SecretDelete { path: String },
+    /// Inspect or explicitly select the home-local secret backend (no migration).
+    SecretBackend {
+        backend: Option<rintawa_host::SecretBackend>,
+    },
+    /// Create a shared secret from bounded UTF-8 stdin, without granting any reader.
+    #[cfg(target_os = "linux")]
+    SecretCreate { label: String },
+    /// Explicitly import a legacy system path into a new managed system entry.
+    #[cfg(target_os = "linux")]
+    SecretImport { path: String, label: String },
+    /// List shared metadata and persisted consumers; never print secret values.
+    #[cfg(target_os = "linux")]
+    SecretList,
+    /// Rename an entry, requiring its current revision from secret-list.
+    #[cfg(target_os = "linux")]
+    SecretRename {
+        id: String,
+        revision: u64,
+        label: String,
+    },
+    /// Replace a shared value from stdin for all readers, with explicit confirmation.
+    #[cfg(target_os = "linux")]
+    SecretReplace {
+        id: String,
+        revision: u64,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Delete a shared entry; consumers keep a missing reference until disconnected.
+    #[cfg(target_os = "linux")]
+    SecretRemove {
+        id: String,
+        revision: u64,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
     /// Approve an exact manifest-requested secret path for the next activation.
     GrantSecretRead {
         instance: String,
@@ -226,6 +262,47 @@ fn main() -> Result<()> {
         } => revoke_http_origin(&home, instance, component, origin, scope),
         Commands::SecretSet { path } => secret_cli::store(&home, &path),
         Commands::SecretDelete { path } => secret_cli::delete(&home, &path),
+        Commands::SecretBackend { backend } => secret_cli::backend(&home, backend),
+        #[cfg(target_os = "linux")]
+        Commands::SecretCreate { label } => secret_cli::create(&home, &label),
+        #[cfg(target_os = "linux")]
+        Commands::SecretImport { path, label } => {
+            let entry =
+                home.import_legacy_secret(&rintawa_sdk::secrets::SecretPath::parse(path)?, &label)?;
+            println!(
+                "{} revision={} {:?}; original legacy value retained.",
+                entry.id, entry.revision, entry.label
+            );
+            Ok(())
+        }
+        #[cfg(target_os = "linux")]
+        Commands::SecretList => secret_cli::list(&home),
+        #[cfg(target_os = "linux")]
+        Commands::SecretRename {
+            id,
+            revision,
+            label,
+        } => {
+            let entry = home.rename_shared_secret(id.parse()?, revision, &label)?;
+            println!("{} revision={} {:?}", entry.id, entry.revision, entry.label);
+            Ok(())
+        }
+        #[cfg(target_os = "linux")]
+        Commands::SecretReplace {
+            id,
+            revision,
+            confirm: _,
+        } => secret_cli::replace(&home, &id, revision),
+        #[cfg(target_os = "linux")]
+        Commands::SecretRemove {
+            id,
+            revision,
+            confirm: _,
+        } => {
+            home.delete_shared_secret(id.parse()?, revision)?;
+            println!("Shared secret deleted; consumer bindings are now missing.");
+            Ok(())
+        }
         Commands::GrantSecretRead {
             instance,
             component,

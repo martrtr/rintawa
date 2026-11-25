@@ -299,6 +299,72 @@ fn secret_revoke_during_vault_read_blocks_disclosure_even_after_regrant() {
         Err(SecretAccessError::AccessDenied)
     ));
 }
+
+#[test]
+fn binding_persists_before_publication_and_rejects_stale_target() {
+    let p = control();
+    let target = bind(&p.contexts, "a", b"v1");
+    let slot = SecretPath::parse("ai.one").unwrap();
+    let entry = SecretPath::parse("managed.entry_123").unwrap();
+    let owner = ComponentRef::new("a", "backend");
+    assert!(
+        p.bind_secret(&target, slot.clone(), entry.clone(), || Err(
+            HostAccessError::Unavailable
+        ))
+        .is_err()
+    );
+    assert!(
+        !p.secrets
+            .has_read_grant(&owner, &SecretPathPattern::Exact(slot.clone()))
+    );
+    p.bind_secret(&target, slot.clone(), entry.clone(), || Ok(()))
+        .unwrap();
+    assert!(
+        p.secrets
+            .has_read_grant(&owner, &SecretPathPattern::Exact(slot.clone()))
+    );
+    let mut stale = target.clone();
+    stale.activation = "0".into();
+    assert!(
+        p.bind_secret(&stale, slot, entry, || panic!(
+            "must not persist stale binding"
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn rebinding_during_vault_read_blocks_old_result() {
+    let (entered, wait) = mpsc::sync_channel(1);
+    let (resume, gate) = mpsc::sync_channel(1);
+    let p = LivePolicyControl::new(
+        ExecutionContexts::default(),
+        RuntimePermissionManager::default(),
+        SecretManager::with_vault(Arc::new(HeldVault {
+            entered,
+            resume: Mutex::new(gate),
+        })),
+    );
+    let target = bind(&p.contexts, "a", b"v1");
+    let slot = SecretPath::parse("ai.one").unwrap();
+    let first = SecretPath::parse("managed.entry_1").unwrap();
+    let second = SecretPath::parse("managed.entry_2").unwrap();
+    p.bind_secret(&target, slot.clone(), first, || Ok(()))
+        .unwrap();
+    let secrets = p.secrets.clone();
+    let read_slot = slot.clone();
+    let reader = std::thread::spawn(move || {
+        secrets.read_for_component(&ComponentRef::new("a", "backend"), &read_slot)
+    });
+    wait.recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    p.bind_secret(&target, slot, second, || Ok(())).unwrap();
+    resume.send(()).unwrap();
+    assert!(matches!(
+        reader.join().unwrap(),
+        Err(SecretAccessError::AccessDenied)
+    ));
+}
 #[test]
 fn lifecycle_cannot_replace_target_during_durable_publication() {
     let p = control();

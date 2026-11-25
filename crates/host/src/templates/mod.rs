@@ -297,6 +297,7 @@ impl HostHome {
                         instance_id: activation.instance_id.clone(),
                         component_id: component_id.clone(),
                         path: path.clone(),
+                        entry_id: None,
                     }));
             }
         })

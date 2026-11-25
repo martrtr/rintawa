@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimePermission {
+    /// Allows requesting a trusted secret picker; grants no secret administration.
+    SecretPrompt,
+    /// Allows baseline administration of shared secret metadata, input and bindings.
+    SecretManage,
     /// Allows owner-scoped cooperative background task scheduling.
     BackgroundTask,
     /// Allows a World backend to read its exact baseline counterpart's published configuration.
@@ -52,6 +56,8 @@ pub enum RuntimePermission {
 impl fmt::Display for RuntimePermission {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SecretManage => formatter.write_str("secret-manage"),
+            Self::SecretPrompt => formatter.write_str("secret-prompt"),
             Self::PublishedPreferenceRead => formatter.write_str("published-preference-read"),
             Self::PublishedPreferenceWrite => formatter.write_str("published-preference-write"),
             Self::BackgroundTask => formatter.write_str("background-task"),
@@ -91,6 +97,8 @@ impl FromStr for RuntimePermission {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
+            "secret-manage" => Ok(Self::SecretManage),
+            "secret-prompt" => Ok(Self::SecretPrompt),
             "published-preference-read" => Ok(Self::PublishedPreferenceRead),
             "published-preference-write" => Ok(Self::PublishedPreferenceWrite),
             "background-task" => Ok(Self::BackgroundTask),
@@ -117,6 +125,14 @@ impl FromStr for RuntimePermission {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_prompt_is_an_explicit_round_trippable_permission() {
+        assert_eq!(RuntimePermission::SecretManage.to_string(), "secret-manage");
+        assert_eq!("secret-manage".parse(), Ok(RuntimePermission::SecretManage));
+        assert_eq!(RuntimePermission::SecretPrompt.to_string(), "secret-prompt");
+        assert_eq!("secret-prompt".parse(), Ok(RuntimePermission::SecretPrompt));
+    }
 
     #[test]
     fn test_should_reject_retired_user_content_permissions() {

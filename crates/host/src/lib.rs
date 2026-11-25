@@ -16,6 +16,7 @@ mod profile;
 mod published_preference_tests;
 mod runtime;
 mod secret_config;
+mod shared_secrets;
 mod templates;
 mod world_metadata;
 
@@ -50,6 +51,7 @@ pub use profile::{
     RuntimePermissionGrant, SecretReadGrant,
 };
 pub use runtime::HostRuntime;
+pub use shared_secrets::{ManagedSecretEntry, SecretBackend, SecretStorageError};
 pub use templates::{CreatedTemplateWorld, PackageInstallResult, TemplateSummary};
 use world_metadata::WorldMetadata;
 pub use world_metadata::{MAX_WORLD_DESCRIPTION_BYTES, MAX_WORLD_TITLE_BYTES};
@@ -255,6 +257,9 @@ impl std::error::Error for HostShutdownFailures {
 /// Errors returned by local host composition operations.
 #[derive(Debug, Error)]
 pub enum HostError {
+    /// Native shared credential storage failure with sanitized diagnostics.
+    #[error(transparent)]
+    SecretStorage(#[from] SecretStorageError),
     /// A local exact secret-read approval is invalid or exceeds its quota.
     #[error("invalid local secret policy: {0}")]
     InvalidSecretPolicy(String),

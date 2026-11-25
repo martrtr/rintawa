@@ -1,6 +1,5 @@
 //! Native-only credential configuration and persisted exact component approvals.
 use crate::{DEFAULT_WORLD_SCOPE, HostError, HostHome, HostResult, SecretReadGrant};
-use rintawa_extension_engine::SecretManager;
 use rintawa_sdk::{
     contracts::ComponentRef,
     secrets::{SecretPath, SecretValue},
@@ -21,20 +20,38 @@ pub(crate) fn apply_secret_read_grants(
             &grant.component_id,
             rintawa_sdk::secrets::SecretPathPattern::Exact(grant.path.clone()),
         )?;
+        if let Some(entry_id) = grant.entry_id {
+            let entry = crate::shared_secrets::entry_path(entry_id);
+            engine.secret_manager().bind_read(
+                ComponentRef::new(grant.instance_id.clone(), grant.component_id.clone()),
+                grant.path.clone(),
+                entry,
+            )?;
+        }
     }
     Ok(())
 }
 
 impl HostHome {
-    /// Stores a value in the existing system vault; never writes a plaintext fallback.
+    /// Lists all persisted consumers, including disabled activations/inactive Worlds.
+    /// Trusted native administration only; no global catalog is exposed to guests.
+    pub fn list_secret_consumers(&self) -> HostResult<Vec<SecretReadGrant>> {
+        let mut grants = self.load_profile()?.secret_read_grants;
+        for world in self.list_worlds()? {
+            grants.extend(self.load_world_composition(world.id)?.secret_read_grants);
+        }
+        Ok(grants)
+    }
+
+    /// Stores a legacy direct path in the explicitly selected backend.
     /// This is a native administrator API, unavailable to guests and browser channels.
     pub fn store_secret(&self, path: &SecretPath, value: &SecretValue) -> HostResult<()> {
-        SecretManager::system().store(path, value)?;
+        self.secret_manager()?.store(path, value)?;
         Ok(())
     }
     /// Deletes a native credential, without reading or returning its value.
     pub fn delete_secret(&self, path: &SecretPath) -> HostResult<bool> {
-        Ok(SecretManager::system().delete(path)?)
+        Ok(self.secret_manager()?.delete(path)?)
     }
     /// Persists one manifest-requested exact path for the next activation of a local owner.
     /// Approvals cannot be stored in the default-World recipe or copied to new Worlds.
@@ -83,6 +100,7 @@ impl HostHome {
             instance_id: owner.instance_id,
             component_id: owner.component_id,
             path,
+            entry_id: None,
         })?;
         self.save_composition_for_scope(&scope, &profile)
     }
@@ -267,6 +285,33 @@ secret-read = ["ai.*"]
                 .secret_read_grants
                 .is_empty()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn managed_binding_round_trips_and_is_not_overwritten_by_legacy_grant() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let home = HostHome::open(root.path().join("home"))?;
+        let activation = home
+            .install_local_rtw(artifact(root.path())?, None)?
+            .activation;
+        let scope = RuntimeScopeId::new(HOST_SCOPE);
+        let owner = ComponentRef::new(activation.instance_id, "backend");
+        let path = SecretPath::parse("ai.example.key")?;
+        let entry_id = uuid::Uuid::now_v7();
+        let mut profile = home.load_profile()?;
+        profile.grant_secret_read(SecretReadGrant {
+            scope_id: scope.clone(),
+            instance_id: owner.instance_id.clone(),
+            component_id: owner.component_id.clone(),
+            path: path.clone(),
+            entry_id: Some(entry_id),
+        })?;
+        profile.save(&home.profile_path)?;
+        home.grant_secret_read(scope, owner, path)?;
+        let reloaded = home.load_profile()?;
+        assert_eq!(reloaded.secret_read_grants.len(), 1);
+        assert_eq!(reloaded.secret_read_grants[0].entry_id, Some(entry_id));
         Ok(())
     }
     #[test]

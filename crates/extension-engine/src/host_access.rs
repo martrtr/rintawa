@@ -856,6 +856,7 @@ impl CompositionAccess for UnavailableCompositionAccess {
 
 #[derive(Clone)]
 pub(crate) struct HostAccessServices {
+    pub(crate) secret_access: Option<Arc<dyn SecretAccess>>,
     pub(crate) runtime_context: Arc<dyn RuntimeContextAccess>,
     pub(crate) world_data: Arc<dyn WorldDataAccess>,
     pub(crate) artifact_store: Arc<dyn ArtifactStoreAccess>,
@@ -877,6 +878,7 @@ impl HostAccessServices {
         runtime_policy: Arc<dyn RuntimePolicyAccess>,
     ) -> Self {
         Self {
+            secret_access: None,
             runtime_context: Arc::new(UnavailableRuntimeContextAccess),
             world_data: Arc::new(UnavailableWorldDataAccess),
             artifact_store,
@@ -911,6 +913,7 @@ impl HostAccessServices {
     }
     pub(crate) fn unavailable() -> Self {
         Self {
+            secret_access: None,
             runtime_context: Arc::new(UnavailableRuntimeContextAccess),
             world_data: Arc::new(UnavailableWorldDataAccess),
             artifact_store: Arc::new(UnavailableArtifactStoreAccess),
@@ -922,4 +925,26 @@ impl HostAccessServices {
             runtime_policy: Arc::new(UnavailableRuntimePolicyAccess),
         }
     }
+}
+
+/// Native Host boundary for activation-owned asynchronous secret operations.
+/// Identity and cancellation are supplied exclusively by the executing WASM Host.
+pub trait SecretAccess: Send + Sync {
+    /// Admit an operation or an already verified requester intent, with bounded retention.
+    fn begin(
+        self: Arc<Self>,
+        owner: &crate::LivePolicyTarget,
+        request: &str,
+        prompt: Option<crate::SecretPromptAuthority>,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> HostAccessResult<u64>;
+    /// Poll a retained operation; the caller's permission is checked by the WASM adapter.
+    fn status(&self, owner: &crate::LivePolicyTarget, handle: u64) -> HostAccessResult<String>;
+    /// Cancel/release only an owned handle, even after permission revocation.
+    fn close(
+        &self,
+        owner: &crate::LivePolicyTarget,
+        handle: u64,
+        release: bool,
+    ) -> HostAccessResult<()>;
 }

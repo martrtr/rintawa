@@ -16,7 +16,7 @@ thiserror.workspace = true
 toml.workspace = true
 tempfile.workspace = true
 tracing.workspace = true
-uuid = { workspace = true, features = ["v7"] }
+uuid = { workspace = true, features = ["v4", "v7"] }
 
 rintawa-artifacts = { path = "../artifacts" }
 rintawa-extension-engine = { path = "../extension-engine" }
@@ -24,6 +24,9 @@ rintawa-sdk = { path = "../sdk" }
 rintawa-storage = { path = "../storage" }
 rintawa-world = { path = "../world" }
 rintawa-world-runtime = { path = "../world-runtime" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 
 [dev-dependencies]
 zenoh = { version = "=1.10.2", default-features = false }

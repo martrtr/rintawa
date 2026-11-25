@@ -6,7 +6,6 @@
 
 use std::{
     collections::HashMap,
-    fmt::Display,
     sync::{
         Arc, RwLock,
         atomic::{AtomicU64, Ordering},
@@ -27,12 +26,18 @@ pub const KEYRING_SERVICE_NAME: &str = "rintawa";
 ///
 /// Extensions never receive this trait. They receive only a component context
 /// that performs an owner-scoped read check.
-pub(crate) trait SecretVault: Send + Sync {
+pub trait SecretVault: Send + Sync {
     /// Stores a secret at the supplied path.
     fn store(&self, path: &SecretPath, value: &SecretValue) -> Result<(), SecretAccessError>;
 
     /// Loads one secret, returning `None` when it has not been configured.
     fn load(&self, path: &SecretPath) -> Result<Option<SecretValue>, SecretAccessError>;
+
+    /// Loads a binding's storage key, distinct from a legacy direct path.
+    /// Simple vaults may resolve both identically; managed vaults check local metadata.
+    fn load_bound(&self, entry: &SecretPath) -> Result<Option<SecretValue>, SecretAccessError> {
+        self.load(entry)
+    }
 
     /// Deletes one secret, returning whether it existed.
     fn delete(&self, path: &SecretPath) -> Result<bool, SecretAccessError>;
@@ -40,21 +45,15 @@ pub(crate) trait SecretVault: Send + Sync {
 
 /// A platform credential-store implementation for production Rintawa hosts.
 #[derive(Debug, Default)]
-pub(crate) struct SystemSecretVault;
+pub struct SystemSecretVault;
 
 impl SystemSecretVault {
     fn entry(path: &SecretPath) -> Result<Entry, SecretAccessError> {
-        Entry::new(KEYRING_SERVICE_NAME, path.as_str())
-            .map_err(|error| Self::unavailable("open", path, error))
+        Entry::new(KEYRING_SERVICE_NAME, path.as_str()).map_err(|_| Self::unavailable("open"))
     }
 
-    fn unavailable(operation: &str, path: &SecretPath, error: impl Display) -> SecretAccessError {
-        warn!(
-            operation,
-            path = %path,
-            error = %error,
-            "OS credential store operation failed"
-        );
+    fn unavailable(operation: &str) -> SecretAccessError {
+        warn!(operation, "OS credential store operation failed");
         SecretAccessError::Unavailable
     }
 }
@@ -63,14 +62,14 @@ impl SecretVault for SystemSecretVault {
     fn store(&self, path: &SecretPath, value: &SecretValue) -> Result<(), SecretAccessError> {
         Self::entry(path)?
             .set_password(value.expose_secret())
-            .map_err(|error| Self::unavailable("store", path, error))
+            .map_err(|_| Self::unavailable("store"))
     }
 
     fn load(&self, path: &SecretPath) -> Result<Option<SecretValue>, SecretAccessError> {
         match Self::entry(path)?.get_password() {
             Ok(value) => Ok(Some(SecretValue::new(value))),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(Self::unavailable("load", path, error)),
+            Err(_) => Err(Self::unavailable("load")),
         }
     }
 
@@ -78,7 +77,7 @@ impl SecretVault for SystemSecretVault {
         match Self::entry(path)?.delete_credential() {
             Ok(()) => Ok(true),
             Err(keyring::Error::NoEntry) => Ok(false),
-            Err(error) => Err(Self::unavailable("delete", path, error)),
+            Err(_) => Err(Self::unavailable("delete")),
         }
     }
 }
@@ -127,6 +126,7 @@ impl SecretVault for InMemorySecretVault {
 #[derive(Clone, Default)]
 pub(crate) struct SecretGrants {
     pub(crate) patterns: Vec<SecretPathPattern>,
+    pub(crate) bindings: HashMap<SecretPath, SecretPath>,
     pub(crate) revision: u64,
 }
 
@@ -151,7 +151,7 @@ impl SecretManager {
     }
 
     /// Creates a manager with a host-supplied durable or test vault.
-    pub(crate) fn with_vault(vault: Arc<dyn SecretVault>) -> Self {
+    pub fn with_vault(vault: Arc<dyn SecretVault>) -> Self {
         Self {
             vault,
             read_grants: Arc::new(RwLock::new(HashMap::new())),
@@ -194,6 +194,30 @@ impl SecretManager {
         Ok(())
     }
 
+    /// Binds an exact approved consumer slot to a vault entry.
+    /// The caller must first validate the slot against the component manifest.
+    pub fn bind_read(
+        &self,
+        owner: ComponentRef,
+        slot: SecretPath,
+        entry: SecretPath,
+    ) -> Result<(), SecretAccessError> {
+        let mut grants = self
+            .read_grants
+            .write()
+            .map_err(|_| SecretAccessError::Unavailable)?;
+        let principal = grants.entry(owner).or_default();
+        let exact = SecretPathPattern::Exact(slot.clone());
+        if !principal.patterns.contains(&exact) {
+            principal.patterns.push(exact);
+        }
+        if principal.bindings.get(&slot) != Some(&entry) {
+            principal.bindings.insert(slot, entry);
+            principal.revision = self.policy_revision.fetch_add(1, Ordering::Relaxed) + 1;
+        }
+        Ok(())
+    }
+
     /// Returns whether one component currently holds a grant covering `pattern`.
     pub(crate) fn has_read_grant(&self, owner: &ComponentRef, pattern: &SecretPathPattern) -> bool {
         let principal = owner.clone();
@@ -232,13 +256,17 @@ impl SecretManager {
             .read_grants
             .read()
             .map_err(|_| SecretAccessError::Unavailable)?;
-        let revision = grants
+        let granted = grants
             .get(&principal)
             .filter(|g| g.patterns.iter().any(|p| p.matches(path)))
-            .map(|g| g.revision)
             .ok_or(SecretAccessError::AccessDenied)?;
+        let revision = granted.revision;
+        let binding = granted.bindings.get(path).cloned();
         drop(grants);
-        let value = self.vault.load(path)?;
+        let value = match binding {
+            Some(entry) => self.vault.load_bound(&entry)?,
+            None => self.vault.load(path)?,
+        };
         let grants = self
             .read_grants
             .read()
@@ -297,6 +325,61 @@ mod tests {
         ));
         assert!(matches!(
             manager.read_for_component(&owner("official_ai.instance-b", "provider"), &allowed_path),
+            Err(SecretAccessError::AccessDenied)
+        ));
+    }
+
+    #[test]
+    fn test_shared_binding_selects_entry_without_granting_other_consumers() {
+        let manager = manager();
+        let slot = SecretPath::parse("ai.provider.key").unwrap();
+        let entry = SecretPath::parse("managed.entry_1").unwrap();
+        let second = SecretPath::parse("managed.entry_2").unwrap();
+        let first_owner = owner("first", "backend");
+        let second_owner = owner("second", "backend");
+        manager
+            .store(&entry, &SecretValue::new("first value"))
+            .unwrap();
+        manager
+            .store(&second, &SecretValue::new("second value"))
+            .unwrap();
+        manager
+            .bind_read(first_owner.clone(), slot.clone(), entry.clone())
+            .unwrap();
+        assert_eq!(
+            manager
+                .read_for_component(&first_owner, &slot)
+                .unwrap()
+                .expose_secret(),
+            "first value"
+        );
+        assert!(matches!(
+            manager.read_for_component(&second_owner, &slot),
+            Err(SecretAccessError::AccessDenied)
+        ));
+        manager
+            .bind_read(second_owner.clone(), slot.clone(), entry)
+            .unwrap();
+        manager
+            .bind_read(first_owner.clone(), slot.clone(), second)
+            .unwrap();
+        assert_eq!(
+            manager
+                .read_for_component(&first_owner, &slot)
+                .unwrap()
+                .expose_secret(),
+            "second value"
+        );
+        assert_eq!(
+            manager
+                .read_for_component(&second_owner, &slot)
+                .unwrap()
+                .expose_secret(),
+            "first value"
+        );
+        manager.revoke_component(&first_owner);
+        assert!(matches!(
+            manager.read_for_component(&first_owner, &slot),
             Err(SecretAccessError::AccessDenied)
         ));
     }

@@ -29,6 +29,7 @@ mod live_policy;
 mod runtime_permissions;
 pub use live_policy::{
     LivePolicyChange, LivePolicyControl, LivePolicyDelta, LivePolicySnapshot, LivePolicyTarget,
+    SecretPromptAuthority,
 };
 
 pub use activation::{ActivationPlan, ActivationPlanError};
@@ -48,8 +49,9 @@ pub use host_access::{
     ArtifactStoreAccess, AssetStoreAccess, CompositionAccess, CompositionActivation,
     HostAccessError, HostAccessResult, ImportedArtifact, ImportedAsset, PreferenceAccess,
     RuntimeArtifactPolicy, RuntimeContextAccess, RuntimeHttpOriginGrant, RuntimePolicyAccess,
-    RuntimePolicyComponent, RuntimePolicyRequest, UserResourceAccess, UserResourceRef,
-    WorldDataAccess, WorldSessionAccess, WorldSessionAssetRef, WorldSessionSummary,
+    RuntimePolicyComponent, RuntimePolicyRequest, SecretAccess, UserResourceAccess,
+    UserResourceRef, WorldDataAccess, WorldSessionAccess, WorldSessionAssetRef,
+    WorldSessionSummary,
 };
 pub use loader::ExtensionLoader;
 pub use runtime::{WasmComponent, WasmExecutionBudget, WasmRuntimeEngine, WasmWorldSystemEndpoint};
@@ -61,7 +63,7 @@ pub use runtime::{WasmComponent, WasmExecutionBudget, WasmRuntimeEngine, WasmWor
 pub fn canonical_http_loopback_origin(origin: &str) -> Option<String> {
     runtime_permissions::parse_exact_local_http_origin(origin).ok()
 }
-pub use secrets::SecretManager;
+pub use secrets::{SecretManager, SecretVault, SystemSecretVault};
 pub use state::{ExtensionStateRecord, ExtensionsStateConfig, STATE_FILE_NAME};
 pub use transport::{TransportError, validate_transport_point};
 
