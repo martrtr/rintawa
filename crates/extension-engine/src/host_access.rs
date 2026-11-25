@@ -63,6 +63,25 @@ pub struct ImportedArtifact {
     pub content: String,
 }
 
+/// One advisory local archive row; integrity is verified separately on admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredArtifact {
+    /// Stable opaque inventory cursor key, including invalid entries.
+    pub key: String,
+    /// Canonical exact digest, absent for malformed filenames.
+    pub digest: Option<String>,
+    /// Declared content type when its header is readable.
+    pub content: Option<String>,
+    /// Unverified display name from bounded content metadata.
+    pub name: Option<String>,
+    /// Unverified declared package version.
+    pub version: Option<String>,
+    /// Unverified declared extension identity; never authorizes mutation.
+    pub subject: Option<String>,
+    /// Bounded row-level diagnostic, without filesystem paths.
+    pub error: Option<String>,
+}
+
 /// One exact activation selected by the host composition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompositionActivation {
@@ -181,6 +200,10 @@ pub trait WorldDataAccess: Send + Sync {
 
 /// Generic immutable RTW artifact-store operations.
 pub trait ArtifactStoreAccess: Send + Sync {
+    /// Reads an exact-digest inventory page; unsupported hosts fail closed.
+    fn list_rtw(&self, _after: Option<&str>, _limit: u32) -> HostAccessResult<Vec<StoredArtifact>> {
+        Err(HostAccessError::Unavailable)
+    }
     /// Validates and imports exact RTW bytes without selecting them for activation.
     fn import_rtw(&self, bytes: &[u8]) -> HostAccessResult<ImportedArtifact>;
 }

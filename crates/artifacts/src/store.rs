@@ -42,6 +42,17 @@ impl ArtifactImport {
     }
 }
 
+/// One advisory directory entry, not proof of artifact integrity.
+#[derive(Debug, Clone)]
+pub struct ArtifactInventoryEntry {
+    /// Stable opaque paging key, including for malformed filenames.
+    pub key: String,
+    /// Canonical digest when the filename identifies an artifact.
+    pub digest: Option<ArtifactDigest>,
+    /// Bounded diagnostic for an unsafe or unrecognized directory entry.
+    pub error: Option<&'static str>,
+}
+
 /// Immutable content-addressed store for validated RTW artifacts.
 ///
 /// The supplied root is expected to be the Rintawa store directory itself.
@@ -244,6 +255,58 @@ impl ArtifactStore {
         RtwArchive::from_file(file, self.limits)
     }
 
+    /// Opens only archive metadata for advisory inventory, without hashing payloads.
+    /// Never use this result for execution, permission approval or selection.
+    ///
+    /// # Errors
+    /// Returns an error for unsafe files or invalid archive structure.
+    pub fn open_inventory_artifact(&self, digest: &ArtifactDigest) -> RtwResult<RtwArchive> {
+        let path = self.path_for(digest);
+        ensure_regular_store_file(&path, digest)?;
+        RtwArchive::from_file(File::open(path)?, self.limits)
+    }
+
+    /// Enumerates bounded advisory entries, retaining malformed entries as rows.
+    ///
+    /// # Errors
+    /// Returns an error if the directory cannot be read or exceeds the scan bound.
+    pub fn inventory_entries_bounded(
+        &self,
+        maximum: usize,
+    ) -> RtwResult<Vec<ArtifactInventoryEntry>> {
+        let mut rows = Vec::new();
+        for entry in fs::read_dir(&self.sha256_directory)? {
+            let entry = entry?;
+            if rows.len() >= maximum {
+                return Err(RtwError::InvalidStoreEntry {
+                    path: self.sha256_directory.display().to_string(),
+                    reason: "artifact directory exceeds inventory scan bound",
+                });
+            }
+            let name = entry.file_name();
+            let digest = name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".rtw"))
+                .and_then(|hex| ArtifactDigest::parse(format!("sha256:{hex}")).ok());
+            let key = digest.as_ref().map(ToString::to_string).unwrap_or_else(|| {
+                format!(
+                    "invalid:{}",
+                    ArtifactDigest::sha256(name.as_encoded_bytes()).hex()
+                )
+            });
+            let error = if let Some(digest) = &digest {
+                ensure_regular_store_file(&entry.path(), digest)
+                    .err()
+                    .map(|_| "not a regular artifact file")
+            } else {
+                Some("noncanonical artifact filename")
+            };
+            rows.push(ArtifactInventoryEntry { key, digest, error });
+        }
+        rows.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(rows)
+    }
+
     /// Verifies both the content address and RTW validity of a stored artifact.
     ///
     /// # Errors
@@ -260,9 +323,23 @@ impl ArtifactStore {
     /// # Errors
     /// Returns an error for a malformed entry in the Host-owned CAS directory.
     pub fn digests(&self) -> RtwResult<Vec<ArtifactDigest>> {
+        self.digests_bounded(usize::MAX)
+    }
+
+    /// Lists canonical digests, refusing to allocate beyond the caller's scan bound.
+    ///
+    /// # Errors
+    /// Returns an invalid-store error when the scan bound or store integrity fails.
+    pub fn digests_bounded(&self, maximum: usize) -> RtwResult<Vec<ArtifactDigest>> {
         let mut result = Vec::new();
         for entry in fs::read_dir(&self.sha256_directory)? {
             let entry = entry?;
+            if result.len() >= maximum {
+                return Err(RtwError::InvalidStoreEntry {
+                    path: self.sha256_directory.display().to_string(),
+                    reason: "artifact directory exceeds inventory scan bound",
+                });
+            }
             let name = entry.file_name();
             let digest = name
                 .to_str()

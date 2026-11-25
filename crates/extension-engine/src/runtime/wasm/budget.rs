@@ -5,7 +5,7 @@ use wasmtime::{StoreLimits, StoreLimitsBuilder};
 /// Host-owned resource limits for one WASM component instance.
 ///
 /// Lifecycle and event callbacks receive a fresh `fuel_per_callback` allowance.
-/// Cooperative runtime tasks and service callbacks receive dedicated larger
+/// Cooperative runtime tasks and World System evaluations receive dedicated larger
 /// allowances while still remaining finite.
 ///
 /// Memory and table limits are enforced by Wasmtime for the lifetime of the
@@ -31,7 +31,8 @@ pub struct WasmExecutionBudget {
     pub fuel_per_callback: u64,
     /// Fuel made available before a cooperative runtime task callback.
     pub fuel_per_runtime_task: u64,
-    /// Fuel made available before a bounded service request callback.
+    /// Fuel made available before a bounded World System command evaluation.
+    /// Lifecycle callbacks continue to use `fuel_per_callback`.
     pub fuel_per_service_request: u64,
     /// Maximum byte length of an inbound event topic or payload.
     pub max_host_message_bytes: usize,

@@ -2,6 +2,79 @@
 use super::*;
 
 #[test]
+fn test_world_system_uses_finite_service_fuel_and_recovers_after_exhaustion() -> anyhow::Result<()>
+{
+    let budget = rintawa_extension_engine::WasmExecutionBudget::default();
+    assert_eq!(budget.fuel_per_callback, 10_000_000);
+    assert_eq!(budget.fuel_per_service_request, 500_000_000);
+    let fixture = Fixture::new(128)?;
+    let submit_burn = |item: ItemId, iterations: u64| -> anyhow::Result<u64> {
+        let reply = fixture.call(json!({
+            "op":"submit", "schema":"fixture.fuel-budget@1",
+            "payload":{"item":item.to_string(),"iterations":iterations}
+        }))?;
+        reply["ticket"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("submit returned {reply}"))
+    };
+
+    // The real guest loop requires more than the 10m callback allowance, but
+    // remains below the separate 500m service allowance.
+    let allowed = ItemId::new();
+    let ticket = submit_burn(allowed, 8_000_000)?;
+    fixture.flush()?;
+    assert_eq!(fixture.poll(ticket)?["state"], "committed");
+    assert!(
+        fixture
+            .runtime
+            .as_ref()
+            .unwrap()
+            .snapshot()?
+            .load_item(allowed)?
+            .is_some()
+    );
+
+    let refused = ItemId::new();
+    let ticket = submit_burn(refused, 100_000_000)?;
+    fixture.flush()?;
+    let failed = fixture.poll(ticket)?;
+    assert_eq!(failed["state"], "failed", "{failed}");
+    assert!(
+        failed["reason"]
+            .as_str()
+            .unwrap()
+            .contains("all fuel consumed"),
+        "{failed}"
+    );
+    assert!(
+        fixture
+            .runtime
+            .as_ref()
+            .unwrap()
+            .snapshot()?
+            .load_item(refused)?
+            .is_none()
+    );
+
+    // A trapped System instance is discarded; the active guest and World can
+    // still commit a later ordinary command.
+    let recovered = ItemId::new();
+    let ticket = fixture.submit("fixture.create@1", recovered)?;
+    fixture.flush()?;
+    assert_eq!(fixture.poll(ticket)?["state"], "committed");
+    assert!(
+        fixture
+            .runtime
+            .as_ref()
+            .unwrap()
+            .snapshot()?
+            .load_item(recovered)?
+            .is_some()
+    );
+    Ok(())
+}
+
+#[test]
 fn test_system_endpoints_share_one_store_across_schemas_separate_from_started_guest()
 -> anyhow::Result<()> {
     let fixture = Fixture::new(128)?;

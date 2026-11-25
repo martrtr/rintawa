@@ -715,6 +715,107 @@ impl WorldDataAccess for WorldDataRuntimeControl {
 }
 
 impl ArtifactStoreAccess for LocalHostAccess {
+    fn list_rtw(
+        &self,
+        after: Option<&str>,
+        limit: u32,
+    ) -> HostAccessResult<Vec<rintawa_extension_engine::StoredArtifact>> {
+        if !(1..=32).contains(&limit) || after.is_some_and(|a| a.len() > 80) {
+            return Err(HostAccessError::InvalidRequest);
+        }
+        let home = self.home()?;
+        let entries = home
+            .artifact_store()
+            .inventory_entries_bounded(10_000)
+            .map_err(|_| HostAccessError::Rejected)?;
+        let mut rows = Vec::new();
+        for entry in entries
+            .into_iter()
+            .filter(|e| after.is_none_or(|a| e.key.as_str() > a))
+            .take(limit as usize)
+        {
+            let mut row = rintawa_extension_engine::StoredArtifact {
+                key: entry.key,
+                digest: entry.digest.as_ref().map(ToString::to_string),
+                content: None,
+                name: None,
+                version: None,
+                subject: None,
+                error: entry.error.map(str::to_string),
+            };
+            if row.error.is_none() {
+                match home
+                    .artifact_store()
+                    .open_inventory_artifact(entry.digest.as_ref().unwrap())
+                {
+                    Ok(mut archive) => {
+                        let content = archive.manifest().content.to_string();
+                        if content.len() > 128 {
+                            row.error = Some("content identifier exceeds inventory limit".into());
+                            rows.push(row);
+                            continue;
+                        }
+                        row.content = Some(content.clone());
+                        let path = archive.manifest().entry.clone();
+                        let metadata = archive.read_with_limit(&path, 64 * 1024);
+                        match metadata {
+                            Ok(bytes) if content == "rintawa.extension@1" => {
+                                let manifest = std::str::from_utf8(&bytes)
+                                    .ok()
+                                    .and_then(|text| {
+                                        toml::from_str::<rintawa_sdk::manifest::ExtensionManifest>(
+                                            text,
+                                        )
+                                        .ok()
+                                    })
+                                    .filter(|m| m.validate().is_ok());
+                                if let Some(m) = manifest {
+                                    let mut bytes = 0;
+                                    row.name = Some(
+                                        m.name
+                                            .chars()
+                                            .take_while(|c| {
+                                                bytes += c.len_utf8();
+                                                bytes <= 128
+                                            })
+                                            .collect(),
+                                    );
+                                    row.version = (m.version.len() <= 64).then_some(m.version);
+                                    row.subject =
+                                        (m.id.as_str().len() <= 128).then(|| m.id.to_string());
+                                } else {
+                                    row.error = Some("invalid extension metadata".into());
+                                }
+                            }
+                            Ok(bytes) if content == "rintawa.world-template@1" => {
+                                row.name = serde_json::from_slice::<serde_json::Value>(&bytes)
+                                    .ok()
+                                    .and_then(|v| {
+                                        v["name"]
+                                            .as_str()
+                                            .filter(|s| s.len() <= 128)
+                                            .map(str::to_string)
+                                    });
+                                if row.name.is_none() {
+                                    row.error = Some("invalid template metadata".into());
+                                }
+                            }
+                            Err(_)
+                                if content == "rintawa.extension@1"
+                                    || content == "rintawa.world-template@1" =>
+                            {
+                                row.error = Some("metadata unavailable or exceeds limit".into())
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(_) => row.error = Some("invalid or unreadable archive metadata".into()),
+                }
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
     fn import_rtw(&self, bytes: &[u8]) -> HostAccessResult<ImportedArtifact> {
         let home = self.home()?;
         let imported = home

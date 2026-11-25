@@ -47,6 +47,7 @@ impl exports::rintawa::engine::guest::Guest for Fixture {
             "fixture.pinned",
             "fixture.pair",
             "fixture.system-limits",
+            "fixture.fuel-budget",
             "fixture.system-counter-a",
             "fixture.system-counter-b",
         ] {
@@ -285,6 +286,16 @@ fn graph_system(
                 "fixture.value",
                 serde_json::json!(7),
             )]
+        }
+        "fixture.fuel-budget@1" => {
+            // Keep work observable to the optimizer without any Host calls or
+            // World mutation. A trapped evaluation must publish no transaction.
+            let mut state = 0_u64;
+            for step in 0..payload["iterations"].as_u64().unwrap() {
+                state = std::hint::black_box(state.wrapping_add(step));
+            }
+            assert_ne!(state, u64::MAX);
+            vec![serde_json::json!({"operation":"create-object","id":payload["item"]})]
         }
         _ => return None,
     };

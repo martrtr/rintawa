@@ -27,13 +27,23 @@ protocols live beside those implementations.
 
 ## Proposed next product contracts
 
+Start with [package and conversation foundation](package-and-conversation-foundation.md):
+local package management, explicit Stop retaining text, independent listed chat
+forks, edit/delete/regenerate, message contributions and player personas. These
+complete basic product paths before transcript-derived memory; typed World examples
+can proceed independently. The two recorded owner product decisions do not approve
+all proposed API/schema amendments.
+
 - [Concurrent AI connections and streaming](ai-multiple-providers-streaming.md): request-scoped model choice, bounded streaming and consumer admission.
 
 - [Responsive, composable experience](extensible-experience.md): freshness,
   contextual actions, workspace layout and persistent permission experience.
-- [Narrative worlds and companions](narrative-and-companion.md): ownership,
-  memory/knowledge, multi-actor turns, media/native boundaries, functional coverage
-  and delivery gates for the Soul-of-Waifu reference scope.
+- [Simulation experiences and companions](narrative-and-companion.md): proposed
+  extension responsibilities, atomic actions, filtered perspectives, narration,
+  optional media and delivery boundaries.
+- [Simulation data and observations](simulation-data-and-observations.md): proposed
+  data recipes, source continuity, memory processing, private retrieval, authoring
+  examples and measured scaling criteria.
 
 These proposals do not change accepted contracts until the owner accepts them.
 They distinguish extension work from missing native/media/client guarantees.

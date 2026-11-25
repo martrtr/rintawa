@@ -49,7 +49,7 @@ pub use host_access::{
     ArtifactStoreAccess, AssetStoreAccess, CompositionAccess, CompositionActivation,
     HostAccessError, HostAccessResult, ImportedArtifact, ImportedAsset, PreferenceAccess,
     RuntimeArtifactPolicy, RuntimeContextAccess, RuntimeHttpOriginGrant, RuntimePolicyAccess,
-    RuntimePolicyComponent, RuntimePolicyRequest, SecretAccess, UserResourceAccess,
+    RuntimePolicyComponent, RuntimePolicyRequest, SecretAccess, StoredArtifact, UserResourceAccess,
     UserResourceRef, WorldDataAccess, WorldSessionAccess, WorldSessionAssetRef,
     WorldSessionSummary,
 };

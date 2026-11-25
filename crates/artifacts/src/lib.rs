@@ -24,4 +24,4 @@ pub use pack::{
     RtwCompression, RtwPackEntry, pack_directory, pack_entries, pack_entries_with_compression,
 };
 pub use path::ArtifactPath;
-pub use store::{ArtifactImport, ArtifactStore, ImportDisposition};
+pub use store::{ArtifactImport, ArtifactInventoryEntry, ArtifactStore, ImportDisposition};

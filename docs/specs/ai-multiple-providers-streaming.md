@@ -3,8 +3,10 @@
 Status: proposed amendment, 2026-11-24. The owner requested this slice for the
 current work. It changes the existing rtwKit inference contract and its
 Narrator-only admission; it does not change Core's permission or transport model.
-Only the accepted Chat streaming slice below is authorized for implementation.
-Other proposed changes still require owner acceptance. Companion documents:
+The accepted Chat streaming slice below is the implementation baseline. The owner
+has additionally selected Stop retaining received text and requested implementation
+of the foundation. Delivery begins with that Stop path. Unrelated consumer/model
+selection proposals remain outside this implementation slice. Companion documents:
 [narrative](narrative-and-companion.md), [settings and AI](extension-settings-and-ai-connections.md).
 
 ## Accepted Chat streaming slice (2026-11-24)
@@ -63,6 +65,17 @@ commit a partial answer. Prompt interruption of silent I/O needs a separate Core
 fix; this streaming slice and a heartbeat-based test do not establish it. See
 [HTTP worker](../../crates/extension-engine/src/runtime/wasm/http_request.rs).
 
+## Explicit Stop product decision (2026-11-25)
+
+The owner selected saving the received text when pressing Stop. This updates the
+previous unaccepted proposal to discard a prefix on explicit cancellation; it does
+not change the accepted network-failure retention block above. Narrator freezes
+its validated prefix, cancels inference and saves through ordinary Chat revision
+guards. Empty output saves nothing. See [foundation Stop semantics](package-and-conversation-foundation.md#3-explicit-stop-with-retained-text)
+for races, admission, resource accounting and the difference from World stop.
+Implementation adds owner-bound Narrator `stop` and Provider `cancel`; no native
+API amendment is included. The existing worker timeout limitation remains explicit.
+
 ## User outcome
 
 A World can run a Chat response while a simulation requests decisions for several
@@ -109,34 +122,49 @@ raw catalog directly to arbitrary consumers.
 
 ## Consumer admission
 
-**Source-review correction (2026-11-25):** Core Single resolution can automatically
-choose the first eligible provider without an explicit preferred selection.
-Consequently, the selection proposed below does not itself prove user consent.
-Before implementing extra-consumer admission, specify an AI-owned explicit
-scope/instance/component-to-connection allow policy using existing preferences and
-trusted Settings administration. Default-deny extra consumers. Contract registration
-alone must never authorize spending a connection's credentials. The following
-selection mechanism is discovery, not a replacement for that permission check.
+Proposed revision, 2026-11-25: use explicit AI-owned caller grants, not a new
+single `rintawa.inference.consumer` role. Core Single resolution can automatically
+choose the first eligible provider; registration/selection is discovery, not user
+consent to spend credentials. A mandatory coordinator would also force unrelated
+Memory, Studio and simulation extensions through one privileged intermediary.
 
+Preserve existing exact selected-Narrator admission. Default-deny additional
+callers until trusted Settings explicitly grants the exact World scope, extension
+instance/component, allowed connection IDs and inference capabilities. Store this
+bounded policy in existing AI-owned local preferences, never World properties or
+an imported self-authorizing manifest. Define the privileged settings method and
+limits before implementation. Local permission state must be remapped or explicitly
+reapproved when instance/World identity changes; an imported template grants none.
 
-Keep exact selected Narrator admission. Additionally allow a World's explicitly
-selected single provider of a new `rintawa.inference.consumer@1` contract. This
-is an application-level selection, resolved through existing selected-provider
-machinery, not a Core role, self-declared authorization or a blanket grant to every
-installed component. The selected simulation coordinator is the consumer; its
-agents need no AI, HTTP or secret permissions. Recheck the attested immediate
-caller, World, component and activation for every operation. Baseline remains
-denied. Selection and manifest setup are part of composition; document exact
-configuration and errors, including zero/ambiguous selection. Verify this use of
-existing registration/selection actually works in real WASM before relying on it;
-if it cannot, stop and propose the smallest admission amendment. This first slice
-supports one extra selected coordinator per World; do not invent a generic ACL or
-claim unlimited simultaneous independently authorized consumer packages.
+Multiple independent consumers may be admitted. An allowed consumer chooses only
+from its allowed connections; choosing primary resolves it first, then checks the
+resolved connection against that policy. Changing global primary cannot silently
+give a caller a different paid/cloud endpoint. Connection/model/capability checks
+remain request-scoped and preserve the shared catalog and secret authority.
 
-Catalog listing is available only to those same admitted callers and the existing
-sibling settings principal. Status/release/cancel and streaming data are scoped to
-the operation's original exact caller activation, not merely to a contract name.
-A different World, restarted activation or guessed operation ID gets invalid-operation.
+Check attested immediate caller, World, component and active execution at admission.
+Do not accept a caller identity or authorization scope from request JSON. An actor
+ID is domain context, not caller authentication. Baseline callers remain denied
+unless a separate accepted administrative operation explicitly permits them.
+
+Consumer catalog listing returns only permitted connection IDs, labels/default
+models and primary indication, without endpoints/secrets. Existing trusted sibling
+Settings administration retains its separate catalog-management authority. Status/release/cancel and streaming
+data remain scoped to the operation's original exact caller activation. A different
+World, restarted activation or guessed operation ID gets invalid-operation.
+
+Use bounded per-caller admission within the existing total operation/HTTP budget;
+no unbounded waiting queue or claim of reserved throughput. A trusted settings
+change is atomic at the policy owner. Revocation prevents new admission immediately
+at the next checked operation, retires affected local pending work/publication
+under existing live policy, and cannot undo remote cost or already disclosed input.
+Define and test the cancellation race rather than promising instant upstream stop.
+
+Acceptance must use real WASM callers: an unapproved self-registered provider is
+denied; two explicitly admitted independent consumers can use different connections;
+wrong scope/component, primary-switch escape and stale activation reject. This
+changes the proposed extra-consumer design only. It does not broaden the previously
+accepted Chat streaming slice.
 
 ## Operations, streaming and cancellation
 
@@ -170,6 +198,18 @@ retires owned handles and no further output/commit may be published. Cancellatio
 is best effort for remote execution and billing. A lost begin reply has unknown
 outcome: do not automatically retry. No automatic replay of billable requests.
 
+Explicit inference cancellation is distinct from Narrator's user-facing Stop.
+Narrator freezes its own last validated prefix when Stop is accepted, ignores later
+provider growth and propagates cancellation before releasing AI. It deliberately
+retains a nonempty frozen prefix through the ordinary captured Chat append guards;
+the cancelled provider result itself does not claim successful generation or save.
+If an append has already been submitted, reconcile its actual outcome instead of
+submitting another. Stale context and unknown outcomes remain explicit failures or
+uncertainty, never a reason to replay or force a write. Empty Stop creates no message.
+Repeated Stop is idempotent while retained. World/activation stop cannot initiate
+this retention path. Existing known-network-failure retention remains unchanged.
+
+
 Concurrent processing must be fair and bounded: preserve the total 16 operation
 limit, existing HTTP and per-poll byte/time limits; a slow operation cannot prevent
 others from making progress. Reject overload clearly; never queue unlimited work.
@@ -180,14 +220,16 @@ Confirm provider/Host ceilings in source and report actual observed concurrency;
 
 Narrator forwards pending AI snapshots via its own operation status, bound to the
 captured conversation and operation. Chat displays the prefix as a provisional
-assistant response. It commits only after Narrator receives successful completion
-and existing `expectedLastEntryId`, conversation revision and triggering-message
-revision validation succeeds. Switching conversation,
-World stop and stale context prevent new writes from the retired/stale operation.
-A known generation failure may retain validated text as specified above; it must
-never attach to a different conversation. Explicit cancellation remains proposed. A late response cannot replace
-newer UI state. The user can cancel from Chat; ensure Narrator propagates cancel to
-AI and releases both operations. Persisted messages remain readable after restart;
+assistant response. Successful completion, accepted known-failure retention and the
+proposed explicit Stop path all require the existing `expectedLastEntryId`,
+conversation revision and triggering-message revision validation before persistence.
+Switching the visible chat detaches observation; it does not redirect a pending
+operation or implicitly issue Stop. World/activation retirement prevents new writes
+from retired work; stale context rejects through ordinary guards. A late response
+cannot replace newer UI state. The user can press Stop from Chat; Narrator freezes
+and retains eligible text, propagates cancellation to AI and releases operations
+according to their real completion and resource lifecycle. Persisted messages
+remain readable after restart;
 unfinished generation is not replayed; a retained prefix survives only after its
 ordinary Chat transaction commits.
 
@@ -219,7 +261,7 @@ HTTP error, disconnect, oversized/escaped data and a missed status poll.
 
 Run the real browser Chat → Narrator → provider path against a delayed fixture:
 observe a prefix before completion, then one committed answer; a known stream interruption retains a validated prefix through Chat COMMIT;
-empty failures create no assistant. Show simulation coordinator making concurrent explicit
+empty failures create no assistant. Show two independently admitted consumers making concurrent explicit
 model requests without network/key capabilities. Retain focused command, revision,
 exit status and raw logs. Optional real OpenRouter/Z.AI smoke requires an explicitly
 provided credential and consent to any paid use; lack of it must be reported, not

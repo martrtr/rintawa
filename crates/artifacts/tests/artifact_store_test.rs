@@ -222,3 +222,50 @@ fn test_should_reject_non_directory_reserved_store_path() -> Result<()> {
     ));
     Ok(())
 }
+
+#[test]
+fn test_should_bound_inventory_scan_without_hiding_or_deleting_artifacts() -> Result<()> {
+    let root = TempDir::new()?;
+    let store = ArtifactStore::open(root.path().join("store"), RtwLimits::default())?;
+    assert!(store.digests_bounded(0)?.is_empty());
+    for name in ["inventory-a", "inventory-b"] {
+        store.import(build_artifact(&root, name)?)?;
+    }
+    assert!(store.digests_bounded(1).is_err());
+    let digests = store.digests_bounded(2)?;
+    assert_eq!(digests.len(), 2);
+    assert!(digests[0] < digests[1]);
+    for digest in digests {
+        store.open_artifact(&digest)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn test_should_keep_invalid_inventory_rows_without_trusting_advisory_metadata() -> Result<()> {
+    let root = TempDir::new()?;
+    let store = ArtifactStore::open(root.path().join("store"), RtwLimits::default())?;
+    let first = store.import(build_artifact(&root, "first")?)?;
+    let second = build_artifact(&root, "second")?;
+    // Structurally valid substituted bytes can be catalog hints, never authority.
+    fs::write(
+        stored_path(&store, &first.digest().hex()),
+        fs::read(second)?,
+    )?;
+    store.open_inventory_artifact(first.digest())?;
+    assert!(matches!(
+        store.open_artifact(first.digest()),
+        Err(RtwError::StoreCorruption(_))
+    ));
+    fs::write(store.root().join("sha256").join("broken-name"), b"bad")?;
+    let entries = store.inventory_entries_bounded(2)?;
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries.iter().filter(|e| e.error.is_some()).count(), 1);
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.digest.as_ref() == Some(first.digest()))
+    );
+    assert!(store.digests_bounded(2).is_err()); // Existing strict readers stay strict.
+    Ok(())
+}

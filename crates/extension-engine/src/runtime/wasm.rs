@@ -140,7 +140,7 @@ use bindings::Plugin;
 use bindings::rintawa::engine::{
     artifact_store::{
         Error as ArtifactStoreError, Host as ArtifactStoreHost,
-        ImportedArtifact as WitImportedArtifact,
+        ImportedArtifact as WitImportedArtifact, StoredArtifact as WitStoredArtifact,
     },
     asset_store::{AssetRef as WitAssetRef, Error as AssetStoreError, Host as AssetStoreHost},
     composition::{
@@ -2471,8 +2471,12 @@ impl WasmWorldSystemEndpoint {
         let instance = runtime.instance.as_mut().ok_or_else(|| {
             SystemError::Failed(String::from("WASM World System instance is unavailable"))
         })?;
-        WasmComponent::set_callback_fuel(&mut instance.store, &self.budget, "World System")
-            .map_err(|error| SystemError::Failed(error.to_string()))?;
+        WasmComponent::set_fuel(
+            &mut instance.store,
+            self.budget.fuel_per_service_request,
+            "World System",
+        )
+        .map_err(|error| SystemError::Failed(error.to_string()))?;
         instance
             .store
             .data_mut()

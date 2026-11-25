@@ -94,6 +94,21 @@ impl RuntimeContextAccess for RecordingScopedHostAccess {
 }
 
 impl ArtifactStoreAccess for RecordingScopedHostAccess {
+    fn list_rtw(
+        &self,
+        _: Option<&str>,
+        _: u32,
+    ) -> HostAccessResult<Vec<crate::host_access::StoredArtifact>> {
+        Ok(vec![crate::host_access::StoredArtifact {
+            key: format!("sha256:{}", "a".repeat(64)),
+            digest: Some(format!("sha256:{}", "a".repeat(64))),
+            content: Some("rintawa.extension@1".into()),
+            name: None,
+            version: None,
+            subject: None,
+            error: None,
+        }])
+    }
     fn import_rtw(&self, _bytes: &[u8]) -> HostAccessResult<ImportedArtifact> {
         Err(HostAccessError::Rejected)
     }
@@ -3113,4 +3128,80 @@ fn test_live_revoke_cancels_tasks_and_sockets_without_guest_poll_or_revival() {
     policy.revoke_component(&owner, &state.transport.contexts);
     RuntimeTasksHost::cancel(&mut state, fresh).unwrap();
     NetworkHost::close(&mut state, client).unwrap();
+}
+
+#[test]
+fn test_should_gate_artifact_inventory_to_granted_host_components() {
+    for scope in ["host", "world:test"] {
+        let access = Arc::new(RecordingScopedHostAccess::default());
+        let mut services = WasmHostServices::standalone(SecretManager::with_vault(Arc::new(
+            InMemorySecretVault::default(),
+        )));
+        services.host_access = HostAccessServices::new(
+            access.clone(),
+            access.clone(),
+            access.clone(),
+            access.clone(),
+            access.clone(),
+            access,
+        );
+        let mut state = WasmHostState::with_host_services_and_budget(
+            ComponentId::new("backend"),
+            services,
+            false,
+            &WasmExecutionBudget::default(),
+        );
+        let scope = RuntimeScopeId::new(scope);
+        let owner = rintawa_sdk::contracts::ComponentRef::new(
+            test_instance_id(),
+            ComponentId::new("backend"),
+        );
+        state
+            .transport
+            .contexts
+            .begin(owner.clone(), scope.clone())
+            .unwrap();
+        state
+            .transport
+            .contexts
+            .activate_instance(&test_instance_id());
+        state
+            .begin_registration(
+                ExtensionId::new("inventory"),
+                test_instance_id(),
+                scope.clone(),
+            )
+            .unwrap();
+        state.finish_registration().unwrap();
+        state.begin_guest_execution();
+        assert!(matches!(
+            ArtifactStoreHost::list_rtw(&mut state, None, 16),
+            Err(ArtifactStoreError::PermissionDenied)
+        ));
+        state
+            .runtime_permissions
+            .grant(owner, RuntimePermission::CompositionRead)
+            .unwrap();
+        if scope.as_str() == "host" {
+            assert_eq!(
+                ArtifactStoreHost::list_rtw(&mut state, None, 16)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(matches!(
+                ArtifactStoreHost::list_rtw(&mut state, None, 33),
+                Err(ArtifactStoreError::Rejected)
+            ));
+            assert!(matches!(
+                ArtifactStoreHost::list_rtw(&mut state, Some("x".repeat(81)), 1),
+                Err(ArtifactStoreError::Rejected)
+            ));
+        } else {
+            assert!(matches!(
+                ArtifactStoreHost::list_rtw(&mut state, None, 16),
+                Err(ArtifactStoreError::PermissionDenied)
+            ));
+        }
+    }
 }

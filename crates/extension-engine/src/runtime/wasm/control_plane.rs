@@ -24,6 +24,59 @@ use crate::{
 const MAX_PUBLISHED_PREFERENCE_BYTES: usize = 64 * 1024;
 
 impl ArtifactStoreHost for WasmHostState {
+    fn list_rtw(
+        &mut self,
+        after: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<super::WitStoredArtifact>, ArtifactStoreError> {
+        if !self.host_access_active {
+            return Err(ArtifactStoreError::AccessNotActive);
+        }
+        let context = self
+            .execution_context
+            .as_ref()
+            .ok_or(ArtifactStoreError::AccessNotActive)?;
+        if context.scope.as_str() != "host" {
+            return Err(ArtifactStoreError::PermissionDenied);
+        }
+        self.runtime_permission_owner(RuntimePermission::CompositionRead)
+            .map_err(|error| match error {
+                RuntimePermissionCheck::Denied => ArtifactStoreError::PermissionDenied,
+                RuntimePermissionCheck::Unavailable => ArtifactStoreError::Unavailable,
+            })?;
+        if !(1..=32).contains(&limit) || after.as_ref().is_some_and(|s| s.len() > 80) {
+            return Err(ArtifactStoreError::Rejected);
+        }
+        let rows = self
+            .host_access
+            .artifact_store
+            .list_rtw(after.as_deref(), limit)
+            .map_err(map_artifact_store_access_error)?;
+        let bytes = rows.iter().fold(0usize, |n, r| {
+            n.saturating_add(r.key.len())
+                .saturating_add(r.digest.as_ref().map_or(0, String::len))
+                .saturating_add(r.content.as_ref().map_or(0, String::len))
+                .saturating_add(r.name.as_ref().map_or(0, String::len))
+                .saturating_add(r.version.as_ref().map_or(0, String::len))
+                .saturating_add(r.subject.as_ref().map_or(0, String::len))
+                .saturating_add(r.error.as_ref().map_or(0, String::len))
+        });
+        if rows.len() > limit as usize || bytes > self.max_host_message_bytes {
+            return Err(ArtifactStoreError::MessageTooLarge);
+        }
+        Ok(rows
+            .into_iter()
+            .map(|r| super::WitStoredArtifact {
+                key: r.key,
+                digest: r.digest,
+                content: r.content,
+                name: r.name,
+                version: r.version,
+                subject: r.subject,
+                error: r.error,
+            })
+            .collect())
+    }
     fn import_rtw(&mut self, bytes: Vec<u8>) -> Result<WitImportedArtifact, ArtifactStoreError> {
         if !self.host_access_active {
             return Err(ArtifactStoreError::AccessNotActive);

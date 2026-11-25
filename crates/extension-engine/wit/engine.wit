@@ -357,6 +357,17 @@ interface artifact-store {
         content: string,
     }
 
+    /// Advisory metadata only. Execution/selection must verify the exact bytes.
+    record stored-artifact {
+        key: string,
+        digest: option<string>,
+        content: option<string>,
+        name: option<string>,
+        version: option<string>,
+        subject: option<string>,
+        error: option<string>,
+    }
+
     /// Failure while importing an RTW artifact.
     variant error {
         access-not-active,
@@ -366,6 +377,10 @@ interface artifact-store {
         rejected,
         unavailable,
     }
+
+    /// Host-only inventory, requiring composition-read. At most 32 results,
+    /// strictly after the optional opaque key. Not a pinned snapshot or integrity check.
+    list-rtw: func(after: option<string>, limit: u32) -> result<list<stored-artifact>, error>;
 
     /// Validates and imports RTW bytes without selecting them for activation.
     import-rtw: func(bytes: list<u8>) -> result<imported-artifact, error>;
